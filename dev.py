@@ -79,8 +79,9 @@ def node_env() -> dict:
 
 
 # Earlier corepack versions reject pnpm 11.x's signing keys with
-# "Cannot find matching keyid" (key rotation, fixed upstream in 0.31).
-_MIN_COREPACK = (0, 31)
+# "Cannot find matching keyid" (key rotation). 0.30.x ships keys that
+# cover pnpm 11.x; older releases do not.
+_MIN_COREPACK = (0, 30)
 _PNPM_READY: str | None = None
 
 
@@ -113,27 +114,29 @@ def ensure_corepack_pnpm() -> None:
 
     env = node_env()
 
+    min_version = ".".join(str(x) for x in _MIN_COREPACK)
+    upgrade_hint = (
+        f"Upgrade corepack to >= {min_version}. Pick whichever fits your setup:\n"
+        "  - Volta-managed Node:   volta install corepack\n"
+        "  - nvm/asdf/system Node: npm i -g corepack@latest\n"
+        "  - Homebrew Node:        brew upgrade node"
+    )
+
     try:
         cp_out = subprocess.run(
             ["corepack", "--version"],
             capture_output=True, text=True, env=env, check=True,
         ).stdout.strip()
     except FileNotFoundError:
-        raise SystemExit(
-            "corepack not found on PATH.\n"
-            "Install with `npm i -g corepack@latest` or use a Node.js version "
-            "that bundles corepack >= 0.31."
-        )
+        raise SystemExit("corepack not found on PATH.\n" + upgrade_hint)
     except subprocess.CalledProcessError as e:
-        raise SystemExit(f"`corepack --version` failed:\n{e.stderr}")
+        raise SystemExit(f"`corepack --version` failed:\n{e.stderr}\n" + upgrade_hint)
 
     cp_version = tuple(int(x) for x in cp_out.split(".") if x.isdigit())
     if cp_version < _MIN_COREPACK:
         raise SystemExit(
-            f"corepack {cp_out} is too old (minimum: "
-            f"{'.'.join(str(x) for x in _MIN_COREPACK)}).\n"
-            "Older versions reject pnpm's current signing keys.\n"
-            "Upgrade with `npm i -g corepack@latest` (sudo if globally installed)."
+            f"corepack {cp_out} is too old (minimum: {min_version}).\n"
+            "Older versions reject pnpm's current signing keys.\n" + upgrade_hint
         )
 
     subprocess.run(["corepack", "enable"], check=True, env=env, capture_output=True)
@@ -150,8 +153,8 @@ def ensure_corepack_pnpm() -> None:
     except FileNotFoundError:
         raise SystemExit(
             "pnpm not found on PATH after `corepack enable`.\n"
-            "Corepack shims should land on PATH automatically — check $PATH "
-            "(an older system pnpm symlink may be shadowing the corepack shim)."
+            "Corepack shims should land on PATH automatically; check that "
+            "your node version manager exposes them."
         )
     except subprocess.CalledProcessError as e:
         raise SystemExit(f"`pnpm --version` failed:\n{e.stderr or e.stdout}")
@@ -159,7 +162,9 @@ def ensure_corepack_pnpm() -> None:
     if actual != pinned:
         raise SystemExit(
             f"pnpm version mismatch: expected {pinned}, got {actual}.\n"
-            f"Run `corepack prepare pnpm@{pinned} --activate` and re-check $PATH."
+            f"Run `corepack prepare pnpm@{pinned} --activate`. "
+            f"If a different pnpm wins on PATH, adjust your node version "
+            f"manager so the corepack shim is found first."
         )
 
     _PNPM_READY = pinned
