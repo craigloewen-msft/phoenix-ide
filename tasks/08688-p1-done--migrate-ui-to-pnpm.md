@@ -1,7 +1,7 @@
 ---
 created: 2026-05-07
 priority: p1
-status: ready
+status: done
 artifact: dev.py
 ---
 
