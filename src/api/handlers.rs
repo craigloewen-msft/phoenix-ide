@@ -1345,6 +1345,13 @@ async fn stream_conversation(
         .get_or_create(&id)
         .await
         .map_err(AppError::Internal)?;
+    // Diagnostic: log current receiver count so we can detect the
+    // "spinner-forever" scenario where clients subscribe to a dead channel.
+    tracing::debug!(
+        conv_id = %id,
+        receivers_before = handle.broadcast_tx.receiver_count(),
+        "SSE client subscribing"
+    );
     let broadcast_rx = handle.broadcast_tx.subscribe();
 
     // Compute initial commits_behind for Work conversations.
@@ -2196,6 +2203,18 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
                 sequence_id: seq,
                 conversation_id: conv_id,
             });
+    }
+
+    // Also reach SSE clients on any evicted-but-not-yet-replaced broadcaster.
+    // This covers the window between evict_runtime (model upgrade) and the next
+    // get_or_create: during that window try_get_handle returns None but clients
+    // are still subscribed to the stashed broadcaster.
+    if let Some(tx) = state.runtime.take_evicted_broadcaster(id).await {
+        let conv_id = id.to_string();
+        let _ = tx.send_seq(|seq| SseEvent::ConversationHardDeleted {
+            sequence_id: seq,
+            conversation_id: conv_id,
+        });
     }
 
     Ok(())
