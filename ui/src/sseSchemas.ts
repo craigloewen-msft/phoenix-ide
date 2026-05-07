@@ -395,11 +395,11 @@ const BashRunningPayloadSchema = v.looseObject({
   status: v.literal('running'),
   handle: v.string(),
   cmd: v.string(),
+  label: v.exactOptional(v.nullable(v.string())),
   display: v.string(),
   kill_signal_sent: v.exactOptional(v.nullable(v.string())),
   kill_attempted_at: v.exactOptional(v.nullable(v.string())),
   signal_sent: v.exactOptional(v.nullable(v.string())),
-  deprecation_notice: v.exactOptional(v.nullable(v.string())),
   ...BashRingWindowFieldsSchema,
 });
 
@@ -407,10 +407,10 @@ const BashStillRunningPayloadSchema = v.looseObject({
   status: v.literal('still_running'),
   handle: v.string(),
   cmd: v.string(),
+  label: v.exactOptional(v.nullable(v.string())),
   waited_ms: v.number(),
   kill_signal_sent: v.exactOptional(v.nullable(v.string())),
   kill_attempted_at: v.exactOptional(v.nullable(v.string())),
-  deprecation_notice: v.exactOptional(v.nullable(v.string())),
   ...BashRingWindowFieldsSchema,
 });
 
@@ -418,6 +418,7 @@ const BashKillPendingKernelPayloadSchema = v.looseObject({
   status: v.literal('kill_pending_kernel'),
   handle: v.string(),
   cmd: v.string(),
+  label: v.exactOptional(v.nullable(v.string())),
   kill_signal_sent: v.string(),
   kill_attempted_at: v.string(),
   display: v.string(),
@@ -429,6 +430,7 @@ const BashTombstonedPayloadSchema = v.looseObject({
   status: v.literal('tombstoned'),
   handle: v.string(),
   cmd: v.string(),
+  label: v.exactOptional(v.nullable(v.string())),
   final_cause: v.string(),
   exit_code: v.nullable(v.number()),
   signal_number: v.exactOptional(v.nullable(v.number())),
@@ -438,15 +440,15 @@ const BashTombstonedPayloadSchema = v.looseObject({
   kill_attempted_at: v.exactOptional(v.nullable(v.string())),
   display: v.string(),
   signal_sent: v.exactOptional(v.nullable(v.string())),
-  deprecation_notice: v.exactOptional(v.nullable(v.string())),
   ...BashRingWindowFieldsSchema,
 });
 
-const BashSpawnTombstonePayloadSchema = (status: 'exited' | 'killed') =>
+const BashRunTombstonePayloadSchema = (status: 'exited' | 'killed') =>
   v.looseObject({
     status: v.literal(status),
     handle: v.string(),
     cmd: v.string(),
+    label: v.exactOptional(v.nullable(v.string())),
     final_cause: v.string(),
     exit_code: v.nullable(v.number()),
     signal_number: v.exactOptional(v.nullable(v.number())),
@@ -454,7 +456,6 @@ const BashSpawnTombstonePayloadSchema = (status: 'exited' | 'killed') =>
     finished_at: v.string(),
     kill_signal_sent: v.exactOptional(v.nullable(v.string())),
     kill_attempted_at: v.exactOptional(v.nullable(v.string())),
-    deprecation_notice: v.exactOptional(v.nullable(v.string())),
     ...BashRingWindowFieldsSchema,
   });
 
@@ -462,6 +463,7 @@ const BashWaiterPanickedPayloadSchema = v.looseObject({
   status: v.literal('waiter_panicked'),
   handle: v.string(),
   cmd: v.string(),
+  label: v.exactOptional(v.nullable(v.string())),
   error_message: v.string(),
 });
 
@@ -473,21 +475,20 @@ export const BashResponseSchema = v.variant('status', [
   BashStillRunningPayloadSchema,
   BashKillPendingKernelPayloadSchema,
   BashTombstonedPayloadSchema,
-  BashSpawnTombstonePayloadSchema('exited'),
-  BashSpawnTombstonePayloadSchema('killed'),
+  BashRunTombstonePayloadSchema('exited'),
+  BashRunTombstonePayloadSchema('killed'),
   BashWaiterPanickedPayloadSchema,
 ]) satisfies v.GenericSchema<unknown, WireBashResponse>;
 
 const BashLiveHandleSummarySchema = v.looseObject({
   handle: v.string(),
   cmd: v.string(),
+  label: v.exactOptional(v.nullable(v.string())),
   age_seconds: v.number(),
   status: v.string(),
 });
 
-/** Bash error envelope (REQ-BASH-008). The dual-pass `mutually_exclusive_modes`
- *  case carries `mode` / `wait_seconds` extras flattened onto the envelope at
- *  runtime — the schema is loose so they pass through. */
+/** Bash error envelope (REQ-BASH-008). */
 export const BashErrorResponseSchema = v.variant('error', [
   v.looseObject({
     error: v.literal('handle_not_found'),
@@ -516,6 +517,11 @@ export const BashErrorResponseSchema = v.variant('error', [
   v.looseObject({
     error: v.literal('spawn_failed'),
     error_message: v.string(),
+  }),
+  v.looseObject({
+    error: v.literal('label_too_long'),
+    error_message: v.string(),
+    max_label_length: v.number(),
   }),
   v.looseObject({
     error: v.literal('mutually_exclusive_modes'),
