@@ -542,34 +542,53 @@ mod tests {
         // rather than echo's 0.
         let tool = BashTool;
         let registry = Arc::new(BashHandleRegistry::new());
-        let c = ctx_with_registry(registry);
+        let c = ctx_with_registry(registry.clone());
 
-        // Use an unusual sleep duration so the inner sleep's argv (`sleep N`)
-        // is unique on the host and matchable via `pkill -xf` without
-        // collateral. Bash's argv is `bash -c sleep N && echo ok`, which
-        // does NOT match `sleep N` exactly under -x.
-        let unique_duration = "8128";
-        let cmd = format!("sleep {unique_duration} && echo ok");
+        let cmd = "sleep 8128 && echo ok";
         let spawn = tool
-            .run(json!({"cmd": &cmd, "wait_seconds": 0}), c.clone())
+            .run(json!({"cmd": cmd, "wait_seconds": 0}), c.clone())
             .await;
         let v = parse_response(&spawn);
         let handle = v["handle"].as_str().unwrap().to_string();
 
-        // Wait for the inner sleep to be visible in the process table.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Look up bash's pid through the registry (in-process), then find
+        // its child via `pgrep -P <bash_pid>` and SIGKILL by pid. Avoids
+        // `pkill -xf` argv matching, which is unreliable on darwin where
+        // KERN_PROCARGS2 reconstructs argv differently from Linux's
+        // /proc/PID/cmdline (NUL-separated).
+        let bash_pid = {
+            use crate::tools::bash::handle::HandleId;
+            let conv = registry.get_or_create("test-conv").await;
+            let h = conv
+                .read()
+                .await
+                .get(&HandleId::new(handle.clone()))
+                .expect("handle should be live");
+            h.live_pid().await.expect("bash should be live")
+        };
 
-        // SIGKILL only the inner sleep — pkill -xf with full-argv exact
-        // match. Bash's argv won't match (it has more words), so bash
-        // stays alive and observes its child dying.
-        let pkill = std::process::Command::new("pkill")
-            .args(["-KILL", "-xf", &format!("sleep {unique_duration}")])
+        // Wait for bash to fork its inner sleep child.
+        let inner_pid = loop {
+            let out = std::process::Command::new("pgrep")
+                .args(["-P", &bash_pid.to_string()])
+                .output()
+                .expect("pgrep should be available");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if let Some(line) = stdout.lines().next() {
+                if let Ok(p) = line.trim().parse::<u32>() {
+                    break p;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
+        // SIGKILL the inner sleep by pid. Bash's argv won't be touched, so
+        // bash stays alive and observes its child dying.
+        let kill = std::process::Command::new("kill")
+            .args(["-KILL", &inner_pid.to_string()])
             .status()
-            .expect("pkill should be available");
-        assert!(
-            pkill.success() || pkill.code() == Some(0) || pkill.code() == Some(1),
-            "pkill exited with {pkill:?}"
-        );
+            .expect("kill should be available");
+        assert!(kill.success(), "kill exited with {kill:?}");
 
         // Wait on the handle — bash sees sleep die signaled, short-circuits
         // the `&&`, and exits with code 137 (= 128 + SIGKILL). Phoenix
