@@ -127,6 +127,33 @@ Each git worktree gets unique ports and database automatically.
 
 ⚠️ Do NOT use `cargo run` directly—server needs LLM gateway config from `./dev.py`.
 
+### Node + pnpm bootstrap (one-time, per host)
+
+The UI uses pnpm via Corepack. `./dev.py` will hard-fail with an actionable
+message if Corepack is missing, too old, or activates a mismatching pnpm
+version — there is no fallback to system pnpm.
+
+On a fresh host (laptop or remote), once Node.js >= 22 is installed:
+
+```bash
+corepack --version          # must be >= 0.31; older versions reject
+                            # pnpm 11.x signing keys
+corepack enable             # idempotent; installs shims on PATH
+# `./dev.py` runs `corepack prepare pnpm@<pinned> --activate` itself,
+# reading the pin from ui/package.json#packageManager.
+```
+
+If `corepack --version` is < 0.31 (older Node bundles, or a stale
+globally-installed corepack from years ago shadowing the bundled one):
+
+```bash
+sudo npm i -g corepack@latest
+```
+
+To bump the pinned pnpm version: edit `packageManager` in
+`ui/package.json`, run `pnpm install` to regenerate `pnpm-lock.yaml`,
+commit both. `./dev.py` will pick up the new pin on the next run.
+
 ---
 
 ## Commits and pushes

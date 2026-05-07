@@ -59,8 +59,9 @@ ok "Worktree at $SHA"
 # ── build UI ─────────────────────────────────────────────────────────────────
 
 info "Building UI"
-npm ci    --prefix "$BUILD_WORKTREE/ui" --silent
-npm run build --prefix "$BUILD_WORKTREE/ui"
+# pnpm uses `-C <dir>` (or `--dir`) where npm uses `--prefix`.
+pnpm -C "$BUILD_WORKTREE/ui" install --frozen-lockfile --silent
+pnpm -C "$BUILD_WORKTREE/ui" run build
 ok "UI built"
 
 # ── build Rust ───────────────────────────────────────────────────────────────

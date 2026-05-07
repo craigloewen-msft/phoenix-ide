@@ -18,12 +18,18 @@ jobs:
       - name: Install musl toolchain
         run: sudo apt-get install -y musl-tools
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        # Reads packageManager from ui/package.json — single source of truth.
+        with:
+          package_json_file: ui/package.json
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: lts/*
-          cache: npm
-          cache-dependency-path: ui/package-lock.json
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -34,7 +40,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build UI
-        run: npm ci && npm run build
+        run: pnpm install --frozen-lockfile && pnpm run build
         working-directory: ui
 
       - name: Build binary

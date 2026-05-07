@@ -58,7 +58,7 @@ This script:
 3. Creates an annotated git tag and pushes it
 
 Pushing the tag triggers `.github/workflows/release.yml`, which:
-- Builds the UI (`npm ci && npm run build`)
+- Builds the UI (`pnpm install --frozen-lockfile && pnpm run build`)
 - Compiles a static `x86_64-unknown-linux-musl` binary
 - Creates a GitHub Release with the binary as an asset
 
