@@ -39,7 +39,7 @@ use axum::{
     http::StatusCode,
     middleware,
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use chrono::Datelike;
@@ -90,6 +90,11 @@ pub fn create_router(state: AppState) -> Router {
         // User actions (REQ-API-004)
         .route("/api/conversations/:id/chat", post(send_chat))
         .route("/api/conversations/:id/cancel", post(cancel_conversation))
+        // Steering queue management (task 01001)
+        .route(
+            "/api/conversations/:id/steering-queue/:message_id",
+            delete(cancel_steering_message),
+        )
         .route(
             "/api/conversations/:id/trigger-continuation",
             post(trigger_continuation),
@@ -1492,6 +1497,7 @@ async fn stream_conversation(
 // User Actions (REQ-API-004)
 // ============================================================
 
+#[allow(clippy::too_many_lines)]
 async fn send_chat(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1509,7 +1515,10 @@ async fn send_chat(
             message_id = %req.message_id,
             "Duplicate message detected, returning success (idempotent)"
         );
-        return Ok(Json(ChatResponse { queued: true }));
+        return Ok(Json(ChatResponse {
+            queued: true,
+            steering: false,
+        }));
     }
 
     // Expand `@file` inline references before sending to the LLM (REQ-IR-001, REQ-IR-007)
@@ -1520,6 +1529,19 @@ async fn send_chat(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
+    // Steering queue idempotency: if message_id is already in the queue a
+    // retry returns the same accepted response without double-enqueuing.
+    if conversation
+        .steering_queue
+        .iter()
+        .any(|e| e.message_id == req.message_id)
+    {
+        return Ok(Json(ChatResponse {
+            queued: true,
+            steering: true,
+        }));
+    }
+
     // Fail-fast when the state would reject UserMessage. Without this, the
     // chat POST returns 200, the runtime drops the queued event with only a
     // "Transition rejected" log line, and the optimistic UI is stuck on
@@ -1528,6 +1550,68 @@ async fn send_chat(
     // (`markFailed` in ConversationPage.tsx) surface the rejection to the
     // user with retry/dismiss controls.
     if let Err(err) = check_user_message_acceptable(&conversation.state) {
+        // `AgentBusy` and `CancellationInProgress` states are transient — the
+        // conversation will reach `Idle` once the current operation completes.
+        // Instead of rejecting, queue the message as a steering directive so
+        // it is delivered automatically when `Idle` is next entered.
+        let steer = matches!(
+            err,
+            TransitionError::AgentBusy | TransitionError::CancellationInProgress
+        );
+        if steer {
+            // Enforce queue depth limit before accepting.
+            const MAX_STEER_QUEUE_DEPTH: usize = 5;
+            if conversation.steering_queue.len() >= MAX_STEER_QUEUE_DEPTH {
+                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "Steering queue is full; try again once a queued message has been delivered."
+                        .to_string(),
+                    "steering_queue_full",
+                ))));
+            }
+
+            let working_dir = std::path::PathBuf::from(&conversation.cwd);
+            let expanded =
+                crate::message_expander::expand(&req.text, &working_dir).map_err(|e| {
+                    AppError::UnprocessableEntity(ExpansionErrorResponse {
+                        error: e.to_string(),
+                        error_type: e.error_type().to_string(),
+                        reference: e.reference(),
+                    })
+                })?;
+            let images: Vec<ImageData> = req
+                .images
+                .into_iter()
+                .map(|img| ImageData {
+                    data: img.data,
+                    media_type: img.media_type,
+                })
+                .collect();
+            let chat_llm_text =
+                (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
+            let steer_event = Event::SteerMessage {
+                text: expanded.display_text,
+                llm_text: chat_llm_text,
+                images,
+                message_id: req.message_id,
+                user_agent: req.user_agent,
+                skill_invocation: expanded.skill_invocation,
+            };
+            tracing::info!(
+                conv_id = %id,
+                state = conversation.state.variant_name(),
+                "Chat queued as steering message (conversation busy)"
+            );
+            state
+                .runtime
+                .enqueue_steer_message(&id, steer_event)
+                .await
+                .map_err(AppError::BadRequest)?;
+            return Ok(Json(ChatResponse {
+                queued: true,
+                steering: true,
+            }));
+        }
+
         let error_type = match err {
             TransitionError::ContextExhausted => "context_exhausted",
             TransitionError::ConversationTerminal => "conversation_terminal",
@@ -1589,7 +1673,10 @@ async fn send_chat(
         .await
         .map_err(AppError::BadRequest)?;
 
-    Ok(Json(ChatResponse { queued: true }))
+    Ok(Json(ChatResponse {
+        queued: true,
+        steering: false,
+    }))
 }
 
 async fn cancel_conversation(
@@ -1695,6 +1782,54 @@ async fn trigger_continuation(
         .send_event(&id, Event::UserTriggerContinuation)
         .await
         .map_err(AppError::BadRequest)?;
+
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+/// Cancel a specific queued steering message (task 01001).
+///
+/// Removes the entry with the given `message_id` from the conversation's
+/// steering queue and persists the change. Returns 404 if the conversation or
+/// message is not found. Returns 200 (success: true) if the message was removed
+/// or was already absent (idempotent).
+async fn cancel_steering_message(
+    State(state): State<AppState>,
+    Path((id, message_id)): Path<(String, String)>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    // Filter out the target message_id
+    let new_queue: Vec<crate::state_machine::event::SteerEntry> = conversation
+        .steering_queue
+        .into_iter()
+        .filter(|e| e.message_id != message_id)
+        .collect();
+
+    state
+        .runtime
+        .db()
+        .update_steering_queue(&id, &new_queue)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // Notify the live executor (if running) to remove the entry from its
+    // in-memory queue. DB is already updated above, so the executor write
+    // in its SteerMessage handler is a no-op if the executor restarts.
+    if let Some(handle) = state.runtime.try_get_handle(&id).await {
+        let _ = handle
+            .event_tx
+            .send(Event::CancelSteerMessage {
+                message_id: message_id.clone(),
+            })
+            .await;
+    }
+
+    tracing::info!(conv_id = %id, %message_id, "Steering message cancelled");
 
     Ok(Json(SuccessResponse { success: true }))
 }

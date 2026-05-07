@@ -101,6 +101,11 @@ where
     /// Buffer for `SubAgentResult` events received before entering `AwaitingSubAgents`.
     /// Pre-allocated with capacity = sub-agent count when spawning (FM-6 prevention).
     sub_agent_result_buffer: Vec<Event>,
+    /// Steering messages queued while the conversation was busy. Delivered
+    /// one-at-a-time (FIFO) when the conversation next enters `Idle`.
+    /// Loaded from DB at executor startup; persisted back after each enqueue
+    /// or dequeue.
+    steering_queue: Vec<crate::state_machine::event::SteerEntry>,
     /// Deadline for sub-agent completion — set when entering `AwaitingSubAgents` (REQ-SA-006)
     sub_agent_deadline: Option<tokio::time::Instant>,
     /// Count of active Work-mode sub-agents for one-writer constraint (REQ-PROJ-008)
@@ -181,6 +186,7 @@ where
             spawn_tx: None,
             cancel_tx: None,
             sub_agent_result_buffer: Vec::new(),
+            steering_queue: Vec::new(),
             sub_agent_deadline: None,
             active_work_subagents: 0,
             llm_turn_count: 0,
@@ -224,6 +230,16 @@ where
     ) -> Self {
         self.spawn_tx = Some(spawn_tx);
         self.cancel_tx = Some(cancel_tx);
+        self
+    }
+
+    /// Initialise the steering queue from a previously-persisted snapshot
+    /// (loaded from `conversations.steering_queue` at executor startup).
+    pub fn with_steering_queue(
+        mut self,
+        queue: Vec<crate::state_machine::event::SteerEntry>,
+    ) -> Self {
+        self.steering_queue = queue;
         self
     }
 
@@ -481,6 +497,60 @@ where
             self.parent_tool_cycle_count = 0;
         }
 
+        // Steering messages are buffered rather than fed to the state machine.
+        // They are delivered as `UserMessage` when the conversation next enters `Idle`.
+        if let Event::SteerMessage {
+            text,
+            llm_text,
+            images,
+            message_id,
+            user_agent,
+            skill_invocation,
+        } = event
+        {
+            let entry = crate::state_machine::event::SteerEntry {
+                text,
+                llm_text,
+                images,
+                message_id: message_id.clone(),
+                user_agent,
+                skill_invocation,
+            };
+            self.steering_queue.push(entry);
+            let queue_position = self.steering_queue.len() - 1;
+            // Persist updated queue
+            if let Err(e) = self
+                .storage
+                .update_steering_queue(&self.context.conversation_id, &self.steering_queue)
+                .await
+            {
+                tracing::warn!(error = %e, "Failed to persist steering queue");
+            }
+            // Notify the UI so it can show the queued indicator
+            let _ = self
+                .broadcast_tx
+                .send_seq(|seq| SseEvent::SteerMessageQueued {
+                    sequence_id: seq,
+                    message_id,
+                    queue_position,
+                });
+            return Ok(());
+        }
+
+        // Cancel steering: remove entry from in-memory queue.
+        // DB is already updated by the cancel handler before this event arrives.
+        if let Event::CancelSteerMessage { message_id } = event {
+            let before = self.steering_queue.len();
+            self.steering_queue.retain(|e| e.message_id != message_id);
+            tracing::info!(
+                conv_id = %self.context.conversation_id,
+                %message_id,
+                removed = before - self.steering_queue.len(),
+                "Steering message cancelled in executor"
+            );
+            return Ok(());
+        }
+
         // Check if this is a SubAgentResult that needs buffering
         if let Event::SubAgentResult { .. } = &event {
             if !self.can_handle_sub_agent_result() {
@@ -623,6 +693,37 @@ where
         // Clear deadline when leaving AwaitingSubAgents/CancellingSubAgents
         if leaving_awaiting {
             self.sub_agent_deadline = None;
+        }
+
+        // Drain one steering message when entering Idle (mirrors sub-agent buffer pattern).
+        // Delivers queued user instructions one at a time rather than all at once, so the
+        // LLM can respond to each before the next is delivered.
+        let entering_idle =
+            !matches!(old_state, ConvState::Idle) && matches!(self.state, ConvState::Idle);
+
+        if entering_idle && !self.steering_queue.is_empty() {
+            let entry = self.steering_queue.remove(0);
+            tracing::debug!(
+                message_id = %entry.message_id,
+                remaining = self.steering_queue.len(),
+                "Delivering queued steering message"
+            );
+            generated_events.push(Event::UserMessage {
+                text: entry.text,
+                llm_text: entry.llm_text,
+                images: entry.images,
+                message_id: entry.message_id,
+                user_agent: entry.user_agent,
+                skill_invocation: entry.skill_invocation,
+            });
+            // Persist the updated queue (one entry removed)
+            if let Err(e) = self
+                .storage
+                .update_steering_queue(&self.context.conversation_id, &self.steering_queue)
+                .await
+            {
+                tracing::warn!(error = %e, "Failed to persist steering queue after drain");
+            }
         }
 
         // Execute effects and collect generated events

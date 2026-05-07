@@ -1,0 +1,288 @@
+-- allium: 3
+-- steering-messages.allium
+--
+-- Phoenix Steering Message Queue: Behavioural Specification
+--
+-- Scope: User-directed message queue for conversations that are busy
+-- Includes: Enqueuing messages when conversation is_busy,
+--           FIFO delivery on idle re-entry (one entry per idle transition),
+--           user cancellation of queued entries,
+--           persistence and crash recovery,
+--           SSE notification of queuing
+-- Excludes:
+--   - Conversation state machine transitions (see bedrock.allium)
+--   - LLM delivery after a drained entry becomes a UserMessage (see bedrock.allium)
+--   - @file / message expansion mechanics (the expand() call that produces
+--     llm_text and skill_invocation from the raw request text; governed
+--     by the inline-references spec and shared with the normal send path)
+--   - UI rendering of queued messages (steering bubble, cancel affordance)
+--   - Sub-agent conversations (steering only applies to Parent conversations)
+--
+-- Architecture: Executor-level queue, orthogonal to the state machine.
+--   Event::SteerMessage is intercepted by the executor before it reaches
+--   the transition function. The queue is persisted in the DB steering_queue
+--   column (JSON) and loaded into executor memory on startup, enabling
+--   crash recovery without re-delivery. After a restart the queue is live
+--   immediately; DrainOnIdleEntry fires on the next idle transition as normal.
+--
+-- Requirement traceability: REQ-STEER-001 through REQ-STEER-007
+
+use "./bedrock.allium" as bedrock
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A pending steering entry, structurally identical to a UserMessage payload.
+-- Stored in the DB as JSON and held in the executor's in-memory queue.
+value SteerEntry {
+    -- Human-readable display text. Always present.
+    text: String
+    -- Text sent to the LLM, with @file references expanded inline.
+    -- Absent when expansion produced no change. Both llm_text and
+    -- skill_invocation below are outputs of the same expansion step.
+    llm_text: String?
+    -- Image attachments (mirrors the normal send path).
+    images: List<ImageData>
+    -- Client-generated UUID. Used as the cancellation key.
+    message_id: String
+    -- HTTP User-Agent of the originating client, for tracing.
+    user_agent: String?
+    -- Skill invocation context extracted by the message expander from the
+    -- request text. Absent when the message did not trigger a skill.
+    -- Populated by the same expand() call that fills llm_text.
+    skill_invocation: SkillInvocation?
+}
+
+value ImageData {
+    media_type: String
+    -- Base64-encoded image bytes.
+    data: String
+}
+
+value SkillInvocation {
+    skill_name: String
+    args: String?
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- SteeringQueue is a per-conversation ordered buffer of pending messages.
+-- It is orthogonal to the conversation core_status: entries accumulate
+-- while the conversation is busy and are delivered one-at-a-time as the
+-- conversation returns to idle.
+--
+-- One SteeringQueue exists per Conversation (one-to-one, by construction).
+entity SteeringQueue {
+    conversation: bedrock.Conversation
+
+    -- Ordered list of pending entries; front = next to be delivered.
+    entries: List<SteerEntry>
+
+    -- Derived: number of entries currently pending.
+    depth: entries.count
+
+    invariant DepthNonNegative {
+        depth >= 0
+    }
+
+    invariant UniqueMessageIds {
+        -- Each message_id appears at most once in the queue.
+        for e in entries:
+            entries.count(f => f.message_id = e.message_id) = 1
+    }
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- REQ-STEER-001
+-- A message sent while the conversation is busy is accepted as a steering
+-- entry rather than rejected. It is appended to the queue and persisted
+-- before the SSE acknowledgement is emitted.
+rule EnqueueSteeringMessage {
+    when: UserSendsMessage(conversation, text, llm_text?, images,
+                           message_id, user_agent?, skill_invocation?)
+    requires: conversation.is_busy
+    requires: not conversation.is_terminal
+    for q in SteeringQueue where q.conversation = conversation:
+        -- Entry appended at the tail; all prior entries are undisturbed.
+        ensures: q.entries.last = SteerEntry {
+                     text: text,
+                     llm_text: llm_text,
+                     images: images,
+                     message_id: message_id,
+                     user_agent: user_agent,
+                     skill_invocation: skill_invocation
+                 }
+        -- The client receives a zero-based position indicating its place in line.
+        ensures: SteerMessageQueuedEmitted(conversation, message_id,
+                     queue_position = q.depth)
+        -- HTTP response confirms the message was accepted as a steering entry.
+        ensures: ChatResponseSent(conversation, message_id, steering = true)
+
+    @guidance
+        -- queue_position is zero-based at the time of enqueue. The first message
+        -- queued receives position 0, the second position 1, and so on. Position
+        -- is not adjusted when earlier entries are cancelled; it reflects the
+        -- snapshot at enqueue time.
+        --
+        -- @file references in text are expanded before constructing the SteerEntry;
+        -- the expanded content is stored in llm_text. If expansion fails, the
+        -- message is still enqueued with llm_text absent.
+        --
+        -- Persistence order (P1): enqueue_steer_message() reads the current queue
+        -- from DB, appends the new SteerEntry, and writes the updated queue to DB
+        -- *before* sending Event::SteerMessage to the executor channel. The HTTP
+        -- response is returned only after the DB write succeeds. This guarantees
+        -- that a crash between acceptance and executor processing does not lose
+        -- the entry.
+}
+
+-- REQ-STEER-002
+-- When a conversation transitions into idle and its queue is non-empty,
+-- one entry is drained from the front and delivered as a UserMessage.
+-- This causes the conversation to re-enter llm_requesting immediately.
+rule DrainOnIdleEntry {
+    when: conversation: bedrock.Conversation.core_status transitions_to idle
+    for q in SteeringQueue where q.conversation = conversation and q.depth > 0:
+        -- The front entry (pre-drain first) is consumed; remaining entries shift forward.
+        ensures: not q.entries.any(e => e.message_id = q.entries.first.message_id)
+        -- The drained entry is converted to a normal UserMessage and delivered.
+        ensures: bedrock.UserSendsMessage(conversation,
+                     q.entries.first.text,
+                     q.entries.first.llm_text,
+                     q.entries.first.images,
+                     q.entries.first.message_id,
+                     q.entries.first.user_agent,
+                     q.entries.first.skill_invocation)
+
+    @guidance
+        -- Triggers on any transition whose destination state is idle, regardless
+        -- of the source state (e.g., cancelling_tool -> idle, executing_tools -> idle).
+        --
+        -- Exactly one entry is drained per idle transition. The conversation
+        -- immediately re-enters llm_requesting when the UserMessage is dispatched,
+        -- so a second drain cannot occur until the next time idle is entered.
+        -- This is the same one-shot buffer pattern used by the sub-agent result queue.
+        --
+        -- Persistence of the shortened queue happens before the UserMessage event
+        -- is generated. If the process crashes between drain and dispatch, the
+        -- next startup will re-drain the same entry; the message_id deduplication
+        -- in bedrock's send path prevents double-delivery of the resulting LLM turn.
+        --
+        -- FIFO is preserved: entries[0] is always the oldest enqueued entry.
+        -- The implementation uses Vec::remove(0) on an in-memory Vec backed by
+        -- the persisted JSON array.
+}
+
+-- REQ-STEER-003
+-- A queued steering entry can be cancelled before it is drained.
+-- Cancellation by message_id is idempotent: if the entry is already gone
+-- (drained or never existed), the operation succeeds silently.
+rule CancelSteeringMessage {
+    when: UserCancelsSteeringMessage(conversation, message_id)
+    for q in SteeringQueue where q.conversation = conversation:
+        ensures: not q.entries.any(e => e.message_id = message_id)
+
+    @guidance
+        -- The HTTP response is 200 OK in all cases, including when no entry with
+        -- the given message_id exists in the queue. The caller cannot distinguish
+        -- a successful cancel from a cancel of an already-drained entry; this is
+        -- intentional: the postcondition "entry is not in queue" holds in both cases.
+        --
+        -- Cancel sequence (P2): the handler updates the DB first, then sends
+        -- Event::CancelSteerMessage{message_id} to the live executor (if one is
+        -- currently loaded) via try_get_handle(). The executor removes the matching
+        -- entry from its in-memory steering_queue without a further DB write.
+        -- If no executor is running, the DB update alone is sufficient: the next
+        -- executor to start loads the already-corrected queue from DB.
+        --
+        -- queue_position values reported in earlier SteerMessageQueuedEmitted
+        -- events are not retroactively adjusted after a cancel. Clients should
+        -- treat queue_position as an ordering hint at enqueue time, not a live index.
+}
+
+-- REQ-STEER-004
+-- A terminal conversation cannot accept new steering entries.
+rule TerminalConversationRejectsSteer {
+    when: UserSendsMessage(conversation, _, _, _, message_id, _, _)
+    requires: conversation.is_terminal
+
+    ensures: SteerRejected(conversation, message_id)
+
+    @guidance
+        -- The same API endpoint handles both idle sends and steering sends.
+        -- When the conversation is terminal (context_exhausted or terminal
+        -- parent_status), the request is rejected before any queue logic runs.
+        -- The HTTP response carries an error indicating the conversation cannot
+        -- accept messages.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Each conversation has at most one SteeringQueue (one-to-one by construction).
+invariant OneQueuePerConversation {
+    for c in bedrock.Conversation:
+        count(SteeringQueue where conversation = c) <= 1
+}
+
+-- The queue depth is always non-negative (also enforced at entity level).
+invariant AllQueuesNonNegative {
+    for q in SteeringQueue:
+        q.depth >= 0
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor User {
+    identified_by: bedrock.Parent
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface SteeringQueueApi {
+    facing user: User
+
+    context conversation: bedrock.Parent
+
+    exposes:
+        conversation.core_status
+        conversation.is_busy
+
+    provides:
+        -- Enqueue or send (behaviour depends on conversation.is_busy at call time)
+        UserSendsMessage(conversation, text, llm_text?, images,
+                         message_id, user_agent?, skill_invocation?)
+            when not conversation.is_terminal
+        -- Cancel a specific queued message by its client-generated ID
+        UserCancelsSteeringMessage(conversation, message_id)
+
+    @guarantee IdempotentCancel
+        -- Cancelling a message_id that is absent from the queue returns HTTP 200.
+        -- No error is raised and no state change occurs.
+
+    @guarantee SteerMessageQueuedAck
+        -- When a message is accepted as a steering entry (conversation was busy
+        -- at call time), the HTTP response body contains { steering: true } and
+        -- an SSE event SteerMessageQueued { message_id, queue_position } is
+        -- emitted to all connected clients before the response is flushed.
+
+    @guarantee DirectSendTransparency
+        -- When a message is sent while the conversation is idle, { steering: false }
+        -- is returned and the message enters the normal bedrock delivery path.
+        -- No SteerMessageQueued event is emitted.
+
+    @guarantee PersistenceBeforeResponse
+        -- In all cases that mutate the queue (enqueue, cancel), the DB reflects
+        -- the new state before the HTTP response is returned to the caller.
+}

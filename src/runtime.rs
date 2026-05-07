@@ -421,6 +421,15 @@ pub enum SseEvent {
         sequence_id: i64,
         active: bool,
     },
+    /// A steering message was accepted and queued for delivery when the
+    /// conversation next reaches `Idle`. The UI uses this to show the message
+    /// with a "Queued" indicator instead of "Sending...".
+    SteerMessageQueued {
+        sequence_id: i64,
+        message_id: String,
+        /// Zero-based position in the steering queue.
+        queue_position: usize,
+    },
 }
 
 impl RuntimeManager {
@@ -945,6 +954,7 @@ impl RuntimeManager {
             event_tx.clone(),
             broadcaster.clone(),
         )
+        .with_steering_queue(conv.steering_queue)
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
         .with_credential_helper(self.credential_helper.clone());
 
@@ -1029,6 +1039,56 @@ impl RuntimeManager {
             .send(event)
             .await
             .map_err(|e| format!("Failed to send event: {e}"))
+    }
+
+    /// Queue a steering message to be delivered when the conversation next
+    /// reaches `Idle`. Persists the entry to DB **before** sending to the
+    /// executor channel, so the entry survives a crash between acceptance
+    /// and executor processing.
+    pub async fn enqueue_steer_message(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        event: Event,
+    ) -> Result<(), String> {
+        let Event::SteerMessage {
+            ref text,
+            ref llm_text,
+            ref images,
+            ref message_id,
+            ref user_agent,
+            ref skill_invocation,
+        } = event
+        else {
+            return Err("enqueue_steer_message expects Event::SteerMessage".into());
+        };
+
+        // Build SteerEntry and persist before touching the executor channel (P1).
+        let new_entry = crate::state_machine::event::SteerEntry {
+            text: text.clone(),
+            llm_text: llm_text.clone(),
+            images: images.clone(),
+            message_id: message_id.clone(),
+            user_agent: user_agent.clone(),
+            skill_invocation: skill_invocation.clone(),
+        };
+        let db = self.db();
+        let conversation = db
+            .get_conversation(conversation_id)
+            .await
+            .map_err(|e| format!("Failed to load conversation for steering persist: {e}"))?;
+        let mut queue = conversation.steering_queue;
+        queue.push(new_entry);
+        db.update_steering_queue(conversation_id, &queue)
+            .await
+            .map_err(|e| format!("Failed to persist steering queue before enqueue: {e}"))?;
+
+        // DB is durable; now update the executor's in-memory queue via channel.
+        let handle = self.get_or_create(conversation_id).await?;
+        handle
+            .event_tx
+            .send(event)
+            .await
+            .map_err(|e| format!("Failed to send steer message: {e}"))
     }
 
     /// Subscribe to conversation updates

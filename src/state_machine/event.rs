@@ -1,6 +1,19 @@
 //! Events that can occur in a conversation
 
 use crate::db::{ErrorKind, ImageData, ToolResult};
+use serde::{Deserialize, Serialize};
+
+/// A steering message that has been queued for delivery when the conversation
+/// next reaches `Idle`. Stored as JSON in `conversations.steering_queue`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SteerEntry {
+    pub text: String,
+    pub llm_text: Option<String>,
+    pub images: Vec<ImageData>,
+    pub message_id: String,
+    pub user_agent: Option<String>,
+    pub skill_invocation: Option<crate::skills::SkillInvocation>,
+}
 use crate::llm::{ContentBlock, Usage};
 use crate::state_machine::state::{
     PendingSubAgent, QuestionAnnotation, SubAgentOutcome, TaskApprovalOutcome, ToolCall,
@@ -132,6 +145,28 @@ pub enum Event {
         /// The repo root path to restore as cwd
         repo_root: String,
     },
+
+    /// A steering message queued while the conversation was busy.
+    /// Intercepted by the executor before reaching the state machine —
+    /// pushed onto `ConversationRuntime::steering_queue` and delivered as
+    /// `UserMessage` when the conversation next enters `Idle`.
+    SteerMessage {
+        /// Display text — stored in DB and shown in history.
+        text: String,
+        /// Expanded text delivered to the LLM when `@` references are present.
+        llm_text: Option<String>,
+        images: Vec<ImageData>,
+        /// Client-generated UUID — canonical identifier for this message.
+        message_id: String,
+        user_agent: Option<String>,
+        skill_invocation: Option<crate::skills::SkillInvocation>,
+    },
+    /// Removes a steering entry from the executor's in-memory queue.
+    /// Intercepted by the executor before reaching the state machine.
+    /// The DB is updated by the cancel handler before this event is sent.
+    CancelSteerMessage {
+        message_id: String,
+    },
 }
 
 impl Event {
@@ -159,6 +194,8 @@ impl Event {
             Event::CredentialBecameAvailable => "CredentialBecameAvailable",
             Event::CredentialHelperFailed { .. } => "CredentialHelperFailed",
             Event::TaskResolved { .. } => "TaskResolved",
+            Event::SteerMessage { .. } => "SteerMessage",
+            Event::CancelSteerMessage { .. } => "CancelSteerMessage",
         }
     }
 }
@@ -400,8 +437,11 @@ impl TryFrom<Event> for ParentEvent {
                 system_message,
                 repo_root,
             })),
-            // Sub-agent-only events are invalid for parent
-            Event::GraceTurnExhausted { .. } => Err(EventConversionError {
+            // Sub-agent-only events are invalid for parent;
+            // SteerMessage and CancelSteerMessage are intercepted by the executor before conversion
+            Event::GraceTurnExhausted { .. }
+            | Event::SteerMessage { .. }
+            | Event::CancelSteerMessage { .. } => Err(EventConversionError {
                 event_variant: event.variant_name(),
                 target_type: "ParentEvent",
             }),
@@ -499,12 +539,15 @@ impl TryFrom<Event> for SubAgentEvent {
             Event::GraceTurnExhausted { result } => Ok(SubAgentEvent::SubAgent(
                 SubAgentOnlyEvent::GraceTurnExhausted { result },
             )),
-            // Parent-only events are invalid for sub-agent
+            // Parent-only events are invalid for sub-agent;
+            // SteerMessage and CancelSteerMessage are intercepted by the executor before conversion
             Event::TaskApprovalResponse { .. }
             | Event::UserQuestionResponse { .. }
             | Event::CredentialBecameAvailable
             | Event::CredentialHelperFailed { .. }
-            | Event::TaskResolved { .. } => Err(EventConversionError {
+            | Event::TaskResolved { .. }
+            | Event::SteerMessage { .. }
+            | Event::CancelSteerMessage { .. } => Err(EventConversionError {
                 event_variant: event.variant_name(),
                 target_type: "SubAgentEvent",
             }),
