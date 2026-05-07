@@ -77,6 +77,93 @@ def node_env() -> dict:
         _NODE_ENV = _node_env()
     return _NODE_ENV
 
+
+# Earlier corepack versions reject pnpm 11.x's signing keys with
+# "Cannot find matching keyid" (key rotation, fixed upstream in 0.31).
+_MIN_COREPACK = (0, 31)
+_PNPM_READY: str | None = None
+
+
+def _read_pnpm_pin() -> str:
+    """Return the pnpm version pinned in ui/package.json#packageManager."""
+    pkg = json.loads((UI_DIR / "package.json").read_text())
+    pm = pkg.get("packageManager", "")
+    if not pm.startswith("pnpm@"):
+        raise SystemExit(
+            f"ui/package.json#packageManager is '{pm}', expected 'pnpm@X.Y.Z'.\n"
+            "This repo uses pnpm via Corepack — fix the packageManager field."
+        )
+    # Format may include an optional "+sha512-..." integrity hash suffix.
+    return pm[len("pnpm@"):].split("+", 1)[0]
+
+
+def ensure_corepack_pnpm() -> None:
+    """Pin and activate the project's pnpm version via Corepack.
+
+    Single source of truth: `ui/package.json#packageManager`.
+    Idempotent and cheap to call repeatedly — the verified pin is cached.
+    Hard-fails (no fallback to system pnpm) if Corepack is missing, too old,
+    or the pnpm version on PATH does not match the pin. The whole point of
+    going through Corepack is that there is exactly one pnpm.
+    """
+    global _PNPM_READY
+    pinned = _read_pnpm_pin()
+    if _PNPM_READY == pinned:
+        return
+
+    env = node_env()
+
+    try:
+        cp_out = subprocess.run(
+            ["corepack", "--version"],
+            capture_output=True, text=True, env=env, check=True,
+        ).stdout.strip()
+    except FileNotFoundError:
+        raise SystemExit(
+            "corepack not found on PATH.\n"
+            "Install with `npm i -g corepack@latest` or use a Node.js version "
+            "that bundles corepack >= 0.31."
+        )
+    except subprocess.CalledProcessError as e:
+        raise SystemExit(f"`corepack --version` failed:\n{e.stderr}")
+
+    cp_version = tuple(int(x) for x in cp_out.split(".") if x.isdigit())
+    if cp_version < _MIN_COREPACK:
+        raise SystemExit(
+            f"corepack {cp_out} is too old (minimum: "
+            f"{'.'.join(str(x) for x in _MIN_COREPACK)}).\n"
+            "Older versions reject pnpm's current signing keys.\n"
+            "Upgrade with `npm i -g corepack@latest` (sudo if globally installed)."
+        )
+
+    subprocess.run(["corepack", "enable"], check=True, env=env, capture_output=True)
+    subprocess.run(
+        ["corepack", "prepare", f"pnpm@{pinned}", "--activate"],
+        check=True, env=env, capture_output=True,
+    )
+
+    try:
+        actual = subprocess.run(
+            ["pnpm", "--version"],
+            capture_output=True, text=True, env=env, check=True,
+        ).stdout.strip()
+    except FileNotFoundError:
+        raise SystemExit(
+            "pnpm not found on PATH after `corepack enable`.\n"
+            "Corepack shims should land on PATH automatically — check $PATH "
+            "(an older system pnpm symlink may be shadowing the corepack shim)."
+        )
+    except subprocess.CalledProcessError as e:
+        raise SystemExit(f"`pnpm --version` failed:\n{e.stderr or e.stdout}")
+
+    if actual != pinned:
+        raise SystemExit(
+            f"pnpm version mismatch: expected {pinned}, got {actual}.\n"
+            f"Run `corepack prepare pnpm@{pinned} --activate` and re-check $PATH."
+        )
+
+    _PNPM_READY = pinned
+
 # Production paths
 PROD_SERVICE_NAME = "phoenix-ide"
 PROD_INSTALL_DIR = Path("/opt/phoenix-ide")
@@ -348,20 +435,13 @@ def stop_process(pid_file: Path, name: str) -> bool:
 
 def ensure_ui_deps():
     """Ensure UI dependencies are installed."""
-    # `node_modules/.package-lock.json` is npm's success marker; checking its
+    ensure_corepack_pnpm()
+    # `node_modules/.modules.yaml` is pnpm's success marker; checking its
     # presence (rather than just `node_modules/`) avoids treating a phantom
     # empty directory left behind by a failed install as already-installed.
-    if not (UI_DIR / "node_modules" / ".package-lock.json").exists():
+    if not (UI_DIR / "node_modules" / ".modules.yaml").exists():
         print("Installing UI dependencies...")
-        env = node_env()
-        # In some envs the available npm is older than `engines.npm` in
-        # ui/package.json declares (e.g. node22 ships npm 10.x, but
-        # package.json wants >=11). The system npm refuses to install
-        # under `engine-strict=true` (set in repo .npmrc). Bypass for the
-        # install — the lockfile is the source of truth and tooling works
-        # fine on the older npm.
-        env["NPM_CONFIG_ENGINE_STRICT"] = "false"
-        subprocess.run(["npm", "install"], cwd=UI_DIR, check=True, env=env)
+        subprocess.run(["pnpm", "install"], cwd=UI_DIR, check=True, env=node_env())
 
 
 def build_rust(release: bool = True):
@@ -508,9 +588,10 @@ def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False):
         env["VITE_API_SCHEME"] = "https"
         env.setdefault("VITE_API_PROXY_SECURE", "false")
     
-    # Start Vite in background (bind to 0.0.0.0 for external access)
+    # Start Vite in background (bind to 0.0.0.0 for external access).
+    # pnpm passes args after the script name directly — no `--` separator.
     proc = subprocess.Popen(
-        ["npm", "run", "dev", "--", "--port", str(port), "--host", "0.0.0.0"],
+        ["pnpm", "run", "dev", "--port", str(port), "--host", "0.0.0.0"],
         cwd=UI_DIR,
         env=env,
         stdout=subprocess.DEVNULL,
@@ -1327,22 +1408,20 @@ def cmd_check():
             print(f"  {sym} {'task validation':<18s} ({elapsed:.1f}s)")
 
     def check_package_lock_clean():
-        """Tripwire: fail if `ui/package-lock.json` has uncommitted changes.
+        """Tripwire: fail if `ui/pnpm-lock.yaml` has uncommitted changes.
 
-        `./dev.py prod deploy` builds in a fresh worktree and runs `npm ci`,
-        which is strict about lockfile sync. Local-only additions (e.g. a
-        native dep that adds transitive packages on the current platform)
-        can leave the developer's lock drifted from HEAD without `./dev.py
-        check` noticing, because vitest / eslint / tsc all tolerate the
-        drift. `npm ci` in the build worktree then fails the deploy.
+        `./dev.py prod deploy` builds in a fresh worktree and runs
+        `pnpm install --frozen-lockfile`, which fails on any lockfile drift.
+        A locally-modified lock left uncommitted would only surface at deploy
+        time — catch it during `./dev.py check` instead.
         """
         run_step("pkglock-clean", ["bash", "-c", (
-            'out=$(git status --porcelain -- ui/package-lock.json); '
+            'out=$(git status --porcelain -- ui/pnpm-lock.yaml); '
             'if [ -n "$out" ]; then '
-            '  echo "ui/package-lock.json has uncommitted changes:"; '
+            '  echo "ui/pnpm-lock.yaml has uncommitted changes:"; '
             '  echo "$out"; '
             '  echo ""; '
-            '  echo "Commit these before deploying, or \'npm ci\' in the build worktree will fail."; '
+            '  echo "Commit these before deploying, or \'pnpm install --frozen-lockfile\' in the build worktree will fail."; '
             '  exit 1; '
             'fi'
         )])
@@ -1417,9 +1496,9 @@ def cmd_check():
 
     threads = [
         threading.Thread(target=lane_rust),
-        threading.Thread(target=run_step, args=("tsc typecheck", ["npx", "tsc", "-b", "--noEmit"], UI_DIR)),
-        threading.Thread(target=run_step, args=("eslint", ["npm", "run", "lint"], UI_DIR)),
-        threading.Thread(target=run_step, args=("vitest", ["npx", "vitest", "run"], UI_DIR)),
+        threading.Thread(target=run_step, args=("tsc typecheck", ["pnpm", "exec", "tsc", "-b", "--noEmit"], UI_DIR)),
+        threading.Thread(target=run_step, args=("eslint", ["pnpm", "run", "lint"], UI_DIR)),
+        threading.Thread(target=run_step, args=("vitest", ["pnpm", "exec", "vitest", "run"], UI_DIR)),
         threading.Thread(target=lane_fast),
         threading.Thread(target=check_ast_grep),
         threading.Thread(target=check_package_lock_clean),
@@ -1677,18 +1756,24 @@ def prod_build(version: str | None = None, strip: bool = True, target: str | Non
         )
     
     ui_dir = worktree / "ui"
-    
-    # Build UI
-    npm_env = node_env()
+
+    # Build UI. Corepack-prepare pnpm before any pnpm invocation in the
+    # worktree (the helper reads the pin from the main checkout's package.json,
+    # but corepack state is global so the worktree picks it up too).
+    ensure_corepack_pnpm()
+    pnpm_env = node_env()
     print("Installing UI dependencies...")
-    result = subprocess.run(["npm", "ci"], cwd=ui_dir, capture_output=True, text=True, env=npm_env)
+    result = subprocess.run(
+        ["pnpm", "install", "--frozen-lockfile"],
+        cwd=ui_dir, capture_output=True, text=True, env=pnpm_env,
+    )
     if result.returncode != 0:
         print(result.stdout, end="")
         print(result.stderr, file=sys.stderr, end="")
-        raise SystemExit(f"npm ci failed (exit {result.returncode})")
+        raise SystemExit(f"pnpm install --frozen-lockfile failed (exit {result.returncode})")
 
     print("Building UI...")
-    subprocess.run(["npm", "run", "build"], cwd=ui_dir, check=True, env=npm_env)
+    subprocess.run(["pnpm", "run", "build"], cwd=ui_dir, check=True, env=pnpm_env)
     
     # Build Rust
     build_env = os.environ.copy()
