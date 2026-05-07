@@ -483,10 +483,6 @@ export const BashErrorResponseSchema = v.variant('error', [
     max_wait_seconds: v.number(),
   }),
   v.looseObject({
-    error: v.literal('peek_args_mutually_exclusive'),
-    error_message: v.string(),
-  }),
-  v.looseObject({
     error: v.literal('command_safety_rejected'),
     error_message: v.string(),
     reason: v.string(),
