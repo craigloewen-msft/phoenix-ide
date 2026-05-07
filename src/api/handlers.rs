@@ -315,6 +315,10 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
         // setup).
         home_dir: std::env::var("HOME").ok(),
         seed_parent_slug: None,
+        // Default to `false`; callers that have access to `AppState` set
+        // this from the manager's `HashMap` via
+        // `enrich_conversation_with_seed`.
+        browser_session_active: false,
         inner: conv.clone(),
     }
 }
@@ -335,6 +339,10 @@ async fn enrich_conversation_with_seed(
             enriched.seed_parent_slug = parent.slug;
         }
     }
+    // Reflect current `BrowserSessionManager` state at hydration. The single
+    // source of truth is the manager's `HashMap`; the SSE
+    // `BrowserSessionState` event keeps the client in sync after this point.
+    enriched.browser_session_active = state.runtime.browser_sessions().is_active(&conv.id).await;
     enriched
 }
 
@@ -345,7 +353,10 @@ async fn enrich_conversation_with_seed(
 /// - `ContextExhausted` without a continuation → `"needs_action"` (user must act)
 /// - All other states → delegate to `ConvState::presentation_mode()`
 fn conv_presentation_mode(conv: &crate::db::Conversation) -> &'static str {
-    if matches!(conv.state, crate::state_machine::ConvState::ContextExhausted { .. }) {
+    if matches!(
+        conv.state,
+        crate::state_machine::ConvState::ContextExhausted { .. }
+    ) {
         if conv.continued_in_conv_id.is_some() {
             return "done";
         }
@@ -366,7 +377,10 @@ fn conversation_to_json(conv: &crate::db::Conversation) -> Value {
             "presentation_mode".to_string(),
             Value::String(conv_presentation_mode(conv).to_string()),
         );
-        map.insert("requires_action".to_string(), Value::Bool(conv_requires_action(conv)));
+        map.insert(
+            "requires_action".to_string(),
+            Value::Bool(conv_requires_action(conv)),
+        );
     }
     val
 }
@@ -383,7 +397,10 @@ async fn conversation_to_json_with_seed(state: &AppState, conv: &crate::db::Conv
             "presentation_mode".to_string(),
             Value::String(conv_presentation_mode(conv).to_string()),
         );
-        map.insert("requires_action".to_string(), Value::Bool(conv_requires_action(conv)));
+        map.insert(
+            "requires_action".to_string(),
+            Value::Bool(conv_requires_action(conv)),
+        );
     }
     val
 }

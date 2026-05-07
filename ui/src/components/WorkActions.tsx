@@ -11,7 +11,7 @@ type FetchState =
 interface WorkActionsProps {
   conversationId: string;
   convModeLabel: string | undefined;
-  /** Live phase type from atom (not stale conversation.display_state) */
+  /** Live phase type from atom (authoritative, not derived from conversation row). */
   phaseType: string;
   branchName: string | undefined;
   baseBranch: string | null | undefined;
@@ -86,7 +86,7 @@ export function WorkActions({
       >
         {diffFetch.status === 'loading' ? 'Loading...' : 'View Diff'}
       </button>
-      {browserView.hasActivated && !browserView.open && (
+      {browserView.browserSessionActive && !browserView.open && (
         <button
           type="button"
           className="work-actions-btn work-actions-view-browser"
