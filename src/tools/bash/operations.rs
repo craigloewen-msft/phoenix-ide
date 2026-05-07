@@ -182,7 +182,6 @@ pub enum BashError {
         provided: i64,
         max: u64,
     },
-    PeekArgsMutuallyExclusive,
     CommandSafetyRejected {
         reason: String,
     },
@@ -239,9 +238,6 @@ impl BashError {
                     max_wait_seconds: max,
                 }
             }
-            BashError::PeekArgsMutuallyExclusive => BashErrorResponse::PeekArgsMutuallyExclusive {
-                error_message: "specify exactly one of lines or since".to_string(),
-            },
             BashError::CommandSafetyRejected { reason } => {
                 BashErrorResponse::CommandSafetyRejected {
                     error_message: reason.clone(),

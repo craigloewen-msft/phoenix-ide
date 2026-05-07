@@ -785,9 +785,6 @@ pub enum BashErrorResponse {
         provided: i64,
         max_wait_seconds: u64,
     },
-    PeekArgsMutuallyExclusive {
-        error_message: String,
-    },
     CommandSafetyRejected {
         error_message: String,
         reason: String,
