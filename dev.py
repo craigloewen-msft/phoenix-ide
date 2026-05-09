@@ -1668,6 +1668,119 @@ def cmd_check():
                 "ast-grep", "scan", "--rule", str(rule_file), "ui/src/",
             ])
 
+    def check_allium():
+        """Validate every specs/<name>/<name>.allium parses under v3 grammar.
+        `allium check` always exits 1 (even on clean files), so we parse the
+        JSON-stream output and aggregate error-severity diagnostics."""
+        import shutil, json
+        if not shutil.which("allium"):
+            with results_lock:
+                results.append(("allium specs", 0, 0.0, ""))
+                print(f"  - {'allium specs':<18s} (skipped — install via 'cargo install allium-cli')")
+            return
+        spec_files = sorted((ROOT / "specs").glob("*/*.allium"))
+        if not spec_files:
+            with results_lock:
+                results.append(("allium specs", 0, 0.0, ""))
+                print(f"  - {'allium specs':<18s} (skipped — no .allium files)")
+            return
+        t0 = time.monotonic()
+        try:
+            proc = subprocess.run(
+                ["allium", "check", *[str(p) for p in spec_files]],
+                capture_output=True, text=True, timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            elapsed = time.monotonic() - t0
+            with results_lock:
+                results.append(("allium specs", 1, elapsed, "allium check timed out after 60s"))
+                print(f"  ✗ {'allium specs':<18s} ({elapsed:.1f}s)")
+            return
+        # Parse the concatenated JSON-doc stream that allium-cli emits
+        # (one {...} per file passed). Use raw_decode to walk the stream
+        # without depending on whitespace conventions.
+        decoder = json.JSONDecoder()
+        text = proc.stdout
+        idx = 0
+        failures = []
+        docs_parsed = 0
+        decode_error = None
+        while idx < len(text):
+            while idx < len(text) and text[idx].isspace():
+                idx += 1
+            if idx >= len(text):
+                break
+            try:
+                doc, end = decoder.raw_decode(text, idx)
+            except json.JSONDecodeError as e:
+                decode_error = str(e)
+                break
+            idx = end
+            docs_parsed += 1
+            errs = [d for d in doc.get("diagnostics", []) if d.get("severity") == "error"]
+            if errs:
+                failures.append((doc.get("diagnostics", [{}])[0].get("location", {}).get("file") or "?", errs))
+        elapsed = time.monotonic() - t0
+
+        # Hard-fail on any structural problem with the gate itself, even if
+        # earlier files already reported errors. A truncated/partial stream
+        # could otherwise hide diagnostics from later files; an empty
+        # stdout (allium changed output format, crashed, wrote only to
+        # stderr) would silently pass; a parsed-doc count below the file
+        # count means we lost some specs to a parse failure mid-stream.
+        # Each of these makes the gate unreliable, so report them
+        # explicitly rather than masking them behind whatever errors we
+        # did see.
+        gate_problems = []
+        if decode_error:
+            gate_problems.append(f"JSON-stream decode error after {docs_parsed} doc(s): {decode_error}")
+        if docs_parsed == 0:
+            gate_problems.append(
+                f"allium check produced no parseable diagnostic docs "
+                f"(passed {len(spec_files)} files; stdout {len(text)} bytes)"
+            )
+        elif docs_parsed != len(spec_files):
+            gate_problems.append(
+                f"allium check returned {docs_parsed} diagnostic doc(s) but "
+                f"{len(spec_files)} spec(s) were passed -- some specs were not validated"
+            )
+
+        if gate_problems or failures:
+            lines = []
+            if gate_problems:
+                lines.append("allium check gate failure:")
+                for p in gate_problems:
+                    lines.append(f"  {p}")
+                if proc.stderr.strip():
+                    lines.append(f"stderr (first 500 chars):\n{proc.stderr[:500]}")
+                if text.strip() and not failures:
+                    lines.append(f"stdout (first 500 chars):\n{text[:500]}")
+                if failures:
+                    lines.append("")
+            for path, errs in failures:
+                rel = path
+                try:
+                    rel = str(Path(path).relative_to(ROOT))
+                except (ValueError, TypeError):
+                    pass
+                lines.append(f"{rel}: {len(errs)} error(s)")
+                for e in errs[:5]:
+                    loc = e.get("location", {}) or {}
+                    msg = (e.get("message") or "?")
+                    if len(msg) > 140:
+                        msg = msg[:140] + "…"
+                    lines.append(f"  L{loc.get('line', '?')}: {msg}")
+                if len(errs) > 5:
+                    lines.append(f"  … and {len(errs) - 5} more")
+            out = "\n".join(lines)
+            with results_lock:
+                results.append(("allium specs", 1, elapsed, out))
+                print(f"  ✗ {'allium specs':<18s} ({elapsed:.1f}s)")
+        else:
+            with results_lock:
+                results.append(("allium specs", 0, elapsed, ""))
+                print(f"  ✓ {'allium specs':<18s} ({elapsed:.1f}s)")
+
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.
     ensure_ui_deps()
 
@@ -1719,11 +1832,16 @@ def cmd_check():
 
     threads = [
         threading.Thread(target=lane_rust),
-        threading.Thread(target=run_step, args=("tsc typecheck", ["pnpm", "exec", "tsc", "-b", "--noEmit"], UI_DIR)),
+        # Use the `typecheck` script so contributors running `pnpm typecheck`
+        # locally exercise the same `tsc -b --noEmit` invocation this lane
+        # uses. Project references + exactOptionalPropertyTypes only fire
+        # under `-b`; bare `pnpm exec tsc --noEmit` silently misses them.
+        threading.Thread(target=run_step, args=("tsc typecheck", ["pnpm", "run", "typecheck"], UI_DIR)),
         threading.Thread(target=run_step, args=("eslint", ["pnpm", "run", "lint"], UI_DIR)),
         threading.Thread(target=run_step, args=("vitest", ["pnpm", "exec", "vitest", "run"], UI_DIR)),
         threading.Thread(target=lane_fast),
         threading.Thread(target=check_ast_grep),
+        threading.Thread(target=check_allium),
         threading.Thread(target=check_package_lock_clean),
     ]
     for t in threads:
