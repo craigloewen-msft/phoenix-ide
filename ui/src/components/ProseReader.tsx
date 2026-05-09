@@ -19,8 +19,8 @@ import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } fr
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { SyntaxHighlighter, createElement, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import type { createElementProps } from '../utils/syntaxHighlighter';
+import { SyntaxHighlighter, createElement, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import { useTheme } from '../hooks/useTheme';
 import { useLongPress } from '../hooks/useLongPress';
@@ -28,6 +28,7 @@ import { useReviewNotes } from '../contexts/ReviewNotesContext';
 import type { ReviewNote } from '../contexts/ReviewNotesContext';
 import { ViewerShell } from './viewer/ViewerShell';
 import { NotesPanel } from './viewer/NotesPanel';
+import { CopyButton } from './CopyButton';
 import { AnnotationDialog } from './viewer/AnnotationDialog';
 import { formatNotesForSend } from './viewer/formatNotes';
 import { Loader2, AlertCircle, MessageSquarePlus } from 'lucide-react';
@@ -172,7 +173,6 @@ export function ProseReader({
   const [showPanel, setShowPanel] = useState(false);
   const [highlightedLine, setHighlightedLine] = useState<number | null>(null);
   const [htmlViewMode, setHtmlViewMode] = useState<'preview' | 'source'>('source');
-
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
   const contentRef = useRef<HTMLDivElement>(null);
   const scrollRestoredRef = useRef(false);
@@ -484,26 +484,38 @@ export function ProseReader({
   // the panel previously showed all notes but `handleJumpTo` only worked
   // for this-file anchors, so cross-viewer entries were no-op clicks.
 
-  const headerExtras = fileType === 'html' ? (
+  const copyDisabled = content === null || loading || error !== null;
+  const headerExtras = (
     <>
-      <button
-        className={`viewer-shell-toggle ${htmlViewMode === 'preview' ? 'active' : ''}`}
-        onClick={() => setHtmlViewMode(htmlViewMode === 'preview' ? 'source' : 'preview')}
-        title={htmlViewMode === 'preview' ? 'Show source' : 'Show sandboxed preview (no scripts)'}
-      >
-        {htmlViewMode === 'preview' ? '</>' : 'Preview'}
-      </button>
-      <a
-        className="viewer-shell-toggle"
-        href={`/preview${absolutePath}`}
-        target="_blank"
-        rel="noopener noreferrer"
-        title="Open in new tab (full render with scripts)"
-      >
-        Open in browser
-      </a>
+      <CopyButton
+        text={content ?? ''}
+        className="viewer-shell-copy-btn"
+        title="Copy file contents"
+        disabled={copyDisabled}
+      />
+      {fileType === 'html' && (
+        <>
+          <button
+            type="button"
+            className={`viewer-shell-toggle ${htmlViewMode === 'preview' ? 'active' : ''}`}
+            onClick={() => setHtmlViewMode(htmlViewMode === 'preview' ? 'source' : 'preview')}
+            title={htmlViewMode === 'preview' ? 'Show source' : 'Show sandboxed preview (no scripts)'}
+          >
+            {htmlViewMode === 'preview' ? '</>' : 'Preview'}
+          </button>
+          <a
+            className="viewer-shell-toggle"
+            href={`/preview${absolutePath}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            title="Open in new tab (full render with scripts)"
+          >
+            Open in browser
+          </a>
+        </>
+      )}
     </>
-  ) : null;
+  );
 
   return (
     <ViewerShell
