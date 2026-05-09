@@ -15,7 +15,7 @@
  * sends or clears.
  */
 
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -175,11 +175,15 @@ export function ProseReader({
 
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
   const contentRef = useRef<HTMLDivElement>(null);
+  const scrollRestoredRef = useRef(false);
+  const lastScrollTopRef = useRef(0);
 
   const absolutePath = useMemo(() => {
     if (filePath.startsWith('/')) return filePath;
     return rootDir.endsWith('/') ? rootDir + filePath : rootDir + '/' + filePath;
   }, [filePath, rootDir]);
+
+  const scrollKey = useMemo(() => `phoenix:prose-scroll:${absolutePath}`, [absolutePath]);
 
   const fileType = useMemo(() => getFileType(filePath), [filePath]);
   const language = useMemo(() => getLanguage(filePath), [filePath]);
@@ -210,17 +214,91 @@ export function ProseReader({
     return () => { cancelled = true; };
   }, [absolutePath]);
 
-  // Auto-scroll to first modified line (REQ-PF-014)
+  // Reset scroll-restored flag when the file (or its scroll key) changes —
+  // a new file means a new restoration target.
   useEffect(() => {
-    if (content && patchContext?.firstModifiedLine) {
-      const timer = setTimeout(() => {
-        const lineEl = lineRefs.current.get(patchContext.firstModifiedLine!);
-        if (lineEl) lineEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      }, 100);
-      return () => clearTimeout(timer);
+    scrollRestoredRef.current = false;
+    lastScrollTopRef.current = 0;
+  }, [scrollKey]);
+
+  // Restore saved scroll position when the file loads. Runs in
+  // useLayoutEffect so it fires before paint — no flash to top before
+  // the jump. Always runs (regardless of patchContext) so the
+  // patchContext auto-scroll below has a sensible fallback if it
+  // can't locate `firstModifiedLine` (markdown blocks map to start-
+  // line numbers, so a firstModifiedLine inside a block won't match).
+  useLayoutEffect(() => {
+    if (!content) return;
+    if (scrollRestoredRef.current) return;
+    const saved = (() => {
+      try { return localStorage.getItem(scrollKey); } catch { return null; }
+    })();
+    if (saved !== null) {
+      const pos = parseInt(saved, 10);
+      if (!Number.isNaN(pos)) {
+        const el = contentRef.current;
+        if (el) {
+          el.scrollTop = pos;
+          lastScrollTopRef.current = pos;
+        }
+      }
     }
-    return undefined;
+    // Note: don't mark scrollRestoredRef here — leave it false so the
+    // patchContext auto-scroll effect below still has a chance to win
+    // when it can locate firstModifiedLine. This effect is the fallback,
+    // not the final word.
+  }, [content, scrollKey]);
+
+  // Auto-scroll to first modified line (REQ-PF-014). Wins over saved
+  // scroll when a patchContext is provided and the line element exists
+  // — opening from a patch context means the user wants to see the
+  // changed lines. If `lineEl` isn't found (markdown block-line miss,
+  // late render), do nothing and leave the saved-scroll restoration
+  // above in place as the fallback. Don't set `scrollRestoredRef` until
+  // we actually scroll, so we don't permanently block other paths.
+  useEffect(() => {
+    if (!content || !patchContext?.firstModifiedLine) return undefined;
+    const timer = setTimeout(() => {
+      const lineEl = lineRefs.current.get(patchContext.firstModifiedLine!);
+      if (lineEl) {
+        lineEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        scrollRestoredRef.current = true;
+      }
+    }, 100);
+    return () => clearTimeout(timer);
   }, [content, patchContext?.firstModifiedLine]);
+
+  // Track scrollTop on every scroll event so visibility-change / unmount
+  // saves see the latest value even if the DOM element has detached.
+  useEffect(() => {
+    const el = contentRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      lastScrollTopRef.current = el.scrollTop;
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, [content]);
+
+  // Persist scroll on visibility-change (iOS PWA backgrounding) and on
+  // unmount (close / route change). Mirrors MessageList's pattern.
+  useEffect(() => {
+    const save = () => {
+      try {
+        localStorage.setItem(scrollKey, String(lastScrollTopRef.current));
+      } catch {
+        // storage full — degrade gracefully
+      }
+    };
+    const onVis = () => {
+      if (document.visibilityState === 'hidden') save();
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      document.removeEventListener('visibilitychange', onVis);
+      save();
+    };
+  }, [scrollKey]);
 
   // Clear highlight after animation
   useEffect(() => {
