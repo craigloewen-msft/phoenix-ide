@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Link } from 'react-router-dom';
+import { FolderTree } from 'lucide-react';
 import type { Conversation, ConversationState, ModelInfo } from '../api';
 import type { ConnectionState } from '../hooks';
 import { getStateDescription } from '../utils';
@@ -31,6 +32,10 @@ interface StateBarProps {
    *  Used to render a live elapsed-time counter ("running bash ... 4s").
    *  `null` or `undefined` when not in tool_executing. */
   toolExecutingStartedAt?: number | null;
+  /** Mobile/tablet-only: opens the file browser overlay. When omitted (e.g. on
+   *  desktop where `FileExplorerPanel` provides the same affordance), the
+   *  button is not rendered. */
+  onOpenFiles?: () => void;
 }
 
 /** Format a context window size in tokens for compact display (e.g. 200k, 1M). */
@@ -101,6 +106,7 @@ export function StateBar({
   onTriggerContinuation,
   onUpgradeModel,
   toolExecutingStartedAt,
+  onOpenFiles,
 }: StateBarProps) {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerShowAll, setPickerShowAll] = useState(false);
@@ -485,6 +491,29 @@ export function StateBar({
               conversationId={conversation.id}
               onTriggerContinuation={indicatorTrigger}
             />
+          )}
+          {onOpenFiles && (
+            <button
+              type="button"
+              className="statebar-files-btn"
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenFiles();
+              }}
+              onKeyDown={(e) => {
+                // The collapsed StateBar (≤768px) has its own Enter/Space
+                // handler on `<header>` that calls preventDefault to expand
+                // the bar. Stop propagation so the button's default
+                // activation isn't suppressed and the bar doesn't toggle.
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.stopPropagation();
+                }
+              }}
+              aria-label="Browse project files"
+              title="Browse project files"
+            >
+              <FolderTree size={18} aria-hidden="true" />
+            </button>
           )}
         </div>
         {isMobile && (

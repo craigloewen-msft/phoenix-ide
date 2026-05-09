@@ -5349,6 +5349,45 @@ html * {
   }
 }
 
+/* ::before extends the 32x32 visible footprint to a 44x44 hit target
+   (WCAG 2.5.5 / Apple HIG) without blowing out the bar's 42px height. */
+.statebar-files-btn {
+  position: relative;
+  background: none;
+  border: 0;
+  color: var(--text-muted);
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  margin-left: 4px;
+  flex-shrink: 0;
+  border-radius: 4px;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.statebar-files-btn::before {
+  content: '';
+  position: absolute;
+  inset: -6px;
+}
+
+.statebar-files-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+.statebar-files-btn:active {
+  background: var(--bg-primary);
+}
+
+.statebar-files-btn:focus-visible {
+  outline: 2px solid var(--accent-blue, currentColor);
+  outline-offset: 2px;
+}
+
 /* IndexedDB init error state */
 .init-error {
   display: flex;
