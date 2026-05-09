@@ -1,4 +1,13 @@
-# Web UI
+# Conversation UI
+
+## Scope
+
+This spec governs the conversation experience: list, chat view, message
+composition, agent-activity display, and the responsive layout that
+holds them. It does **not** govern the broader UI surface — see
+`specs/conversation-ui/executive.md` for the boundary list and the
+specs that own adjacent surfaces (file explorer, command palette,
+viewer slot, voice input, notifications, etc.).
 
 ## User Story
 
@@ -35,7 +44,7 @@ answered confidently from the UI, that is a missing or incomplete requirement.
 
 ## Requirements
 
-### REQ-UI-001: Conversation List
+### REQ-CONV-001: Conversation List
 
 WHEN user opens the app
 THE SYSTEM SHALL display a list of active conversations
@@ -50,7 +59,7 @@ AND preserve the URL for deep linking (`/c/{slug}`)
 
 ---
 
-### REQ-UI-002: Chat View
+### REQ-CONV-002: Chat View
 
 WHEN viewing a conversation
 THE SYSTEM SHALL display all messages in chronological order
@@ -65,7 +74,7 @@ THE SYSTEM SHALL render basic markdown (code blocks, bold, italic, paragraphs)
 
 ---
 
-### REQ-UI-003: Message Composition
+### REQ-CONV-003: Message Composition
 
 WHEN user types in the input field
 THE SYSTEM SHALL auto-resize the input up to a maximum height
@@ -82,7 +91,7 @@ THE SYSTEM SHALL insert a newline
 
 ---
 
-### REQ-UI-004: Message Delivery States
+### REQ-CONV-004: Message Delivery States
 
 WHEN user sends a message
 THE SYSTEM SHALL immediately display it with "sending" indicator (optimistic UI)
@@ -108,7 +117,7 @@ Message states:
 
 ---
 
-### REQ-UI-005: Connection Status
+### REQ-CONV-005: Connection Status
 
 WHEN SSE connection is established
 THE SYSTEM SHALL show "ready" indicator (green)
@@ -135,7 +144,7 @@ AND resume normal "ready" state
 
 ---
 
-### REQ-UI-006: Reconnection Data Integrity
+### REQ-CONV-006: Reconnection Data Integrity
 
 WHEN reconnecting to SSE stream
 THE SYSTEM SHALL track `last_sequence_id` from all received messages
@@ -150,7 +159,7 @@ AND NOT show duplicate messages
 
 ---
 
-### REQ-UI-007: Agent Activity Indicators
+### REQ-CONV-007: Agent Activity Indicators
 
 WHEN agent is working
 THE SYSTEM SHALL show activity indicator (yellow pulsing dot)
@@ -180,7 +189,7 @@ THE SYSTEM SHALL NOT show the activity indicator
 
 ---
 
-### REQ-UI-008: Cancellation
+### REQ-CONV-008: Cancellation
 
 WHEN agent is working
 THE SYSTEM SHALL show Cancel button instead of Send
@@ -194,15 +203,15 @@ AND disable further cancel attempts
 
 ---
 
-### REQ-UI-009: New Conversation
+### REQ-CONV-009: New Conversation
 
-**DEPRECATED:** Replaced by REQ-UI-015 (mobile bottom sheet), REQ-UI-017 (desktop full page), and REQ-UI-018 (desktop inline sidebar).
+**DEPRECATED:** Replaced by REQ-CONV-015 (mobile bottom sheet), REQ-CONV-017 (desktop full page), and REQ-CONV-018 (desktop inline sidebar).
 
 **Deprecation Reason:** Original requirement was too generic. New conversation flows differ significantly by viewport and context, requiring separate requirements for each mode.
 
 ---
 
-### REQ-UI-010: Responsive Layout
+### REQ-CONV-010: Responsive Layout
 
 WHEN viewport is mobile-sized (< 768px)
 THE SYSTEM SHALL use full-width single-column layout
@@ -214,14 +223,14 @@ THE SYSTEM SHALL use mobile layout patterns
 AND support keyboard navigation where available
 
 WHEN viewport is desktop-sized (> 1024px)
-THE SYSTEM SHALL use sidebar layout per REQ-UI-016
+THE SYSTEM SHALL use sidebar layout per REQ-CONV-016
 AND support full keyboard navigation
 
 **Rationale:** Phoenix serves both mobile (on-the-go monitoring) and desktop (primary development) use cases. Each viewport size gets optimized layout rather than one-size-fits-all responsive scaling.
 
 ---
 
-### REQ-UI-011: Local Storage Schema
+### REQ-CONV-011: Local Storage Schema
 
 WHEN persisting data to localStorage
 THE SYSTEM SHALL use keys namespaced by conversation ID:
@@ -237,7 +246,7 @@ AND log warning to console
 
 ---
 
-### REQ-UI-012: Conversation State Indicators
+### REQ-CONV-012: Conversation State Indicators
 
 WHEN displaying the conversation list
 THE SYSTEM SHALL show a visual state indicator for each conversation
@@ -250,7 +259,7 @@ THE SYSTEM SHALL enable at-a-glance identification of which conversations need a
 
 ---
 
-### REQ-UI-013: Per-Conversation Scroll Position Memory
+### REQ-CONV-013: Per-Conversation Scroll Position Memory
 
 WHEN user navigates away from a conversation
 THE SYSTEM SHALL persist the current scroll position for that conversation
@@ -267,7 +276,7 @@ AND provide affordance to jump to newest content
 
 ---
 
-### REQ-UI-014: Desktop Message Readability
+### REQ-CONV-014: Desktop Message Readability
 
 WHEN viewport is desktop-sized (> 768px)
 THE SYSTEM SHALL constrain message content width to a readable maximum (approximately 800px)
@@ -280,7 +289,7 @@ THE SYSTEM SHALL allow horizontal scroll within the block rather than expanding 
 
 ---
 
-### REQ-UI-015: Mobile New Conversation Bottom Sheet
+### REQ-CONV-015: Mobile New Conversation Bottom Sheet
 
 WHEN user initiates new conversation on mobile viewport
 THE SYSTEM SHALL present a bottom sheet overlay (not full-page navigation)
@@ -303,7 +312,7 @@ AND show brief confirmation toast
 
 ---
 
-### REQ-UI-016: Desktop Sidebar Layout
+### REQ-CONV-016: Desktop Sidebar Layout
 
 WHEN viewport is desktop-sized (> 1024px)
 THE SYSTEM SHALL display conversation list as a persistent sidebar alongside the main content
@@ -322,59 +331,60 @@ AND expand on click or hover
 
 ---
 
-### REQ-UI-017: Desktop New Conversation - Full Page Mode
+### REQ-CONV-017: Desktop New Conversation — Full Page Route
 
-WHEN user navigates to root route (`/`) on desktop with sidebar visible
+WHEN user navigates to `/new` on desktop with sidebar visible
 THE SYSTEM SHALL render the full new-conversation form in the main content area
 AND show the conversation list in the sidebar (no active highlight)
-AND display Phoenix icon at top of sidebar as click target for this view
-
-WHEN user clicks "+ New" button while on root route
-THE SYSTEM SHALL treat click as no-op (already on new conversation view)
 
 WHEN user clicks Phoenix icon in sidebar
-THE SYSTEM SHALL navigate to root route (`/`)
+THE SYSTEM SHALL navigate to root route (`/`) — the conversation list view
 
 WHEN user submits the new conversation form
-THE SYSTEM SHALL create the conversation and navigate to it
+THE SYSTEM SHALL create the conversation and navigate to `/c/{slug}`
 AND highlight it in the sidebar
 
 WHEN user submits with "Send in Background" option
 THE SYSTEM SHALL create the conversation and start agent processing
-AND remain on root route for another new conversation
+AND remain on `/new` so the user can spawn another
 AND show brief confirmation toast
 
-**Rationale:** Direct navigation to `/` indicates intentional "start fresh" flow. Full-page form provides complete settings access without space constraints. Phoenix icon provides visual anchor and alternative navigation path. Background send enables batch-spawning multiple conversations.
+**Rationale:** A dedicated `/new` route gives the new-conversation form complete settings access without space constraints and a stable URL the sidebar can navigate to from any view. Background send enables batch-spawning multiple conversations.
 
 ---
 
-### REQ-UI-018: Desktop New Conversation - Inline Sidebar Mode
+### REQ-CONV-018: Sidebar "+ New" Entry Point
 
-WHEN user clicks "+ New" while viewing an existing conversation (`/c/:slug`)
-THE SYSTEM SHALL expand an inline new-conversation form at the top of the sidebar
-AND keep the current conversation visible in the main content area
-AND NOT navigate away from the current conversation
+WHEN user clicks "+ New" button in the sidebar while viewing a conversation (`/c/:slug`)
+THE SYSTEM SHALL navigate to `/new`
+AND keep the previous conversation reachable via browser back or sidebar click
 
-WHEN inline form is visible
-THE SYSTEM SHALL provide directory picker, model selector, and message input
-AND provide "Send" button to create and navigate to conversation
-AND provide "Send in Background" option to create without navigating
-AND allow dismissal via cancel button or Escape key
+WHEN user clicks "+ New" button while already on `/new`
+THE SYSTEM SHALL treat the click as a no-op (the new-conversation form is already presented)
 
-WHEN user submits with "Send" (default)
-THE SYSTEM SHALL create the conversation, navigate to it, and collapse the form
-
-WHEN user submits with "Send in Background"
-THE SYSTEM SHALL create the conversation and start agent processing
-AND collapse the form
-AND keep user in current conversation
-AND show brief confirmation toast
-
-**Rationale:** Users monitoring an active conversation need to spawn side tasks without losing context. Inline form enables "quick new conversation" without disrupting the current view. "Send in Background" is the power-user path for spawning work while staying focused.
+**Rationale:** A single new-conversation route serves every entry point — the sidebar, direct navigation, browser bookmarks. Earlier drafts of this spec proposed an inline-form mode that expanded inside the sidebar without navigating; the implementation simplified to route-based navigation, which preserves browser history (the previous conversation is one back-button away) and removes the dual-mode form complexity. The previous conversation remains intact in the React tree behind the route, so SSE streams stay alive and a click back to it does not refetch.
 
 ---
 
-### REQ-UI-020: Navigation Persistence
+### REQ-CONV-019: Streaming Text Display
+
+WHEN LLM is generating a text response
+THE SYSTEM SHALL display partial text as it arrives, below the conversation history
+AND render the text with basic formatting as it accumulates
+
+WHEN LLM response completes and the message is saved
+THE SYSTEM SHALL replace the streaming display with the finalized rendered message
+AND the transition SHALL NOT produce visible duplication, flickering, or content loss
+
+WHEN user scrolls up during streaming
+THE SYSTEM SHALL NOT force auto-scroll back to the streaming text
+AND SHALL provide affordance to jump to live output
+
+**Rationale:** Progressive text display confirms the system is working and lets users start reading during generation. Clean transition to the finalized message ensures the streaming view is never a "different version" of the response — the saved message is always authoritative.
+
+---
+
+### REQ-CONV-020: Navigation Persistence
 
 WHEN user navigates away from a conversation and returns within the same session
 THE SYSTEM SHALL restore the conversation state without a full re-fetch
@@ -390,21 +400,3 @@ THE SYSTEM SHALL show the current agent state (streaming may have completed duri
 AND NOT attempt to reconstruct missed token events
 
 **Rationale:** Navigation between conversations should feel instantaneous for recently-visited conversations. The reconnection cursor (`lastSequenceId`) must survive navigation — it cannot live in component state that unmounts. Missed streaming tokens during navigation are acceptable; the finalized message will arrive via normal reconnection.
-
----
-
-### REQ-UI-019: Streaming Text Display
-
-WHEN LLM is generating a text response
-THE SYSTEM SHALL display partial text as it arrives, below the conversation history
-AND render the text with basic formatting as it accumulates
-
-WHEN LLM response completes and the message is saved
-THE SYSTEM SHALL replace the streaming display with the finalized rendered message
-AND the transition SHALL NOT produce visible duplication, flickering, or content loss
-
-WHEN user scrolls up during streaming
-THE SYSTEM SHALL NOT force auto-scroll back to the streaming text
-AND SHALL provide affordance to jump to live output
-
-**Rationale:** Progressive text display confirms the system is working and lets users start reading during generation. Clean transition to the finalized message ensures the streaming view is never a "different version" of the response — the saved message is always authoritative.

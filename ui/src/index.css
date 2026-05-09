@@ -515,7 +515,7 @@ body {
   padding: 12px;
 }
 
-/* Jump to newest messages button (REQ-UI-013) */
+/* Jump to newest messages button (REQ-CONV-013) */
 .jump-to-newest {
   position: sticky;
   bottom: 12px;
@@ -5558,7 +5558,7 @@ html * {
 }
 
 /* ======================================================== */
-/* Desktop Sidebar Layout (REQ-UI-016, 017, 018)           */
+/* Desktop Sidebar Layout (REQ-CONV-016, 017, 018)           */
 /* ======================================================== */
 
 .desktop-layout {
@@ -6158,8 +6158,9 @@ html * {
   font-size: 12px;
 }
 
-/* --- Sidebar Inline New Form (REQ-UI-018) --- */
-/* --- Desktop main area overrides --- */
+/* --- New Conversation Page styles (REQ-CONV-017, REQ-CONV-018) --- */
+/* The "+ New" sidebar entry navigates to /new; the page below renders
+   in the desktop main area and adapts to mobile via responsive CSS. */
 .desktop-main #app {
   height: 100%;
 }
