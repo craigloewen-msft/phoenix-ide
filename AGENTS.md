@@ -9,25 +9,29 @@ The core is a **state machine-driven conversation runtime**: messages flow throu
 ## Architecture
 
 ```
-src/
+crates/phoenix-ide/src/
   runtime/       # Conversation lifecycle, state machine executor
   state_machine/ # Pure state transitions (Elm architecture)
-  tools/         # bash, patch, browser, keyword_search, think, etc.
+  tools/         # bash, patch, browser, keyword_search, think, tmux, etc.
   llm/           # Provider abstraction (Anthropic, OpenAI, Fireworks)
   api/           # HTTP handlers, SSE streaming
   db/            # SQLite persistence
+  chain_runtime.rs / chain_qa/    # Phoenix Chains v1 (see specs/chains/)
+  terminal/      # In-app terminal + tmux-attach bridging
+crates/phoenix-tls/  # Terminal-line stream library (used by terminal/)
 ui/src/
   components/    # React components
   machines/      # XState state machines
   hooks/         # Custom React hooks
-specs/           # Tool specifications (read before modifying tools!)
+  pages/         # Route-level components
+specs/           # Behavioural specs (read before modifying anything spec'd!)
 tasks/           # Task tracking
 phoenix-client.py  # CLI client — interact with the app without a browser
 ```
 
 `phoenix-client.py` is a standalone CLI for the Phoenix API (spec: `specs/simple_client/`). LLM agents should prefer it over browser automation for testing conversations.
 
-**Allium specs** (`.allium` files in `specs/`) are formal behavioral specifications that complement spEARS prose. See [Behavioral Specifications](#behavioral-specifications-allium) below.
+**Specs** live under `specs/<name>/`: spEARS prose (`requirements.md`, `design.md`, `executive.md`) plus optional Allium behavioural specs (`.allium`). Both are normative. See [Specifications](#specifications) below.
 
 ---
 
@@ -37,7 +41,7 @@ phoenix-client.py  # CLI client — interact with the app without a browser
 
 ```bash
 echo 'What the task does, in a few sentences.' \
-  | taskmd new --slug fix-login --artifact src/auth.py --priority p1
+  | taskmd new --slug fix-login --artifact crates/phoenix-ide/src/api/auth.rs --priority p1
 ```
 
 `taskmd new` allocates the next ID, synthesizes the frontmatter, and writes
@@ -174,21 +178,21 @@ The SSE wire format is typed on the Rust side in [`src/api/wire.rs`](src/api/wir
 
 Types that feed codegen need `#[derive(ts_rs::TS)]` + `#[ts(export, export_to = "../ui/src/generated/")]`. Types that are referenced but intentionally left opaque on the TS side (e.g. `MessageContent`, `ConvState`) are annotated `#[ts(type = "unknown")]` at their reference site.
 
-Byte-for-byte wire parity with the pre-typed `json!()` path is guarded by the `parity_*` tests in `src/api/sse.rs`.
+Byte-for-byte wire parity with the pre-typed `json!()` path is guarded by the `parity_*` tests in `crates/phoenix-ide/src/api/sse.rs`.
 
 ---
 
 ## Adding a New Tool
 
-See [`src/tools/think.rs`](src/tools/think.rs) as the simplest example.
+See [`crates/phoenix-ide/src/tools/think.rs`](crates/phoenix-ide/src/tools/think.rs) as the simplest example.
 
-1. Create `src/tools/your_tool.rs` implementing the `Tool` trait:
+1. Create `crates/phoenix-ide/src/tools/your_tool.rs` implementing the `Tool` trait:
    - `name()` — tool identifier
    - `description()` — shown to LLM
    - `input_schema()` — JSON schema for parameters
    - `run()` — async execution, returns `ToolOutput`
 
-2. Register in `src/tools.rs` → `ToolRegistry::new_with_options()`
+2. Register in `crates/phoenix-ide/src/tools.rs` → `ToolRegistry::new_with_options()`
 
 3. Add spec in `specs/your-tool/executive.md` (see existing specs for format)
 
@@ -196,29 +200,34 @@ See [`src/tools/think.rs`](src/tools/think.rs) as the simplest example.
 
 ---
 
-## Behavioral Specifications (Allium)
+## Specifications
 
-spEARS specs (`requirements.md`, `design.md`, `executive.md`) capture *why* something should be built and track implementation status. Allium specs (`.allium` files) capture *what exactly* the system does — states, transitions, preconditions, postconditions, invariants — precisely enough to generate tests and catch ambiguities.
+This project uses two complementary specification formats. **Both are normative** — code that contradicts either is wrong.
 
-**spEARS without Allium:** rigorous about whether to build, vague about what exactly to build.
-**Allium without spEARS:** precise about behaviour, unmoored from user need and project reality.
-**Together:** user story → requirement ID → precise behavioral spec → testable implementation → status tracking, all traceable end-to-end.
+- **spEARS** specs (`requirements.md`, `design.md`, `executive.md`) capture the *what* and *why*, plus the high-level *how*. They establish user need, named requirements (REQ-* IDs), design rationale, and track implementation status.
+- **Allium** specs (`.allium` files) capture *how specifically* — states, transitions, preconditions, postconditions, invariants — precisely enough to generate tests and catch ambiguities.
 
-### When to use Allium
+The two formats complement each other. spEARS without Allium is vague about exact behaviour; Allium without spEARS is unmoored from user need. Together: user story → REQ-IDs → precise behavioural spec → testable implementation → status tracking, traceable end-to-end.
+
+### When to write an Allium spec alongside spEARS
+
+Allium is a heavier tool; not every spEARS spec needs an Allium counterpart. Write one when the system has:
 
 - **State machines** with multiple states and complex transitions (bedrock, projects)
 - **Lifecycle flows** with preconditions that must hold (task approval, complete, abandon)
 - **Multi-step operations** where ordering matters and partial failure is possible
 - **Cross-boundary contracts** where two specs interact (projects importing bedrock)
 
-Do NOT use for: CRUD endpoints, pure data transformations, UI components, tool implementations with no lifecycle.
+Do NOT add Allium for: CRUD endpoints, pure data transformations, UI components, tool implementations with no lifecycle. spEARS alone is sufficient there.
 
-### Current Allium specs
+### Discovering specs
 
-| Spec | Imports | Scope |
-|------|---------|-------|
-| `specs/bedrock/bedrock.allium` | — | Conversation state machine (14 states, 48 rules) |
-| `specs/projects/projects.allium` | bedrock | Project lifecycle, git operations (12 rules) |
+Both formats live under `specs/<name>/`:
+
+- spEARS: `requirements.md`, `design.md`, `executive.md`
+- Allium: `<name>.allium`
+
+Enumerate Allium specs with `ls specs/*/*.allium`. Cross-spec dependencies are declared in each file's header via `use "./other.allium" as other`. Validate with `allium check specs/<name>/<name>.allium` (install via `cargo install allium-cli`).
 
 ### Working with Allium specs
 
@@ -232,7 +241,7 @@ Do NOT use for: CRUD endpoints, pure data transformations, UI components, tool i
 
 **Resolving open questions is mandatory.** An open question in an Allium spec is not documentation — it's an unresolved ambiguity that may hide a bug. When distilling, present each open question to the user via `AskUserQuestion` with concrete options (not open-ended). The user decides; you implement the fix. Do not leave open questions as prose notes or "future work." Every ambiguity either becomes a code fix or an explicit design decision before the spec is merged.
 
-**The spec is authoritative for behavior.** If the code disagrees with the Allium spec, one of them is wrong. The transition graph, preconditions, and invariants in the `.allium` file define correct behavior. `@guidance` blocks describe implementation sequences — if the code's sequence differs, investigate before assuming the code is right.
+**Both formats are authoritative.** If the code disagrees with either spEARS or Allium, one of them is wrong. spEARS requirements (REQ-* IDs) define what must be built; Allium's transition graph, preconditions, and invariants define exact behaviour. `@guidance` blocks in Allium describe implementation sequences — if the code's sequence differs, investigate before assuming the code is right.
 
 ---
 
