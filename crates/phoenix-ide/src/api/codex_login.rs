@@ -316,18 +316,20 @@ async fn drive_pkce(
                 m.code
             }
         }
-    } else { tokio::select! {
-        biased;
-        () = cancel.cancelled() => return Err(LoginError::Cancelled),
-        () = tokio::time::sleep(PKCE_TIMEOUT) => return Err(LoginError::Cancelled),
-        manual = manual_rx => {
-            let m = manual.map_err(|_| {
-                LoginError::Loopback("manual code channel closed (no loopback)".into())
-            })?;
-            validate_state(&expected_state, &m.state)?;
-            m.code
+    } else {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(LoginError::Cancelled),
+            () = tokio::time::sleep(PKCE_TIMEOUT) => return Err(LoginError::Cancelled),
+            manual = manual_rx => {
+                let m = manual.map_err(|_| {
+                    LoginError::Loopback("manual code channel closed (no loopback)".into())
+                })?;
+                validate_state(&expected_state, &m.state)?;
+                m.code
+            }
         }
-    } };
+    };
 
     // Re-check after the await above and before each subsequent step, so a
     // cancellation that lands between the callback and the file-write still
@@ -455,7 +457,9 @@ fn url_decode(s: &str) -> String {
                     if let (Some(h), Some(l)) =
                         (char::from(h).to_digit(16), char::from(l).to_digit(16))
                     {
-                        out.push(char::from(((h << 4) | l) as u8));
+                        out.push(char::from(
+                            u8::try_from((h << 4) | l).expect("nibbles fit in u8"),
+                        ));
                     } else {
                         out.push('%');
                         out.push(char::from(h));
@@ -749,6 +753,7 @@ pub async fn device_cancel(
 // state is, so the UI can warn the user about restart-required.
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::struct_excessive_bools)] // wire-format DTO; field shape is the JSON contract with the UI
 #[derive(Debug, Serialize)]
 pub struct LoginPreflight {
     /// Path the in-app login will write to (Phoenix's own auth file).
@@ -772,6 +777,7 @@ pub struct LoginPreflight {
     ///    login writes to (e.g. piggyback mode loaded `~/.codex/auth.json`,
     ///    but the new login writes `~/.phoenix-ide/codex-auth.json` — the
     ///    in-memory credential keeps watching the old path).
+    ///
     /// False only when the loaded credential's path matches the destination
     /// of the in-app login, i.e. its `mtime` watch will pick up new tokens
     /// without a restart.

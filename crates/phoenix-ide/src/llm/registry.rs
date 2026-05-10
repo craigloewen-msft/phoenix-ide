@@ -220,6 +220,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("auth_style", &self.auth_style)
             .field("use_codex_auth", &self.use_codex_auth)
             .field("codex_credential", &self.codex_credential.is_some())
+            .field("codex_credential_path", &self.codex_credential_path)
             .finish()
     }
 }
@@ -931,6 +932,7 @@ impl ModelRegistry {
         &self,
         new_path: Option<std::path::PathBuf>,
     ) -> CodexReloadOutcome {
+        use crate::llm::models::Provider;
         let cred_with_account = match new_path.as_ref() {
             Some(path) => match CodexCredential::load(path.clone()) {
                 Ok((cred, account_id)) => Some((cred, account_id)),
@@ -963,7 +965,6 @@ impl ModelRegistry {
 
         // Rebuild the OpenAI bridge services off-lock so the write window is
         // short. Build into a separate map; we'll merge under lock.
-        use crate::llm::models::Provider;
         let mut new_codex_services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         let mut new_codex_specs: HashMap<String, super::ModelSpec> = HashMap::new();
         if let Some((cred, _)) = cred_with_account.as_ref() {
@@ -1017,7 +1018,7 @@ impl ModelRegistry {
             }
 
             let prev = current_path.clone();
-            *current_path = new_path.clone();
+            current_path.clone_from(&new_path);
             prev
         };
 

@@ -598,7 +598,7 @@ struct CallbackState {
     /// process that hits `/auth/callback` with garbage cannot `DoS` the login
     /// session by burning the one-shot before the real browser callback
     /// arrives.
-    expected_state: Arc<String>,
+    expected_state: Arc<str>,
 }
 
 /// Either a successful auth code or an error reported by the OAuth provider.
@@ -680,7 +680,7 @@ impl LoopbackServer {
         let (callback_tx, callback_rx) = oneshot::channel();
         let state = CallbackState {
             sender: Arc::new(TokioMutex::new(Some(callback_tx))),
-            expected_state: Arc::new(expected_state),
+            expected_state: Arc::from(expected_state),
         };
 
         let mut shutdown_txs = Vec::new();
@@ -741,7 +741,7 @@ async fn callback_handler(
     // exact state value sees an error page but does NOT settle the session.
     // The real browser callback can still arrive afterwards.
     let returned_state = params.get("state").map(String::as_str);
-    if returned_state != Some(state.expected_state.as_str()) {
+    if returned_state != Some(&*state.expected_state) {
         tracing::debug!(
             "codex_login: rejecting callback with missing/mismatched state — \
              not consuming session sender"
@@ -759,7 +759,7 @@ async fn callback_handler(
             code: code.clone(),
             // We've already validated state above, but pass it through for
             // the defense-in-depth check in `drive_pkce`.
-            state: state.expected_state.as_ref().clone(),
+            state: state.expected_state.to_string(),
         }
     } else {
         // State validated but neither error nor code present. Treat as
@@ -1006,7 +1006,7 @@ mod tests {
         let (tx, rx) = oneshot::channel::<CallbackPayload>();
         let state = CallbackState {
             sender: Arc::new(TokioMutex::new(Some(tx))),
-            expected_state: Arc::new("real-state".into()),
+            expected_state: Arc::from("real-state"),
         };
 
         // (1) Mismatched state — handler rejects, sender preserved.
