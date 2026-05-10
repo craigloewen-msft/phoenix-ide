@@ -1,0 +1,536 @@
+-- allium: 3
+-- terminal-panel.allium
+--
+-- Terminal Panel Frontend: Behavioural Specification
+--
+-- Scope: The four interacting client-side state machines inside
+--        TerminalPanel.tsx — WebSocket lifecycle, shell-integration
+--        detection, command tracker, byte-activity sampler. Plus the
+--        cross-machine gating rules that decide which source feeds
+--        the HUD's activity indicator.
+-- Includes:
+--   - WebSocket connection states (not_connected → connecting →
+--     connected → disconnected) and the reconnect-nonce escape hatch.
+--   - Monotonic shell-integration detection (unknown → detected |
+--     absent) over a 5-second window.
+--   - Command tracker fed by OSC 133 A/B/C/D markers, with the
+--     running → completed transition that promotes the previous
+--     command into lastCompletedCommand.
+--   - Byte-activity sampler (idle ↔ running) gated off when
+--     integration is detected, locked to disconnected once the WS
+--     closes until the next nonce-bumped reconnect.
+-- Excludes:
+--   - The backend PTY state machine (see specs/terminal/terminal.allium).
+--   - WebSocket protocol byte-format details (see specs/terminal/).
+--   - HUD render decisions per se — those are in
+--     specs/terminal-panel/design.md as a decision tree. The state
+--     machines below are the inputs the renderer reads.
+--   - Pure UI flags (snippet modal open, copy ack, hint tooltip,
+--     assist in flight) — these are local useState booleans with no
+--     transition graph worth modelling.
+--
+-- Requirement traceability: this allium drives the user-visible
+-- behaviours in REQ-TPANEL-001 (open/use), REQ-TPANEL-002
+-- (disconnect + recover), REQ-TPANEL-003 (live command status),
+-- REQ-TPANEL-004 (cwd in header), REQ-TPANEL-006 (shell integration
+-- detection + CTA), and REQ-TPANEL-008 (conflict resolution target).
+-- REQ-TPANEL-005 (collapse + unread) and REQ-TPANEL-007 (theme) are
+-- render/lifecycle requirements with no state machine to model.
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Window during which an OSC 133;C marker must arrive for shell
+    -- integration to be considered detected. Mirrors the backend's
+    -- shell_integration_detection_window from specs/terminal/. Drift
+    -- between the two is silent — see design.md "Open Questions".
+    detection_window_ms: Integer = 5000
+
+    -- Quiet-time after which the byte-activity sampler decays running
+    -- back to idle.
+    activity_decay_ms: Integer = 500
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum WsStatus {
+    not_connected
+    connecting
+    connected
+    disconnected
+    -- conflict — REQ-TPANEL-008 target; not yet implemented. Today
+    -- the panel folds 409 into disconnected. Adding `conflict` is the
+    -- spec target for the reclaim flow.
+}
+
+enum IntegrationStatus { unknown | detected | absent }
+
+enum CommandStatus { idle | running | completed }
+
+enum ActivityState { idle | running | disconnected }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value CommandExecution {
+    command_text: String
+    started_at: Integer       -- Date.now() at OSC 133;C
+    finished_at: Integer?     -- Date.now() at OSC 133;D; null while running
+    exit_code: Integer?       -- from D payload; null if shell omitted it
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- One TerminalPanelInstance per (conversation, reconnect nonce). A
+-- nonce bump replaces the entity entirely — the cleanup effect tears
+-- everything down and a fresh entity is constructed for the new
+-- nonce. Spec-wise: a fresh PanelInstance starts in not_connected
+-- with integration=unknown, the WS is allocated, and the detection
+-- timer arms.
+entity TerminalPanelInstance {
+    conversation_id: String
+    reconnect_nonce: Integer
+
+    ws_status: WsStatus
+    integration_status: IntegrationStatus
+
+    -- Live command tracker: at most one running command at a time.
+    -- last_completed_command is set on OSC 133;D (when a command
+    -- finishes), persists through the prompt-idle window so the
+    -- HUD's ✓/✗ glyph stays visible, and is cleared on the next
+    -- OSC 133;C (when a new command starts running) so the new
+    -- running window doesn't show stale outcome data. See the
+    -- CommandStartedOnC and CommandCompletedOnD rules below.
+    command_status: CommandStatus
+    current_command: CommandExecution? when command_status = running
+    last_completed_command: CommandExecution?
+
+    -- Byte-activity sampler. Authoritative for the HUD only when
+    -- integration_status != detected (see ActivityIsAuthoritativeWhenDetected).
+    activity: ActivityState
+
+    -- Working directory reported via OSC 7. Falls back to the
+    -- conversation's cwd at render time when null (REQ-TPANEL-004).
+    reported_cwd: String?
+
+    -- WebSocket transitions. `connecting` is the initial post-mount
+    -- state; `connected` follows ws.onopen; `disconnected` is the
+    -- terminal state until reconnect bumps the nonce.
+    transitions ws_status {
+        not_connected -> connecting
+        connecting -> connected
+        connecting -> disconnected
+        connected -> disconnected
+    }
+
+    -- Integration detection is monotonic. Once settled, stays.
+    transitions integration_status {
+        unknown -> detected
+        unknown -> absent
+    }
+
+    -- Command tracker cycles: idle ↔ running, with completed as a
+    -- pass-through on the way back to idle/running. The "completed"
+    -- state is transient — set when D arrives, cleared when the next
+    -- C arrives (or implicitly on disconnect).
+    transitions command_status {
+        idle -> running
+        running -> completed
+        completed -> running
+        completed -> idle
+    }
+
+    -- Activity sampler. The disconnected state is sticky: only a
+    -- nonce-bumped reconnect (which spawns a fresh entity) clears it,
+    -- never an in-place transition.
+    transitions activity {
+        idle -> running
+        running -> idle
+        idle -> disconnected
+        running -> disconnected
+    }
+}
+
+------------------------------------------------------------
+-- Events (referenced inline by rules)
+------------------------------------------------------------
+
+-- Lifecycle events the panel observes. Naming mirrors the WebSocket
+-- and OSC API surfaces.
+--   PanelMounted(panel)
+--   WsOpened(panel)
+--   WsErrored(panel)
+--   WsClosed(panel)
+--   WsMessageReceived(panel, bytes)
+--   ReconnectClicked(panel)
+--
+-- OSC marker events. A/B are accepted but produce no state change.
+--   Osc133MarkerA(panel, payload)
+--   Osc133MarkerB(panel, payload)
+--   Osc133MarkerC(panel, command_text)
+--   Osc133MarkerD(panel, exit_code?)
+--   Osc7Marker(panel, path)
+--
+-- Timer events.
+--   DetectionWindowElapsed(panel)
+--   ActivityDecayElapsed(panel)
+
+------------------------------------------------------------
+-- Rules — WebSocket lifecycle
+------------------------------------------------------------
+
+rule WsConnectingOnMount {
+    when: PanelMounted(panel)
+
+    ensures: panel.ws_status = connecting
+    ensures: panel.activity = disconnected
+    ensures: panel.integration_status = unknown
+    ensures: panel.command_status = idle
+    ensures: panel.current_command = null
+    ensures: panel.last_completed_command = null
+    ensures: panel.reported_cwd = null
+
+    @guidance
+        -- TerminalPanel.tsx:481 allocates the WebSocket synchronously
+        -- after the deferred xterm allocation completes. Initial
+        -- status text "Connecting…" is set at :484. The deferred
+        -- timer at :319-331 dodges React 18 StrictMode double-mount;
+        -- the spec treats the deferred allocation as part of mount.
+        --
+        -- activity starts at `disconnected` rather than `idle`: the
+        -- panel hasn't yet seen a live signal from the shell. The
+        -- HUD's "Disconnected" rendering path is gated on
+        -- ws_status (not activity alone), so showing "Shell exited"
+        -- before the connection completes would be wrong — the
+        -- panel renders "Connecting…" via the status banner during
+        -- this phase. WsConnected promotes activity to idle on
+        -- ws.onopen.
+}
+
+rule WsConnected {
+    when: WsOpened(panel)
+    requires: panel.ws_status = connecting
+
+    ensures: panel.ws_status = connected
+    ensures: panel.activity = idle
+    ensures: InitialResizeFrameSent(panel)
+
+    @guidance
+        -- Initial resize is REQ-TERM-005 territory on the backend
+        -- side; the frontend always sends it before any other frame
+        -- so the PTY agrees on geometry before the first prompt.
+}
+
+rule WsErroredTransitionsToDisconnected {
+    when: WsErrored(panel)
+    requires: panel.ws_status in { connecting, connected }
+
+    ensures: panel.ws_status = disconnected
+    ensures: panel.activity = disconnected
+}
+
+rule WsClosedTransitionsToDisconnected {
+    when: WsClosed(panel)
+    requires: panel.ws_status in { connecting, connected }
+
+    ensures: panel.ws_status = disconnected
+    ensures: panel.activity = disconnected
+}
+
+-- Reconnect is modelled as a nonce bump that produces a fresh
+-- TerminalPanelInstance. The old instance is torn down by the cleanup
+-- effect; the new one starts in connecting via WsConnectingOnMount.
+-- The rule below captures the "user intent" event; the actual entity
+-- replacement is a side effect of React's effect re-run on the new
+-- nonce, not modelled here.
+rule ReconnectRequested {
+    when: ReconnectClicked(panel)
+    requires: panel.ws_status = disconnected
+
+    ensures: ReconnectNonceBumped(panel.conversation_id)
+
+    @guidance
+        -- TerminalPanel.tsx:619 increments reconnectNonce; the mount
+        -- effect's deps include the nonce, so a bump tears down the
+        -- old xterm + WS and spawns a fresh entity per the
+        -- WsConnectingOnMount rule.
+}
+
+------------------------------------------------------------
+-- Rules — integration detection
+------------------------------------------------------------
+
+rule IntegrationDetectedOnFirstC {
+    when: Osc133MarkerC(panel, command_text)
+    requires: panel.integration_status = unknown
+
+    ensures: panel.integration_status = detected
+    ensures: DetectionTimerCancelled(panel)
+
+    @guidance
+        -- Rule fires on the first C marker arrival. Subsequent C
+        -- markers feed the command tracker (CommandStartedOnC) but
+        -- do not re-trigger detection because of the requires guard
+        -- on integration_status = unknown.
+}
+
+rule IntegrationAbsentOnTimeout {
+    when: DetectionWindowElapsed(panel)
+    requires: panel.integration_status = unknown
+
+    ensures: panel.integration_status = absent
+}
+
+------------------------------------------------------------
+-- Rules — command tracking
+------------------------------------------------------------
+
+-- Both this rule and IntegrationDetectedOnFirstC fire on the same
+-- OSC 133;C event. The implementation (TerminalPanel.tsx:380-411)
+-- promotes integration_status to detected AND starts the command
+-- inside one handler call — so the precondition here covers BOTH
+-- "first C marker, integration still unknown" and "subsequent C
+-- markers, integration already detected." A precondition of just
+-- `integration_status = detected` would skip the first command of
+-- every session.
+rule CommandStartedOnC {
+    when: Osc133MarkerC(panel, command_text)
+    requires: panel.integration_status in { unknown, detected }
+    requires: panel.command_status in { idle, completed }
+
+    ensures: panel.command_status = running
+    ensures: panel.current_command = CommandExecution(
+        command_text: command_text,
+        started_at: now(),
+        finished_at: null,
+        exit_code: null
+    )
+    ensures: panel.last_completed_command = null
+    -- HUD contract (TerminalPanel.tsx:403): a new command starts
+    -- with a clean "what just happened" slot. Otherwise the
+    -- previous command's ✓/✗ glyph would keep showing while the
+    -- new command runs, conflating the two timelines.
+}
+
+rule CommandCompletedOnD {
+    when: Osc133MarkerD(panel, exit_code)
+    requires: panel.command_status = running
+
+    ensures: panel.command_status = completed
+    ensures: panel.last_completed_command = CommandExecution(
+        command_text: panel.current_command.command_text,
+        started_at: panel.current_command.started_at,
+        finished_at: now(),
+        exit_code: exit_code
+    )
+    ensures: panel.current_command = null
+}
+
+-- @guidance: Osc133MarkerA and Osc133MarkerB produce no state
+-- change. The shell emits A at the start of a prompt sequence and B
+-- at the end of the prompt's command-line region; neither is needed
+-- by the HUD because the C payload already carries the command text.
+-- Modelled as no-op rules below so the spec covers all four sub-markers.
+
+-- A/B markers can arrive while integration_status is still unknown
+-- (e.g. powerlevel10k emits them at startup before the user runs
+-- anything). They are accepted as no-ops in any state — explicit
+-- no-op rules cover all three integration_status values so the
+-- model doesn't reject events the runtime would otherwise see.
+
+rule Osc133AIsNoop {
+    when: Osc133MarkerA(panel, payload)
+
+    ensures: panel.command_status = panel.command_status
+}
+
+rule Osc133BIsNoop {
+    when: Osc133MarkerB(panel, payload)
+
+    ensures: panel.command_status = panel.command_status
+}
+
+-- Once integration_status has timed out to absent, late-arriving C/D
+-- markers are explicitly ignored by the implementation
+-- (TerminalPanel.tsx early-returns when integrationStatusRef ===
+-- 'absent'). They can occur at runtime if the shell finally emits
+-- markers after the 5s detection window — modelling them as
+-- no-op rules captures the behaviour.
+
+rule Osc133CIgnoredAfterAbsent {
+    when: Osc133MarkerC(panel, command_text)
+    requires: panel.integration_status = absent
+
+    ensures: panel.command_status = panel.command_status
+}
+
+rule Osc133DIgnoredAfterAbsent {
+    when: Osc133MarkerD(panel, exit_code)
+    requires: panel.integration_status = absent
+
+    ensures: panel.command_status = panel.command_status
+}
+
+------------------------------------------------------------
+-- Rules — byte-activity sampler
+------------------------------------------------------------
+
+rule ActivityRunningOnData {
+    when: WsMessageReceived(panel, bytes)
+    requires: panel.ws_status = connected
+    requires: panel.activity != disconnected
+
+    ensures: panel.activity = running
+    ensures: ActivityDecayTimerArmed(panel, config.activity_decay_ms)
+
+    @guidance
+        -- The sampler always updates on data arrival, regardless of
+        -- integration_status. The render-side gate
+        -- (specs/terminal-panel/design.md "HUD Rendering Decision
+        -- Tree") decides which source to display: when integration =
+        -- detected, the HUD uses CommandTracker and ignores activity;
+        -- when integration = absent, the HUD uses activity as the
+        -- coarse "shell is producing output / quiet" indicator.
+        -- Modelling the sampler as state-gated (only firing when
+        -- integration != detected) would be cheaper but doesn't match
+        -- the implementation, which uses a single hot path through
+        -- ws.onmessage (TerminalPanel.tsx:493-527).
+        --
+        -- Once ws closes (activity = disconnected), the sampler is
+        -- locked until the next nonce-bumped reconnect.
+}
+
+rule ActivityIdleOnDecay {
+    when: ActivityDecayElapsed(panel)
+    requires: panel.activity = running
+    requires: panel.ws_status = connected
+
+    ensures: panel.activity = idle
+}
+
+------------------------------------------------------------
+-- Rules — OSC 7 cwd
+------------------------------------------------------------
+
+rule ReportedCwdUpdated {
+    when: Osc7Marker(panel, path)
+
+    ensures: panel.reported_cwd = path
+
+    @guidance
+        -- HUD renders reported_cwd if non-null, falls back to the
+        -- conversation's cwd prop otherwise (REQ-TPANEL-004). OSC 7
+        -- arrives whenever the shell hooks chpwd; for shells without
+        -- the hook, reported_cwd stays null and the static
+        -- conversation cwd is shown.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- @invariant DetectionMonotonic
+-- Once integration_status leaves unknown, it never returns. Captured
+-- structurally by the transitions block above (no edge from detected
+-- or absent back to unknown), restated here for spec consumers.
+invariant DetectionMonotonic {
+    for p in TerminalPanelInstance:
+        p.integration_status != unknown
+            implies p.integration_status in { detected, absent }
+}
+
+-- @invariant ActivityDisconnectedSticky
+-- Once the activity sampler enters disconnected, only a fresh entity
+-- (post-reconnect) can leave it — there is no in-place transition
+-- back to idle/running. Captured structurally: the transitions block
+-- has no edge from disconnected to anything.
+--
+-- activity = disconnected is reachable from two sources:
+--   1. WsConnectingOnMount (initial state, before ws.onopen fires).
+--      During this phase ws_status = connecting, and the HUD shows
+--      "Connecting…" via the status banner — not the "Shell exited"
+--      Disconnected path, which gates on ws_status, not activity.
+--   2. WsErroredTransitionsToDisconnected /
+--      WsClosedTransitionsToDisconnected (post-connect failure).
+--      Here ws_status = disconnected.
+-- The invariant therefore allows ws_status in any of {connecting,
+-- disconnected}; reaching activity = disconnected via a `connected`
+-- ws_status is a bug.
+invariant ActivityDisconnectedSticky {
+    for p in TerminalPanelInstance:
+        p.activity = disconnected
+            implies p.ws_status in { connecting, disconnected }
+}
+
+-- @invariant CurrentCommandPresenceMatchesStatus
+-- current_command is non-null iff command_status = running.
+-- Structurally enforced by the `when command_status = running`
+-- annotation on the field.
+invariant CurrentCommandPresenceMatchesStatus {
+    for p in TerminalPanelInstance:
+        (p.command_status = running) implies (p.current_command != null)
+    for p in TerminalPanelInstance:
+        (p.command_status != running) implies (p.current_command = null)
+}
+
+-- @invariant ActivityIsAuthoritativeWhenDetected
+-- When integration_status = detected, the HUD ignores the activity
+-- sampler and reads from the command tracker. The sampler may still
+-- transition (ActivityRunningOnData rule's requires gates this), but
+-- a render that consults activity while integration_status = detected
+-- is a bug. This is a render-side contract; the structural model
+-- captures it as a comment because the renderer is out of scope of
+-- this spec — the @guidance on ActivityRunningOnData and the design
+-- doc's HUD decision tree are the operational contract.
+
+-- @invariant WsStatusReachable
+-- Every disconnected entity has a path back to connected via a
+-- nonce-bumped reconnect. The current spec models that path as a new
+-- entity (ReconnectRequested → fresh PanelInstance with
+-- WsConnectingOnMount), not as an in-place transition. The check is
+-- "can the user always recover?" — yes, by clicking the disconnected
+-- HUD header (REQ-TPANEL-002).
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+actor User {}
+
+-- The user's interaction surface for the panel. The two events the
+-- user can produce that aren't byte input on the WebSocket are
+-- clicking the disconnected header (reconnect) and clicking the
+-- shell-integration dot (open snippet modal). Modal interactions
+-- (copy, assist setup) are out of scope of the state machine —
+-- they're local UI.
+surface TerminalPanelControls {
+    facing user: User
+
+    context panel: TerminalPanelInstance
+
+    exposes:
+        panel.ws_status
+        panel.integration_status
+        panel.command_status
+        panel.current_command when panel.command_status = running
+        panel.last_completed_command
+        panel.activity
+        panel.reported_cwd
+
+    provides:
+        ReconnectClicked(panel)
+            when panel.ws_status = disconnected
+
+    @guarantee NoAutoReconnect
+        -- The panel does not auto-retry the WebSocket on error or
+        -- close. Recovery is always user-initiated via
+        -- ReconnectClicked. Auto-retry would mask transient backend
+        -- problems; the explicit click keeps the user in the loop.
+}
