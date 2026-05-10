@@ -4920,6 +4920,34 @@ html * {
   border-radius: 3px;
 }
 
+.llm-status-banner__action {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--accent-color, #7c9ef8);
+  font-size: inherit;
+  font-family: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.llm-status-banner__action:hover {
+  color: var(--accent-color-hover, #a0b8ff);
+}
+
+.llm-status-banner--expanded {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  padding: 12px 16px;
+}
+
+.llm-status-banner__panel-header {
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
 /* Legacy input-box kept for mobile fallback only */
 .new-conv-input-box {
   width: 100%;

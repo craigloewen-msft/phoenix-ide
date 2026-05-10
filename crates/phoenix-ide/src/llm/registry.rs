@@ -663,8 +663,14 @@ impl ModelRegistry {
         spec: &super::ModelSpec,
         config: &LlmConfig,
     ) -> Option<Arc<dyn LlmService>> {
-        // Mock provider needs no credentials
+        // Mock provider: opt-in only via PHOENIX_ENABLE_MOCK_MODEL=1
         if spec.provider == Provider::Mock {
+            let enabled = std::env::var("PHOENIX_ENABLE_MOCK_MODEL")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if !enabled {
+                return None;
+            }
             let service: Arc<dyn LlmService> = Arc::new(super::mock::MockLlmService);
             return Some(Arc::new(LoggingService::new(service)));
         }
@@ -1054,11 +1060,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_no_api_keys_only_mock() {
+    fn test_no_api_keys_no_models() {
         let config = LlmConfig::default();
         let registry = ModelRegistry::new(&config);
-        // Mock model is always available (no credentials needed)
-        assert_eq!(registry.available_models(), vec!["mock".to_string()]);
+        // Without PHOENIX_ENABLE_MOCK_MODEL=1, no models are available
+        assert!(registry.available_models().is_empty());
     }
 
     #[test]
