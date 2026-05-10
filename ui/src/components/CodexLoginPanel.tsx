@@ -41,7 +41,13 @@ export function CodexLoginPanel({ onDismiss }: CodexLoginPanelProps) {
 
   return (
     <div className="codex-login-panel">
-      {result && <SuccessBanner result={result} preflight={preflight} onDismiss={onDismiss} />}
+      {result && (
+        <SuccessBanner
+          result={result}
+          preflight={preflight}
+          {...(onDismiss !== undefined ? { onDismiss } : {})}
+        />
+      )}
       {error && <div className="login-error">{error}</div>}
 
       {mode === 'choose' && (
@@ -49,7 +55,7 @@ export function CodexLoginPanel({ onDismiss }: CodexLoginPanelProps) {
           preflight={preflight}
           onPickPkce={() => { setError(null); setMode('pkce'); }}
           onPickDevice={() => { setError(null); setMode('device'); }}
-          onCancel={onDismiss}
+          {...(onDismiss !== undefined ? { onCancel: onDismiss } : {})}
         />
       )}
 
