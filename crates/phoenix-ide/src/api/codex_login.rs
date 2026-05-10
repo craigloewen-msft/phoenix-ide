@@ -24,8 +24,8 @@
 //! switching accounts from a piggyback-loaded credential to a Phoenix-own
 //! one, the `settle_*` handlers call
 //! [`crate::llm::ModelRegistry::reload_codex_credential`] *before* publishing
-//! the success status. That hot-reload swaps the OpenAI bridge services in
-//! atomically, so the next OpenAI request after login uses the new credential
+//! the success status. That hot-reload swaps the `OpenAI` bridge services in
+//! atomically, so the next `OpenAI` request after login uses the new credential
 //! without a Phoenix restart (task 13005).
 
 use axum::{
@@ -282,55 +282,52 @@ async fn drive_pkce(
     // when multiple branches ready simultaneously — we never want to hand a
     // late callback through to `finalize_login` after the user has clicked
     // Cancel.
-    let code = match loopback {
-        Some(mut server) => {
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => return Err(LoginError::Cancelled),
-                () = tokio::time::sleep(PKCE_TIMEOUT) => return Err(LoginError::Cancelled),
-                cb = &mut server.callback_rx => {
-                    match cb.map_err(|_| LoginError::Loopback("callback channel closed".into()))? {
-                        CallbackPayload::Success { code, state: returned_state } => {
-                            validate_state(&expected_state, &returned_state)?;
-                            code
-                        }
-                        CallbackPayload::Error { error, description } => {
-                            return Err(LoginError::OAuth(match description {
-                                Some(d) if !d.is_empty() => format!("{error}: {d}"),
-                                _ => error,
-                            }));
-                        }
-                    }
-                }
-                manual = manual_rx => {
-                    // Manual paste must validate state too. Without this
-                    // check, an attacker who tricked the user into pasting
-                    // an authorization code minted for the attacker's own
-                    // session would have Phoenix store tokens for the wrong
-                    // ChatGPT account. The UI now collects the full
-                    // post-redirect URL (or both code+state) so this branch
-                    // has the same CSRF guarantee as the loopback path.
-                    let m = manual.map_err(|_| {
-                        LoginError::Loopback("manual code channel closed".into())
-                    })?;
-                    validate_state(&expected_state, &m.state)?;
-                    m.code
-                }
-            }
-        }
-        None => tokio::select! {
+    let code = if let Some(mut server) = loopback {
+        tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(LoginError::Cancelled),
             () = tokio::time::sleep(PKCE_TIMEOUT) => return Err(LoginError::Cancelled),
+            cb = &mut server.callback_rx => {
+                match cb.map_err(|_| LoginError::Loopback("callback channel closed".into()))? {
+                    CallbackPayload::Success { code, state: returned_state } => {
+                        validate_state(&expected_state, &returned_state)?;
+                        code
+                    }
+                    CallbackPayload::Error { error, description } => {
+                        return Err(LoginError::OAuth(match description {
+                            Some(d) if !d.is_empty() => format!("{error}: {d}"),
+                            _ => error,
+                        }));
+                    }
+                }
+            }
             manual = manual_rx => {
+                // Manual paste must validate state too. Without this
+                // check, an attacker who tricked the user into pasting
+                // an authorization code minted for the attacker's own
+                // session would have Phoenix store tokens for the wrong
+                // ChatGPT account. The UI now collects the full
+                // post-redirect URL (or both code+state) so this branch
+                // has the same CSRF guarantee as the loopback path.
                 let m = manual.map_err(|_| {
-                    LoginError::Loopback("manual code channel closed (no loopback)".into())
+                    LoginError::Loopback("manual code channel closed".into())
                 })?;
                 validate_state(&expected_state, &m.state)?;
                 m.code
             }
-        },
-    };
+        }
+    } else { tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(LoginError::Cancelled),
+        () = tokio::time::sleep(PKCE_TIMEOUT) => return Err(LoginError::Cancelled),
+        manual = manual_rx => {
+            let m = manual.map_err(|_| {
+                LoginError::Loopback("manual code channel closed (no loopback)".into())
+            })?;
+            validate_state(&expected_state, &m.state)?;
+            m.code
+        }
+    } };
 
     // Re-check after the await above and before each subsequent step, so a
     // cancellation that lands between the callback and the file-write still
@@ -400,7 +397,7 @@ fn schedule_pkce_sweep(mgr: Arc<CodexLoginManager>, session_id: String) {
 /// `state` is mandatory because the backend validates it before exchanging
 /// the code; without that check, an attacker who tricked the user into
 /// pasting a code minted for the attacker's session would have Phoenix
-/// store tokens for the wrong ChatGPT account.
+/// store tokens for the wrong `ChatGPT` account.
 #[derive(Deserialize)]
 pub struct ManualCodeRequest {
     #[serde(default)]

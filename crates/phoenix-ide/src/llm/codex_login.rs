@@ -595,7 +595,7 @@ struct CallbackState {
     sender: Arc<TokioMutex<Option<oneshot::Sender<CallbackPayload>>>>,
     /// State we generated and embedded in the authorize URL. The handler
     /// validates this **before** consuming the sender, so a malicious local
-    /// process that hits `/auth/callback` with garbage cannot DoS the login
+    /// process that hits `/auth/callback` with garbage cannot `DoS` the login
     /// session by burning the one-shot before the real browser callback
     /// arrives.
     expected_state: Arc<String>,
@@ -617,7 +617,7 @@ pub enum CallbackPayload {
 pub struct LoopbackServer {
     /// Receiver for the single callback. May be consumed at most once.
     pub callback_rx: oneshot::Receiver<CallbackPayload>,
-    /// One sender per bound listener (typically two: 127.0.0.1 + ::1).
+    /// One sender per bound listener (typically two: 127.0.0.1 + `::1`).
     /// Dropping all of them initiates graceful shutdown.
     shutdown_txs: Vec<oneshot::Sender<()>>,
     handles: Vec<tokio::task::JoinHandle<()>>,

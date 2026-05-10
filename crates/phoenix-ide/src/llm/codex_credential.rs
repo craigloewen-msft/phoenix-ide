@@ -109,7 +109,7 @@ pub fn default_auth_path() -> PathBuf {
     }
 }
 
-/// Resolve Phoenix's own ChatGPT auth file. Used by the in-app login flow
+/// Resolve Phoenix's own `ChatGPT` auth file. Used by the in-app login flow
 /// (task 27104) so Phoenix has an independent session that doesn't depend on
 /// Codex CLI being installed.
 ///
@@ -144,7 +144,7 @@ pub fn default_phoenix_auth_path() -> PathBuf {
 ///    already use the Codex CLI and want a single shared session.
 ///
 /// Returns `None` when neither is available; the registry treats that as
-/// "no ChatGPT bridge today".
+/// "no `ChatGPT` bridge today".
 pub fn resolve_active_auth_path() -> Option<PathBuf> {
     let phoenix_path = default_phoenix_auth_path();
     if phoenix_path.exists() {

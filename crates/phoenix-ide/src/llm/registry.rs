@@ -400,7 +400,7 @@ fn derive_models_url(base_url: &str) -> Option<String> {
 ///
 /// Most state is frozen at construction. The Codex/ChatGPT bridge bits are
 /// interior-mutable (RwLock-protected) so [`Self::reload_codex_credential`]
-/// can swap the OpenAI bridge services in atomically after an in-app login —
+/// can swap the `OpenAI` bridge services in atomically after an in-app login —
 /// no Phoenix restart needed (task 13005). Reads of the bridged services go
 /// through the same `services` map readers already use; the lock gates a
 /// per-OpenAI-model rebuild on the write side only.
@@ -423,7 +423,7 @@ pub struct ModelRegistry {
     pub codex_loaded_path_at_startup: Option<std::path::PathBuf>,
     /// Path the **currently-loaded** credential was constructed from. `None`
     /// when no credential is active. Updated by `reload_codex_credential`
-    /// in lockstep with the OpenAI bridge services.
+    /// in lockstep with the `OpenAI` bridge services.
     current_codex_loaded_path: std::sync::RwLock<Option<std::path::PathBuf>>,
     /// Config template kept for rebuilding bridge services on reload. The
     /// `codex_credential` / `codex_credential_path` fields are ignored on
@@ -897,19 +897,19 @@ impl ModelRegistry {
             )
     }
 
-    /// Re-resolve the active Codex/ChatGPT credential and rebuild the OpenAI
+    /// Re-resolve the active Codex/ChatGPT credential and rebuild the `OpenAI`
     /// bridge services in place. Called from the login completion handlers
     /// (`settle_pkce` / `settle_device`) after a successful in-app login so
-    /// the next OpenAI request picks up the new account without a Phoenix
+    /// the next `OpenAI` request picks up the new account without a Phoenix
     /// restart.
     ///
     /// On reload:
-    ///  - If the active path produces a credential, every OpenAI model spec
+    ///  - If the active path produces a credential, every `OpenAI` model spec
     ///    gets a fresh `LlmServiceImpl::new_with_codex_backend` registered
     ///    under its id (replacing any prior bridge entry or non-bridge
     ///    direct-API-key entry).
     ///  - If the active path is `None` (logout-equivalent: file deleted, env
-    ///    flag cleared), OpenAI bridge entries are removed. Direct OpenAI
+    ///    flag cleared), `OpenAI` bridge entries are removed. Direct `OpenAI`
     ///    via `OPENAI_API_KEY` is *not* re-registered here — callers that
     ///    need that should restart. Logging out is filed separately.
     ///
