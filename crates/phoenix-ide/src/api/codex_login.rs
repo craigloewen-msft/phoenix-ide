@@ -1,4 +1,4 @@
-//! HTTP API for the native ChatGPT/Codex login flows.
+//! HTTP API for the native `ChatGPT`/Codex login flows.
 //!
 //! Two flows are exposed (matching `crate::llm::codex_login`):
 //!
@@ -244,7 +244,7 @@ async fn bind_loopback_with_retry(
                 tracing::debug!(attempt, "codex_login: loopback bind succeeded after drain retry");
                 return Some(srv);
             }
-            Err(LoginError::PortInUse(_)) => continue,
+            Err(LoginError::PortInUse(_)) => {}
             Err(e) => {
                 tracing::warn!(error = %e, "codex_login: loopback bind failed during retry");
                 return None;
@@ -366,7 +366,7 @@ async fn drive_pkce(
                 // check, an attacker who tricked the user into pasting
                 // an authorization code minted for the attacker's own
                 // session would have Phoenix store tokens for the wrong
-                // ChatGPT account. The UI now collects the full
+                // `ChatGPT` account. The UI now collects the full
                 // post-redirect URL (or both code+state) so this branch
                 // has the same CSRF guarantee as the loopback path.
                 let m = manual.map_err(|_| {
@@ -422,7 +422,7 @@ async fn settle_pkce(
         sessions.get(session_id).cloned()
     };
     let Some(session) = session else { return };
-    // Hot-reload the registry's ChatGPT bridge BEFORE publishing the success
+    // Hot-reload the registry's `ChatGPT` bridge BEFORE publishing the success
     // status (task 13005). Sequence matters: the UI's status poller treats
     // `kind: success` as "the bridge is live now" and may immediately fire
     // an OpenAI request — that request must hit the new credential, not the
@@ -846,15 +846,15 @@ pub struct LoginPreflight {
     /// Informational; the env-var only governs piggyback mode, not whether
     /// in-app login works.
     pub piggyback_env_set: bool,
-    /// `account_id` from the loaded ChatGPT credential, when one is loaded.
+    /// `account_id` from the loaded `ChatGPT` credential, when one is loaded.
     /// Surfaced so the UI can display account identity in the sidebar account
     /// chip / sign-out menu without making a second request. `None` when no
     /// credential is loaded or when the token has no `account_id` claim.
     pub account_id: Option<String>,
-    /// Email address from the OIDC `email` claim on the loaded id_token.
+    /// Email address from the OIDC `email` claim on the loaded `id_token`.
     /// Lets the UI render a human-friendly identity in the account chip
     /// menu instead of the opaque `account_id` UUID. `None` when no
-    /// credential is loaded or the id_token lacks an `email` claim.
+    /// credential is loaded or the `id_token` lacks an `email` claim.
     pub account_email: Option<String>,
 }
 
@@ -896,7 +896,7 @@ pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflig
     })
 }
 
-/// Sign out of the in-app ChatGPT login: delete `~/.phoenix-ide/codex-auth.json`
+/// Sign out of the in-app `ChatGPT` login: delete `~/.phoenix-ide/codex-auth.json`
 /// and hot-reload the registry to deregister `OpenAI`/Codex bridge models.
 ///
 /// Idempotent — missing file is treated as success. Piggyback mode (loaded from

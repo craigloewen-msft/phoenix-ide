@@ -472,9 +472,9 @@ pub fn extract_account_id(jwt: &str) -> Option<String> {
 
 /// Pull the standard OIDC `email` claim out of an ID token's payload.
 /// Surfaced by the in-app login preflight so the sidebar account chip can
-/// show "alice@example.com" instead of the opaque chatgpt_account_id UUID.
+/// show "alice@example.com" instead of the opaque `chatgpt_account_id` UUID.
 /// `None` on any parse failure or missing claim — caller falls back to the
-/// account_id form.
+/// `account_id` form.
 pub fn extract_email(jwt: &str) -> Option<String> {
     let payload_b64 = jwt.split('.').nth(1)?;
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD

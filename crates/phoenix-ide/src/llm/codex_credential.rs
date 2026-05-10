@@ -420,7 +420,7 @@ impl CodexCredential {
         self.account_id.lock().ok().and_then(|g| g.clone())
     }
 
-    /// Read the on-disk id_token without instantiating a credential. Used by
+    /// Read the on-disk `id_token` without instantiating a credential. Used by
     /// the login preflight to extract human-friendly identity claims (email,
     /// name) for the sidebar account chip without exposing the JWT itself
     /// or coupling the API layer to the on-disk schema.
