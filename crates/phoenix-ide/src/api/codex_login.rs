@@ -241,7 +241,10 @@ async fn bind_loopback_with_retry(
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         match LoopbackServer::start(expected_state.to_string()).await {
             Ok(srv) => {
-                tracing::debug!(attempt, "codex_login: loopback bind succeeded after drain retry");
+                tracing::debug!(
+                    attempt,
+                    "codex_login: loopback bind succeeded after drain retry"
+                );
                 return Some(srv);
             }
             Err(LoginError::PortInUse(_)) => {}
