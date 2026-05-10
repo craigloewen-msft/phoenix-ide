@@ -255,7 +255,11 @@ export function Sidebar({
           +
         </button>
         <ThemeToggle theme={theme} onToggle={toggleTheme} />
-        <AccountChip preflight={codexPreflight} onPreflightInvalidated={refetchCodexPreflight} />
+        <AccountChip
+          preflight={codexPreflight}
+          onPreflightInvalidated={refetchCodexPreflight}
+          compact
+        />
         <div className="sidebar-collapsed-dots">
           {conversations.map(conv => {
             const displayState = getConvDisplayState(conv);

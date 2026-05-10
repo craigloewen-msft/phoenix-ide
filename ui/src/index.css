@@ -3096,6 +3096,7 @@ pre:hover .copy-btn {
 .account-chip-wrap {
   position: relative;
   display: inline-flex;
+  flex-shrink: 0;
 }
 
 .account-chip {
@@ -3112,7 +3113,18 @@ pre:hover .copy-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
+  white-space: nowrap;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+/* Compact variant for the 48px-wide collapsed sidebar — single-letter
+ * label, tighter box. Paired with `compact` prop on AccountChip. */
+.account-chip--compact {
+  padding: 2px 0;
+  width: 24px;
+  letter-spacing: 0;
+  font-weight: 700;
 }
 
 .account-chip:hover,
@@ -5833,6 +5845,12 @@ html * {
   padding: 4px;
   border-radius: 6px;
   color: var(--text-primary);
+  /* Allow brand to absorb width pressure first — the logo stays, the
+   * "Phoenix" label truncates so the right-edge controls (theme, account
+   * chip) keep their full size at narrow sidebar widths. */
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
 }
 
 .sidebar-brand:hover {
@@ -5847,6 +5865,10 @@ html * {
 .sidebar-brand-text {
   font-size: 15px;
   font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 
 .sidebar-header .sidebar-new-btn {

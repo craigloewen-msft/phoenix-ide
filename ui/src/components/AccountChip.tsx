@@ -5,6 +5,9 @@ import { refreshModels } from '../modelsPoller';
 interface AccountChipProps {
   preflight: CodexLoginPreflight | null;
   onPreflightInvalidated: () => void;
+  /** Tight rendering for the collapsed sidebar (48px wide). Shows a single
+   *  letter so the chip fits alongside the icon-strip toggles. */
+  compact?: boolean;
 }
 
 function shortAccount(id: string | null): string {
@@ -13,7 +16,7 @@ function shortAccount(id: string | null): string {
   return `${id.slice(0, 4)}…${id.slice(-4)}`;
 }
 
-export function AccountChip({ preflight, onPreflightInvalidated }: AccountChipProps) {
+export function AccountChip({ preflight, onPreflightInvalidated, compact = false }: AccountChipProps) {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -61,14 +64,14 @@ export function AccountChip({ preflight, onPreflightInvalidated }: AccountChipPr
     <div className="account-chip-wrap" ref={wrapRef}>
       <button
         type="button"
-        className="account-chip"
+        className={`account-chip${compact ? ' account-chip--compact' : ''}`}
         title={tooltip}
         aria-label={tooltip}
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
       >
-        Codex
+        {compact ? 'C' : 'Codex'}
       </button>
       {open && (
         <div className="account-chip-menu" role="menu">
