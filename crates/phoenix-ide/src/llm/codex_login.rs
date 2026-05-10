@@ -470,6 +470,20 @@ pub fn extract_account_id(jwt: &str) -> Option<String> {
     auth.get("chatgpt_account_id")?.as_str().map(str::to_string)
 }
 
+/// Pull the standard OIDC `email` claim out of an ID token's payload.
+/// Surfaced by the in-app login preflight so the sidebar account chip can
+/// show "alice@example.com" instead of the opaque chatgpt_account_id UUID.
+/// `None` on any parse failure or missing claim — caller falls back to the
+/// account_id form.
+pub fn extract_email(jwt: &str) -> Option<String> {
+    let payload_b64 = jwt.split('.').nth(1)?;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64.as_bytes())
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    value.get("email")?.as_str().map(str::to_string)
+}
+
 // ---------------------------------------------------------------------------
 // Persistence — write to ~/.codex/auth.json in the format
 // codex_credential::CodexCredential::load() reads.

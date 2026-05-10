@@ -3170,8 +3170,10 @@ pre:hover .copy-btn {
 }
 
 .account-chip-menu-id {
-  font-size: 12px;
+  font-size: 13px;
+  color: var(--text-primary);
   margin-top: 2px;
+  word-break: break-all;
 }
 
 .account-chip-menu-id code {

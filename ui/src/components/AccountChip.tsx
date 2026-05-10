@@ -56,8 +56,12 @@ export function AccountChip({ preflight, onPreflightInvalidated, compact = false
 
   if (!preflight?.already_signed_in) return null;
 
-  const tooltip = preflight.account_id
-    ? `Signed in as ${shortAccount(preflight.account_id)}`
+  // Prefer email over the opaque chatgpt_account_id UUID for human-readable
+  // identity. Fall back to the short id only when the id_token didn't carry
+  // an `email` claim (older tokens, or scopes that omitted the email scope).
+  const identity = preflight.account_email ?? (preflight.account_id ? shortAccount(preflight.account_id) : null);
+  const tooltip = identity
+    ? `Signed in as ${identity}`
     : 'Signed in to Codex';
 
   return (
@@ -76,10 +80,13 @@ export function AccountChip({ preflight, onPreflightInvalidated, compact = false
       {open && (
         <div className="account-chip-menu" role="menu">
           <div className="account-chip-menu-header">
-            <div className="account-chip-menu-label">Signed in to Codex</div>
-            {preflight.account_id && (
-              <div className="account-chip-menu-id" title={preflight.account_id}>
-                <code>{shortAccount(preflight.account_id)}</code>
+            <div className="account-chip-menu-label">Signed in as</div>
+            {identity && (
+              <div
+                className="account-chip-menu-id"
+                title={preflight.account_id ?? undefined}
+              >
+                {preflight.account_email ? identity : <code>{identity}</code>}
               </div>
             )}
           </div>

@@ -420,6 +420,15 @@ impl CodexCredential {
         self.account_id.lock().ok().and_then(|g| g.clone())
     }
 
+    /// Read the on-disk id_token without instantiating a credential. Used by
+    /// the login preflight to extract human-friendly identity claims (email,
+    /// name) for the sidebar account chip without exposing the JWT itself
+    /// or coupling the API layer to the on-disk schema.
+    pub fn read_id_token(auth_path: &PathBuf) -> Option<String> {
+        let auth = read_auth_file(auth_path).ok()?;
+        auth.tokens.and_then(|t| t.id_token)
+    }
+
     /// Acquire a valid access token, refreshing if needed. The mutex is held
     /// for the full body so concurrent callers that arrive with an expired
     /// token serialise behind a single refresh — the second caller sees the

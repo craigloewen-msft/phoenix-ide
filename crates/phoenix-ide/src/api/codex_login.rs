@@ -851,6 +851,11 @@ pub struct LoginPreflight {
     /// chip / sign-out menu without making a second request. `None` when no
     /// credential is loaded or when the token has no `account_id` claim.
     pub account_id: Option<String>,
+    /// Email address from the OIDC `email` claim on the loaded id_token.
+    /// Lets the UI render a human-friendly identity in the account chip
+    /// menu instead of the opaque `account_id` UUID. `None` when no
+    /// credential is loaded or the id_token lacks an `email` claim.
+    pub account_email: Option<String>,
 }
 
 pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflight> {
@@ -861,6 +866,13 @@ pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflig
             Ok((_cred, account_id)) => (true, account_id),
             Err(_) => (false, None),
         };
+    let account_email = if already_signed_in {
+        codex_credential::CodexCredential::read_id_token(&auth_path)
+            .as_deref()
+            .and_then(crate::llm::codex_login::extract_email)
+    } else {
+        None
+    };
     let bridge_loaded_at_startup = state.llm_registry.codex_bridge_loaded_at_startup;
     // Read the *current* (post-reload-aware) loaded path. Task 13005's
     // hot-reload makes restart-required false in the common case: the
@@ -880,6 +892,7 @@ pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflig
         restart_required_after_login,
         piggyback_env_set,
         account_id,
+        account_email,
     })
 }
 

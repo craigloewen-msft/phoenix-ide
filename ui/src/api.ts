@@ -400,6 +400,7 @@ export interface CodexLoginPreflight {
   restart_required_after_login: boolean;
   piggyback_env_set: boolean;
   account_id: string | null;
+  account_email: string | null;
 }
 
 export interface CodexManualCodeRequest {
