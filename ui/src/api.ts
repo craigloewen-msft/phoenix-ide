@@ -399,6 +399,7 @@ export interface CodexLoginPreflight {
   /// loaded credential is pinned to a different file (the piggyback case).
   restart_required_after_login: boolean;
   piggyback_env_set: boolean;
+  account_id: string | null;
 }
 
 export interface CodexManualCodeRequest {
@@ -502,6 +503,16 @@ export const api = {
 
   async codexDeviceCancel(sessionId: string): Promise<void> {
     await fetch(`/api/codex/login/device/${encodeURIComponent(sessionId)}/cancel`, { method: 'POST' });
+  },
+
+  async codexSignout(): Promise<void> {
+    const resp = await fetch('/api/codex/login/signout', { method: 'POST' });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string };
+      throw new Error(err.error ?? 'Sign-out failed');
+    }
+    const body = await resp.json().catch(() => ({})) as { ok?: boolean; error?: string };
+    if (body.ok === false) throw new Error(body.error ?? 'Sign-out failed');
   },
 
   async getProjects(): Promise<Project[]> {

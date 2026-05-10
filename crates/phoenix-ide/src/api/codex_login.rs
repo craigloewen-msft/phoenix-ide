@@ -189,6 +189,74 @@ pub struct PkceStartResponse {
     pub callback_port: u16,
 }
 
+/// Cancel + remove every active PKCE session. Returns the number drained.
+///
+/// Used by `pkce_start` to clear stale sessions that may still be holding the
+/// loopback port, and by `signout` to make sure half-open sign-in flows don't
+/// outlive the credential they were trying to install.
+async fn drain_active_pkce(mgr: &CodexLoginManager) -> usize {
+    let stale: Vec<Arc<PkceSession>> = {
+        let mut sessions = mgr.pkce.lock().await;
+        sessions.drain().map(|(_, v)| v).collect()
+    };
+    let n = stale.len();
+    for s in stale {
+        s.cancel.cancel();
+    }
+    n
+}
+
+/// Bind the loopback callback server, retrying briefly on `PortInUse` when
+/// we just drained a previous session. The retry covers the gap between
+/// firing a `CancellationToken` and the previous driver task dropping its
+/// `LoopbackServer` (axum graceful shutdown is async).
+async fn bind_loopback_with_retry(
+    expected_state: &str,
+    just_drained_prior: bool,
+) -> Option<LoopbackServer> {
+    // First attempt: always go straight at it.
+    match LoopbackServer::start(expected_state.to_string()).await {
+        Ok(srv) => return Some(srv),
+        Err(LoginError::PortInUse(_)) => {
+            // Fall through to retry only if we have reason to believe a stale
+            // bind is about to release; otherwise it's a third party (e.g.
+            // Codex CLI in a separate terminal) and waiting won't help.
+            if !just_drained_prior {
+                tracing::info!(
+                    "codex_login: loopback port {CALLBACK_PORT} in use (no prior session to drain); falling back to manual paste only"
+                );
+                return None;
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "codex_login: loopback bind failed; manual paste only");
+            return None;
+        }
+    }
+
+    // Retry loop: 50ms × 6 = up to ~300ms. Empirically more than enough for
+    // axum graceful shutdown to release the listener after the cancel token
+    // fires; capped so a genuine third-party port hog doesn't stall login.
+    for attempt in 1..=6u32 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        match LoopbackServer::start(expected_state.to_string()).await {
+            Ok(srv) => {
+                tracing::debug!(attempt, "codex_login: loopback bind succeeded after drain retry");
+                return Some(srv);
+            }
+            Err(LoginError::PortInUse(_)) => continue,
+            Err(e) => {
+                tracing::warn!(error = %e, "codex_login: loopback bind failed during retry");
+                return None;
+            }
+        }
+    }
+    tracing::info!(
+        "codex_login: loopback port {CALLBACK_PORT} still in use after drain + retries; falling back to manual paste only"
+    );
+    None
+}
+
 pub async fn pkce_start(
     State(state): State<AppState>,
 ) -> Result<Json<PkceStartResponse>, (StatusCode, Json<serde_json::Value>)> {
@@ -207,21 +275,13 @@ pub async fn pkce_start(
         cancel: cancel.clone(),
     });
 
-    // Try to bind the loopback. Failure here isn't fatal — the manual paste
-    // fallback can still complete the flow.
-    let loopback = match LoopbackServer::start(session.state.clone()).await {
-        Ok(srv) => Some(srv),
-        Err(LoginError::PortInUse(_)) => {
-            tracing::info!(
-                "codex_login: loopback port {CALLBACK_PORT} in use; falling back to manual paste only"
-            );
-            None
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "codex_login: loopback bind failed; manual paste only");
-            None
-        }
-    };
+    // Cancel any prior in-flight PKCE session before binding. Without this,
+    // a user-cancel-then-restart sequence races: pkce_cancel fires the token
+    // and returns, but the previous driver task hasn't yet been polled to
+    // drop its LoopbackServer — so this start would hit AddrInUse on the
+    // loopback. Draining + brief retry covers the polling delay.
+    let drained = drain_active_pkce(&mgr).await;
+    let loopback = bind_loopback_with_retry(&session.state, drained > 0).await;
     let loopback_bound = loopback.is_some();
 
     {
@@ -786,12 +846,21 @@ pub struct LoginPreflight {
     /// Informational; the env-var only governs piggyback mode, not whether
     /// in-app login works.
     pub piggyback_env_set: bool,
+    /// `account_id` from the loaded ChatGPT credential, when one is loaded.
+    /// Surfaced so the UI can display account identity in the sidebar account
+    /// chip / sign-out menu without making a second request. `None` when no
+    /// credential is loaded or when the token has no `account_id` claim.
+    pub account_id: Option<String>,
 }
 
 pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflight> {
     let auth_path = codex_credential::default_phoenix_auth_path();
     let piggyback_path = codex_credential::default_auth_path();
-    let already_signed_in = codex_credential::CodexCredential::load(auth_path.clone()).is_ok();
+    let (already_signed_in, account_id) =
+        match codex_credential::CodexCredential::load(auth_path.clone()) {
+            Ok((_cred, account_id)) => (true, account_id),
+            Err(_) => (false, None),
+        };
     let bridge_loaded_at_startup = state.llm_registry.codex_bridge_loaded_at_startup;
     // Read the *current* (post-reload-aware) loaded path. Task 13005's
     // hot-reload makes restart-required false in the common case: the
@@ -810,7 +879,45 @@ pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflig
         bridge_loaded_at_startup,
         restart_required_after_login,
         piggyback_env_set,
+        account_id,
     })
+}
+
+/// Sign out of the in-app ChatGPT login: delete `~/.phoenix-ide/codex-auth.json`
+/// and hot-reload the registry to deregister `OpenAI`/Codex bridge models.
+///
+/// Idempotent — missing file is treated as success. Piggyback mode (loaded from
+/// `~/.codex/auth.json` via `OPENAI_USE_CODEX_AUTH=1`) is left alone: this
+/// endpoint only manages Phoenix's own auth file.
+pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let auth_path = codex_credential::default_phoenix_auth_path();
+    let removed = match std::fs::remove_file(&auth_path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %auth_path.display(),
+                "codex_login: signout failed to remove auth file");
+            return Json(serde_json::json!({
+                "ok": false,
+                "error": format!("failed to delete {}: {e}", auth_path.display()),
+            }));
+        }
+    };
+    // Sweep half-open sign-in flows so an in-progress PKCE driver can't race
+    // against the registry reload below and re-install a credential the user
+    // just asked us to delete.
+    let drained = drain_active_pkce(&state.codex_login).await;
+    let registry = state.llm_registry.clone();
+    let outcome = tokio::task::spawn_blocking(move || registry.reload_codex_credential())
+        .await
+        .ok();
+    tracing::info!(
+        removed,
+        drained_pkce_sessions = drained,
+        bridge_path = ?outcome.as_ref().and_then(|o| o.current_path.as_ref()),
+        "codex_login: signed out"
+    );
+    Json(serde_json::json!({ "ok": true, "removed": removed }))
 }
 
 #[cfg(test)]

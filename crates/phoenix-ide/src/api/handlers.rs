@@ -237,6 +237,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/codex/login/device/:id/cancel",
             post(super::codex_login::device_cancel),
         )
+        .route(
+            "/api/codex/login/signout",
+            post(super::codex_login::signout),
+        )
         // Share mode (REQ-AUTH-004 through REQ-AUTH-008)
         .route("/share/c/:slug", get(create_or_redirect_share))
         .route("/s/:token", get(serve_share_page))
