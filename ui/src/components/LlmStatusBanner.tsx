@@ -27,7 +27,7 @@ export function LlmStatusBanner({ models }: LlmStatusBannerProps) {
         <Suspense fallback={<div className="llm-status-banner llm-status-banner--unconfigured">Loading…</div>}>
           <div className="llm-status-banner llm-status-banner--unconfigured llm-status-banner--expanded">
             <div className="llm-status-banner__panel-header">
-              <strong>Sign in with ChatGPT</strong>
+              <strong>Sign in with Codex</strong>
             </div>
             <CodexLoginPanel onDismiss={() => setShowCodexPanel(false)} />
           </div>
@@ -44,7 +44,7 @@ export function LlmStatusBanner({ models }: LlmStatusBannerProps) {
             className="llm-status-banner__action"
             onClick={() => setShowCodexPanel(true)}
           >
-            Sign in with ChatGPT
+            Sign in with Codex
           </button>
           {', '}or set <code>ANTHROPIC_API_KEY</code> / <code>LLM_GATEWAY</code> and restart.
         </span>

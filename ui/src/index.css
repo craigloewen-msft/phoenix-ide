@@ -7874,12 +7874,28 @@ html * {
 
 .codex-login-success {
   border-color: var(--accent-green, #2e8b57);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 20px 16px;
+  text-align: center;
 }
 
 .codex-login-success-title {
   font-weight: 600;
+  font-size: 16px;
   color: var(--text-primary);
-  margin-bottom: 4px;
+}
+
+.codex-login-success-body {
+  color: var(--text-secondary);
+}
+
+.codex-login-success-cta {
+  width: auto;
+  align-self: center;
+  margin-top: 4px;
 }
 
 .codex-login-help {
@@ -7898,9 +7914,35 @@ html * {
   word-break: break-all;
 }
 
-.codex-login-link a {
+.codex-login-link a:not(.login-button),
+.codex-login-help a:not(.login-button) {
   color: var(--accent-blue);
   text-decoration: underline;
+}
+
+.codex-login-link a:not(.login-button):visited,
+.codex-login-help a:not(.login-button):visited {
+  color: var(--accent-blue);
+}
+
+/* PKCE browser flow CTA block */
+.pkce-action {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 20px 16px 16px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  text-align: center;
+}
+
+.pkce-open-btn {
+  display: inline-flex;
+  align-items: center;
+  width: auto;
+  align-self: center;
 }
 
 .codex-login-status {
@@ -7911,7 +7953,19 @@ html * {
 }
 
 .codex-login-paste-toggle {
+  background: none;
+  border: none;
+  padding: 0;
   font-size: 12px;
+  color: var(--text-muted);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  align-self: center;
+}
+
+.codex-login-paste-toggle:hover {
+  color: var(--text-primary);
 }
 
 .codex-login-cancel {
