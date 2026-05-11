@@ -42,17 +42,46 @@ export class CacheDB {
     if (this.initPromise) return this.initPromise;
 
     this.initPromise = this.openDB();
-    await this.initPromise;
+    try {
+      await this.initPromise;
+    } catch (e) {
+      // Reset so a future caller (e.g. after the blocking tab closes)
+      // can retry rather than staying permanently failed.
+      this.initPromise = null;
+      throw e;
+    }
   }
 
   private async openDB(): Promise<void> {
     return new Promise((resolve, reject) => {
       const request = indexedDB.open(DB_NAME, DB_VERSION);
 
-      request.onerror = () => reject(request.error);
+      // Task 60006: bail after 5s. If another tab holds the DB open at a
+      // different version, indexedDB.open hangs silently with no error.
+      // Callers (useAppMachine.init, refreshOnce cache hydration) then deadlock
+      // and the app shows an empty sidebar with no /api/conversations request.
+      const timeoutId = window.setTimeout(() => {
+        console.warn(
+          '[cacheDB] IDB open timed out after 5s — likely blocked by another Phoenix tab. ' +
+            'Aborting cache; live network refresh will proceed.',
+        );
+        reject(new Error('cacheDB: IDB open timed out'));
+      }, 5000);
+
+      request.onerror = () => {
+        window.clearTimeout(timeoutId);
+        reject(request.error);
+      };
       request.onsuccess = () => {
+        window.clearTimeout(timeoutId);
         this.db = request.result;
         resolve();
+      };
+      request.onblocked = () => {
+        // Stays open until either the holding tab closes or the timeout above fires.
+        console.warn(
+          '[cacheDB] IDB open blocked — another Phoenix tab is holding the DB at a different version. Will time out in 5s.',
+        );
       };
 
       request.onupgradeneeded = (event) => {
