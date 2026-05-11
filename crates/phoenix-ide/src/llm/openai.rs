@@ -267,6 +267,11 @@ impl ResponsesStreamAccumulator {
             }
             // Top-level stream error. Shape: { type, code, message, param, sequence_number }
             "error" => {
+                tracing::warn!(
+                    event = "error",
+                    data = %data,
+                    "responses_api SSE error event — full payload"
+                );
                 let code = v
                     .get("code")
                     .and_then(serde_json::Value::as_str)
@@ -279,6 +284,11 @@ impl ResponsesStreamAccumulator {
             }
             // Terminal failure event. Shape: { type, response: { status: "failed", error: { code, message } } }
             "response.failed" => {
+                tracing::warn!(
+                    event = "response.failed",
+                    data = %data,
+                    "responses_api SSE response.failed event — full payload"
+                );
                 let err = v.pointer("/response/error");
                 let code = err
                     .and_then(|e| e.get("code"))
@@ -292,6 +302,11 @@ impl ResponsesStreamAccumulator {
             }
             // Partial response — model stopped early. Shape: { response: { incomplete_details: { reason } } }
             "response.incomplete" => {
+                tracing::warn!(
+                    event = "response.incomplete",
+                    data = %data,
+                    "responses_api SSE response.incomplete event — full payload"
+                );
                 let reason = v
                     .pointer("/response/incomplete_details/reason")
                     .and_then(serde_json::Value::as_str)
