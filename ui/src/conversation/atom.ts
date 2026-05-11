@@ -1,5 +1,18 @@
+import * as v from 'valibot';
 import type { ConversationState, Message, Conversation, ToolResultContent } from '../api';
 import type { Breadcrumb } from '../types';
+import {
+  SseTokenDataSchema,
+  SseStateChangeDataSchema,
+  SseMessageDataSchema,
+  SseMessageUpdatedDataSchema,
+  SseAgentDoneDataSchema,
+  SseConversationUpdateDataSchema,
+  SseBrowserSessionStateDataSchema,
+  SseSteerMessageQueuedDataSchema,
+  SseErrorDataSchema,
+} from '../sseSchemas';
+import { parseConversationState } from '../utils';
 
 export interface StreamingBuffer {
   text: string;
@@ -55,6 +68,21 @@ export interface InitPayload {
   breadcrumbSequenceIds: ReadonlySet<number>;
   contextWindow: { used: number };
   lastSequenceId: number;
+  /** ReplayRing anchor: seq of the last persisted Message at subscribe time.
+   *  Every entry in `pendingEvents` has `sequence_id > pendingAnchorSequenceId`.
+   *  On fresh-connect the init reducer seeds `lastSequenceId` from this value
+   *  so the per-event applyIfNewer guards accept pending entries instead of
+   *  dropping them as replays against `payload.lastSequenceId`. */
+  pendingAnchorSequenceId: number;
+  /** ReplayRing contents at subscribe time. Each entry is a wire-format
+   *  `SseWireEvent` (snake_case fields, `type` discriminator). Validated
+   *  per-entry at apply time via the existing per-event valibot schemas;
+   *  malformed entries are skipped without crashing the whole init. */
+  pendingEvents: unknown[];
+  /** True iff the server-side ring overflowed since the last anchor. Treated
+   *  as a soft hint: the DB snapshot is still authoritative and the safety
+   *  belt advances `lastSequenceId` to the server's witnessed tip. */
+  pendingTruncated: boolean;
 }
 
 // Task 02675: every wire-originated SSE action carries a `sequenceId` from
@@ -313,6 +341,181 @@ function isStaleEpoch(atom: ConversationAtom, action: SSEAction): boolean {
   return true;
 }
 
+/**
+ * Apply one entry from `payload.pendingEvents` to the atom by routing it
+ * through `conversationReducer` as if it had arrived as a live SSE event.
+ *
+ * Each entry is a wire-format `SseWireEvent` (snake_case fields, `type`
+ * discriminator). We validate against the same per-event valibot schema
+ * the live SSE handler uses, then map to the matching `SSEAction` shape
+ * and re-dispatch. The reducer's per-event `applyIfNewer` guards naturally
+ * drop pending entries whose seq is at or below the current floor — the
+ * exact contract that lets fresh-connect (floor = anchor) accept all
+ * entries while reconnect (floor = previously-observed live tip) drops
+ * replays.
+ *
+ * Malformed entries are skipped with a dev warn rather than crashing the
+ * whole init — Phase 2 (`tasks/62001`) deliberately left `pending_events`
+ * loose-typed on the wire so each entry is re-validated here.
+ *
+ * `init` itself is excluded from the ring by construction
+ * (`sse_wire.allium`); we don't recurse into a nested `sse_init`.
+ */
+function applyPendingEvent(atom: ConversationAtom, entry: unknown): ConversationAtom {
+  if (!entry || typeof entry !== 'object') {
+    if (import.meta.env.DEV) {
+      console.warn('[sse] dropping malformed pending entry (not an object)', { entry });
+    }
+    return atom;
+  }
+  const obj = entry as Record<string, unknown>;
+  const type = obj['type'];
+  switch (type) {
+    case 'token': {
+      const res = v.safeParse(SseTokenDataSchema, entry);
+      if (!res.success) {
+        if (import.meta.env.DEV) {
+          console.warn('[sse] dropping malformed pending token entry', { issues: res.issues });
+        }
+        return atom;
+      }
+      return conversationReducer(atom, {
+        type: 'sse_token',
+        sequenceId: res.output.sequence_id,
+        delta: res.output.text,
+      });
+    }
+    case 'state_change': {
+      const res = v.safeParse(SseStateChangeDataSchema, entry);
+      if (!res.success) {
+        if (import.meta.env.DEV) {
+          console.warn('[sse] dropping malformed pending state_change entry', { issues: res.issues });
+        }
+        return atom;
+      }
+      return conversationReducer(atom, {
+        type: 'sse_state_change',
+        sequenceId: res.output.sequence_id,
+        phase: parseConversationState(res.output.state),
+      });
+    }
+    case 'message': {
+      const res = v.safeParse(SseMessageDataSchema, entry);
+      if (!res.success) {
+        if (import.meta.env.DEV) {
+          console.warn('[sse] dropping malformed pending message entry', { issues: res.issues });
+        }
+        return atom;
+      }
+      return conversationReducer(atom, {
+        type: 'sse_message',
+        message: res.output.message,
+        sequenceId: res.output.sequence_id,
+      });
+    }
+    case 'message_updated': {
+      const res = v.safeParse(SseMessageUpdatedDataSchema, entry);
+      if (!res.success) {
+        if (import.meta.env.DEV) {
+          console.warn('[sse] dropping malformed pending message_updated entry', { issues: res.issues });
+        }
+        return atom;
+      }
+      const data = res.output;
+      return conversationReducer(atom, {
+        type: 'sse_message_updated',
+        sequenceId: data.sequence_id,
+        messageId: data.message_id,
+        ...(data.display_data != null && { displayData: data.display_data as Record<string, unknown> }),
+        ...(data.content != null && { content: data.content as Message['content'] }),
+        ...(data.duration_ms != null && { durationMs: data.duration_ms }),
+      });
+    }
+    case 'agent_done': {
+      const res = v.safeParse(SseAgentDoneDataSchema, entry);
+      if (!res.success) {
+        if (import.meta.env.DEV) {
+          console.warn('[sse] dropping malformed pending agent_done entry', { issues: res.issues });
+        }
+        return atom;
+      }
+      return conversationReducer(atom, {
+        type: 'sse_agent_done',
+        sequenceId: res.output.sequence_id,
+      });
+    }
+    case 'conversation_update': {
+      const res = v.safeParse(SseConversationUpdateDataSchema, entry);
+      if (!res.success) {
+        if (import.meta.env.DEV) {
+          console.warn('[sse] dropping malformed pending conversation_update entry', { issues: res.issues });
+        }
+        return atom;
+      }
+      return conversationReducer(atom, {
+        type: 'sse_conversation_update',
+        sequenceId: res.output.sequence_id,
+        updates: res.output.conversation as Partial<Conversation>,
+      });
+    }
+    case 'browser_session_state': {
+      const res = v.safeParse(SseBrowserSessionStateDataSchema, entry);
+      if (!res.success) {
+        if (import.meta.env.DEV) {
+          console.warn('[sse] dropping malformed pending browser_session_state entry', { issues: res.issues });
+        }
+        return atom;
+      }
+      return conversationReducer(atom, {
+        type: 'sse_browser_session_state',
+        sequenceId: res.output.sequence_id,
+        active: res.output.active,
+      });
+    }
+    case 'steer_message_queued': {
+      // Validated for forward-compat parity with the live handler in
+      // useConnection.ts; no reducer action needed (no-op). Schema drift
+      // still warns in DEV so a Rust-side wire change surfaces here.
+      const res = v.safeParse(SseSteerMessageQueuedDataSchema, entry);
+      if (!res.success && import.meta.env.DEV) {
+        console.warn('[sse] dropping malformed pending steer_message_queued entry', { issues: res.issues });
+      }
+      return atom;
+    }
+    case 'error': {
+      const res = v.safeParse(SseErrorDataSchema, entry);
+      if (!res.success) {
+        if (import.meta.env.DEV) {
+          console.warn('[sse] dropping malformed pending error entry', { issues: res.issues });
+        }
+        return atom;
+      }
+      return conversationReducer(atom, {
+        type: 'sse_error',
+        sequenceId: res.output.sequence_id,
+        error: { type: 'BackendError', message: res.output.message },
+      });
+    }
+    // Known event types that don't belong in the ring by construction:
+    // init is per-stream (never broadcast); terminal/delete events post-
+    // date any in-flight turn (the broadcaster anchor resets on each
+    // persisted Message, and these types arrive after the final message).
+    // Drop silently — surfacing them as warnings would be noise during
+    // forward-compatible server changes, not signal.
+    case 'init':
+    case 'conversation_became_terminal':
+    case 'conversation_hard_deleted':
+      return atom;
+    // Truly unknown discriminator (new Rust-side variant the client
+    // hasn't been updated for). Warn in DEV so the drift is observable.
+    default:
+      if (import.meta.env.DEV) {
+        console.warn('[sse] dropping unrecognized pending entry type', { type, entry });
+      }
+      return atom;
+  }
+}
+
 export function conversationReducer(
   atom: ConversationAtom,
   action: SSEAction
@@ -323,16 +526,21 @@ export function conversationReducer(
     case 'sse_init': {
       const p = action.payload;
 
-      // On fresh connect (lastSequenceId=0): replace entirely.
-      // On reconnect (lastSequenceId>0): the server always returns the full
-      // message list so we get a current snapshot of any mutable state. Merge
-      // by replacing existing messages with the incoming version (handles
-      // display_data/content mutations that occurred while disconnected) and
-      // appending genuinely new messages.
+      // Phase 1 — snapshot. Apply the DB-backed view. On fresh-connect the
+      // floor seeds from `pendingAnchorSequenceId` so the per-event
+      // `applyIfNewer` guards in Phase 2 accept the pending entries (their
+      // seqs are strictly above the anchor). On reconnect we preserve the
+      // atom's existing floor so any pending entry the atom has already
+      // observed live is dropped as a replay.
+      //
+      // Reconnect merges by message_id (replace existing with incoming +
+      // append genuinely new); fresh-connect replaces entirely. See
+      // `SseInitReconnectMerge` / `SseInitFreshConnect` in
+      // `specs/conversation_atom/conversation_atom.allium`.
+      const isFreshConnect = atom.lastSequenceId === 0;
       let mergedMessages: Message[];
-      if (atom.lastSequenceId > 0) {
+      if (!isFreshConnect) {
         const incomingById = new Map(p.messages.map((m) => [m.message_id, m]));
-        // Replace existing messages with incoming version if present (captures mutations).
         const replaced = atom.messages.map((m) => incomingById.get(m.message_id) ?? m);
         const existingIds = new Set(atom.messages.map((m) => m.message_id));
         const appended = p.messages.filter((m) => !existingIds.has(m.message_id));
@@ -341,11 +549,12 @@ export function conversationReducer(
         mergedMessages = p.messages;
       }
 
-      // Apply in-progress phase breadcrumb if the server breadcrumbs don't include it
+      // Derive in-progress phase breadcrumb if the server breadcrumbs don't
+      // already carry it. UI-only enrichment; not in the spec but preserves
+      // the rendering contract for snapshots whose phase is mid-turn.
       const currentCrumb = breadcrumbFromPhase(p.phase, p.lastSequenceId);
-      let finalBreadcrumbs = p.breadcrumbs;
-      let finalBreadcrumbSeqIds = p.breadcrumbSequenceIds;
-
+      let snapshotBreadcrumbs = p.breadcrumbs;
+      let snapshotBreadcrumbSeqIds = p.breadcrumbSequenceIds;
       if (currentCrumb) {
         const alreadyPresent = p.breadcrumbs.some(
           (b) =>
@@ -354,38 +563,76 @@ export function conversationReducer(
         );
         if (!alreadyPresent) {
           const applied = applyBreadcrumb(
-            finalBreadcrumbs,
-            finalBreadcrumbSeqIds,
+            snapshotBreadcrumbs,
+            snapshotBreadcrumbSeqIds,
             currentCrumb,
             undefined
           );
-          finalBreadcrumbs = applied.breadcrumbs;
-          finalBreadcrumbSeqIds = applied.breadcrumbSequenceIds;
+          snapshotBreadcrumbs = applied.breadcrumbs;
+          snapshotBreadcrumbSeqIds = applied.breadcrumbSequenceIds;
         }
       }
 
-      // Init uses max() rather than replace for lastSequenceId. Rationale:
-      // task 02675 §2 — "Server-side sequence jumps strand messages". If
-      // init arrives with lastSequenceId=100 but we've already seen id 105
-      // from live events that raced ahead, we must not regress to 100 (that
-      // would re-accept the 101–105 events on re-delivery and corrupt
-      // state). `max()` keeps the floor monotonically non-decreasing.
-      const newLastSeq = Math.max(atom.lastSequenceId, p.lastSequenceId);
-
-      return {
+      const phase1Floor = isFreshConnect ? p.pendingAnchorSequenceId : atom.lastSequenceId;
+      // streamingBuffer policy: fresh-connect always clears (atom had no
+      // buffer to preserve). Reconnect preserves the existing buffer when
+      // the snapshot phase is still llm_requesting AND the ring did not
+      // overflow — pending tokens with seq > floor extend it via the
+      // sse_token reducer, tokens at or below are dropped as replays.
+      // Clearing on reconnect unconditionally would create a blank-UI
+      // window the pending replay cannot rebuild because applyIfNewer
+      // drops the very tokens we'd need. When pendingTruncated is true
+      // we MUST clear — the missing middle of the stream is unreplayable
+      // and the safety belt advances lastSequenceId past it, so any
+      // preserved buffer would be a stale prefix that future live tokens
+      // append onto (producing a gapped, corrupted message). When the
+      // snapshot phase is anything else, the turn ended while
+      // disconnected and we clear. See SseInitReconnectMerge in
+      // specs/conversation_atom/conversation_atom.allium.
+      const phase1StreamingBuffer =
+        !isFreshConnect && p.phase.type === 'llm_requesting' && !p.pendingTruncated
+          ? atom.streamingBuffer
+          : null;
+      let next: ConversationAtom = {
         ...atom,
         conversationId: p.conversation.id,
         conversation: p.conversation,
         messages: mergedMessages,
         phase: p.phase,
-        breadcrumbs: finalBreadcrumbs,
-        breadcrumbSequenceIds: finalBreadcrumbSeqIds,
+        breadcrumbs: snapshotBreadcrumbs,
+        breadcrumbSequenceIds: snapshotBreadcrumbSeqIds,
         contextWindow: p.contextWindow,
-        lastSequenceId: newLastSeq,
-        streamingBuffer: null,
+        lastSequenceId: phase1Floor,
+        streamingBuffer: phase1StreamingBuffer,
         uiError: null,
         toolExecutingStartedAt: p.phase.type === 'tool_executing' ? Date.now() : null,
       };
+
+      // Phase 2 — fold pending events through the reducer. Each entry is a
+      // wire-format SseWireEvent; per-entry validation gates against the
+      // existing valibot schemas before dispatch. Malformed entries are
+      // skipped with a dev warn rather than crashing the whole init.
+      if (p.pendingTruncated && import.meta.env.DEV) {
+        console.debug('[sse] init pendingTruncated=true — server ring overflowed; DB-only render', {
+          pendingAnchorSequenceId: p.pendingAnchorSequenceId,
+          lastSequenceId: p.lastSequenceId,
+          pendingCount: p.pendingEvents.length,
+        });
+      }
+      for (const entry of p.pendingEvents) {
+        next = applyPendingEvent(next, entry);
+      }
+
+      // Phase 3 — safety belt. Cover the cases where pendingEvents was
+      // truncated/empty but the server's witnessed tip is ahead of the
+      // anchor: advance the floor so future live events with lower seqs are
+      // correctly dropped. Also covers the original "stale-init lags live
+      // events" case (atom.lastSequenceId > payload.lastSequenceId).
+      const finalLastSeq = Math.max(next.lastSequenceId, p.lastSequenceId);
+      if (finalLastSeq !== next.lastSequenceId) {
+        next = { ...next, lastSequenceId: finalLastSeq };
+      }
+      return next;
     }
 
     case 'sse_message': {

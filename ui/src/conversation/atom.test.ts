@@ -33,6 +33,7 @@ function makeMessage(sequenceId: number, messageType: 'user' | 'agent' = 'agent'
 }
 
 function makeInitPayload(overrides: Partial<InitPayload> = {}): InitPayload {
+  const lastSequenceId = overrides.lastSequenceId ?? 5;
   return {
     conversation: testConversation,
     messages: [],
@@ -40,7 +41,12 @@ function makeInitPayload(overrides: Partial<InitPayload> = {}): InitPayload {
     breadcrumbs: [],
     breadcrumbSequenceIds: new Set(),
     contextWindow: { used: 1000 },
-    lastSequenceId: 5,
+    lastSequenceId,
+    // Default to "no pending replay": anchor matches the tip and the ring
+    // is empty. Tests exercising ReplayRing behaviour override these.
+    pendingAnchorSequenceId: lastSequenceId,
+    pendingEvents: [],
+    pendingTruncated: false,
     ...overrides,
   };
 }
@@ -257,6 +263,302 @@ describe('conversationReducer', () => {
       expect(atom.messages).toHaveLength(6);
       expect(atom.messages.map((m) => m.sequence_id)).toEqual([95, 96, 97, 98, 99, 100]);
       expect(atom.lastSequenceId).toBe(100);
+    });
+  });
+
+  // Phase 3 of the SSE ReplayRing rollout (`tasks/62002`). Pending events
+  // delivered on the `init` snapshot are applied through the reducer's
+  // per-event rules so a mid-turn reconnect restores in-flight streaming
+  // text, current-tool state, and eager assistant Messages. See
+  // `specs/conversation_atom/conversation_atom.allium` SseInitFreshConnect
+  // and SseInitReconnectMerge.
+  describe('sse_init pending replay', () => {
+    function tokenEntry(seq: number, text: string): unknown {
+      return { type: 'token', sequence_id: seq, text, request_id: 'req-1' };
+    }
+    function stateChangeEntry(seq: number, state: Record<string, unknown>): unknown {
+      return { type: 'state_change', sequence_id: seq, state, presentation_mode: 'default' };
+    }
+    function messageEntry(seq: number, msg: Message): unknown {
+      return { type: 'message', sequence_id: seq, message: msg };
+    }
+
+    it('fresh connect with pending tokens rebuilds streamingBuffer', () => {
+      const payload = makeInitPayload({
+        phase: { type: 'llm_requesting', attempt: 1 },
+        lastSequenceId: 7,
+        pendingAnchorSequenceId: 5,
+        pendingEvents: [
+          tokenEntry(6, 'Hel'),
+          tokenEntry(7, 'lo '),
+        ],
+      });
+
+      const next = dispatch(createInitialAtom(), { type: 'sse_init', payload });
+
+      expect(next.streamingBuffer).not.toBeNull();
+      expect(next.streamingBuffer!.text).toBe('Hello ');
+      expect(next.streamingBuffer!.lastSequence).toBe(7);
+      expect(next.lastSequenceId).toBe(7);
+    });
+
+    // Load-bearing test for the SseInitFreshConnect rule: fresh-connect must
+    // seed lastSequenceId from `pendingAnchorSequenceId`, NOT from
+    // `lastSequenceId`. If it seeded from `lastSequenceId` (the server's
+    // tip), every pending entry would be dropped as a replay because each
+    // entry's seq ≤ tip. With the anchor as the floor, applyIfNewer(5, 6)
+    // → 6 > 5 → accept.
+    it('fresh-connect anchor: token at seq=anchor+1 is accepted, not dropped', () => {
+      const payload = makeInitPayload({
+        phase: { type: 'llm_requesting', attempt: 1 },
+        lastSequenceId: 6,
+        pendingAnchorSequenceId: 5,
+        pendingEvents: [tokenEntry(6, 'X')],
+      });
+
+      const next = dispatch(createInitialAtom(), { type: 'sse_init', payload });
+
+      expect(next.streamingBuffer?.text).toBe('X');
+      expect(next.lastSequenceId).toBe(6);
+    });
+
+    it('fresh connect with pending state_change updates phase to latest pending state', () => {
+      const payload = makeInitPayload({
+        phase: { type: 'awaiting_llm' },
+        lastSequenceId: 7,
+        pendingAnchorSequenceId: 5,
+        pendingEvents: [
+          stateChangeEntry(6, { type: 'llm_requesting', attempt: 1 }),
+          stateChangeEntry(7, {
+            type: 'tool_executing',
+            current_tool: { id: 't1', name: 'bash', input: {} },
+            remaining_tools: [],
+          }),
+        ],
+      });
+
+      const next = dispatch(createInitialAtom(), { type: 'sse_init', payload });
+
+      expect(next.phase.type).toBe('tool_executing');
+      expect(next.lastSequenceId).toBe(7);
+    });
+
+    it('reconnect with pending eager Message adds the tool_use message', () => {
+      const existing = makeMessage(3, 'user');
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastSequenceId: 5,
+        messages: [existing],
+        conversationId: 'conv-1',
+      };
+      const eagerMsg: Message = {
+        message_id: 'eager-1',
+        sequence_id: 7,
+        conversation_id: 'conv-1',
+        message_type: 'agent',
+        content: [
+          { type: 'tool_use', id: 'tool-1', name: 'bash', input: { command: 'ls' } },
+        ] as Message['content'],
+        created_at: '2024-01-01T00:00:00Z',
+      };
+      const payload = makeInitPayload({
+        messages: [existing], // DB snapshot — eager not yet persisted
+        lastSequenceId: 7,
+        pendingAnchorSequenceId: 5,
+        pendingEvents: [messageEntry(7, eagerMsg)],
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.messages).toHaveLength(2);
+      expect(next.messages[1]!.message_id).toBe('eager-1');
+      expect(next.messages[1]!.content).toEqual([
+        { type: 'tool_use', id: 'tool-1', name: 'bash', input: { command: 'ls' } },
+      ]);
+      expect(next.lastSequenceId).toBe(7);
+    });
+
+    it('pendingTruncated=true with empty pendingEvents yields DB-only render and advances lastSequenceId', () => {
+      const payload = makeInitPayload({
+        messages: [makeMessage(50)],
+        lastSequenceId: 100,
+        pendingAnchorSequenceId: 50,
+        pendingEvents: [],
+        pendingTruncated: true,
+      });
+
+      const next = dispatch(createInitialAtom(), { type: 'sse_init', payload });
+
+      expect(next.lastSequenceId).toBe(100);
+      expect(next.messages).toHaveLength(1);
+      expect(next.messages[0]!.sequence_id).toBe(50);
+      expect(next.uiError).toBeNull();
+      expect(next.streamingBuffer).toBeNull();
+    });
+
+    // Reconnect floor stays at the atom's live tip. Pending entries whose
+    // seq is at or below that floor are dropped by the per-event
+    // applyIfNewer guard — exactly the dedup contract the spec relies on.
+    it('reconnect drops pending entries with seq <= atom.lastSequenceId as replays', () => {
+      const existing = makeMessage(10);
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastSequenceId: 10,
+        messages: [existing],
+        conversationId: 'conv-1',
+      };
+      const dupMsg: Message = {
+        ...makeMessage(8),
+        message_id: 'replay-id',
+      };
+      const payload = makeInitPayload({
+        messages: [existing],
+        lastSequenceId: 10,
+        pendingAnchorSequenceId: 5,
+        pendingEvents: [messageEntry(8, dupMsg)],
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.messages).toHaveLength(1);
+      expect(next.messages[0]!.message_id).toBe('msg-10');
+      expect(next.lastSequenceId).toBe(10);
+    });
+
+    // Malformed pending entries should not crash the init — the whole
+    // value of the loose `unknown[]` wire shape is per-entry recoverability.
+    it('skips malformed pending entries without crashing', () => {
+      const payload = makeInitPayload({
+        phase: { type: 'llm_requesting', attempt: 1 },
+        lastSequenceId: 7,
+        pendingAnchorSequenceId: 5,
+        pendingEvents: [
+          { type: 'token', sequence_id: 'not-a-number', text: 'oops', request_id: 'r' },
+          tokenEntry(7, 'ok'),
+        ],
+      });
+
+      const next = dispatch(createInitialAtom(), { type: 'sse_init', payload });
+
+      expect(next.streamingBuffer?.text).toBe('ok');
+      expect(next.lastSequenceId).toBe(7);
+    });
+
+    // In-page reconnect after a network blip: the atom has already
+    // accepted live tokens, so atom.lastSequenceId is at the live tip.
+    // The init's pending tokens carry the same seqs and are dropped by
+    // applyIfNewer as replays. If phase 1 cleared streamingBuffer, the
+    // cleared buffer would have no way to rebuild (replays can't fill
+    // it) and the user would see a blank window until the next live
+    // token arrives. Phase 1 must preserve the buffer when the snapshot
+    // phase is still llm_requesting. Codex P1 from PR #79.
+    it('reconnect preserves streamingBuffer when snapshot phase is llm_requesting', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastSequenceId: 7,
+        phase: { type: 'llm_requesting', attempt: 1 },
+        streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000 },
+        conversationId: 'conv-1',
+      };
+      const payload = makeInitPayload({
+        phase: { type: 'llm_requesting', attempt: 1 },
+        lastSequenceId: 7,
+        pendingAnchorSequenceId: 5,
+        pendingEvents: [
+          tokenEntry(6, 'Hel'),
+          tokenEntry(7, 'lo '),
+        ],
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.streamingBuffer).not.toBeNull();
+      expect(next.streamingBuffer!.text).toBe('Hello ');
+      expect(next.streamingBuffer!.lastSequence).toBe(7);
+      expect(next.lastSequenceId).toBe(7);
+    });
+
+    // Companion to the above: if the gap is real (server emitted tokens
+    // 8, 9 while the atom was offline), pending tokens above the floor
+    // extend the preserved buffer.
+    it('reconnect extends preserved streamingBuffer with above-floor pending tokens', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastSequenceId: 7,
+        phase: { type: 'llm_requesting', attempt: 1 },
+        streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000 },
+        conversationId: 'conv-1',
+      };
+      const payload = makeInitPayload({
+        phase: { type: 'llm_requesting', attempt: 1 },
+        lastSequenceId: 9,
+        pendingAnchorSequenceId: 5,
+        pendingEvents: [
+          tokenEntry(6, 'Hel'),  // replay, dropped
+          tokenEntry(7, 'lo '),  // replay, dropped
+          tokenEntry(8, 'wor'),  // new, extends
+          tokenEntry(9, 'ld'),   // new, extends
+        ],
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.streamingBuffer!.text).toBe('Hello world');
+      expect(next.streamingBuffer!.lastSequence).toBe(9);
+      expect(next.lastSequenceId).toBe(9);
+    });
+
+    // Codex P2 from PR #79: when pendingTruncated=true the ring
+    // overflowed, so the server is intentionally NOT sending the tokens
+    // between anchor and tip. The safety belt advances lastSequenceId
+    // past the gap. Preserving the buffer would leave a stale prefix
+    // that future live tokens append onto, producing a gapped/corrupted
+    // message. Truncated must force a clear regardless of phase.
+    it('reconnect clears streamingBuffer when pendingTruncated even if phase is llm_requesting', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastSequenceId: 7,
+        phase: { type: 'llm_requesting', attempt: 1 },
+        streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000 },
+        conversationId: 'conv-1',
+      };
+      const payload = makeInitPayload({
+        phase: { type: 'llm_requesting', attempt: 1 },
+        lastSequenceId: 50,
+        pendingAnchorSequenceId: 7,
+        pendingEvents: [],
+        pendingTruncated: true,
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.streamingBuffer).toBeNull();
+      expect(next.lastSequenceId).toBe(50);
+    });
+
+    // Turn ended while disconnected: snapshot phase is no longer
+    // llm_requesting, so the buffer must clear (the next response will
+    // start fresh; preserving stale text would confuse the UI).
+    it('reconnect clears streamingBuffer when snapshot phase is not llm_requesting', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastSequenceId: 7,
+        phase: { type: 'llm_requesting', attempt: 1 },
+        streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000 },
+        conversationId: 'conv-1',
+      };
+      const payload = makeInitPayload({
+        phase: { type: 'idle' },
+        lastSequenceId: 10,
+        pendingAnchorSequenceId: 7,
+        pendingEvents: [],
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.streamingBuffer).toBeNull();
+      expect(next.phase.type).toBe('idle');
+      expect(next.lastSequenceId).toBe(10);
     });
   });
 
