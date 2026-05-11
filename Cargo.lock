@@ -2941,10 +2941,10 @@ dependencies = [
 
 [[package]]
 name = "taskmd-core"
-version = "0.1.0"
-source = "git+https://github.com/scottopell/taskmd.git#8f41556082c94ca04f2cf52a98c0676ccdfb3e88"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f2415b7cb9a7bb7297a8a5d8dc23459bf5d4e219c1f54dd3f0c915a7e278a98"
 dependencies = [
- "chrono",
  "gethostname",
  "regex",
  "sha2",

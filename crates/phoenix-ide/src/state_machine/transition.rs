@@ -21,8 +21,138 @@ use super::state::{
 use super::{ConvContext, ConvState, Effect, Event};
 use crate::db::{ErrorKind, ToolResult, UsageData};
 use serde_json::json;
+use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
+
+/// Statuses a task file may be in for `propose_task` to accept it.
+const ACCEPTABLE_PROPOSE_STATUSES: &[taskmd_core::constants::Status] = &[
+    taskmd_core::constants::Status::Ready,
+    taskmd_core::constants::Status::InProgress,
+    taskmd_core::constants::Status::Brainstorming,
+];
+
+/// Validated snapshot of a task file at the moment `propose_task` was called.
+///
+/// `task_file` is normalised to a forward-slash path relative to the
+/// conversation cwd; `title` is the first H1 heading or, lacking that, a
+/// title-cased version of the slug from the filename.
+#[derive(Debug)]
+struct TaskFileSnapshot {
+    task_file: String,
+    title: String,
+    priority: String,
+    plan: String,
+}
+
+/// Read and validate a task file referenced by `propose_task`.
+///
+/// In taskmd 1.0 the filename is the sole source of metadata — id,
+/// priority, status, and slug all come from the filename. The body is
+/// free-form markdown; we use it only to pull out the H1 for a UI title
+/// and to surface the plan in the approval reader.
+///
+/// The state machine treats this read as a deterministic data-load — like
+/// reading the conversation cwd off disk — not as an external side effect.
+/// All I/O is local to the worktree, synchronous, and bounded.
+fn resolve_task_file(cwd: &Path, task_file: &str) -> Result<TaskFileSnapshot, String> {
+    if task_file.is_empty() {
+        return Err("task_file is required".to_string());
+    }
+    let rel_path = Path::new(task_file);
+    if rel_path.is_absolute() {
+        return Err(format!(
+            "task_file must be a relative path (got '{task_file}')"
+        ));
+    }
+    // Reject `..` components: a path like `tasks/../other/foo.md` has
+    // `tasks` as its first component but escapes the tree once joined to
+    // cwd. PatchTool enforces the same rule.
+    if rel_path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "task_file must not contain '..' components (got '{task_file}')"
+        ));
+    }
+    let first_component = rel_path
+        .components()
+        .next()
+        .and_then(|c| c.as_os_str().to_str());
+    if first_component != Some("tasks") {
+        return Err(format!(
+            "task_file must be under tasks/ (got '{task_file}')"
+        ));
+    }
+
+    let filename = rel_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
+    let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
+        format!(
+            "task_file '{filename}' does not match the taskmd filename pattern \
+             (NNNNN-pX-status--slug.md)"
+        )
+    })?;
+
+    if !ACCEPTABLE_PROPOSE_STATUSES.contains(&parsed.status) {
+        let allowed: Vec<&str> = ACCEPTABLE_PROPOSE_STATUSES
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        return Err(format!(
+            "task file status '{}' cannot be proposed for approval. \
+             Acceptable statuses: {}.",
+            parsed.status,
+            allowed.join(", ")
+        ));
+    }
+
+    let abs_path = cwd.join(rel_path);
+    let body = std::fs::read_to_string(&abs_path).map_err(|e| {
+        format!(
+            "Failed to read task file '{task_file}': {e}. \
+             Create the file under tasks/ (taskmd filename format \
+             NNNNN-pX-status--slug.md) before calling propose_task."
+        )
+    })?;
+
+    let title = extract_title(&body).unwrap_or_else(|| slug_to_title(&parsed.slug));
+    let plan = body.trim().to_string();
+
+    Ok(TaskFileSnapshot {
+        task_file: task_file.replace('\\', "/"),
+        title,
+        priority: parsed.priority.to_string(),
+        plan,
+    })
+}
+
+fn extract_title(body: &str) -> Option<String> {
+    body.lines().find_map(|line| {
+        let trimmed = line.trim_start();
+        trimmed
+            .strip_prefix("# ")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+}
+
+fn slug_to_title(slug: &str) -> String {
+    slug.split('-')
+        .filter(|s| !s.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 const MAX_RETRY_ATTEMPTS: u32 = 3;
 
@@ -1241,6 +1371,7 @@ pub fn transition_parent(
 
         (
             ParentState::AwaitingTaskApproval {
+                task_file,
                 title,
                 priority,
                 plan,
@@ -1251,6 +1382,7 @@ pub fn transition_parent(
         ) => Ok(
             ParentTransitionResult::new(ParentState::Core(CoreState::LlmRequesting { attempt: 1 }))
                 .with_effect(Effect::ApproveTask {
+                    task_file: task_file.clone(),
                     title: title.clone(),
                     priority: priority.clone(),
                     plan: plan.clone(),
@@ -1524,6 +1656,32 @@ pub fn transition_parent(
                     .with_effect(Effect::RequestLlm));
                 }
                 if let ToolInput::ProposeTask(ref input) = tool.input {
+                    let snapshot = match resolve_task_file(&context.working_dir, &input.task_file) {
+                        Ok(s) => s,
+                        Err(err_msg) => {
+                            // Validation failed: surface the error as a tool_result and
+                            // re-request the LLM so it can fix the file (or pick another)
+                            // and retry.
+                            let display_data =
+                                compute_bash_display_data(&content, &context.working_dir);
+                            let assistant_message =
+                                AssistantMessage::new(content, Some(usage_data), display_data);
+                            let tool_result = ToolResult::error(tool.id.clone(), err_msg);
+                            let checkpoint = CheckpointData::tool_round(
+                                assistant_message,
+                                vec![tool_result],
+                            )
+                            .expect("propose_task produces exactly one tool_use and one result");
+                            return Ok(ParentTransitionResult::new(ParentState::Core(
+                                CoreState::LlmRequesting { attempt: 1 },
+                            ))
+                            .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                            .with_effect(Effect::PersistState)
+                            .with_effect(notify_llm_requesting(1))
+                            .with_effect(Effect::RequestLlm));
+                        }
+                    };
+
                     let tool_result = ToolResult::success(
                         tool.id.clone(),
                         "Plan submitted for review".to_string(),
@@ -1537,18 +1695,20 @@ pub fn transition_parent(
 
                     return Ok(
                         ParentTransitionResult::new(ParentState::AwaitingTaskApproval {
-                            title: input.title.clone(),
-                            priority: input.priority.clone(),
-                            plan: input.plan.clone(),
+                            task_file: snapshot.task_file.clone(),
+                            title: snapshot.title.clone(),
+                            priority: snapshot.priority.clone(),
+                            plan: snapshot.plan.clone(),
                         })
                         .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                         .with_effect(Effect::PersistState)
                         .with_effect(Effect::notify_state_change(
                             "awaiting_task_approval",
                             json!({
-                                "title": input.title,
-                                "priority": input.priority,
-                                "plan": input.plan
+                                "task_file": snapshot.task_file,
+                                "title": snapshot.title,
+                                "priority": snapshot.priority,
+                                "plan": snapshot.plan,
                             }),
                         )),
                     );
@@ -3019,9 +3179,7 @@ mod tests {
         let propose_tool = ToolCall::new(
             "tool-propose-1",
             ToolInput::ProposeTask(ProposeTaskInput {
-                title: "Fix the bug".to_string(),
-                priority: "p1".to_string(),
-                plan: "Step 1: Do the thing".to_string(),
+                task_file: "tasks/12345-p1-ready--fix-the-bug.md".to_string(),
             }),
         );
         let bash_tool = ToolCall::new(
