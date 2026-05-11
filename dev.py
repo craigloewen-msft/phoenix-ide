@@ -3244,14 +3244,22 @@ def _ensure_newsyslog_config():
         tmp.write(desired)
         tmp_path = tmp.name
     try:
-        subprocess.run(
-            ["sudo", "install", "-m", "644", "-o", "root", "-g", "wheel",
+        result = subprocess.run(
+            ["sudo", "-n", "install", "-m", "644", "-o", "root", "-g", "wheel",
              tmp_path, str(NEWSYSLOG_CONF_PATH)],
-            check=True,
+            capture_output=True, text=True,
         )
-        print(f"  ✓ Log rotation installed: daily @T00, 14 generations, bzip2, copy-truncate")
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
+        if result.returncode == 0:
+            print(f"  ✓ Log rotation installed: daily @T00, 14 generations, bzip2, copy-truncate")
+        else:
+            # Non-fatal: deploy proceeds without rotation. Print one-shot install command.
+            print(f"  WARN: could not install rotation config (sudo unavailable in this shell).", file=sys.stderr)
+            print(f"  To enable: sudo install -m 644 -o root -g wheel {tmp_path!s} {NEWSYSLOG_CONF_PATH}", file=sys.stderr)
+            print(f"  Or rerun `./dev.py prod deploy` from an interactive terminal.", file=sys.stderr)
+            return  # Skip cleanup so the printed path stays valid for the user
+    except FileNotFoundError:
+        print(f"  WARN: sudo not found; rotation config not installed.", file=sys.stderr)
+    Path(tmp_path).unlink(missing_ok=True)
 
 
 def _launchd_stop_if_loaded():
