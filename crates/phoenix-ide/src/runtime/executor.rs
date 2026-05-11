@@ -1275,6 +1275,44 @@ where
 
             Effect::PersistCheckpoint { data } => self.persist_checkpoint(data).await,
 
+            Effect::BroadcastAssistantMessage { message } => {
+                // Broadcast-only: no DB write here. The atomic
+                // `PersistCheckpoint` at the end of the tool round performs
+                // the durable write (and emits a duplicate `sse_message`
+                // that the UI dedups by `message_id`).
+                //
+                // The eager message is appended to the per-conversation
+                // ReplayRing via `send_ephemeral_message` so reconnecting
+                // clients during the tool round still see the in-flight
+                // assistant content. The eventual persisted Message with
+                // the same `message_id` will fire `send_persisted_message`
+                // when the checkpoint completes, resetting the ring anchor
+                // and discarding this entry; the client dedups by
+                // `message_id` via `SseMessageDedupReplay`.
+                //
+                // `created_at` comes from `AssistantMessage` (captured at
+                // LLM-response time) — NOT a fresh `Utc::now()`. The same
+                // timestamp is later written to the DB row by
+                // `persist_checkpoint`, so a reconnecting client's init
+                // payload reads back the same timestamp the UI is already
+                // displaying. Without that alignment, the displayed
+                // timestamp would jump when init merges the DB row in.
+                let seq = self.broadcast_tx.next_seq();
+                let agent_content = MessageContent::agent(message.content);
+                let db_msg = crate::db::Message {
+                    message_id: message.message_id,
+                    conversation_id: self.context.conversation_id.clone(),
+                    sequence_id: seq,
+                    message_type: agent_content.message_type(),
+                    content: agent_content,
+                    display_data: message.display_data,
+                    usage_data: message.usage,
+                    created_at: message.created_at,
+                };
+                let _ = self.broadcast_tx.send_ephemeral_message(db_msg);
+                Ok(None)
+            }
+
             Effect::PersistToolResults { results } => {
                 for result in results {
                     let content = MessageContent::tool(
@@ -1820,18 +1858,29 @@ where
                 assistant_message,
                 tool_results,
             } => {
-                // Persist assistant message
+                // Persist assistant message.
+                //
+                // Uses `add_message_with_seq_at` so the DB row carries the
+                // exact `assistant_message.created_at` value the eager
+                // broadcast (`Effect::BroadcastAssistantMessage`) already
+                // delivered for this `message_id`. Single INSERT, no
+                // transient `Utc::now()` value visible to a concurrent
+                // reconnect's init read. Without this, a reconnect that
+                // landed between the INSERT and a follow-up UPDATE would
+                // see a shifted timestamp on the same message_id the UI
+                // is already displaying.
                 let agent_content = MessageContent::agent(assistant_message.content);
                 let agent_seq = self.broadcast_tx.next_seq();
                 let agent_msg = self
                     .storage
-                    .add_message_with_seq(
+                    .add_message_with_seq_at(
                         &assistant_message.message_id,
                         &self.context.conversation_id,
                         agent_seq,
                         &agent_content,
                         assistant_message.display_data.as_ref(),
                         assistant_message.usage.as_ref(),
+                        assistant_message.created_at,
                     )
                     .await?;
                 let _ = self.broadcast_tx.send_message(agent_msg);

@@ -33,10 +33,10 @@ use crate::db::{ConvMode, Database};
 use crate::llm::ModelRegistry;
 use crate::state_machine::{ConvContext, ConvState, Event};
 use crate::system_prompt::ModeContext;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc, RwLock};
 
 /// Request to spawn a sub-agent
@@ -131,6 +131,186 @@ pub struct ConversationHandle {
 /// dance happens; it does not change correctness.
 pub const SSE_BROADCAST_CAPACITY: usize = 4096;
 
+/// Capacity of the per-conversation `ReplayRing` (`sse_wire.allium`
+/// `replay_ring_capacity`). Bounds how many ephemeral events between two
+/// persisted Messages can be replayed on reconnect. At 50 tokens/sec this
+/// covers ~10 seconds of LLM streaming; overflow forces a full resync
+/// (the ring clears and the truncated flag is set; subsequent appends are
+/// no-ops until the next persisted Message resets the anchor).
+pub const REPLAY_RING_CAPACITY: usize = 512;
+
+/// One entry in the per-conversation `ReplayRing`. Carries the original
+/// `sequence_id` allocated by the broadcaster when the event was emitted,
+/// so the client's `applyIfNewer` guard works identically on replay.
+#[derive(Debug, Clone)]
+pub struct ReplayRingEntry {
+    pub event: SseEvent,
+    pub sequence_id: i64,
+}
+
+/// Per-conversation buffer of ephemeral SSE events between persisted-Message
+/// anchors. Source-of-truth for `sse_wire.allium`'s `ReplayRing` entity. See the
+/// spec for invariants:
+///   - `entries` has length ≤ `REPLAY_RING_CAPACITY`.
+///   - Every entry has `sequence_id > anchor_seq`.
+///   - Entries are in strictly increasing `sequence_id` order (preserved by
+///     FIFO append + anchor-reset clear; no out-of-order insertion paths
+///     exist).
+///   - Once `truncated = true`, no further appends accumulate until the
+///     next anchor reset.
+///
+/// Byte-size observability is lazy: see [`ReplayRing::total_bytes`].
+/// Tokens are the dominant append path during LLM streaming and we
+/// refuse to pay a `serde_json::to_vec` on every one of them just to
+/// keep a running counter. Bytes are computed on demand at the
+/// truncation log line and through the `replay_ring_bytes()` accessor.
+#[derive(Debug)]
+struct ReplayRing {
+    entries: VecDeque<ReplayRingEntry>,
+    /// Sequence id of the most recent persisted Message; everything in
+    /// `entries` has seq > this. Starts at 0 for a fresh conversation.
+    anchor_seq: i64,
+    /// True iff the ring has overflowed since the last anchor reset.
+    /// Once true, subsequent appends are no-ops. Cleared by `reset`.
+    truncated: bool,
+}
+
+impl ReplayRing {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            anchor_seq: 0,
+            truncated: false,
+        }
+    }
+
+    /// Anchor reset on persisted Message broadcast. Clears entries,
+    /// advances anchor, clears truncation flag.
+    fn reset(&mut self, new_anchor: i64) {
+        self.entries.clear();
+        self.anchor_seq = new_anchor;
+        self.truncated = false;
+    }
+
+    /// Append an entry. If accepting it would exceed `REPLAY_RING_CAPACITY`,
+    /// transition to truncated state: clear the ring and set
+    /// `truncated = true`. Subsequent appends within this anchor window
+    /// are no-ops. The next `reset` clears the truncated flag.
+    ///
+    /// Concurrent-allocation safety: `SseBroadcaster::send_seq` allocates
+    /// `next_seq()` outside this ring mutex, then builds the event, then
+    /// re-acquires the mutex to append. Two concurrent senders can
+    /// therefore interleave such that a higher seq locks the ring first
+    /// and a lower seq locks second. Two guards keep the ring consistent:
+    ///
+    /// 1. Entries with `seq <= anchor_seq` are dropped on append. Covers
+    ///    the case where a persisted-Message broadcast slips in between
+    ///    a sender's `next_seq` and its ring-append: the anchor advances
+    ///    past the late sender's seq, and the late entry is for a
+    ///    superseded message anyway.
+    /// 2. `snapshot()` sorts entries by `sequence_id`. Out-of-order
+    ///    insertion at append time is then corrected at read time, so
+    ///    replay delivers events in the order the client's
+    ///    `applyIfNewer` expects.
+    fn append(&mut self, entry: ReplayRingEntry) {
+        if self.truncated {
+            return;
+        }
+        // Concurrent-allocation guard #1: drop seqs that no longer beat
+        // the current anchor. A persisted Message broadcast may have
+        // raced ahead of this sender, advancing the anchor past its seq.
+        if entry.sequence_id <= self.anchor_seq {
+            tracing::trace!(
+                target: "phoenix_ide::replay_ring",
+                seq = entry.sequence_id,
+                anchor = self.anchor_seq,
+                "ReplayRing append dropped: seq below anchor (concurrent reset raced ahead)"
+            );
+            return;
+        }
+        if self.entries.len() >= REPLAY_RING_CAPACITY {
+            // One-shot bytes computation at the truncation transition.
+            // This is the only place we pay the serialisation cost during
+            // an anchor window — ops gets a useful "what was in the ring
+            // when it overflowed?" data point without making every token
+            // append a hot-path serde call.
+            let bytes = self.total_bytes();
+            tracing::warn!(
+                target: "phoenix_ide::replay_ring",
+                cap = REPLAY_RING_CAPACITY,
+                anchor = self.anchor_seq,
+                bytes,
+                "ReplayRing capacity reached; clearing and entering truncated mode (next subscribe will force-resync)"
+            );
+            self.entries.clear();
+            self.truncated = true;
+            return;
+        }
+        tracing::trace!(
+            target: "phoenix_ide::replay_ring",
+            seq = entry.sequence_id,
+            entries = self.entries.len() + 1,
+            "ReplayRing append"
+        );
+        self.entries.push_back(entry);
+    }
+
+    /// Snapshot for delivery in `SseEvent::Init`: returns the anchor, the
+    /// truncated flag, and a clone of the entries (empty if truncated, per
+    /// Q3 resolution: force full resync rather than partial replay).
+    ///
+    /// Concurrent-allocation guard #2: entries are sorted by
+    /// `sequence_id` here. The append path can receive entries out of seq
+    /// order when two senders race between `next_seq()` and the ring
+    /// mutex (see [`ReplayRing::append`] for details). The client's
+    /// `applyIfNewer` reducer relies on strictly increasing seqs to apply
+    /// per-event rules, so the read path establishes the ordering rather
+    /// than the write path (which would require holding seq allocation
+    /// inside the ring mutex and serialising every broadcast).
+    fn snapshot(&self) -> (i64, bool, Vec<SseEvent>) {
+        let events = if self.truncated {
+            Vec::new()
+        } else {
+            let mut entries: Vec<&ReplayRingEntry> = self.entries.iter().collect();
+            entries.sort_by_key(|e| e.sequence_id);
+            entries.into_iter().map(|e| e.event.clone()).collect()
+        };
+        (self.anchor_seq, self.truncated, events)
+    }
+
+    /// Aggregate serialised JSON byte length across current ring entries.
+    /// Lazy / on-demand — iterates and serialises each entry via the
+    /// `SseWireEvent` conversion (matching the production wire path).
+    /// NOT a hot-path metric: call from the truncation log line or the
+    /// `replay_ring_bytes()` ops accessor, not from per-event append.
+    fn total_bytes(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|e| {
+                let wire: crate::api::wire::SseWireEvent = e.event.clone().into();
+                serde_json::to_vec(&wire).map(|v| v.len()).unwrap_or(0)
+            })
+            .sum()
+    }
+}
+
+/// What to do with the per-conversation `ReplayRing` when broadcasting an
+/// event. The variant is determined at the public-API surface (e.g.
+/// `send_persisted_message` selects `Anchor`; `send_seq` selects `Append`),
+/// not inferred from the `SseEvent` variant — because two different code
+/// paths emit `SseEvent::Message` (persisted vs eager) and the ring
+/// lifecycle differs between them.
+#[derive(Debug, Clone, Copy)]
+enum RingOp {
+    /// Reset the ring with `seq` as the new anchor. Used by the persisted
+    /// Message broadcast path (the DB row is now durable; ephemeral events
+    /// below this seq need not be replayed).
+    Anchor,
+    /// Append the event to the ring. Used for ephemeral events emitted via
+    /// `send_seq` and for eager (non-persisted) Message broadcasts.
+    Append,
+}
+
 /// Per-conversation SSE broadcaster with monotonic `sequence_id` allocation.
 ///
 /// Every [`SseEvent`] emitted for a conversation carries a `sequence_id` drawn
@@ -139,18 +319,28 @@ pub const SSE_BROADCAST_CAPACITY: usize = 4096;
 /// first obtaining a `sequence_id` from here, which means the total-order
 /// invariant is enforced by the type rather than by caller discipline.
 ///
-/// Two broadcast paths exist:
+/// Three broadcast paths exist:
 ///
 /// 1. **Ephemeral/derived events** (`Token`, `StateChange`, `MessageUpdated`, …) —
 ///    allocate a fresh id via [`SseBroadcaster::next_seq`] or use
 ///    [`SseBroadcaster::send_seq`], which hands the id to a construction
-///    closure so the caller cannot forget to insert it.
+///    closure so the caller cannot forget to insert it. These append to
+///    the `ReplayRing` so a reconnect mid-turn can replay them.
 ///
 /// 2. **Persisted `Message` events** already carry a `message.sequence_id`
 ///    allocated by `add_message` in the DB layer. Use
-///    [`SseBroadcaster::send_message`], which reuses that id and atomically
-///    advances the broadcaster's counter past it so ephemeral events emitted
-///    afterwards are ordered strictly after the message.
+///    [`SseBroadcaster::send_persisted_message`], which reuses that id,
+///    advances the broadcaster's counter past it, and **resets** the
+///    `ReplayRing` anchor (the DB row is now durable, so ephemeral events
+///    below it are no longer needed for replay).
+///
+/// 3. **Eager (non-persisted) Message events** are broadcast before their
+///    corresponding `persist_checkpoint` runs (see
+///    `Effect::BroadcastAssistantMessage`). Use
+///    [`SseBroadcaster::send_ephemeral_message`], which appends to the
+///    `ReplayRing` like an ephemeral event so reconnecting clients still
+///    see the in-flight assistant message. The eventual persisted Message
+///    with the same `message_id` will fire path #2, clearing this entry.
 #[derive(Clone)]
 pub struct SseBroadcaster {
     tx: broadcast::Sender<SseEvent>,
@@ -159,6 +349,11 @@ pub struct SseBroadcaster {
     /// bumps this value up to at least `s` so message-originated ids integrate
     /// into the same total order.
     last_seq: Arc<AtomicI64>,
+    /// Per-conversation `ReplayRing` (`sse_wire.allium`). Shared across
+    /// clones of this `SseBroadcaster` so every broadcast path mutates
+    /// the same buffer. Mutex contention is acceptable: every broadcast
+    /// is already serialised through tokio's broadcast channel.
+    ring: Arc<Mutex<ReplayRing>>,
 }
 
 impl SseBroadcaster {
@@ -167,10 +362,17 @@ impl SseBroadcaster {
     /// `initial_last_seq` is the highest `sequence_id` the client can already
     /// have observed (typically `db.get_last_sequence_id(conversation_id)`).
     /// The next allocated id will be `initial_last_seq + 1`.
+    ///
+    /// The `ReplayRing` is seeded with `anchor_seq = initial_last_seq` so
+    /// the first ephemeral event broadcast has its seq strictly greater
+    /// than the anchor.
     pub fn from_sender(tx: broadcast::Sender<SseEvent>, initial_last_seq: i64) -> Self {
+        let mut ring = ReplayRing::new();
+        ring.anchor_seq = initial_last_seq;
         Self {
             tx,
             last_seq: Arc::new(AtomicI64::new(initial_last_seq)),
+            ring: Arc::new(Mutex::new(ring)),
         }
     }
 
@@ -217,33 +419,103 @@ impl SseBroadcaster {
         self.tx.receiver_count()
     }
 
-    /// Send an event that has already been stamped with a `sequence_id`.
-    /// Private on purpose — callers must go through [`SseBroadcaster::send_seq`]
-    /// or [`SseBroadcaster::send_message`] so the stamping is done at the
-    /// broadcaster and forgetting a `sequence_id` is a compile error.
+    /// Send an event that has already been stamped with a `sequence_id`,
+    /// applying the requested `ReplayRing` operation atomically with the
+    /// broadcast.
+    ///
+    /// Order: the ring mutation happens **before** the channel send. This
+    /// guarantees that any concurrent subscriber observing the ring after
+    /// the broadcast sees a state consistent with what the live channel
+    /// would deliver — never a state where the broadcast happened but the
+    /// ring lifecycle hasn't yet (which would let a fresh subscribe miss
+    /// an event in the gap).
     ///
     /// Returns `Ok(receiver_count)` on success, `Err(())` when the channel has
     /// no active receivers. The error payload is discarded on purpose —
     /// `broadcast::error::SendError<SseEvent>` is ~320 bytes, which triggers
     /// clippy's `result_large_err` lint, and every call site here only ever
     /// reads `.is_err()`.
-    fn send(&self, event: SseEvent) -> Result<usize, ()> {
+    fn send_with_ring(&self, event: SseEvent, seq: i64, op: RingOp) -> Result<usize, ()> {
+        match op {
+            RingOp::Anchor => {
+                self.ring.lock().expect("ReplayRing mutex").reset(seq);
+            }
+            RingOp::Append => {
+                self.ring
+                    .lock()
+                    .expect("ReplayRing mutex")
+                    .append(ReplayRingEntry {
+                        event: event.clone(),
+                        sequence_id: seq,
+                    });
+            }
+        }
         self.tx.send(event).map_err(|_| ())
     }
 
-    /// Allocate the next `sequence_id`, pass it to `build`, and broadcast the
-    /// resulting event. The closure's signature forces the caller to place the
-    /// id on the event — forgetting is a compile error.
+    /// Allocate the next `sequence_id`, pass it to `build`, broadcast the
+    /// resulting event, and append it to the `ReplayRing` so reconnects
+    /// can replay it. The closure's signature forces the caller to place
+    /// the id on the event — forgetting is a compile error.
     pub fn send_seq(&self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
         let seq = self.next_seq();
-        self.send(build(seq))
+        let event = build(seq);
+        self.send_with_ring(event, seq, RingOp::Append)
     }
 
-    /// Broadcast a `Message` event using the DB-allocated `message.sequence_id`,
-    /// then advance the broadcaster's counter past it.
+    /// Broadcast a persisted `Message` event using the DB-allocated
+    /// `message.sequence_id`, advance the broadcaster's counter, AND reset
+    /// the `ReplayRing` anchor (the DB row is now durable, so ephemeral
+    /// events below this seq are no longer needed for replay).
+    pub fn send_persisted_message(&self, message: crate::db::Message) -> Result<usize, ()> {
+        let seq = message.sequence_id;
+        self.observe_seq(seq);
+        self.send_with_ring(SseEvent::Message { message }, seq, RingOp::Anchor)
+    }
+
+    /// Backward-compatible alias for [`SseBroadcaster::send_persisted_message`].
+    /// Existing call sites that broadcast persisted messages can keep using
+    /// `send_message`; the eager (non-persisted) path is the new entry point
+    /// [`SseBroadcaster::send_ephemeral_message`].
     pub fn send_message(&self, message: crate::db::Message) -> Result<usize, ()> {
-        self.observe_seq(message.sequence_id);
-        self.send(SseEvent::Message { message })
+        self.send_persisted_message(message)
+    }
+
+    /// Broadcast an eager (non-persisted) `Message` event and append it to
+    /// the `ReplayRing` WITHOUT resetting the anchor. Used by
+    /// `Effect::BroadcastAssistantMessage` to deliver the in-flight assistant
+    /// message during a tool round, before `persist_checkpoint` produces the
+    /// durable DB row.
+    ///
+    /// The eventual persisted Message with the same `message_id` will go
+    /// through [`SseBroadcaster::send_persisted_message`] when the tool round
+    /// checkpoints, which resets the ring (discarding this entry) and emits
+    /// a duplicate `sse_message` that the UI dedups via
+    /// `SseMessageDedupReplay`.
+    pub fn send_ephemeral_message(&self, message: crate::db::Message) -> Result<usize, ()> {
+        let seq = message.sequence_id;
+        self.observe_seq(seq);
+        self.send_with_ring(SseEvent::Message { message }, seq, RingOp::Append)
+    }
+
+    /// Atomic snapshot of the `ReplayRing` for delivery in `SseEvent::Init`.
+    /// Returns `(pending_anchor_sequence_id, pending_truncated,
+    /// pending_events)`. When truncated, `pending_events` is empty — forcing
+    /// a full DB-only resync on the client side per the Q3 resolution in
+    /// `sse_wire.allium`.
+    pub fn snapshot_pending(&self) -> (i64, bool, Vec<SseEvent>) {
+        self.ring.lock().expect("ReplayRing mutex").snapshot()
+    }
+
+    /// Aggregate serialised byte size of `ReplayRing` entries, computed
+    /// on demand. Observability-only; exposed for callers that want to
+    /// surface the metric (e.g. a future ops dashboard / Prometheus gauge).
+    ///
+    /// Cost: O(entries) serialisations. Do not call on the hot path —
+    /// scrape periodically from a gauge collector or read at truncation
+    /// time only.
+    pub fn replay_ring_bytes(&self) -> usize {
+        self.ring.lock().expect("ReplayRing mutex").total_bytes()
     }
 }
 
@@ -1424,5 +1696,313 @@ mod broadcaster_tests {
         b.observe_seq(2);
         let next = b.next_seq();
         assert_eq!(next, 3, "broadcaster must allocate past the DB watermark");
+    }
+
+    // ── ReplayRing ──────────────────────────────────────────────────────
+
+    /// Make a test `Token` event with the given seq. Token is the
+    /// dominant ring entry in practice; using it keeps the byte-size
+    /// estimate small and the assertions readable.
+    fn token_event(seq: i64, text: &str) -> SseEvent {
+        SseEvent::Token {
+            sequence_id: seq,
+            text: text.to_string(),
+            request_id: "test-req".to_string(),
+        }
+    }
+
+    /// Build a minimal `crate::db::Message` for ring tests. Persisted vs
+    /// ephemeral selection happens at the broadcaster API layer, not via
+    /// any field on the struct itself.
+    fn test_message(seq: i64, message_id: &str) -> crate::db::Message {
+        use crate::db::{MessageContent, MessageType};
+        use chrono::Utc;
+        crate::db::Message {
+            message_id: message_id.to_string(),
+            conversation_id: "test-conv".to_string(),
+            sequence_id: seq,
+            message_type: MessageType::Agent,
+            content: MessageContent::agent(vec![crate::llm::ContentBlock::text("hi")]),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// Fresh broadcaster: ring is empty, anchor matches `initial_last_seq`,
+    /// truncated is false.
+    #[test]
+    fn replay_ring_starts_empty_and_anchored_at_initial_seq() {
+        let b = SseBroadcaster::new(16, 5);
+        let (anchor, truncated, events) = b.snapshot_pending();
+        assert_eq!(anchor, 5, "anchor should match initial_last_seq");
+        assert!(!truncated);
+        assert!(events.is_empty());
+        assert_eq!(b.replay_ring_bytes(), 0);
+    }
+
+    /// `send_seq` (ephemeral) appends the event to the ring.
+    #[test]
+    fn send_seq_appends_to_replay_ring() {
+        let b = SseBroadcaster::new(16, 0);
+        // A subscriber is required for the channel send to succeed; otherwise
+        // `tx.send` would return SendError. The ring path runs first, so the
+        // append happens even with no subscriber, but for parity with real
+        // usage we attach one.
+        let _rx = b.subscribe();
+
+        let _ = b.send_seq(|seq| token_event(seq, "hello"));
+        let _ = b.send_seq(|seq| token_event(seq, "world"));
+
+        let (anchor, truncated, events) = b.snapshot_pending();
+        assert_eq!(anchor, 0, "no persisted Message yet; anchor stays at 0");
+        assert!(!truncated);
+        assert_eq!(events.len(), 2);
+        assert!(b.replay_ring_bytes() > 0);
+
+        // Replayed events carry their original seqs.
+        match &events[0] {
+            SseEvent::Token {
+                sequence_id, text, ..
+            } => {
+                assert_eq!(*sequence_id, 1);
+                assert_eq!(text, "hello");
+            }
+            other => panic!("expected Token, got {other:?}"),
+        }
+        match &events[1] {
+            SseEvent::Token { sequence_id, .. } => assert_eq!(*sequence_id, 2),
+            other => panic!("expected Token, got {other:?}"),
+        }
+    }
+
+    /// `send_persisted_message` resets the ring: anchor advances, entries
+    /// clear, truncated flag clears, byte counter resets.
+    #[test]
+    fn send_persisted_message_resets_ring_anchor() {
+        let b = SseBroadcaster::new(16, 0);
+        let _rx = b.subscribe();
+
+        // Two ephemeral events sit in the ring.
+        let _ = b.send_seq(|seq| token_event(seq, "a"));
+        let _ = b.send_seq(|seq| token_event(seq, "b"));
+
+        // Persisted message arrives.
+        let msg = test_message(3, "msg-1");
+        let _ = b.send_persisted_message(msg);
+
+        let (anchor, truncated, events) = b.snapshot_pending();
+        assert_eq!(anchor, 3, "anchor advances to the persisted message's seq");
+        assert!(!truncated);
+        assert!(events.is_empty(), "ring entries cleared on anchor reset");
+        assert_eq!(b.replay_ring_bytes(), 0);
+    }
+
+    /// `send_ephemeral_message` appends a `Message` event to the ring
+    /// without resetting the anchor — the eager-broadcast path.
+    #[test]
+    fn send_ephemeral_message_appends_without_reset() {
+        let b = SseBroadcaster::new(16, 0);
+        let _rx = b.subscribe();
+
+        // First, a real anchor.
+        let _ = b.send_persisted_message(test_message(1, "anchor"));
+        // Then an ephemeral state_change.
+        let _ = b.send_seq(|seq| SseEvent::Token {
+            sequence_id: seq,
+            text: "x".to_string(),
+            request_id: "r".to_string(),
+        });
+        // Then the eager assistant message.
+        let _ = b.send_ephemeral_message(test_message(3, "eager"));
+
+        let (anchor, truncated, events) = b.snapshot_pending();
+        assert_eq!(anchor, 1, "eager message does not advance the anchor");
+        assert!(!truncated);
+        assert_eq!(events.len(), 2, "token + eager message both in ring");
+        match &events[1] {
+            SseEvent::Message { message } => assert_eq!(message.message_id, "eager"),
+            other => panic!("expected Message, got {other:?}"),
+        }
+    }
+
+    /// Overflow: appending past `REPLAY_RING_CAPACITY` triggers
+    /// clear-and-truncate; subsequent appends are no-ops; snapshot returns
+    /// `truncated=true` and empty events (force full resync, Q3 resolution).
+    #[test]
+    fn replay_ring_overflow_clears_and_truncates() {
+        let b = SseBroadcaster::new(REPLAY_RING_CAPACITY * 2, 0);
+        let _rx = b.subscribe();
+
+        // Fill the ring exactly to capacity.
+        for i in 0..REPLAY_RING_CAPACITY {
+            let _ = b.send_seq(|seq| token_event(seq, &format!("t{i}")));
+        }
+        {
+            let (_, truncated, events) = b.snapshot_pending();
+            assert!(!truncated, "exactly-at-capacity is not yet truncated");
+            assert_eq!(events.len(), REPLAY_RING_CAPACITY);
+        }
+
+        // One more pushes past the cap — clear and truncate.
+        let _ = b.send_seq(|seq| token_event(seq, "overflow"));
+        let (anchor, truncated, events) = b.snapshot_pending();
+        assert_eq!(anchor, 0, "anchor unchanged across overflow");
+        assert!(truncated, "ring should be marked truncated");
+        assert!(
+            events.is_empty(),
+            "snapshot returns empty events on truncation"
+        );
+        assert_eq!(b.replay_ring_bytes(), 0);
+
+        // Further appends are no-ops within this anchor window.
+        let _ = b.send_seq(|seq| token_event(seq, "after-truncate"));
+        let (_, truncated2, events2) = b.snapshot_pending();
+        assert!(truncated2);
+        assert!(events2.is_empty());
+    }
+
+    /// Persisted Message after truncation clears the truncated flag.
+    #[test]
+    fn persisted_message_clears_truncated_flag() {
+        let b = SseBroadcaster::new(REPLAY_RING_CAPACITY * 2, 0);
+        let _rx = b.subscribe();
+
+        // Overflow.
+        for i in 0..=REPLAY_RING_CAPACITY {
+            let _ = b.send_seq(|seq| token_event(seq, &format!("t{i}")));
+        }
+        assert!(b.snapshot_pending().1, "should be truncated");
+
+        // Persisted message resets.
+        let next_seq = b.next_seq();
+        let _ = b.send_persisted_message(test_message(next_seq, "msg"));
+
+        let (anchor, truncated, events) = b.snapshot_pending();
+        assert_eq!(anchor, next_seq);
+        assert!(!truncated, "anchor reset clears truncated flag");
+        assert!(events.is_empty());
+
+        // Future appends accumulate normally.
+        let _ = b.send_seq(|seq| token_event(seq, "post-reset"));
+        let (_, _, events) = b.snapshot_pending();
+        assert_eq!(events.len(), 1);
+    }
+
+    /// Ring entries appear in strictly increasing `sequence_id` order
+    /// (preserved by FIFO append + anchor-reset clear).
+    #[test]
+    fn replay_ring_entries_in_seq_order() {
+        let b = SseBroadcaster::new(64, 10);
+        let _rx = b.subscribe();
+        for i in 0..20 {
+            let _ = b.send_seq(|seq| token_event(seq, &format!("t{i}")));
+        }
+        let (_, _, events) = b.snapshot_pending();
+        let seqs: Vec<i64> = events
+            .iter()
+            .map(|e| match e {
+                SseEvent::Token { sequence_id, .. } => *sequence_id,
+                _ => unreachable!(),
+            })
+            .collect();
+        for w in seqs.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "entries must be in strictly increasing seq order"
+            );
+        }
+    }
+
+    /// Snapshot returns entries sorted by `sequence_id` even when
+    /// appends arrive out of seq order. Models the
+    /// `next_seq` → build → ring-mutex race where two tasks allocate
+    /// in one order and lock the ring in the opposite order.
+    #[test]
+    fn replay_ring_snapshot_sorts_out_of_order_appends() {
+        let mut ring = ReplayRing::new();
+        // Two tasks: A allocated seq 5 first, B allocated 6 second.
+        // B raced ahead and appended first.
+        ring.append(ReplayRingEntry {
+            event: token_event(6, "b"),
+            sequence_id: 6,
+        });
+        ring.append(ReplayRingEntry {
+            event: token_event(5, "a"),
+            sequence_id: 5,
+        });
+
+        let (_, _, events) = ring.snapshot();
+        assert_eq!(events.len(), 2);
+        let seqs: Vec<i64> = events
+            .iter()
+            .map(|e| {
+                let SseEvent::Token { sequence_id, .. } = e else {
+                    unreachable!()
+                };
+                *sequence_id
+            })
+            .collect();
+        assert_eq!(
+            seqs,
+            vec![5, 6],
+            "snapshot must sort entries by sequence_id"
+        );
+    }
+
+    /// An append with `sequence_id <= anchor_seq` is dropped. Models the
+    /// race where a persisted-Message broadcast advances the anchor
+    /// between a sender's `next_seq` and the sender's ring-mutex acquire.
+    #[test]
+    fn replay_ring_append_below_anchor_dropped() {
+        let mut ring = ReplayRing::new();
+        ring.anchor_seq = 10;
+
+        // Late append with seq <= anchor: dropped.
+        ring.append(ReplayRingEntry {
+            event: token_event(8, "stale"),
+            sequence_id: 8,
+        });
+        ring.append(ReplayRingEntry {
+            event: token_event(10, "boundary"),
+            sequence_id: 10,
+        });
+        // Above anchor: accepted.
+        ring.append(ReplayRingEntry {
+            event: token_event(11, "fresh"),
+            sequence_id: 11,
+        });
+
+        let (anchor, _, events) = ring.snapshot();
+        assert_eq!(anchor, 10);
+        assert_eq!(events.len(), 1, "only seq=11 should remain");
+        let SseEvent::Token { sequence_id, .. } = &events[0] else {
+            unreachable!()
+        };
+        assert_eq!(*sequence_id, 11);
+    }
+
+    /// Every ring entry has seq strictly greater than the ring's anchor.
+    #[test]
+    fn replay_ring_entries_above_anchor() {
+        let b = SseBroadcaster::new(64, 0);
+        let _rx = b.subscribe();
+
+        let _ = b.send_persisted_message(test_message(5, "anchor"));
+        for i in 0..5 {
+            let _ = b.send_seq(|seq| token_event(seq, &format!("t{i}")));
+        }
+
+        let (anchor, _, events) = b.snapshot_pending();
+        assert_eq!(anchor, 5);
+        for e in events {
+            let SseEvent::Token {
+                sequence_id: seq, ..
+            } = e
+            else {
+                unreachable!()
+            };
+            assert!(seq > anchor, "every entry's seq must exceed anchor");
+        }
     }
 }

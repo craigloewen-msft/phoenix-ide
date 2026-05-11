@@ -51,6 +51,24 @@ pub trait MessageStore: Send + Sync {
         usage_data: Option<&UsageData>,
     ) -> Result<Message, String>;
 
+    /// Like `add_message_with_seq`, but writes a caller-supplied
+    /// `created_at` instead of `Utc::now()`. Used by `persist_checkpoint`
+    /// to align the durable DB row's timestamp with the eager-broadcast
+    /// `AssistantMessage` timestamp atomically (single INSERT), so there
+    /// is no window where a concurrent reconnect's init read could see
+    /// a transient `Utc::now()` value before the alignment write lands.
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_with_seq_at(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Message, String>;
+
     /// Get all messages for a conversation
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String>;
 
@@ -210,6 +228,30 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
                 content,
                 display_data,
                 usage_data,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_with_seq_at(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Message, String> {
+        (**self)
+            .add_message_with_seq_at(
+                message_id,
+                conv_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+                created_at,
             )
             .await
     }
@@ -391,6 +433,31 @@ impl MessageStore for DatabaseStorage {
                 content,
                 display_data,
                 usage_data,
+            )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_with_seq_at(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Message, String> {
+        self.db
+            .add_message_with_seq_at(
+                message_id,
+                conv_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+                created_at,
             )
             .await
             .map_err(|e| e.to_string())
