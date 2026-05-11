@@ -26,6 +26,15 @@ const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const REFRESH_SKEW_SECS: i64 = 30;
 pub const CODEX_BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 
+/// Context-window cap enforced by the ChatGPT-backend codex bridge,
+/// regardless of the model's platform-API ceiling. Sourced from
+/// `~/.codex/models_cache.json` — every gpt-5.x model lists `context_window:
+/// 272000`, and the bridge returns `context_length_exceeded` past that point
+/// even when the underlying model supports more (gpt-5.5 supports 1M via
+/// the platform API). Applied at registry construction when the bridge route
+/// is selected for an `OpenAI` model.
+pub const CODEX_BRIDGE_CONTEXT_WINDOW: usize = 272_000;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CodexAuthError {
     #[error("codex auth file not found at {0:?} — run `codex login` first")]

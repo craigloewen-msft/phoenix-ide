@@ -160,6 +160,10 @@ impl LlmService for LlmServiceImpl {
     fn model_id(&self) -> &str {
         &self.spec.id
     }
+
+    fn uses_codex_bridge(&self) -> bool {
+        self.use_codex_backend
+    }
 }
 
 impl LlmServiceImpl {

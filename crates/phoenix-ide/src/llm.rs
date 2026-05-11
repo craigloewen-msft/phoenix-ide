@@ -71,7 +71,7 @@ mod service;
 pub(crate) mod sse;
 mod types;
 
-pub use codex_credential::{CodexCredential, CODEX_BACKEND_URL};
+pub use codex_credential::{CodexCredential, CODEX_BACKEND_URL, CODEX_BRIDGE_CONTEXT_WINDOW};
 pub use credential_helper::{CredentialHelper, CredentialStatus};
 pub use discovery::{discover_models, probe_gateway, DiscoveryConfig};
 pub use error::{LlmError, LlmErrorKind};
@@ -121,6 +121,14 @@ pub trait LlmService: Send + Sync {
 
     /// Get the model ID
     fn model_id(&self) -> &str;
+
+    /// True if this service routes through the ChatGPT-backend codex bridge.
+    /// Consumed by [`crate::llm::ModelSpec::context_window_for`] to apply the
+    /// bridge's 272K cap regardless of the model's platform-API ceiling.
+    /// Default `false` covers Anthropic, mock, and gateway/direct `OpenAI`.
+    fn uses_codex_bridge(&self) -> bool {
+        false
+    }
 }
 
 /// Logging wrapper for LLM services
@@ -202,5 +210,9 @@ impl LlmService for LoggingService {
 
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    fn uses_codex_bridge(&self) -> bool {
+        self.inner.uses_codex_bridge()
     }
 }

@@ -585,7 +585,7 @@ impl ModelRegistry {
             {
                 if let Some(service) = Self::try_create_model(&spec, config) {
                     services.insert(spec.id.clone(), service);
-                    specs.insert(spec.id.clone(), spec.clone());
+                    specs.insert(spec.id.clone(), spec);
                 }
             }
         }
@@ -767,11 +767,18 @@ impl ModelRegistry {
 
     /// Get the context window size for a model (REQ-BED-022)
     pub fn context_window(&self, model_id: &str) -> usize {
-        self.specs
-            .read()
-            .ok()
-            .and_then(|map| map.get(model_id).map(|s| s.context_window))
-            .unwrap_or(crate::state_machine::state::DEFAULT_CONTEXT_WINDOW)
+        let default = crate::state_machine::state::DEFAULT_CONTEXT_WINDOW;
+        let specs = self.specs.read().ok();
+        let services = self.services.read().ok();
+        match (specs.as_deref(), services.as_deref()) {
+            (Some(specs), Some(services)) => specs
+                .get(model_id)
+                .zip(services.get(model_id))
+                .map_or(default, |(spec, service)| {
+                    spec.context_window_for(service.as_ref())
+                }),
+            _ => default,
+        }
     }
 
     /// List all available model IDs
@@ -788,12 +795,12 @@ impl ModelRegistry {
         let specs = self.specs.read().expect("specs lock poisoned");
         let mut model_infos = Vec::new();
         for (model_id, spec) in specs.iter() {
-            if services.contains_key(model_id) {
+            if let Some(service) = services.get(model_id) {
                 model_infos.push(crate::api::ModelInfo {
                     id: spec.id.clone(),
                     provider: spec.provider.display_name().to_string(),
                     description: spec.description.clone(),
-                    context_window: spec.context_window,
+                    context_window: spec.context_window_for(service.as_ref()),
                     recommended: spec.recommended,
                 });
             }
