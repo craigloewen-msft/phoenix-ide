@@ -202,6 +202,12 @@ struct ResponsesStreamAccumulator {
     output_items: Vec<ResponsesApiOutput>,
     /// Set true when `response.done` is received.
     pub done: bool,
+    /// Logged-once flag: first empty-`dispatch_type` event per stream gets a
+    /// truncated payload dump at debug, subsequent ones are silent. Gateways
+    /// that omit the SSE `event:` line **and** the JSON `type` field are
+    /// otherwise opaque — capturing one example per stream is enough to
+    /// classify the wire shape next time the success path stops working.
+    logged_empty_dispatch: bool,
 }
 
 impl ResponsesStreamAccumulator {
@@ -211,6 +217,7 @@ impl ResponsesStreamAccumulator {
             output_tokens: 0,
             output_items: Vec::new(),
             done: false,
+            logged_empty_dispatch: false,
         }
     }
 
@@ -348,10 +355,62 @@ impl ResponsesStreamAccumulator {
                 } else {
                     tracing::warn!(data, "responses_api terminal event had no /response/usage");
                 }
+                // Fallback: recover the assembled output from the terminal
+                // event's `/response/output` array when no per-item.done
+                // events arrived. Observed against the AI gateway path on
+                // 2026-05-11: stream emitted `response.output_item.added` +
+                // `response.content_part.added` + several events with no
+                // SSE `event:` line and no JSON `type` field, then
+                // `response.completed` — no `response.output_item.done`.
+                // Per-item events captured nothing, the terminal payload
+                // contained the full assembled message, and Phoenix
+                // persisted an empty agent message ("end_turn with empty
+                // content"). Reading /response/output as authoritative
+                // here removes the single-event dependency.
+                if self.output_items.is_empty() {
+                    if let Some(arr) = v
+                        .pointer("/response/output")
+                        .and_then(serde_json::Value::as_array)
+                    {
+                        for item in arr {
+                            match serde_json::from_value::<ResponsesApiOutput>(item.clone()) {
+                                Ok(output) => self.output_items.push(output),
+                                Err(e) => tracing::warn!(
+                                    error = %e,
+                                    item = %item,
+                                    "responses_api response.completed fallback: output item deserialize failed"
+                                ),
+                            }
+                        }
+                        if !self.output_items.is_empty() {
+                            tracing::info!(
+                                n = self.output_items.len(),
+                                "responses_api recovered output from response.completed \
+                                 (no per-item.done events seen on stream)"
+                            );
+                        }
+                    }
+                }
                 self.done = true;
             }
             _ => {
                 tracing::debug!(dispatch_type, "responses_api ignoring event");
+                if dispatch_type.is_empty() && !self.logged_empty_dispatch {
+                    self.logged_empty_dispatch = true;
+                    // Char-aware truncation — slicing by byte index would
+                    // panic on a non-UTF8 boundary.
+                    let truncated: String = data.chars().take(500).collect();
+                    let suffix = if data.len() > truncated.len() {
+                        format!("…[truncated from {} bytes]", data.len())
+                    } else {
+                        String::new()
+                    };
+                    tracing::debug!(
+                        event_type = %event_type,
+                        data = %format!("{truncated}{suffix}"),
+                        "responses_api empty-dispatch event — first occurrence in this stream"
+                    );
+                }
             }
         }
         Ok(())
@@ -1290,6 +1349,74 @@ mod tests {
             .process_event("response.incomplete", data, &tx)
             .unwrap_err();
         assert_eq!(err.kind, LlmErrorKind::ServerError);
+    }
+
+    /// When the stream lacks `response.output_item.done` events but
+    /// `response.completed` carries `/response/output: [...]`, the terminal
+    /// payload is authoritative — fall back to it instead of dropping the
+    /// assembled message. Repro of the 2026-05-11 gateway behaviour where
+    /// `support-chat-completions` produced 5 output tokens, was billed for
+    /// them, but Phoenix persisted "end_turn with empty content".
+    #[test]
+    fn process_event_recovers_output_from_response_completed_when_no_item_done() {
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mut acc = ResponsesStreamAccumulator::new();
+        let data = r#"{
+            "type":"response.completed",
+            "response":{
+                "usage":{"input_tokens":320682,"output_tokens":5,"total_tokens":320687},
+                "output":[
+                    {"type":"message","role":"assistant","content":[
+                        {"type":"output_text","text":"Pong"}
+                    ]}
+                ]
+            }
+        }"#;
+        acc.process_event("response.completed", data, &tx)
+            .expect("response.completed handler should not error on valid payload");
+        assert!(acc.done, "response.completed should set done");
+        assert_eq!(
+            acc.output_items.len(),
+            1,
+            "fallback should recover the message from /response/output"
+        );
+        assert_eq!(acc.input_tokens, 320682);
+        assert_eq!(acc.output_tokens, 5);
+    }
+
+    /// If both `response.output_item.done` and `response.completed` carry
+    /// output, the per-item events win — don't double-count by appending the
+    /// terminal-event payload on top.
+    #[test]
+    fn process_event_fallback_skips_when_output_items_already_captured() {
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mut acc = ResponsesStreamAccumulator::new();
+        let item_done = r#"{
+            "type":"response.output_item.done",
+            "item":{"type":"message","role":"assistant","content":[
+                {"type":"output_text","text":"Pong"}
+            ]}
+        }"#;
+        let completed = r#"{
+            "type":"response.completed",
+            "response":{
+                "usage":{"input_tokens":10,"output_tokens":1},
+                "output":[
+                    {"type":"message","role":"assistant","content":[
+                        {"type":"output_text","text":"Pong"}
+                    ]}
+                ]
+            }
+        }"#;
+        acc.process_event("response.output_item.done", item_done, &tx)
+            .unwrap();
+        acc.process_event("response.completed", completed, &tx)
+            .unwrap();
+        assert_eq!(
+            acc.output_items.len(),
+            1,
+            "fallback must not duplicate items already captured via item.done"
+        );
     }
 }
 
