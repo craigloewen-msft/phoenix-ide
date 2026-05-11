@@ -188,6 +188,7 @@ LAUNCHD_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL
 LAUNCHD_INSTALL_DIR = Path.home() / ".phoenix-ide"
 LAUNCHD_LOG_PATH = Path.home() / ".phoenix-ide" / "prod.log"
 PROD_SHA_PATH = Path.home() / ".phoenix-ide" / "deployed.sha"
+NEWSYSLOG_CONF_PATH = Path("/etc/newsyslog.d") / f"{LAUNCHD_LABEL}.conf"
 
 # exe.dev LLM gateway configuration
 EXE_DEV_CONFIG = Path("/exe.dev/shelley.json")
@@ -3215,6 +3216,44 @@ def generate_launchd_plist(version: str, llm_gateway: str | None, extra_env: dic
 """
 
 
+def _ensure_newsyslog_config():
+    """Install /etc/newsyslog.d/<label>.conf for prod.log rotation.
+
+    Uses copy-truncate (`c` flag) so launchd's open stdout/stderr fd stays
+    valid across rotation. Daily at midnight, 14 generations, bzip2.
+    Idempotent: skips sudo if installed file already matches desired content.
+    """
+    import pwd
+    user = pwd.getpwuid(os.getuid()).pw_name
+    group = "staff"
+    desired = (
+        f"# Installed by ./dev.py prod deploy — log rotation for phoenix-ide.\n"
+        f"# logfilename                              [owner:group]    mode count size when  flags\n"
+        f"{LAUNCHD_LOG_PATH}    {user}:{group}    644  14    *    @T00  Jc\n"
+    )
+    try:
+        existing = NEWSYSLOG_CONF_PATH.read_text()
+        if existing == desired:
+            return  # Already installed, no sudo needed
+    except (FileNotFoundError, PermissionError):
+        pass
+
+    print(f"  Installing {NEWSYSLOG_CONF_PATH} (sudo required)…")
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", delete=False, suffix=".conf") as tmp:
+        tmp.write(desired)
+        tmp_path = tmp.name
+    try:
+        subprocess.run(
+            ["sudo", "install", "-m", "644", "-o", "root", "-g", "wheel",
+             tmp_path, str(NEWSYSLOG_CONF_PATH)],
+            check=True,
+        )
+        print(f"  ✓ Log rotation installed: daily @T00, 14 generations, bzip2, copy-truncate")
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
 def _launchd_stop_if_loaded():
     """Stop and unload the launchd service if it is currently loaded."""
     uid = os.getuid()
@@ -3247,6 +3286,9 @@ def launchd_prod_deploy(version: str | None = None):
             cwd=ROOT, capture_output=True, text=True,
         )
         version = f"dev-{result.stdout.strip()}"
+
+    # Install log rotation config (idempotent; sudo only if missing/stale)
+    _ensure_newsyslog_config()
 
     # Stop existing service
     _launchd_stop_if_loaded()
