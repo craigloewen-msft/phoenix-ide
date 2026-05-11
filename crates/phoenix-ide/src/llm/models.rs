@@ -148,14 +148,25 @@ pub fn all_models() -> Vec<ModelSpec> {
             supports_tool_search: true,
         },
         // OpenAI models
-        // GPT-5 models
+        // Context windows match the codex bridge defaults from
+        // ~/.codex/models_cache.json (the source-of-truth codex CLI uses).
+        // Earlier values were copy-pasted from OpenAI platform-API marketing
+        // (1M for 5.5, 400K for 5.4 family) — but codex caps every model at
+        // 272K by default. Conversations grew past the 90% continuation
+        // threshold without firing because the threshold was computed against
+        // the inflated 1M figure, then codex returned terminal
+        // `context_length_exceeded`.
+        //
+        // gpt-5.4 and codex-auto-review have a `max_context_window: 1M` in the
+        // codex cache (an opt-in higher ceiling), but the opt-in mechanism
+        // isn't wired up in Phoenix — TODO if a 1M-tier user wants it.
         ModelSpec {
             id: "gpt-5.5".into(),
             api_name: "gpt-5.5".into(),
             provider: Provider::OpenAI,
             api_format: ApiFormat::OpenAIResponses,
-            description: "GPT-5.5 (frontier, 1M context)".into(),
-            context_window: 1_000_000,
+            description: "GPT-5.5 (frontier)".into(),
+            context_window: 272_000,
             recommended: true,
             supports_tool_search: false,
         },
@@ -165,7 +176,8 @@ pub fn all_models() -> Vec<ModelSpec> {
             provider: Provider::OpenAI,
             api_format: ApiFormat::OpenAIResponses,
             description: "GPT-5.4 (frontier, native computer use)".into(),
-            context_window: 400_000,
+            // codex max_context_window: 1_000_000 (opt-in not implemented)
+            context_window: 272_000,
             recommended: false,
             supports_tool_search: false,
         },
@@ -175,7 +187,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             provider: Provider::OpenAI,
             api_format: ApiFormat::OpenAIResponses,
             description: "GPT-5.4 Mini (fast, efficient)".into(),
-            context_window: 400_000,
+            context_window: 272_000,
             recommended: true,
             supports_tool_search: false,
         },
@@ -186,7 +198,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             provider: Provider::OpenAI,
             api_format: ApiFormat::OpenAIResponses,
             description: "GPT-5.3 Codex (latest code model)".into(),
-            context_window: 200_000,
+            context_window: 272_000,
             recommended: true,
             supports_tool_search: false,
         },
