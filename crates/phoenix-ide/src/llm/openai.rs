@@ -120,6 +120,38 @@ pub async fn complete(
 // Streaming — Responses API
 // ---------------------------------------------------------------------------
 
+/// Map a Responses API error `code` + message to a typed `LlmError`.
+/// Substring match on `code` because `OpenAI` uses many code variants
+/// (e.g. `rate_limit_exceeded`, `requests_per_min_limit`).
+fn classify_responses_error(code: &str, message: &str) -> LlmError {
+    let detail = if code.is_empty() {
+        message.to_string()
+    } else {
+        format!("{code}: {message}")
+    };
+    let lower = code.to_ascii_lowercase();
+    if lower.contains("rate_limit") || lower.contains("quota") || lower.contains("requests_per") {
+        LlmError::rate_limit(detail)
+    } else if lower.contains("auth")
+        || lower.contains("invalid_api_key")
+        || lower.contains("permission")
+    {
+        LlmError::auth(detail)
+    } else if lower.contains("context_length")
+        || lower.contains("token_limit")
+        || lower.contains("max_tokens")
+    {
+        LlmError::new(super::LlmErrorKind::ContextWindowExceeded, detail)
+    } else if lower.contains("content_filter") || lower.contains("safety") {
+        LlmError::new(super::LlmErrorKind::ContentFilter, detail)
+    } else if lower.contains("invalid") || lower.contains("bad_request") {
+        LlmError::invalid_request(detail)
+    } else {
+        // Default: retryable server error so the executor's retry loop kicks in.
+        LlmError::server_error(detail)
+    }
+}
+
 /// Accumulates state across Responses API SSE stream events.
 struct ResponsesStreamAccumulator {
     input_tokens: u32,
@@ -140,6 +172,7 @@ impl ResponsesStreamAccumulator {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // dispatch table; each arm is small
     fn process_event(
         &mut self,
         event_type: &str,
@@ -189,6 +222,46 @@ impl ResponsesStreamAccumulator {
                         }
                     }
                 }
+            }
+            // Top-level stream error. Shape: { type, code, message, param, sequence_number }
+            "error" => {
+                let code = v
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let message = v
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("(no message)");
+                return Err(classify_responses_error(code, message));
+            }
+            // Terminal failure event. Shape: { type, response: { status: "failed", error: { code, message } } }
+            "response.failed" => {
+                let err = v.pointer("/response/error");
+                let code = err
+                    .and_then(|e| e.get("code"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let message = err
+                    .and_then(|e| e.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("(no message)");
+                return Err(classify_responses_error(code, message));
+            }
+            // Partial response — model stopped early. Shape: { response: { incomplete_details: { reason } } }
+            "response.incomplete" => {
+                let reason = v
+                    .pointer("/response/incomplete_details/reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                return Err(if reason == "content_filter" {
+                    LlmError::new(
+                        super::LlmErrorKind::ContentFilter,
+                        format!("Response incomplete: {reason}"),
+                    )
+                } else {
+                    LlmError::server_error(format!("Response incomplete: {reason}"))
+                });
             }
             // OpenAI Responses API terminal event. Task 583 spec incorrectly named
             // this "response.done" — the actual OpenAI spec uses "response.completed".
@@ -778,6 +851,77 @@ mod tests {
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["tags"]["disable_data_logging"], "true");
         assert_eq!(json["tags"]["foo"], "bar");
+    }
+
+    #[test]
+    fn classify_responses_error_maps_codes() {
+        use super::super::LlmErrorKind;
+        assert_eq!(
+            classify_responses_error("rate_limit_exceeded", "x").kind,
+            LlmErrorKind::RateLimit
+        );
+        assert_eq!(
+            classify_responses_error("requests_per_min_limit", "x").kind,
+            LlmErrorKind::RateLimit
+        );
+        assert_eq!(
+            classify_responses_error("invalid_api_key", "x").kind,
+            LlmErrorKind::Auth
+        );
+        assert_eq!(
+            classify_responses_error("context_length_exceeded", "x").kind,
+            LlmErrorKind::ContextWindowExceeded
+        );
+        assert_eq!(
+            classify_responses_error("content_filter", "x").kind,
+            LlmErrorKind::ContentFilter
+        );
+        assert_eq!(
+            classify_responses_error("invalid_request_error", "x").kind,
+            LlmErrorKind::InvalidRequest
+        );
+        // Unknown code defaults to retryable server error.
+        assert_eq!(
+            classify_responses_error("foo_bar_baz", "x").kind,
+            LlmErrorKind::ServerError
+        );
+        // Empty code falls back to message.
+        assert_eq!(
+            classify_responses_error("", "boom").kind,
+            LlmErrorKind::ServerError
+        );
+    }
+
+    #[test]
+    fn process_event_returns_err_on_top_level_error() {
+        use super::super::LlmErrorKind;
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mut acc = ResponsesStreamAccumulator::new();
+        let data = r#"{"type":"error","code":"rate_limit_exceeded","message":"slow down"}"#;
+        let err = acc.process_event("error", data, &tx).unwrap_err();
+        assert_eq!(err.kind, LlmErrorKind::RateLimit);
+    }
+
+    #[test]
+    fn process_event_returns_err_on_response_failed() {
+        use super::super::LlmErrorKind;
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mut acc = ResponsesStreamAccumulator::new();
+        let data = r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"upstream"}}}"#;
+        let err = acc.process_event("response.failed", data, &tx).unwrap_err();
+        assert_eq!(err.kind, LlmErrorKind::ServerError);
+    }
+
+    #[test]
+    fn process_event_returns_err_on_response_incomplete_max_tokens() {
+        use super::super::LlmErrorKind;
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mut acc = ResponsesStreamAccumulator::new();
+        let data = r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#;
+        let err = acc
+            .process_event("response.incomplete", data, &tx)
+            .unwrap_err();
+        assert_eq!(err.kind, LlmErrorKind::ServerError);
     }
 }
 
