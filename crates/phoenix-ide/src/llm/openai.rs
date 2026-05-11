@@ -133,6 +133,12 @@ pub async fn complete(
 /// Map a Responses API error `code` + message to a typed `LlmError`.
 /// Substring match on `code` because `OpenAI` uses many code variants
 /// (e.g. `rate_limit_exceeded`, `requests_per_min_limit`).
+///
+/// Codex-specific codes (`usage_limit_reached`, `usage_not_included`,
+/// `server_is_overloaded`, `slow_down`) route to the same terminal variants
+/// `parse_codex_error` uses on the HTTP-status path. SSE-side has no headers,
+/// so `QuotaDetails` is empty — the plan-aware formatter handles `plan_type:
+/// None` by falling back to generic wording (see PR #77 tests).
 fn classify_responses_error(code: &str, message: &str) -> LlmError {
     let detail = if code.is_empty() {
         message.to_string()
@@ -140,6 +146,32 @@ fn classify_responses_error(code: &str, message: &str) -> LlmError {
         format!("{code}: {message}")
     };
     let lower = code.to_ascii_lowercase();
+
+    // Codex-specific terminal signals — match PR 77's HTTP-path semantics.
+    if lower == "usage_limit_reached" {
+        return LlmError::usage_limit_reached(QuotaDetails {
+            plan_type: None,
+            resets_at: None,
+            limit_id: None,
+            limit_name: None,
+            primary: None,
+            secondary: None,
+            credits: None,
+            promo_message: None,
+        });
+    }
+    if lower == "usage_not_included" {
+        return LlmError::auth(
+            "Upgrade required: this plan does not include Codex usage. \
+             Visit https://chatgpt.com/codex/settings/usage to upgrade.",
+        );
+    }
+    if lower == "server_is_overloaded" || lower == "slow_down" {
+        return LlmError::server_overloaded(
+            "Selected model is at capacity. Try a different model.",
+        );
+    }
+
     if lower.contains("rate_limit") || lower.contains("quota") || lower.contains("requests_per") {
         LlmError::rate_limit(detail)
     } else if lower.contains("auth")
@@ -1117,6 +1149,41 @@ mod tests {
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["tags"]["disable_data_logging"], "true");
         assert_eq!(json["tags"]["foo"], "bar");
+    }
+
+    #[test]
+    fn classify_responses_error_codex_codes_route_to_terminal_variants() {
+        use super::super::LlmErrorKind;
+        // Matches PR 77's HTTP-path semantics — keep these two paths in sync.
+        assert_eq!(
+            classify_responses_error("usage_limit_reached", "x").kind,
+            LlmErrorKind::UsageLimitReached
+        );
+        assert_eq!(
+            classify_responses_error("usage_not_included", "x").kind,
+            LlmErrorKind::Auth
+        );
+        assert_eq!(
+            classify_responses_error("server_is_overloaded", "x").kind,
+            LlmErrorKind::ServerOverloaded
+        );
+        assert_eq!(
+            classify_responses_error("slow_down", "x").kind,
+            LlmErrorKind::ServerOverloaded
+        );
+        // All four terminal — not retryable
+        assert!(!classify_responses_error("usage_limit_reached", "x")
+            .kind
+            .is_retryable());
+        assert!(!classify_responses_error("usage_not_included", "x")
+            .kind
+            .is_retryable());
+        assert!(!classify_responses_error("server_is_overloaded", "x")
+            .kind
+            .is_retryable());
+        assert!(!classify_responses_error("slow_down", "x")
+            .kind
+            .is_retryable());
     }
 
     #[test]
