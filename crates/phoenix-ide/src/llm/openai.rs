@@ -265,20 +265,26 @@ impl ResponsesStreamAccumulator {
                     }
                 }
             }
-            // Top-level stream error. Shape: { type, code, message, param, sequence_number }
+            // Top-level stream error. Two shapes observed in the wild:
+            //   OpenAI platform: { type:"error", code, message, param, sequence_number }
+            //   Codex/ChatGPT:   { type:"error", error:{ type, code, message, param }, sequence_number }
+            // Try the nested codex shape first; fall back to flat OpenAI shape.
             "error" => {
                 tracing::warn!(
                     event = "error",
                     data = %data,
                     "responses_api SSE error event — full payload"
                 );
-                let code = v
-                    .get("code")
+                let nested = v.get("error");
+                let code = nested
+                    .and_then(|e| e.get("code"))
                     .and_then(serde_json::Value::as_str)
+                    .or_else(|| v.get("code").and_then(serde_json::Value::as_str))
                     .unwrap_or("");
-                let message = v
-                    .get("message")
+                let message = nested
+                    .and_then(|e| e.get("message"))
                     .and_then(serde_json::Value::as_str)
+                    .or_else(|| v.get("message").and_then(serde_json::Value::as_str))
                     .unwrap_or("(no message)");
                 return Err(classify_responses_error(code, message));
             }
@@ -1248,6 +1254,20 @@ mod tests {
         let data = r#"{"type":"error","code":"rate_limit_exceeded","message":"slow down"}"#;
         let err = acc.process_event("error", data, &tx).unwrap_err();
         assert_eq!(err.kind, LlmErrorKind::RateLimit);
+    }
+
+    #[test]
+    fn process_event_handles_codex_nested_error_shape() {
+        use super::super::LlmErrorKind;
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mut acc = ResponsesStreamAccumulator::new();
+        // Real codex/ChatGPT-backend payload captured 2026-05-11 via WARN log.
+        let data = r#"{"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again.","param":"input"},"sequence_number":2}"#;
+        let err = acc.process_event("error", data, &tx).unwrap_err();
+        assert_eq!(err.kind, LlmErrorKind::ContextWindowExceeded);
+        assert!(!err.kind.is_retryable());
+        assert!(err.message.contains("context_length_exceeded"));
+        assert!(err.message.contains("Your input exceeds"));
     }
 
     #[test]
