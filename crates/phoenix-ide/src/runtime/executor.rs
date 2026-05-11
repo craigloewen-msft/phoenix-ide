@@ -2370,6 +2370,16 @@ where
                     .await?;
                 self.context.working_dir = std::path::PathBuf::from(&approval_result.worktree_path);
 
+                // Refresh in-memory mode_context so downstream checks
+                // (e.g. spawn_agents Work-parent guard) observe Work mode
+                // for the rest of this runtime's lifetime. Without this,
+                // mode_context stays the Explore value set at runtime start.
+                self.context.mode_context = Some(ModeContext::Work {
+                    branch_name: approval_result.branch_name.clone(),
+                    base_branch: approval_result.base_branch.clone(),
+                    worktree_path: approval_result.worktree_path.clone(),
+                });
+
                 // Upgrade tool registry from Explore to Work mode so the agent
                 // gets bash, patch, etc. for the rest of this conversation.
                 self.tool_executor.upgrade_to_work_mode();
@@ -3364,30 +3374,17 @@ mod error_mapping_tests {
     }
 }
 
-/// Task 24696 Phase 3: verify the `Effect::NotifyContextExhausted` handler
-/// preserves the worktree and does NOT demote `conv_mode`. The old
-/// `cleanup_context_exhausted_worktree` path is gone — worktree handoff to a
-/// continuation (REQ-BED-030) or a user-initiated abandon / mark-as-merged
-/// are now the only ways a context-exhausted worktree is removed.
-///
-/// The effect is dispatched through the real `execute_effect` match arm
-/// (not a private helper) so the handler's full transition-time behaviour
-/// is exercised end-to-end.
+/// Shared git fixture helpers for the executor's worktree-aware test
+/// modules. Lives next to those modules (rather than in
+/// `runtime::testing`) because every consumer is in this file and the
+/// helpers are deliberately tied to the on-disk layout
+/// `create_managed_explore_worktree_blocking` produces.
 #[cfg(test)]
-mod context_exhausted_preserves_worktree_tests {
-    use super::*;
-    use crate::db::{ConvMode, NonEmptyString};
-    use crate::llm::ModelRegistry;
-    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
-    use crate::state_machine::{ConvContext, Effect};
-    use crate::tools::BrowserSessionManager;
+mod test_git_helpers {
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::time::Duration;
     use tempfile::TempDir;
-    use tokio::sync::{broadcast, mpsc};
 
-    fn init_repo() -> (TempDir, PathBuf) {
+    pub fn init_repo() -> (TempDir, PathBuf) {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
         for args in [
@@ -3414,7 +3411,10 @@ mod context_exhausted_preserves_worktree_tests {
         (tmp, root)
     }
 
-    fn add_worktree(repo: &Path, id: &str, branch: &str) -> String {
+    /// Add a worktree at `{repo}/.phoenix/worktrees/{id}` on a fresh
+    /// `branch`. Used by tests that need a Work-mode worktree directly,
+    /// skipping the Explore->Work promotion path.
+    pub fn add_worktree(repo: &Path, id: &str, branch: &str) -> String {
         let wt = repo.join(".phoenix").join("worktrees").join(id);
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
         let wt_s = wt.to_string_lossy().to_string();
@@ -3427,7 +3427,32 @@ mod context_exhausted_preserves_worktree_tests {
         wt_s
     }
 
-    fn branch_exists(repo: &Path, branch: &str) -> bool {
+    /// Add an Explore worktree at the canonical Phoenix path
+    /// `{repo}/.phoenix/worktrees/{conv_id}` on a temp branch, exactly
+    /// as `create_managed_explore_worktree_blocking` does in production.
+    /// Used by tests that exercise the Explore->Work promotion path.
+    pub fn add_explore_worktree(repo: &Path, conv_id: &str, base_branch: &str) -> PathBuf {
+        let id_prefix: String = conv_id.chars().take(8).collect();
+        let temp_branch = format!("task-pending-{id_prefix}");
+        let wt = repo.join(".phoenix").join("worktrees").join(conv_id);
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        let s = std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                &temp_branch,
+                wt.to_str().unwrap(),
+                base_branch,
+            ])
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(s.success(), "git worktree add failed");
+        wt
+    }
+
+    pub fn branch_exists(repo: &Path, branch: &str) -> bool {
         let o = std::process::Command::new("git")
             .args(["branch", "--list", branch])
             .current_dir(repo)
@@ -3435,6 +3460,42 @@ mod context_exhausted_preserves_worktree_tests {
             .unwrap();
         !String::from_utf8_lossy(&o.stdout).trim().is_empty()
     }
+
+    pub fn worktree_list(repo: &Path) -> String {
+        String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["worktree", "list", "--porcelain"])
+                .current_dir(repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .to_string()
+    }
+}
+
+/// Task 24696 Phase 3: verify the `Effect::NotifyContextExhausted` handler
+/// preserves the worktree and does NOT demote `conv_mode`. The old
+/// `cleanup_context_exhausted_worktree` path is gone — worktree handoff to a
+/// continuation (REQ-BED-030) or a user-initiated abandon / mark-as-merged
+/// are now the only ways a context-exhausted worktree is removed.
+///
+/// The effect is dispatched through the real `execute_effect` match arm
+/// (not a private helper) so the handler's full transition-time behaviour
+/// is exercised end-to-end.
+#[cfg(test)]
+mod context_exhausted_preserves_worktree_tests {
+    use super::test_git_helpers::{add_worktree, branch_exists, init_repo};
+    use super::*;
+    use crate::db::{ConvMode, NonEmptyString};
+    use crate::llm::ModelRegistry;
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::state_machine::{ConvContext, Effect};
+    use crate::tools::BrowserSessionManager;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{broadcast, mpsc};
 
     #[allow(clippy::type_complexity)]
     fn build_runtime(
@@ -3684,81 +3745,8 @@ mod context_exhausted_preserves_worktree_tests {
 
 #[cfg(test)]
 mod cwd_immutability_tests {
+    use super::test_git_helpers::{add_explore_worktree, branch_exists, init_repo, worktree_list};
     use super::*;
-    use std::path::{Path, PathBuf};
-    use tempfile::TempDir;
-
-    fn init_repo() -> (TempDir, PathBuf) {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        for args in [
-            &["init", "-q", "-b", "main"][..],
-            &[
-                "-c",
-                "user.email=t@example.com",
-                "-c",
-                "user.name=t",
-                "commit",
-                "--allow-empty",
-                "-m",
-                "init",
-                "-q",
-            ][..],
-        ] {
-            let s = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&root)
-                .status()
-                .unwrap();
-            assert!(s.success(), "git {args:?} failed");
-        }
-        (tmp, root)
-    }
-
-    /// Create an Explore worktree at the canonical Phoenix path
-    /// `{repo}/.phoenix/worktrees/{conv_id}` on a temp branch, exactly as
-    /// `create_managed_explore_worktree_blocking` does.
-    fn add_explore_worktree(repo: &Path, conv_id: &str, base_branch: &str) -> PathBuf {
-        let id_prefix: String = conv_id.chars().take(8).collect();
-        let temp_branch = format!("task-pending-{id_prefix}");
-        let wt = repo.join(".phoenix").join("worktrees").join(conv_id);
-        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
-        let s = std::process::Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                "-b",
-                &temp_branch,
-                wt.to_str().unwrap(),
-                base_branch,
-            ])
-            .current_dir(repo)
-            .status()
-            .unwrap();
-        assert!(s.success(), "git worktree add failed");
-        wt
-    }
-
-    fn branch_exists(repo: &Path, branch: &str) -> bool {
-        let o = std::process::Command::new("git")
-            .args(["branch", "--list", branch])
-            .current_dir(repo)
-            .output()
-            .unwrap();
-        !String::from_utf8_lossy(&o.stdout).trim().is_empty()
-    }
-
-    fn worktree_list(repo: &Path) -> String {
-        String::from_utf8_lossy(
-            &std::process::Command::new("git")
-                .args(["worktree", "list", "--porcelain"])
-                .current_dir(repo)
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .to_string()
-    }
 
     /// Core task-02702 regression:
     ///
@@ -3835,6 +3823,110 @@ mod cwd_immutability_tests {
             ".phoenix must not exist inside the worktree; \
              its presence means a nested worktree was created"
         );
+    }
+}
+
+// ============================================================
+// Mode-context refresh on Explore -> Work promotion
+// ============================================================
+//
+// Regression test for task 03002: after a Managed conversation
+// approves its task and is promoted to Work mode, the in-memory
+// `context.mode_context` must reflect Work (not the stale Explore
+// value from runtime startup). The `spawn_agents` Work-parent guard
+// reads this field; a stale Explore value rejects legitimate
+// `mode: "work"` sub-agent requests from a Work-mode parent.
+
+#[cfg(test)]
+mod approve_task_refreshes_mode_context_tests {
+    use super::test_git_helpers::{add_explore_worktree, init_repo};
+    use super::*;
+    use crate::llm::ModelRegistry;
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::state_machine::{ConvContext, ConvState, Effect};
+    use crate::system_prompt::ModeContext;
+    use crate::tools::BrowserSessionManager;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn approve_task_sets_mode_context_to_work() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "mode-ctx-refresh-1";
+        let base_branch = "main";
+
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
+        let tasks_dir = explore_wt.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let task_filename = "12345-p2-ready--spawn-work-subagents.md";
+        std::fs::write(
+            tasks_dir.join(task_filename),
+            "# Spawn work subagents\n\n1. Plan\n2. Spawn\n",
+        )
+        .unwrap();
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let mut context = ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000);
+        context.mode_context = Some(ModeContext::Explore);
+        context.desired_base_branch = Some(base_branch.to_string());
+
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let broadcaster = SseBroadcaster::new(128, 0);
+
+        let mut rt = ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: format!("tasks/{task_filename}"),
+                title: "Spawn work subagents".to_string(),
+                priority: "p2".to_string(),
+                plan: "Plan and spawn".to_string(),
+            },
+            storage,
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            broadcaster,
+        );
+
+        rt.execute_effect(Effect::ApproveTask {
+            task_file: format!("tasks/{task_filename}"),
+            title: "Spawn work subagents".to_string(),
+            priority: "p2".to_string(),
+            plan: "Plan and spawn".to_string(),
+        })
+        .await
+        .expect("approve task effect failed");
+
+        match rt.context.mode_context.as_ref() {
+            Some(ModeContext::Work {
+                branch_name,
+                base_branch: bb,
+                worktree_path,
+            }) => {
+                assert!(
+                    !branch_name.is_empty(),
+                    "branch_name must be populated post-approval"
+                );
+                assert_eq!(bb, base_branch, "base_branch must round-trip");
+                assert_eq!(
+                    worktree_path,
+                    &explore_wt.to_string_lossy().to_string(),
+                    "worktree_path must equal the in-place-promoted Explore worktree"
+                );
+            }
+            other => panic!(
+                "mode_context must be refreshed to Work after approval; got {other:?}. \
+                 Stale Explore here is the task-03002 bug: spawn_agents rejects \
+                 mode: \"work\" sub-agents because parent_allows_work is false."
+            ),
+        }
     }
 }
 
