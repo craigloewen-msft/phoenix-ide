@@ -168,6 +168,14 @@ pub enum Event {
         message_id: String,
     },
 
+    /// Drained steering entries delivered to bedrock for persistence as
+    /// `UserMessage`s. Fired by the executor at steering-drain hook points:
+    /// turn-end (entering `Idle`) or mid-turn (entering `LlmRequesting` from
+    /// a tool round). Parent conversations only.
+    SteerDrainedUserMessages {
+        entries: Vec<SteerEntry>,
+    },
+
     /// Sent by `RuntimeManager::evict_runtime` (e.g. after a model upgrade)
     /// to cleanly terminate a running runtime that is being replaced.
     /// The executor returns from `run()` immediately on receipt, which drops
@@ -203,6 +211,7 @@ impl Event {
             Event::TaskResolved { .. } => "TaskResolved",
             Event::SteerMessage { .. } => "SteerMessage",
             Event::CancelSteerMessage { .. } => "CancelSteerMessage",
+            Event::SteerDrainedUserMessages { .. } => "SteerDrainedUserMessages",
             Event::Shutdown => "Shutdown",
         }
     }
@@ -265,6 +274,14 @@ pub enum CoreEvent {
         error: String,
     },
     UserTriggerContinuation,
+    /// Drained steering entries to be persisted as `UserMessage`s mid-conversation.
+    /// Fired by the executor when transitioning into a state that is about to ask
+    /// the LLM (entering `Idle`, or entering `LlmRequesting` from a tool round).
+    /// Bedrock persists each entry as a User message and may transition state.
+    /// See `specs/steering-messages/` for the queue mechanism.
+    SteerDrainedUserMessages {
+        entries: Vec<SteerEntry>,
+    },
 }
 
 /// Events only valid for parent conversations.
@@ -419,6 +436,11 @@ impl TryFrom<Event> for ParentEvent {
             Event::UserTriggerContinuation => {
                 Ok(ParentEvent::Core(CoreEvent::UserTriggerContinuation))
             }
+            Event::SteerDrainedUserMessages { entries } => {
+                Ok(ParentEvent::Core(CoreEvent::SteerDrainedUserMessages {
+                    entries,
+                }))
+            }
             // Parent-only events
             Event::TaskApprovalResponse { outcome } => {
                 Ok(ParentEvent::Parent(ParentOnlyEvent::TaskApprovalResponse {
@@ -552,6 +574,9 @@ impl TryFrom<Event> for SubAgentEvent {
             // Parent-only events are invalid for sub-agent;
             // SteerMessage, CancelSteerMessage, and Shutdown are intercepted by
             // the executor before reaching the state-machine conversion.
+            // SteerDrainedUserMessages is parent-only: steering is a parent-
+            // conversation feature, and the executor's drain detector guards
+            // against firing for sub-agents.
             Event::TaskApprovalResponse { .. }
             | Event::UserQuestionResponse { .. }
             | Event::CredentialBecameAvailable
@@ -559,6 +584,7 @@ impl TryFrom<Event> for SubAgentEvent {
             | Event::TaskResolved { .. }
             | Event::SteerMessage { .. }
             | Event::CancelSteerMessage { .. }
+            | Event::SteerDrainedUserMessages { .. }
             | Event::Shutdown => Err(EventConversionError {
                 event_variant: event.variant_name(),
                 target_type: "SubAgentEvent",
@@ -583,6 +609,7 @@ impl CoreEvent {
             CoreEvent::ContinuationResponse { .. } => "ContinuationResponse",
             CoreEvent::ContinuationFailed { .. } => "ContinuationFailed",
             CoreEvent::UserTriggerContinuation => "UserTriggerContinuation",
+            CoreEvent::SteerDrainedUserMessages { .. } => "SteerDrainedUserMessages",
         }
     }
 }

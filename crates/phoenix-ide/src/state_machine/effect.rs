@@ -88,6 +88,12 @@ pub enum Effect {
         /// The canonical message identifier (client-generated for user messages,
         /// server-generated for agent/tool messages)
         message_id: String,
+        /// If true, skip the insert (and broadcast) when a message with this
+        /// `message_id` already exists. Set only by code paths where the same
+        /// effect may be re-emitted after crash recovery (e.g., steering-queue
+        /// re-drain). Default `false` for normal write paths to avoid the
+        /// extra `message_exists` query.
+        idempotent: bool,
     },
 
     /// Persist the new state
@@ -159,6 +165,15 @@ pub enum Effect {
         system_message: String,
         repo_root: String,
     },
+
+    /// Remove the specified drained entries from the persisted steering queue.
+    /// Emitted by `SteerDrainedUserMessages` transition arms AFTER all
+    /// `PersistMessage` + `PersistState` effects so that a crash before this
+    /// effect runs leaves the queue intact for re-drain on restart (idempotent
+    /// persist guards against double-delivery). Removing only the drained ids
+    /// (rather than overwriting with empty) preserves concurrently-enqueued
+    /// steers that arrived during the drain window.
+    ClearSteeringQueueEntries { message_ids: Vec<String> },
 }
 
 impl Effect {
@@ -169,6 +184,7 @@ impl Effect {
         message_id: String,
         user_agent: Option<String>,
         skill_invocation: Option<crate::skills::SkillInvocation>,
+        idempotent: bool,
     ) -> Self {
         let text = text.into();
         let content = if let Some(invocation) = skill_invocation {
@@ -198,6 +214,7 @@ impl Effect {
             display_data,
             usage_data: None,
             message_id,
+            idempotent,
         }
     }
 
@@ -216,6 +233,7 @@ impl Effect {
             display_data,
             usage_data: usage,
             message_id: uuid::Uuid::new_v4().to_string(),
+            idempotent: false,
         }
     }
 
@@ -239,6 +257,7 @@ impl Effect {
             display_data,
             usage_data: None,
             message_id,
+            idempotent: false,
         }
     }
 
@@ -285,6 +304,7 @@ impl Effect {
             display_data: Some(serde_json::json!({ "summary": summary })),
             usage_data: None,
             message_id: uuid::Uuid::new_v4().to_string(),
+            idempotent: false,
         }
     }
 }

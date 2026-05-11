@@ -57,6 +57,11 @@ pub trait MessageStore: Send + Sync {
     /// Get a single message by ID
     async fn get_message_by_id(&self, message_id: &str) -> Result<Message, String>;
 
+    /// Returns true if a message with the given `message_id` already exists.
+    /// Used by `PersistMessage` to make persistence idempotent across crash
+    /// recovery (re-drain after partial steering-queue drain).
+    async fn message_exists(&self, message_id: &str) -> Result<bool, String>;
+
     /// Update `display_data` for an existing message
     async fn update_message_display_data(
         &self,
@@ -111,6 +116,16 @@ pub trait StateStore: Send + Sync {
         &self,
         conv_id: &str,
         queue: &[crate::state_machine::event::SteerEntry],
+    ) -> Result<(), String>;
+
+    /// Remove specific drained entries from the persisted steering queue,
+    /// preserving any concurrently-enqueued entries. Implementations must be
+    /// atomic re: `enqueue_steer_message`'s read-modify-write to avoid losing
+    /// a steer queued during the drain window.
+    async fn remove_steering_entries(
+        &self,
+        conv_id: &str,
+        message_ids: &[String],
     ) -> Result<(), String>;
 }
 
@@ -207,6 +222,10 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         (**self).get_message_by_id(message_id).await
     }
 
+    async fn message_exists(&self, message_id: &str) -> Result<bool, String> {
+        (**self).message_exists(message_id).await
+    }
+
     async fn update_message_display_data(
         &self,
         message_id: &str,
@@ -268,6 +287,14 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         queue: &[crate::state_machine::event::SteerEntry],
     ) -> Result<(), String> {
         (**self).update_steering_queue(conv_id, queue).await
+    }
+
+    async fn remove_steering_entries(
+        &self,
+        conv_id: &str,
+        message_ids: &[String],
+    ) -> Result<(), String> {
+        (**self).remove_steering_entries(conv_id, message_ids).await
     }
 }
 
@@ -383,6 +410,13 @@ impl MessageStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
+    async fn message_exists(&self, message_id: &str) -> Result<bool, String> {
+        self.db
+            .message_exists(message_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     async fn update_message_display_data(
         &self,
         message_id: &str,
@@ -467,6 +501,17 @@ impl StateStore for DatabaseStorage {
     ) -> Result<(), String> {
         self.db
             .update_steering_queue(conv_id, queue)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn remove_steering_entries(
+        &self,
+        conv_id: &str,
+        message_ids: &[String],
+    ) -> Result<(), String> {
+        self.db
+            .remove_steering_entries(conv_id, message_ids)
             .await
             .map_err(|e| e.to_string())
     }
