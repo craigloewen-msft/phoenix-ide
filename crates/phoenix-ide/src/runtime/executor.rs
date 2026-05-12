@@ -2282,8 +2282,6 @@ where
                     worktree_path: None,
                     conv_mode_label: None,
                     base_branch: None,
-                    commits_behind: None,
-                    commits_ahead: None,
                     task_title: None,
                 },
             });
@@ -2444,8 +2442,6 @@ where
                             worktree_path: Some(approval_result.worktree_path.clone()),
                             conv_mode_label: Some("Work".to_string()),
                             base_branch: Some(approval_result.base_branch.clone()),
-                            commits_behind: None,
-                            commits_ahead: None,
                             task_title: Some(approval_result.task_title.clone()),
                         },
                     });
@@ -2935,8 +2931,7 @@ fn promote_task_status_to_in_progress(
 
 /// Global mutex serializing the scan-tasks + write + commit sequence.
 /// Task approval is rare; a single mutex is sufficient.
-/// Also used by Complete/Abandon flows (task 0604) for git-on-main-checkout operations.
-pub(crate) static TASK_APPROVAL_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static TASK_APPROVAL_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Blocking implementation of approve task git operations.
 /// Runs on a blocking thread via `spawn_blocking`.

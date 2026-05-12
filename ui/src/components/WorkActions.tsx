@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { api } from '../api';
+import { api, type PrStatusResponse } from '../api';
 import { useBrowserViewState, useDiffViewerState } from '../contexts/ViewerStateContext';
 import { useFileExplorer } from '../hooks/useFileExplorer';
 
@@ -29,11 +29,14 @@ export function WorkActions({
   conversationId,
   convModeLabel,
   phaseType,
+  branchName,
   continuedInConvId,
 }: WorkActionsProps) {
   const [error, setError] = useState<string | null>(null);
   const [markingMerged, setMarkingMerged] = useState(false);
   const [abandoning, setAbandoning] = useState(false);
+  const [prStatus, setPrStatus] = useState<PrStatusResponse | null>(null);
+  const [manualFallback, setManualFallback] = useState(false);
   // Loading/error UI state for the GET diff fetch lives here; the
   // resolved payload is published into DiffViewerStateContext so
   // ConversationPage can mount the viewer in the split pane (or as
@@ -48,12 +51,78 @@ export function WorkActions({
     setError(null);
   }, [phaseType]);
 
+  useEffect(() => {
+    // New conversation/branch → drop the previous one's PR status so the
+    // cleanup affordance never reflects a stale PR, and require a fresh
+    // explicit opt-in for the gh-unavailable manual fallback.
+    setPrStatus(null);
+    setManualFallback(false);
+    if (!branchName || (convModeLabel !== 'Work' && convModeLabel !== 'Branch')) {
+      return;
+    }
+    let cancelled = false;
+    // Per-effect-run sequence: fetchStatus can fire from the initial call and
+    // again on visibilitychange, so only the most recent response may apply
+    // (out-of-order resolutions must not clobber fresher data).
+    let latestSeq = 0;
+    const fetchStatus = () => {
+      const seq = ++latestSeq;
+      const fresh = () => !cancelled && seq === latestSeq;
+      api.getPrStatus(conversationId)
+        .then(status => {
+          if (!fresh()) return;
+          setPrStatus(status);
+          // gh became available again → drop any stale manual-fallback opt-in.
+          if (!status.unavailable_reason) setManualFallback(false);
+        })
+        .catch(() => { if (fresh()) setPrStatus({ found: false, unavailable_reason: 'command_failed' }); });
+    };
+    fetchStatus();
+    // Re-fetch when the tab regains focus so a merge done elsewhere unsticks
+    // the cleanup button without a page reload.
+    const onVisible = () => { if (document.visibilityState === 'visible') fetchStatus(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      cancelled = true;
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [conversationId, branchName, convModeLabel]);
+
   const isBranch = convModeLabel === 'Branch';
   if (convModeLabel !== 'Work' && !isBranch) return null;
   if (phaseType !== 'idle') return null;
 
   const isLoading = markingMerged || abandoning;
   const hasContinuation = !!continuedInConvId;
+  // prStatus === null means the PR-status fetch is still in flight (or being
+  // reset on a conversation switch). Block cleanup until we know — otherwise a
+  // fast click could mark-merged a conversation whose PR is still open.
+  const prChecking = prStatus === null;
+  const prMerged = prStatus?.found && prStatus.display_state === 'merged';
+  const prUnavailable = !!prStatus?.unavailable_reason;
+  const prBlocksCleanup = prStatus?.found && !prMerged;
+  const completeDisabled =
+    isLoading || hasContinuation || prChecking || (!!prBlocksCleanup && !manualFallback);
+  const completeLabel = prChecking
+    ? 'Checking PR…'
+    : prMerged
+      ? 'Clean up merged PR'
+      : prBlocksCleanup
+        ? 'Waiting for PR merge'
+        : prUnavailable && !manualFallback
+          ? 'Use manual fallback'
+          : 'Mark as Merged';
+  const completeTitle = hasContinuation
+    ? 'This conversation has been continued. Abandon the continuation instead.'
+    : prChecking
+      ? 'Checking PR status…'
+      : prMerged
+        ? 'GitHub reports this PR is merged. Clean up Phoenix local state.'
+        : prBlocksCleanup
+          ? `GitHub reports PR #${prStatus?.number} is ${prStatus?.display_state}; merge it before cleanup.`
+          : prUnavailable && !manualFallback
+            ? 'GitHub CLI status is unavailable. Click to enable the explicit manual cleanup fallback.'
+            : 'Manual fallback: assert the PR was merged outside Phoenix and clean up local state.';
   const continuationTooltip = hasContinuation
     ? 'This conversation has been continued. Abandon the continuation instead.'
     : undefined;
@@ -106,10 +175,14 @@ export function WorkActions({
       )}
       <button
         className="work-actions-btn work-actions-complete"
-        disabled={isLoading || hasContinuation}
-        title={continuationTooltip}
+        disabled={completeDisabled}
+        title={completeTitle}
         data-testid="mark-merged-button"
         onClick={async () => {
+          if (prUnavailable && !manualFallback) {
+            setManualFallback(true);
+            return;
+          }
           setError(null);
           setMarkingMerged(true);
           try {
@@ -121,7 +194,7 @@ export function WorkActions({
           }
         }}
       >
-        {markingMerged ? 'Marking...' : 'Mark as Merged'}
+        {markingMerged ? 'Cleaning...' : completeLabel}
       </button>
       <button
         className="work-actions-btn work-actions-abandon"
@@ -147,6 +220,16 @@ export function WorkActions({
       >
         {abandoning ? 'Abandoning...' : 'Abandon'}
       </button>
+      {prBlocksCleanup && !manualFallback && (
+        <span className="work-actions-pr-note">
+          PR #{prStatus.number} is {prStatus.display_state}; cleanup unlocks after GitHub reports merged.
+        </span>
+      )}
+      {prUnavailable && manualFallback && (
+        <span className="work-actions-pr-note work-actions-pr-note--warning">
+          gh unavailable — manual cleanup fallback enabled.
+        </span>
+      )}
       {hasContinuation && (
         <span className="work-actions-continuation-note">
           Continued — actions belong on the continuation.
