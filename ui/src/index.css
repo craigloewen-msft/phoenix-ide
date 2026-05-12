@@ -8,6 +8,7 @@
   font-style: normal;
   font-display: swap;
 }
+
 @font-face {
   font-family: 'SauceCodePro NF Mono';
   src: url('./assets/fonts/SauceCodeProNerdFontMono-Bold.ttf') format('truetype');
@@ -15,6 +16,7 @@
   font-style: normal;
   font-display: swap;
 }
+
 @font-face {
   font-family: 'SauceCodePro NF Mono';
   src: url('./assets/fonts/SauceCodeProNerdFontMono-Italic.ttf') format('truetype');
@@ -22,6 +24,7 @@
   font-style: italic;
   font-display: swap;
 }
+
 @font-face {
   font-family: 'SauceCodePro NF Mono';
   src: url('./assets/fonts/SauceCodeProNerdFontMono-BoldItalic.ttf') format('truetype');
@@ -69,14 +72,14 @@
      variables at construction. */
   --terminal-bg: #1a1a1a;
   --terminal-header-bg: #252525;
-  --terminal-border: #333333;
+  --terminal-border: #333;
   --terminal-fg: #e6edf3;
   --terminal-cursor: #e6edf3;
 }
 
 /* Light theme */
 [data-theme="light"] {
-  --bg-primary: #ffffff;
+  --bg-primary: #fff;
   --bg-secondary: #f6f8fa;
   --bg-tertiary: #eaeef2;
   --text-primary: #1f2328;
@@ -102,6 +105,7 @@
 
 html {
   height: 100%;
+  transition: background-color 0.2s ease, color 0.2s ease;
 }
 
 body {
@@ -205,9 +209,17 @@ body {
 
 .dot.idle { background: var(--accent-green); }
 .dot.terminal { background: var(--text-muted); }
-.dot.working { background: var(--accent-yellow); animation: pulse 1.5s infinite; }
+
+.dot.working {
+  background: var(--accent-yellow);
+  animation: pulse 1.5s infinite;
+}
 .dot.error { background: var(--accent-red); }
-.dot.connecting { background: var(--text-muted); animation: pulse 1s infinite; }
+
+.dot.connecting {
+  background: var(--text-muted);
+  animation: pulse 1s infinite;
+}
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }
@@ -231,8 +243,7 @@ body {
   height: var(--breadcrumb-height);
   background: var(--bg-tertiary);
   border-top: 1px solid var(--border-color);
-  overflow-x: auto;
-  overflow-y: hidden;
+  overflow: auto hidden;
   white-space: nowrap;
   -webkit-overflow-scrolling: touch;
   scrollbar-width: none;
@@ -263,6 +274,7 @@ body {
   border-radius: 4px;
   cursor: pointer;
   flex-shrink: 0;
+  position: relative;
 }
 
 .breadcrumb-item:hover {
@@ -271,7 +283,7 @@ body {
 
 .breadcrumb-item.active {
   color: var(--accent-blue);
-  background: rgba(88, 166, 255, 0.15);
+  background: rgb(88 166 255 / 15%);
 }
 
 .breadcrumb-item.tool {
@@ -280,22 +292,19 @@ body {
 
 .breadcrumb-item.subagents {
   color: var(--accent-yellow);
-  background: rgba(210, 153, 34, 0.15);
+  background: rgb(210 153 34 / 15%);
 }
 
 .breadcrumb-item.subagents.active {
   color: var(--accent-yellow);
-  background: rgba(210, 153, 34, 0.25);
+  background: rgb(210 153 34 / 25%);
 }
 
 /* Breadcrumb tooltip */
-.breadcrumb-item {
-  position: relative;
-}
-
 .breadcrumb-tooltip {
   position: fixed;
   bottom: calc(var(--breadcrumb-height) + 24px);
+
   /* left is set dynamically via inline style */
   width: 280px;
   background: var(--bg-primary);
@@ -306,7 +315,7 @@ body {
   max-width: 280px;
   white-space: normal;
   z-index: 1000;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  box-shadow: 0 4px 12px rgb(0 0 0 / 30%);
   pointer-events: none;
 }
 
@@ -316,6 +325,7 @@ body {
 .breadcrumb-tooltip-arrow {
   position: absolute;
   top: 100%;
+
   /* left is set dynamically via inline style */
   width: 0;
   height: 0;
@@ -353,7 +363,7 @@ body {
   color: var(--text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
-  word-break: break-word;
+  overflow-wrap: anywhere;
   line-height: 1.4;
 }
 
@@ -367,8 +377,7 @@ body {
 #main-area {
   flex: 1 1 auto;
   min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
+  overflow: hidden auto;
 }
 
 /* Views */
@@ -416,6 +425,9 @@ body {
   margin-bottom: 8px;
   cursor: pointer;
   transition: background 0.15s;
+  position: relative;
+  display: flex;
+  flex-direction: column;
 }
 
 .conv-item:hover {
@@ -468,7 +480,7 @@ body {
   background: var(--text-muted, #6b7280);
 }
 
-.conv-state-dot.awaiting_approval {
+.conv-state-dot.awaiting-approval {
   background: var(--accent-purple, #7c3aed);
 }
 
@@ -531,7 +543,7 @@ body {
   font-size: 13px;
   font-weight: 500;
   cursor: pointer;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+  box-shadow: 0 2px 8px rgb(0 0 0 / 30%);
   z-index: 10;
   animation: jump-btn-fade-in 200ms ease;
 }
@@ -541,8 +553,15 @@ body {
 }
 
 @keyframes jump-btn-fade-in {
-  from { opacity: 0; transform: translateX(-50%) translateY(8px); }
-  to { opacity: 1; transform: translateX(-50%) translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
 }
 
 #messages {
@@ -609,7 +628,7 @@ body {
   color: var(--text-primary);
   background: var(--bg-secondary);
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
   max-height: 60vh;
   overflow-y: auto;
   border-top: 1px solid var(--border-color);
@@ -623,16 +642,13 @@ body {
   transition: box-shadow 0.3s ease;
 }
 
-.message.breadcrumb-highlight {
-  box-shadow: 0 0 0 2px var(--accent-blue), 0 0 16px rgba(88, 166, 255, 0.3);
-}
-
 @keyframes breadcrumb-pulse {
-  0%, 100% { box-shadow: 0 0 0 2px var(--accent-blue), 0 0 16px rgba(88, 166, 255, 0.3); }
-  50% { box-shadow: 0 0 0 3px var(--accent-blue), 0 0 24px rgba(88, 166, 255, 0.5); }
+  0%, 100% { box-shadow: 0 0 0 2px var(--accent-blue), 0 0 16px rgb(88 166 255 / 30%); }
+  50% { box-shadow: 0 0 0 3px var(--accent-blue), 0 0 24px rgb(88 166 255 / 50%); }
 }
 
 .message.breadcrumb-highlight {
+  box-shadow: 0 0 0 2px var(--accent-blue), 0 0 16px rgb(88 166 255 / 30%);
   animation: breadcrumb-pulse 0.75s ease-in-out 2;
 }
 
@@ -668,12 +684,7 @@ body {
   opacity: 0.7;
 }
 
-.message-status {
-  margin-left: auto;
-}
-
 .message-content {
-  word-wrap: break-word;
   overflow-wrap: break-word;
 }
 
@@ -723,6 +734,7 @@ body {
 .agent-text-block h2 { font-size: 1.3rem; }
 .agent-text-block h3 { font-size: 1.15rem; }
 .agent-text-block h4 { font-size: 1.05rem; }
+
 .agent-text-block h5,
 .agent-text-block h6 { font-size: 1rem; }
 
@@ -752,6 +764,10 @@ body {
   color: var(--text-secondary);
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Targets a distinct DOM scope from `.message-content p:last-child` above;
+   the rules cannot match the same element, and this rule belongs grouped
+   with the other `.agent-text-block` markdown styles. */
 .agent-text-block blockquote p {
   margin: 0;
 }
@@ -828,7 +844,7 @@ body {
 .streaming-code-pre {
   margin: 0.5em 0;
   padding: 0;
-  background: hsl(220, 13%, 18%);
+  background: hsl(220deg 13% 18%);
   border-radius: 0.3em;
   overflow-x: auto;
 }
@@ -838,8 +854,8 @@ body {
   font-family: var(--font-mono);
   font-size: 1em;
   line-height: 1.5;
-  color: hsl(220, 14%, 71%);
-  background: hsl(220, 13%, 18%);
+  color: hsl(220deg 14% 71%);
+  background: hsl(220deg 13% 18%);
   padding: 1em;
   border-radius: 0.3em;
   white-space: pre;
@@ -883,6 +899,7 @@ body {
 }
 
 /* Tool Groups - visually pairs tool call with result */
+
 /* New tool block styles - input always visible, output collapsible */
 .tool-block {
   margin: 6px 0;
@@ -900,6 +917,7 @@ body {
   background: var(--bg-tertiary);
   border-bottom: 1px solid var(--border-color);
   font-size: 12px;
+  position: relative;
 }
 
 .tool-block-name {
@@ -939,8 +957,9 @@ body {
   font-size: 13px;
   color: var(--text-primary);
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
   line-height: 1.35;
+  position: relative;
 }
 
 .tool-block-input.multiline {
@@ -956,19 +975,6 @@ body {
 .tool-block-output.error {
   border-left: 4px solid var(--accent-red);
   background: color-mix(in srgb, var(--accent-red) 8%, transparent);
-}
-
-.tool-block-output.error .tool-block-output-header,
-.tool-block-output.error .tool-block-output-preview {
-  background: color-mix(in srgb, var(--accent-red) 10%, var(--bg-secondary));
-}
-
-.tool-block-output.error .tool-block-output-header:hover {
-  background: color-mix(in srgb, var(--accent-red) 14%, var(--bg-tertiary));
-}
-
-.tool-block-output.error .tool-block-output-content {
-  background: color-mix(in srgb, var(--accent-red) 6%, var(--bg-primary));
 }
 
 .tool-block-output:not(.error) {
@@ -1054,16 +1060,32 @@ body {
   font-family: var(--font-mono);
   font-size: 13px;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
   color: var(--text-secondary);
   max-height: 300px;
   overflow-y: auto;
   line-height: 1.35;
+  position: relative;
 }
 
 /* Short output (no collapse header) */
 .tool-block-output:not(.expanded) .tool-block-output-content {
   padding: 6px 10px;
+}
+
+/* Error variants — placed after the base rules so the `.error .X` overrides
+   win without relying on source-order against lower-specificity defaults. */
+.tool-block-output.error .tool-block-output-header,
+.tool-block-output.error .tool-block-output-preview {
+  background: color-mix(in srgb, var(--accent-red) 10%, var(--bg-secondary));
+}
+
+.tool-block-output.error .tool-block-output-header:hover {
+  background: color-mix(in srgb, var(--accent-red) 14%, var(--bg-tertiary));
+}
+
+.tool-block-output.error .tool-block-output-content {
+  background: color-mix(in srgb, var(--accent-red) 6%, var(--bg-primary));
 }
 
 .tool-empty {
@@ -1112,22 +1134,15 @@ body {
   flex: 1;
 }
 
-.think-aside-header .copy-btn {
-  opacity: 0.6;
-}
-
-.think-aside-header .copy-btn:hover {
-  opacity: 1;
-}
-
 .think-aside-body {
   margin-top: 4px;
   padding: 4px 8px 4px 18px;
+
   /* Proportional font for prose — system UI stack matches body default */
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   font-size: 13px;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
   line-height: 1.5;
   color: var(--text-secondary);
   border-left: 2px solid var(--border-color);
@@ -1154,72 +1169,18 @@ body {
   width: 16px;
   height: 16px;
   fill: none;
-  stroke: currentColor;
+  stroke: currentcolor;
   stroke-width: 1.7;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
 
-.copy-btn:hover:not(:disabled) {
-  background: var(--bg-tertiary);
-  color: var(--text-primary);
-}
-
-.copy-btn:disabled {
-  opacity: 0.45;
-  cursor: default;
-}
-.copy-btn.copied {
-  color: var(--accent-green);
-}
-
-/* Copy button positioning in tool blocks */
-.tool-block-header {
-  position: relative;
-}
-
-.tool-block-header .copy-btn {
-  margin-left: auto;
-  margin-right: 4px;
-}
-
-.tool-block-input {
-  position: relative;
-}
-
-.tool-block-input .copy-btn {
-  position: absolute;
-  top: 6px;
-  right: 6px;
-  opacity: 0;
-  transition: opacity 0.15s;
-}
-
-.tool-block-input:hover .copy-btn {
-  opacity: 1;
-}
-
-.tool-block-output-header .copy-btn {
-  margin-left: auto;
-}
-
-.tool-block-output-content {
-  position: relative;
-}
-
-.tool-block-output-content .copy-btn {
-  position: absolute;
-  top: 6px;
-  right: 6px;
-  opacity: 0;
-  transition: opacity 0.15s;
-}
-
-.tool-block-output-content:hover .copy-btn {
-  opacity: 1;
-}
-
-/* Code block copy button */
+/* Code block copy button — `pre` selector first so its (0,0,1) specificity
+   does not descend after later class-based rules. */
+/* stylelint-disable-next-line no-descending-specificity --
+   `pre` (0,0,1) follows `.message-content pre` (0,1,1) from the markdown
+   section; they set orthogonal properties (position vs background) and the
+   element rule must stay scoped to the copy-button positioning section. */
 pre {
   position: relative;
 }
@@ -1232,8 +1193,73 @@ pre .copy-btn {
   transition: opacity 0.15s;
 }
 
+/* Copy button positioning in tool blocks.
+   Rules grouped by ascending specificity to satisfy no-descending-specificity:
+   `.parent .copy-btn` positioning rules (0,2,0) first, then `.parent:hover
+   .copy-btn` reveal rules (0,3,0). */
+.tool-block-header .copy-btn {
+  margin-left: auto;
+  margin-right: 4px;
+}
+
+.tool-block-input .copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.tool-block-output-header .copy-btn {
+  margin-left: auto;
+}
+
+.tool-block-output-content .copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+/* Think-aside copy button — placed with the other context-specific overrides
+   so its (0,2,0) specificity stays sorted with neighbors. */
+.think-aside-header .copy-btn {
+  opacity: 0.6;
+}
+
+/* Pseudo-class states for .copy-btn — same (0,2,0) bucket as the contextual
+   `.parent .copy-btn` rules above. */
+.copy-btn.copied {
+  color: var(--accent-green);
+}
+
+.copy-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* (0,2,1) bucket: hover reveals scoped to `pre` and `.think-aside-header`. */
 pre:hover .copy-btn {
   opacity: 1;
+}
+
+.think-aside-header .copy-btn:hover {
+  opacity: 1;
+}
+
+/* (0,3,0) bucket: parent-hover reveals and the base :hover state. */
+.tool-block-input:hover .copy-btn {
+  opacity: 1;
+}
+
+.tool-block-output-content:hover .copy-btn {
+  opacity: 1;
+}
+
+.copy-btn:hover:not(:disabled) {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
 }
 
 /* Legacy styles kept for backward compatibility */
@@ -1391,14 +1417,9 @@ pre:hover .copy-btn {
   gap: 16px;
 }
 
-/* Fade in animation for content after skeleton */
-@keyframes fadeIn {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-
+/* Fade in animation for content after skeleton — shares @keyframes fade-in defined below */
 .skeleton-loaded {
-  animation: fadeIn 0.2s ease-out;
+  animation: fade-in 0.2s ease-out;
 }
 
 /* Input Area */
@@ -1465,17 +1486,6 @@ pre:hover .copy-btn {
   --pulse-color: var(--accent-purple, #a371f7);
 }
 
-.input-textarea-wrap--working #message-input {
-  border-color: color-mix(in srgb, var(--pulse-color) 40%, transparent);
-  background: color-mix(in srgb, var(--bg-primary) 90%, var(--pulse-color));
-  animation: input-pulse 2s ease-in-out infinite;
-}
-
-@keyframes input-pulse {
-  0%, 100% { border-color: color-mix(in srgb, var(--pulse-color) 30%, transparent); }
-  50% { border-color: color-mix(in srgb, var(--pulse-color) 60%, transparent); }
-}
-
 #message-input {
   width: 100%;
   padding: 10px 80px 10px 12px; /* right padding reserves space for inline buttons */
@@ -1493,9 +1503,20 @@ pre:hover .copy-btn {
   transition: border-color 0.2s, background 0.2s;
 }
 
+#message-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 #message-input:focus {
   outline: none;
   border-color: var(--accent-blue);
+}
+
+.input-textarea-wrap--working #message-input {
+  border-color: color-mix(in srgb, var(--pulse-color) 40%, transparent);
+  background: color-mix(in srgb, var(--bg-primary) 90%, var(--pulse-color));
+  animation: input-pulse 2s ease-in-out infinite;
 }
 
 /* When working + focused, keep the pulse color (don't override with blue) */
@@ -1503,9 +1524,9 @@ pre:hover .copy-btn {
   border-color: color-mix(in srgb, var(--pulse-color) 60%, transparent);
 }
 
-#message-input:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
+@keyframes input-pulse {
+  0%, 100% { border-color: color-mix(in srgb, var(--pulse-color) 30%, transparent); }
+  50% { border-color: color-mix(in srgb, var(--pulse-color) 60%, transparent); }
 }
 
 /* Inline action buttons -- inside textarea container, bottom-right */
@@ -1533,13 +1554,13 @@ pre:hover .copy-btn {
   transition: background 0.15s;
 }
 
-.input-send-btn:hover:not(:disabled) {
-  background: #4c9aed;
-}
-
 .input-send-btn:disabled {
   opacity: 0.35;
   cursor: not-allowed;
+}
+
+.input-send-btn:hover:not(:disabled) {
+  background: #4c9aed;
 }
 
 /* Stop button -- inside textarea */
@@ -1555,15 +1576,15 @@ pre:hover .copy-btn {
   transition: color 0.15s, border-color 0.15s, background 0.15s;
 }
 
+.input-stop-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .input-stop-btn:hover:not(:disabled) {
   color: var(--text-primary);
   border-color: var(--text-secondary);
   background: color-mix(in srgb, var(--bg-tertiary) 60%, transparent);
-}
-
-.input-stop-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
 }
 
 /* Buttons */
@@ -1579,13 +1600,13 @@ pre:hover .copy-btn {
   min-height: 36px;
 }
 
-.btn-primary:hover:not(:disabled) {
-  background: #4c9aed;
-}
-
 .btn-primary:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: #4c9aed;
 }
 
 .btn-secondary {
@@ -1607,7 +1628,7 @@ pre:hover .copy-btn {
 #modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.7);
+  background: rgb(0 0 0 / 70%);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1628,6 +1649,11 @@ pre:hover .copy-btn {
   max-width: 400px;
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   `.modal h3` (0,1,1) follows `.agent-text-block h3:first-child` (0,2,1)
+   from the markdown section. Different DOM scopes (modal vs agent text),
+   orthogonal properties, and the rule belongs with the other `.modal`
+   styles. */
 .modal h3 {
   margin-bottom: 16px;
   font-size: 18px;
@@ -1658,7 +1684,7 @@ pre:hover .copy-btn {
 
 .modal-actions {
   display: flex;
-  gap: 8px;
+  gap: 12px;
   justify-content: flex-end;
   margin-top: 16px;
 }
@@ -1767,15 +1793,17 @@ pre:hover .copy-btn {
 }
 
 .subagent-item.pending {
-  background: rgba(210, 153, 34, 0.1);
+  background: rgb(210 153 34 / 10%);
 }
 
 .subagent-item.completed {
-  background: rgba(63, 185, 80, 0.1);
+  background: rgb(63 185 80 / 10%);
+  flex-direction: column;
+  align-items: stretch;
 }
 
 .subagent-item.completed.error {
-  background: rgba(248, 81, 73, 0.1);
+  background: rgb(248 81 73 / 10%);
 }
 
 .subagent-icon {
@@ -1825,11 +1853,6 @@ pre:hover .copy-btn {
 }
 
 /* Completed sub-agent with expandable result */
-.subagent-item.completed {
-  flex-direction: column;
-  align-items: stretch;
-}
-
 .subagent-item-header {
   display: flex;
   align-items: center;
@@ -1854,7 +1877,7 @@ pre:hover .copy-btn {
   padding-left: 30px;
   line-height: 1.4;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .subagent-result.expanded {
@@ -1883,14 +1906,14 @@ pre:hover .copy-btn {
   transition: background 150ms ease, color 150ms ease;
 }
 
-.subagent-open-link:hover:not(:disabled) {
-  background: var(--bg-hover);
-  color: var(--accent-blue);
-}
-
 .subagent-open-link:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+.subagent-open-link:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--accent-blue);
 }
 
 /* ============================================================================
@@ -2022,16 +2045,18 @@ pre:hover .copy-btn {
   100% { transform: scale(1); }
 }
 
-/* Offline Banner */
+/* Offline banner - minimal top bar */
 .offline-banner {
   flex: 0 0 auto;
-  background: var(--accent-red);
-  color: white;
-  padding: 8px 16px;
+  background: var(--accent-yellow);
+  color: #000;
+  padding: 6px 16px;
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 14px;
+  font-size: 12px;
+  font-weight: 500;
+  text-align: center;
   animation: slide-down 0.2s ease-out;
 }
 
@@ -2040,6 +2065,7 @@ pre:hover .copy-btn {
     transform: translateY(-100%);
     opacity: 0;
   }
+
   to {
     transform: translateY(0);
     opacity: 1;
@@ -2056,8 +2082,8 @@ pre:hover .copy-btn {
 
 .offline-banner-retry {
   background: none;
-  border: 1px solid rgba(255, 255, 255, 0.6);
-  color: white;
+  border: 1px solid rgb(0 0 0 / 40%);
+  color: #000;
   padding: 2px 10px;
   border-radius: 4px;
   font-size: 13px;
@@ -2066,12 +2092,13 @@ pre:hover .copy-btn {
 }
 
 .offline-banner-retry:hover {
-  background: rgba(255, 255, 255, 0.15);
-  border-color: white;
+  background: rgb(0 0 0 / 10%);
+  border-color: #000;
 }
 
 /* Message Status Indicators */
 .message-status {
+  margin-left: auto;
   font-size: 14px;
   text-transform: none;
   letter-spacing: normal;
@@ -2115,7 +2142,7 @@ pre:hover .copy-btn {
 
 .cancel-steering-btn:hover {
   color: var(--accent-red);
-  background: rgba(var(--accent-red-rgb, 220, 50, 47), 0.12);
+  background: rgb(220 50 47 / 12%);
 }
 
 /* Steering-queued message bubble: muted appearance */
@@ -2146,7 +2173,7 @@ pre:hover .copy-btn {
   align-items: center;
   gap: 8px;
   padding: 8px 12px;
-  background: rgba(248, 81, 73, 0.1);
+  background: rgb(248 81 73 / 10%);
   border: 1px solid var(--accent-red);
   border-radius: 6px;
   margin-bottom: 4px;
@@ -2239,7 +2266,7 @@ pre:hover .copy-btn {
 }
 
 /* Hide slug/back-arrow on desktop when sidebar is visible */
-@media (min-width: 1025px) {
+@media (width >= 1025px) {
   .statebar-slug {
     display: none;
   }
@@ -2365,7 +2392,7 @@ pre:hover .copy-btn {
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: 6px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 4px 12px rgb(0 0 0 / 25%);
   z-index: 1000;
   min-width: 240px;
   max-width: calc(100vw - 16px);
@@ -2562,6 +2589,7 @@ pre:hover .copy-btn {
   opacity: 0.75;
   white-space: nowrap;
 }
+
 .statebar-project {
   margin-left: auto;
   color: var(--text-muted);
@@ -2677,7 +2705,7 @@ pre:hover .copy-btn {
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: 6px;
-  box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.15);
+  box-shadow: 0 -4px 12px rgb(0 0 0 / 15%);
   z-index: 1000;
   min-width: 200px;
 }
@@ -2781,7 +2809,7 @@ pre:hover .copy-btn {
   gap: 8px;
   width: 100%;
   padding: 10px 14px;
-  background: rgba(var(--accent-yellow-rgb, 234, 179, 8), 0.1);
+  background: rgb(234 179 8 / 10%);
   border: none;
   color: inherit;
   font: inherit;
@@ -2790,7 +2818,7 @@ pre:hover .copy-btn {
 }
 
 .context-exhausted-header:hover {
-  background: rgba(var(--accent-yellow-rgb, 234, 179, 8), 0.15);
+  background: rgb(234 179 8 / 15%);
 }
 
 .context-exhausted-banner--expanded .context-exhausted-header {
@@ -2838,11 +2866,11 @@ pre:hover .copy-btn {
   border: 1px solid var(--border-color);
   border-radius: 6px;
   padding: 12px;
-  margin: 12px 0 0 0;
+  margin: 12px 0 0;
   font-size: 13px;
   line-height: 1.5;
   white-space: pre-wrap;
-  word-wrap: break-word;
+  overflow-wrap: break-word;
   max-height: 300px;
   overflow-y: auto;
   color: var(--text-primary);
@@ -2893,15 +2921,15 @@ pre:hover .copy-btn {
   transition: background-color 0.15s, color 0.15s, border-color 0.15s;
 }
 
-.context-exhausted-abandon:hover:not(:disabled) {
-  background: var(--danger-bg, rgba(239, 68, 68, 0.1));
-  color: var(--danger, #ef4444);
-  border-color: var(--danger, #ef4444);
-}
-
 .context-exhausted-abandon:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+.context-exhausted-abandon:hover:not(:disabled) {
+  background: var(--danger-bg, rgb(239 68 68 / 10%));
+  color: var(--danger, #ef4444);
+  border-color: var(--danger, #ef4444);
 }
 
 /* Terminal conversation banner */
@@ -2953,7 +2981,7 @@ pre:hover .copy-btn {
   pointer-events: auto;
   background: transparent;
   border: none;
-  border-left: 1px solid currentColor;
+  border-left: 1px solid currentcolor;
   opacity: 0.85;
   cursor: pointer;
   border-radius: 0 4px 4px 0;
@@ -2962,7 +2990,7 @@ pre:hover .copy-btn {
 
 .status-icon-btn:active {
   opacity: 1;
-  background: color-mix(in srgb, currentColor 15%, transparent);
+  background: color-mix(in srgb, currentcolor 15%, transparent);
 }
 
 .status-icon.status-checking {
@@ -2993,7 +3021,7 @@ pre:hover .copy-btn {
   border: 1px solid var(--border-color);
   border-radius: 6px;
   background: var(--bg-primary);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  box-shadow: 0 4px 12px rgb(0 0 0 / 15%);
   margin-top: 4px;
 }
 
@@ -3053,7 +3081,6 @@ pre:hover .copy-btn {
 }
 
 .directory-list-loading {
-
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -3169,7 +3196,7 @@ pre:hover .copy-btn {
   border: 1px solid var(--border-color);
   border-radius: 8px;
   padding: 8px;
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 6px 24px rgb(0 0 0 / 25%);
   z-index: 100;
   display: flex;
   flex-direction: column;
@@ -3202,6 +3229,10 @@ pre:hover .copy-btn {
   word-break: break-all;
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   `.account-chip-menu-id code` follows `.message-content code:not(pre code)`
+   from the markdown section. Different DOM scopes; rule stays grouped with
+   the account-chip menu styles. */
 .account-chip-menu-id code {
   background: var(--bg-tertiary);
   padding: 1px 5px;
@@ -3228,20 +3259,16 @@ pre:hover .copy-btn {
   transition: background 0.1s;
 }
 
-.account-chip-menu-item:hover:not(:disabled) {
-  background: var(--bg-tertiary);
-}
-
 .account-chip-menu-item:disabled {
   opacity: 0.6;
   cursor: not-allowed;
 }
 
-/* Smooth theme transition */
-html {
-  transition: background-color 0.2s ease, color 0.2s ease;
+.account-chip-menu-item:hover:not(:disabled) {
+  background: var(--bg-tertiary);
 }
 
+/* Smooth theme transition */
 html * {
   transition: background-color 0.2s ease, border-color 0.2s ease;
 }
@@ -3319,12 +3346,6 @@ html * {
 }
 
 /* Conversation Item Actions */
-.conv-item {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-}
-
 .conv-item-main {
   display: flex;
   flex-direction: column;
@@ -3385,7 +3406,7 @@ html * {
 }
 
 .action-btn.danger:hover {
-  background: rgba(248, 81, 73, 0.1);
+  background: rgb(248 81 73 / 10%);
   border-color: var(--accent-red);
   color: var(--accent-red);
 }
@@ -3441,12 +3462,14 @@ html * {
   border: none;
   color: var(--accent-blue);
   cursor: pointer;
-  font-size: 13px;
   padding: 0;
+  font-size: inherit;
+  font-family: inherit;
+  text-decoration: underline;
 }
 
 .btn-link:hover {
-  text-decoration: underline;
+  text-decoration: none;
 }
 
 /* Confirm Dialog */
@@ -3454,6 +3477,10 @@ html * {
   max-width: 400px;
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   `.confirm-dialog h3` follows `.agent-text-block h3:first-child` (0,2,1)
+   from the markdown section. Different DOM scopes; rule stays with the
+   confirm-dialog styles. */
 .confirm-dialog h3 {
   margin-bottom: 12px;
 }
@@ -3468,7 +3495,7 @@ html * {
 }
 
 .chain-delete-confirm .confirm-message p {
-  margin: 0 0 8px 0;
+  margin: 0 0 8px;
 }
 
 .chain-delete-bullets {
@@ -3484,12 +3511,6 @@ html * {
 .chain-delete-final {
   font-weight: 500;
   color: var(--text-primary);
-}
-
-.modal-actions {
-  display: flex;
-  gap: 12px;
-  justify-content: flex-end;
 }
 
 .btn-danger {
@@ -3513,6 +3534,10 @@ html * {
   max-width: 400px;
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   `.rename-dialog h3` follows `.agent-text-block h3:first-child` (0,2,1)
+   from the markdown section. Different DOM scopes; rule stays with the
+   rename-dialog styles. */
 .rename-dialog h3 {
   margin-bottom: 16px;
 }
@@ -3549,15 +3574,6 @@ html * {
 }
 
 /* Status header styles */
-/* Offline banner - minimal top bar */
-.offline-banner {
-  padding: 6px 16px;
-  text-align: center;
-  font-size: 12px;
-  font-weight: 500;
-  background: var(--accent-yellow);
-  color: #000;
-}
 
 /* Pull-to-refresh indicator */
 .pull-refresh-indicator {
@@ -3587,7 +3603,7 @@ html * {
   position: fixed;
   bottom: 20px;
   right: 20px;
-  background: rgba(0, 0, 0, 0.7);
+  background: rgb(0 0 0 / 70%);
   color: white;
   padding: 4px 8px;
   border-radius: 4px;
@@ -3602,7 +3618,7 @@ html * {
   position: fixed;
   bottom: 20px;
   left: 20px;
-  background: rgba(0, 0, 0, 0.9);
+  background: rgb(0 0 0 / 90%);
   color: white;
   padding: 16px;
   border-radius: 8px;
@@ -3612,10 +3628,14 @@ html * {
   min-width: 250px;
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   `.performance-dashboard h4` follows `.agent-text-block h4:first-child`
+   (0,2,1) from the markdown section. Different DOM scopes; rule stays with
+   the performance-dashboard styles. */
 .performance-dashboard h4 {
-  margin: 0 0 12px 0;
+  margin: 0 0 12px;
   font-size: 14px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+  border-bottom: 1px solid rgb(255 255 255 / 20%);
   padding-bottom: 8px;
 }
 
@@ -3632,7 +3652,7 @@ html * {
 }
 
 .metric .label {
-  color: rgba(255, 255, 255, 0.7);
+  color: rgb(255 255 255 / 70%);
   font-size: 10px;
   margin-bottom: 2px;
 }
@@ -3644,8 +3664,8 @@ html * {
 }
 
 .reset-btn {
-  background: rgba(255, 255, 255, 0.1);
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgb(255 255 255 / 10%);
+  border: 1px solid rgb(255 255 255 / 20%);
   color: white;
   padding: 4px 12px;
   border-radius: 4px;
@@ -3655,9 +3675,11 @@ html * {
 }
 
 .reset-btn:hover {
-  background: rgba(255, 255, 255, 0.2);
+  background: rgb(255 255 255 / 20%);
 }
+
 /* Status header improvements */
+
 /* Settings Modal */
 .settings-list {
   display: flex;
@@ -3707,7 +3729,7 @@ html * {
   position: fixed;
   top: 60px;
   left: 8px;
-  background: rgba(0, 0, 0, 0.9);
+  background: rgb(0 0 0 / 90%);
   color: #0f0;
   font-family: var(--font-mono);
   font-size: 10px;
@@ -3738,7 +3760,7 @@ html * {
 }
 
 .debug-section.highlight {
-  background: rgba(255, 255, 0, 0.1);
+  background: rgb(255 255 0 / 10%);
   padding: 4px;
   margin: -4px;
   margin-top: 4px;
@@ -3792,14 +3814,14 @@ html * {
   min-height: 36px;
 }
 
-.file-browser-btn:hover:not(:disabled) {
-  background: var(--bg-tertiary);
-  color: var(--text-primary);
-}
-
 .file-browser-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.file-browser-btn:hover:not(:disabled) {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
 }
 
 .file-browser-path {
@@ -4098,23 +4120,24 @@ html * {
   transition: background-color 0.15s;
 }
 .annotatable:hover { background: var(--bg-tertiary); }
+
 /* Disable text selection on touch devices only — desktop users need to copy code */
 @media (hover: none) {
-  .annotatable { user-select: none; -webkit-user-select: none; }
+  .annotatable { user-select: none; }
 }
 
 .annotatable--modified {
-  background-color: rgba(255, 236, 156, 0.3) !important;
+  background-color: rgb(255 236 156 / 30%) !important;
   border-left: 3px solid #f0ad4e;
 }
 
 .annotatable--highlighted {
-  background-color: rgba(59, 130, 246, 0.3) !important;
+  background-color: rgb(59 130 246 / 30%) !important;
   animation: highlight-fade 2s ease-out;
 }
 
 @keyframes highlight-fade {
-  0% { background-color: rgba(59, 130, 246, 0.5); }
+  0% { background-color: rgb(59 130 246 / 50%); }
   100% { background-color: transparent; }
 }
 
@@ -4137,16 +4160,26 @@ html * {
   transition: opacity 0.15s, color 0.15s, background-color 0.15s;
   z-index: 1;
 }
-.annotatable:hover > .annotatable__btn { opacity: 1; pointer-events: auto; }
+
 .annotatable__btn:hover {
   color: var(--accent-blue);
   background: var(--bg-tertiary);
   border-color: var(--accent-blue);
 }
+
+.annotatable:hover > .annotatable__btn {
+  opacity: 1;
+  pointer-events: auto;
+}
+
 @media (hover: none) { .annotatable__btn { display: none; } }
 
 /* === View-specific layout (compose with .annotatable) === */
-.prose-line { display: flex; min-height: 24px; }
+.prose-line {
+  display: flex;
+  min-height: 24px;
+}
+
 .prose-line__number {
   width: 48px;
   padding: 0 12px;
@@ -4156,6 +4189,7 @@ html * {
   flex-shrink: 0;
   font-size: 12px;
 }
+
 .prose-line__content {
   flex: 1;
   padding: 0 16px;
@@ -4173,6 +4207,11 @@ html * {
   line-height: 1.6;
 }
 
+/* stylelint-disable no-descending-specificity --
+   The `.prose-reader-markdown *` rules below target a distinct DOM scope
+   from the `.agent-text-block *:first-child` and `.message-content code/p`
+   rules in the markdown section above. Different components, orthogonal
+   properties; keep all `.prose-reader-markdown` rules grouped together. */
 .prose-reader-markdown h1,
 .prose-reader-markdown h2,
 .prose-reader-markdown h3 {
@@ -4207,6 +4246,7 @@ html * {
   background: none;
   padding: 0;
 }
+/* stylelint-enable no-descending-specificity */
 
 .prose-reader-markdown ul,
 .prose-reader-markdown ol {
@@ -4284,7 +4324,7 @@ html * {
 .prose-reader-annotation-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.5);
+  background: rgb(0 0 0 / 50%);
   display: flex;
   align-items: flex-end;
   justify-content: center;
@@ -4399,7 +4439,7 @@ html * {
   right: 0;
   background: var(--bg-primary);
   border-radius: 16px 16px 0 0;
-  box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.15);
+  box-shadow: 0 -4px 20px rgb(0 0 0 / 15%);
   max-height: 60vh;
   display: flex;
   flex-direction: column;
@@ -4416,6 +4456,9 @@ html * {
   font-weight: 500;
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Distinct DOM scope from `.prose-reader-annotation-actions button:first-child`;
+   rule stays with the prose-reader-notes-header styles. */
 .prose-reader-notes-header button {
   background: transparent;
   border: none;
@@ -4490,6 +4533,9 @@ html * {
   border-top: 1px solid var(--border-color);
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Distinct DOM scope from `.prose-reader-annotation-actions button:first-child`;
+   rule stays with the prose-reader-notes-actions styles. */
 .prose-reader-notes-actions button {
   flex: 1;
   padding: 12px;
@@ -4520,7 +4566,7 @@ html * {
 .prose-reader-confirm-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.5);
+  background: rgb(0 0 0 / 50%);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -4536,6 +4582,9 @@ html * {
   width: 100%;
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Distinct DOM scope from `.message-content p:last-child`; rule stays with
+   the prose-reader-confirm-dialog styles. */
 .prose-reader-confirm-dialog p {
   margin-bottom: 16px;
   color: var(--text-primary);
@@ -4547,6 +4596,9 @@ html * {
   gap: 8px;
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Distinct DOM scope from `.prose-reader-annotation-actions button:first-child`;
+   rule stays with the prose-reader-confirm-actions styles. */
 .prose-reader-confirm-actions button {
   flex: 1;
   padding: 12px;
@@ -4709,7 +4761,7 @@ html * {
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: 12px;
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+  box-shadow: 0 4px 24px rgb(0 0 0 / 30%);
   box-sizing: border-box;
   flex-direction: column;
 }
@@ -4900,7 +4952,7 @@ html * {
   top: 50%;
   transform: translateY(-50%);
   font-size: 10px;
-  color: rgb(251, 191, 36);
+  color: rgb(251 191 36);
 }
 
 .branch-combobox-loading {
@@ -4924,7 +4976,7 @@ html * {
   border: 1px solid var(--border-color);
   border-radius: 6px;
   z-index: 100;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  box-shadow: 0 4px 12px rgb(0 0 0 / 30%);
 }
 
 .branch-combobox-item {
@@ -4962,19 +5014,19 @@ html * {
   font-size: 10px;
   padding: 1px 5px;
   border-radius: 3px;
-  background: var(--bg-tertiary, rgba(255, 255, 255, 0.08));
+  background: var(--bg-tertiary, rgb(255 255 255 / 8%));
   color: var(--text-muted);
   flex-shrink: 0;
 }
 
 .branch-tag--local {
-  background: rgba(255, 255, 255, 0.06);
+  background: rgb(255 255 255 / 6%);
   color: var(--text-muted);
 }
 
 .branch-behind-badge {
   font-size: 10px;
-  color: rgb(251, 191, 36);
+  color: rgb(251 191 36);
   flex-shrink: 0;
 }
 
@@ -4990,13 +5042,16 @@ html * {
   padding: 8px 12px;
   font-size: 12px;
   border-radius: 6px;
-  background: rgba(251, 191, 36, 0.08);
-  border: 1px solid rgba(251, 191, 36, 0.25);
-  color: rgb(251, 191, 36);
+  background: rgb(251 191 36 / 8%);
+  border: 1px solid rgb(251 191 36 / 25%);
+  color: rgb(251 191 36);
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Distinct DOM scope from `.agent-text-block a:hover` in the markdown
+   section; rule stays with the branch-conflict-banner styles. */
 .branch-conflict-banner a {
-  color: rgb(96, 165, 250);
+  color: rgb(96 165 250);
   text-decoration: underline;
 }
 
@@ -5011,7 +5066,7 @@ html * {
 }
 
 .new-conv-error {
-  background: rgba(239, 68, 68, 0.1);
+  background: rgb(239 68 68 / 10%);
   color: #f87171;
   padding: 10px 14px;
   border-radius: 8px;
@@ -5036,15 +5091,15 @@ html * {
 }
 
 .llm-status-banner--warning {
-  background: rgba(234, 179, 8, 0.12);
+  background: rgb(234 179 8 / 12%);
   color: #ca8a04;
-  border: 1px solid rgba(234, 179, 8, 0.3);
+  border: 1px solid rgb(234 179 8 / 30%);
 }
 
 .llm-status-banner--unconfigured {
-  background: rgba(59, 130, 246, 0.1);
+  background: rgb(59 130 246 / 10%);
   color: #60a5fa;
-  border: 1px solid rgba(59, 130, 246, 0.25);
+  border: 1px solid rgb(59 130 246 / 25%);
 }
 
 .llm-status-banner__icon {
@@ -5057,10 +5112,13 @@ html * {
   flex: 1;
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Distinct DOM scope from `.message-content code:not(pre code)`; rule stays
+   with the llm-status-banner styles. */
 .llm-status-banner__text code {
   font-family: var(--font-mono);
   font-size: 12px;
-  background: rgba(255, 255, 255, 0.08);
+  background: rgb(255 255 255 / 8%);
   padding: 1px 4px;
   border-radius: 3px;
 }
@@ -5298,6 +5356,10 @@ html * {
   box-sizing: border-box;
 }
 
+.settings-select {
+  cursor: pointer;
+}
+
 .settings-input:focus,
 .settings-select:focus {
   outline: none;
@@ -5307,10 +5369,6 @@ html * {
 .settings-input.status-ok { border-color: var(--success-color, #4ade80); }
 .settings-input.status-create { border-color: var(--warning-color, #facc15); }
 .settings-input.status-error { border-color: var(--error-color, #f87171); }
-
-.settings-select {
-  cursor: pointer;
-}
 
 .model-filter-toggle {
   display: flex;
@@ -5427,7 +5485,7 @@ html * {
 }
 
 /* Mobile adjustments */
-@media (max-width: 768px) {
+@media (width <= 768px) {
   .mobile-only {
     display: flex;
   }
@@ -5573,6 +5631,11 @@ html * {
   color: var(--text-primary);
 }
 
+/* stylelint-disable no-descending-specificity --
+   `.init-error h2/p/button` rules target a distinct DOM scope from the
+   global `.agent-text-block`, `.message-content`, and
+   `.prose-reader-annotation-actions` rules earlier in the file. Different
+   components; keep `.init-error` rules grouped. */
 .init-error h2 {
   font-size: 24px;
   margin-bottom: 16px;
@@ -5601,6 +5664,7 @@ html * {
 .init-error button:hover {
   background: var(--accent-hover, #2563eb);
 }
+/* stylelint-enable no-descending-specificity */
 
 /* ============================================
    Error Banner - Prominent error display
@@ -5646,7 +5710,7 @@ html * {
   font-size: 13px;
   color: var(--text-error-details, #d4a5a5);
   line-height: 1.4;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 /* Action bar — mirrors #input-area bottom bar */
@@ -5674,6 +5738,7 @@ html * {
   font-weight: 500;
   cursor: pointer;
   transition: background 0.15s ease;
+
   /* Comfortable tap target on mobile */
   min-height: 44px;
 }
@@ -5731,7 +5796,9 @@ html * {
 }
 
 /* ======================================================== */
+
 /* Desktop Sidebar Layout (REQ-CONV-016, 017, 018)           */
+
 /* ======================================================== */
 
 .desktop-layout {
@@ -5805,7 +5872,7 @@ html * {
 }
 
 .pane-divider--dragging {
-  background: rgba(88, 166, 255, 0.1);
+  background: rgb(88 166 255 / 10%);
 }
 
 .pane-divider--dragging::after {
@@ -5836,8 +5903,8 @@ html * {
   height: 28px;
 }
 
-.pane-divider:hover .pane-divider-grip,
-.pane-divider--dragging .pane-divider-grip {
+.pane-divider--dragging .pane-divider-grip,
+.pane-divider:hover .pane-divider-grip {
   opacity: 0.85;
 }
 
@@ -5873,6 +5940,7 @@ html * {
   padding: 4px;
   border-radius: 6px;
   color: var(--text-primary);
+
   /* Allow brand to absorb width pressure first — the logo stays, the
    * "Phoenix" label truncates so the right-edge controls (theme, account
    * chip) keep their full size at narrow sidebar widths. */
@@ -5917,8 +5985,9 @@ html * {
   overflow-x: auto;
   flex-shrink: 0;
   scrollbar-width: none;
-  mask-image: linear-gradient(to right, black 85%, transparent 100%);
+  /* stylelint-disable-next-line property-no-vendor-prefix -- Safari < 17.2 needs the prefixed property for CSS masks */
   -webkit-mask-image: linear-gradient(to right, black 85%, transparent 100%);
+  mask-image: linear-gradient(to right, black 85%, transparent 100%);
 }
 
 .project-tabs::-webkit-scrollbar {
@@ -5966,8 +6035,7 @@ html * {
 
 .sidebar-list {
   flex: 1 1 auto;
-  overflow-y: auto;
-  overflow-x: hidden;
+  overflow: hidden auto;
 }
 
 /* Sidebar mode overrides for ConversationList */
@@ -6012,6 +6080,11 @@ html * {
   display: none;
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   `.sidebar-mode .conv-item-menu-btn` (0,2,0) follows the conv-item section's
+   `.conv-item.expanded .conv-item-menu-btn` (0,3,0); they set orthogonal
+   properties (padding/font-size vs background/color) and the rule belongs
+   with the sidebar-mode layout overrides, not with the conv-item base. */
 .sidebar-mode .conv-item-menu-btn {
   padding: 4px 6px;
   font-size: 14px;
@@ -6022,6 +6095,7 @@ html * {
 }
 
 /* ----- Chain blocks (REQ-CHN-002) -------------------------------------- */
+
 /* A chain block is a collapsible group rendered between standalone
  * conversation rows in the sidebar. The header (caret + name) is the
  * primary affordance; members are rendered nested below, indented to
@@ -6147,7 +6221,7 @@ html * {
   gap: 4px;
   border: 1px solid var(--border-color);
   border-radius: 6px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+  box-shadow: 0 4px 12px rgb(0 0 0 / 18%);
   padding: 6px;
 }
 
@@ -6160,6 +6234,7 @@ html * {
   list-style: none;
   margin: 0;
   padding: 0 0 2px 12px;
+
   /* Subtle entrance animation when expanding (purposeful 200ms,
    * AGENTS.md). Collapsed state is unmounted so this only runs on
    * expand. */
@@ -6171,6 +6246,7 @@ html * {
     opacity: 0;
     transform: translateY(-2px);
   }
+
   to {
     opacity: 1;
     transform: translateY(0);
@@ -6342,6 +6418,7 @@ html * {
 }
 
 /* --- New Conversation Page styles (REQ-CONV-017, REQ-CONV-018) --- */
+
 /* The "+ New" sidebar entry navigates to /new; the page below renders
    in the desktop main area and adapts to mobile via responsive CSS. */
 .desktop-main #app {
@@ -6382,7 +6459,7 @@ html * {
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: 8px;
-  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.2);
+  box-shadow: 0 -4px 16px rgb(0 0 0 / 20%);
   z-index: 500;
   overflow: hidden;
   animation: iac-in 100ms ease-out;
@@ -6392,8 +6469,15 @@ html * {
 }
 
 @keyframes iac-in {
-  from { opacity: 0; transform: translateY(4px); }
-  to   { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 /* Header row: trigger prefix + hint */
@@ -6474,8 +6558,8 @@ html * {
   align-items: center;
   gap: 6px;
   padding: 4px 10px;
-  background: rgba(239, 68, 68, 0.1);
-  border: 1px solid rgba(239, 68, 68, 0.3);
+  background: rgb(239 68 68 / 10%);
+  border: 1px solid rgb(239 68 68 / 30%);
   border-radius: 4px;
   margin-bottom: 4px;
   font-size: 12px;
@@ -6504,7 +6588,7 @@ html * {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  border-top: 1px solid var(--border-subtle, rgba(255,255,255,0.06));
+  border-top: 1px solid var(--border-subtle, rgb(255 255 255 / 6%));
 }
 
 .input-skill-hint-text::before {
@@ -6523,7 +6607,7 @@ html * {
   position: fixed;
   inset: 0;
   z-index: 2000;
-  background: rgba(0, 0, 0, 0.5);
+  background: rgb(0 0 0 / 50%);
   display: flex;
   justify-content: center;
   align-items: flex-start;
@@ -6543,7 +6627,7 @@ html * {
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: 12px;
-  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 16px 48px rgb(0 0 0 / 40%);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -6555,6 +6639,7 @@ html * {
     opacity: 0;
     transform: scale(0.96) translateY(-8px);
   }
+
   to {
     opacity: 1;
     transform: scale(1) translateY(0);
@@ -6790,8 +6875,7 @@ html * {
 /* Tree scroll container */
 .fe-tree-scroll {
   flex: 1;
-  overflow-y: auto;
-  overflow-x: hidden;
+  overflow: hidden auto;
 }
 
 /* FileTree styles */
@@ -7123,6 +7207,9 @@ html * {
   margin-bottom: 12px;
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Distinct DOM scope from `.message-content code:not(pre code)` in the
+   markdown section; rule stays with the first-task-welcome styles. */
 .first-task-welcome-text code {
   background: var(--bg-tertiary);
   padding: 1px 5px;
@@ -7136,6 +7223,9 @@ html * {
   margin-bottom: 16px;
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Distinct DOM scope from `.agent-text-block a:hover` in the markdown
+   section; rule stays with the first-task-welcome styles. */
 .first-task-welcome-link a {
   color: var(--accent-blue);
   text-decoration: none;
@@ -7200,6 +7290,7 @@ html * {
 .work-actions-pr-note--warning {
   color: var(--accent-yellow, #eab308);
 }
+
 .work-actions-abandon {
   color: var(--text-muted);
   border-color: transparent;
@@ -7488,7 +7579,7 @@ html * {
 }
 
 .auth-strip-header:hover {
-  background: rgba(255, 255, 255, 0.03);
+  background: rgb(255 255 255 / 3%);
 }
 
 .auth-strip-indicator {
@@ -7557,8 +7648,8 @@ html * {
 }
 
 .auth-strip-error {
-  background: rgba(239, 68, 68, 0.08);
-  border: 1px solid rgba(239, 68, 68, 0.2);
+  background: rgb(239 68 68 / 8%);
+  border: 1px solid rgb(239 68 68 / 20%);
   border-radius: 4px;
   padding: 8px 10px;
   font-size: 12px;
@@ -7590,7 +7681,7 @@ html * {
 }
 
 .auth-strip-link {
-  color: rgb(96, 165, 250);
+  color: rgb(96 165 250);
   text-decoration: underline;
 }
 
@@ -7599,7 +7690,7 @@ html * {
 .commit-modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.5);
+  background: rgb(0 0 0 / 50%);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -7619,13 +7710,20 @@ html * {
   padding: 20px 24px;
   width: 90%;
   max-width: 520px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 8px 32px rgb(0 0 0 / 40%);
   animation: commit-modal-slide-in 150ms ease;
 }
 
 @keyframes commit-modal-slide-in {
-  from { transform: translateY(8px); opacity: 0; }
-  to { transform: translateY(0); opacity: 1; }
+  from {
+    transform: translateY(8px);
+    opacity: 0;
+  }
+
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
 }
 
 .commit-modal-title {
@@ -7635,6 +7733,9 @@ html * {
   margin: 0 0 12px;
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Distinct DOM scope from `.message-content code:not(pre code)`; rule
+   stays with the commit-modal styles. */
 .commit-modal-title code {
   font-family: var(--font-mono);
   font-size: 13px;
@@ -7686,14 +7787,14 @@ html * {
   white-space: nowrap;
 }
 
-.commit-modal-nudge-fix:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 10%, transparent);
-  border-color: var(--accent-blue, #3b82f6);
-}
-
 .commit-modal-nudge-fix:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+.commit-modal-nudge-fix:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 10%, transparent);
+  border-color: var(--accent-blue, #3b82f6);
 }
 
 .commit-modal-nudge-dismiss {
@@ -7854,13 +7955,13 @@ html * {
   transition: opacity 150ms;
 }
 
-.login-button:hover:not(:disabled) {
-  opacity: 0.9;
-}
-
 .login-button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.login-button:hover:not(:disabled) {
+  opacity: 0.9;
 }
 
 .login-error {
@@ -7915,6 +8016,9 @@ html * {
   color: var(--text-secondary);
 }
 
+/* stylelint-disable no-descending-specificity --
+   Distinct DOM scope from `.message-content code:not(pre code)`; rules
+   stay with the codex-login styles. */
 .codex-login-info code,
 .codex-login-warning code,
 .codex-login-success code {
@@ -7923,6 +8027,7 @@ html * {
   border-radius: 3px;
   font-size: 12px;
 }
+/* stylelint-enable no-descending-specificity */
 
 .codex-login-warning {
   border-color: var(--accent-yellow, #c4a000);
@@ -7962,6 +8067,9 @@ html * {
   margin: 0;
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Distinct DOM scope from `.message-content code:not(pre code)`; rule
+   stays with the codex-login styles. */
 .codex-login-help code {
   font-size: 11px;
 }
@@ -8149,13 +8257,13 @@ html * {
 
 .auth-chip.valid {
   color: var(--success-color, #22c55e);
-  background: rgba(34, 197, 94, 0.1);
+  background: rgb(34 197 94 / 10%);
 }
 
 .auth-chip.required,
 .auth-chip.failed {
   color: var(--error-color, #ef4444);
-  background: rgba(239, 68, 68, 0.1);
+  background: rgb(239 68 68 / 10%);
   cursor: pointer;
 }
 
@@ -8170,6 +8278,7 @@ html * {
 .terminal-panel {
   display: flex;
   flex-direction: column;
+
   /* height applied inline by useResizablePane */
   background: var(--terminal-bg);
   flex-shrink: 0;
@@ -8222,6 +8331,7 @@ html * {
 .terminal-panel-status {
   font-size: 11px;
   color: var(--text-muted, #888);
+
   /* Allow the status div to shrink so the chevron can pin to the far right
      regardless of how long the prompt text is. */
   flex: 1 1 0;
@@ -8235,7 +8345,7 @@ html * {
   flex-shrink: 0;
   padding: 1px 6px;
   border-radius: 3px;
-  background: rgba(210, 153, 34, 0.12);
+  background: rgb(210 153 34 / 12%);
   transition: color 150ms ease, background 150ms ease;
 }
 
@@ -8306,7 +8416,7 @@ html * {
 
 .terminal-live-dot--running {
   background: var(--accent-blue, #58a6ff);
-  box-shadow: 0 0 0 0 rgba(88, 166, 255, 0.7);
+  box-shadow: 0 0 0 0 rgb(88 166 255 / 70%);
   animation: terminal-live-pulse-running 0.8s ease-in-out infinite;
 }
 
@@ -8322,11 +8432,12 @@ html * {
 
 @keyframes terminal-live-pulse-running {
   0%, 100% {
-    box-shadow: 0 0 0 0 rgba(88, 166, 255, 0.7);
+    box-shadow: 0 0 0 0 rgb(88 166 255 / 70%);
     opacity: 0.85;
   }
+
   50% {
-    box-shadow: 0 0 0 5px rgba(88, 166, 255, 0);
+    box-shadow: 0 0 0 5px rgb(88 166 255 / 0%);
     opacity: 1;
   }
 }
@@ -8337,15 +8448,18 @@ html * {
   filter: grayscale(0.4);
   cursor: pointer;
 }
+
 .terminal-panel--dead .terminal-panel-header {
-  background: rgba(209, 67, 67, 0.08);
+  background: rgb(209 67 67 / 8%);
   border-top-color: var(--accent-red, #f85149);
 }
+
 .terminal-panel-prompt--dead {
   color: var(--accent-red, #f85149);
   font-family: var(--font-mono);
   font-size: 12px;
 }
+
 /* CTA word ("click") inside the disconnected-state prompt — underlined,
  * brighter, slight weight bump to draw the eye to the action. */
 .terminal-panel-prompt-cta {
@@ -8354,12 +8468,14 @@ html * {
   font-weight: 700;
   color: var(--text-primary, #e6edf3);
 }
+
 .terminal-panel-prompt--dim {
   color: var(--text-muted, #6e7681);
   font-family: var(--font-mono);
   font-size: 12px;
   opacity: 0.6;
 }
+
 .terminal-hud-cwd--dim {
   color: var(--text-muted, #6e7681);
   opacity: 0.85;
@@ -8389,7 +8505,7 @@ html * {
   background: #2d2d2d;
   border: 1px solid #444;
   border-radius: 4px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 2px 8px rgb(0 0 0 / 40%);
   white-space: nowrap;
   font-family: var(--font-mono);
   font-size: 11px;
@@ -8409,32 +8525,46 @@ html * {
 }
 
 @keyframes terminal-hint-tooltip-fade {
-  from { opacity: 0; transform: translateY(2px); }
-  to   { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 /* Rich HUD (OSC 133 detected) — inline spans inside .terminal-panel-prompt */
 .terminal-hud-cwd {
   color: var(--accent-blue, #58a6ff);
 }
+
 .terminal-hud-sep {
   color: var(--text-muted, #888);
 }
+
 .terminal-hud-cmd {
   color: var(--text-primary, #e6edf3);
 }
+
 .terminal-hud-dur {
   color: var(--text-muted, #888);
 }
+
 .terminal-hud-glyph {
   font-weight: 600;
 }
+
 .terminal-hud-glyph--ok {
   color: var(--accent-green, #3fb950);
 }
+
 .terminal-hud-glyph--err {
   color: #f85149;
 }
+
 .terminal-hud-glyph--unknown {
   color: var(--text-muted, #888);
 }
@@ -8443,7 +8573,7 @@ html * {
 .terminal-snippet-modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
+  background: rgb(0 0 0 / 55%);
   z-index: 1000;
   display: flex;
   align-items: center;
@@ -8460,7 +8590,7 @@ html * {
   background: #1f1f1f;
   border: 1px solid #3a3a3a;
   border-radius: 6px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  box-shadow: 0 8px 32px rgb(0 0 0 / 60%);
   width: min(640px, 90vw);
   max-height: 80vh;
   display: flex;
@@ -8508,6 +8638,9 @@ html * {
   line-height: 1.5;
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Distinct DOM scope from `.message-content code:not(pre code)`; rule
+   stays with the terminal-snippet-modal styles. */
 .terminal-snippet-modal-help code {
   font-family: var(--font-mono);
   background: #2a2a2a;
@@ -8565,13 +8698,13 @@ html * {
   transition: background 150ms ease, opacity 150ms ease;
 }
 
-.terminal-snippet-modal-assist:hover:not(:disabled) {
-  background: #4cc962;
-}
-
 .terminal-snippet-modal-assist:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.terminal-snippet-modal-assist:hover:not(:disabled) {
+  background: #4cc962;
 }
 
 /* Seed conversation breadcrumb (REQ-SEED-003) */
@@ -8584,16 +8717,22 @@ html * {
   font-size: 12px;
   color: var(--text-muted, #6e7681);
   font-family: var(--font-mono);
-  border-bottom: 1px solid var(--border-primary, rgba(255, 255, 255, 0.06));
+  border-bottom: 1px solid var(--border-primary, rgb(255 255 255 / 6%));
   flex-shrink: 0;
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Distinct DOM scope from `.agent-text-block a:hover` in the markdown
+   section; rule stays with the conversation-seed-breadcrumb styles. */
 .conversation-seed-breadcrumb a {
   color: var(--text-muted, #6e7681);
   text-decoration: none;
   transition: color 150ms ease;
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Distinct DOM scope from `.codex-login-link a:not(.login-button):visited`;
+   rule stays with the conversation-seed-breadcrumb styles. */
 .conversation-seed-breadcrumb a:hover {
   color: var(--text-primary, #e6edf3);
   text-decoration: underline;
@@ -8603,6 +8742,7 @@ html * {
   flex: 1 1 0;
   min-height: 0;
   padding: 4px 8px;
+
   /* xterm.js manages its own scrollbar */
   overflow: hidden;
 }
@@ -8640,6 +8780,10 @@ html * {
   max-width: 480px;
 }
 
+/* stylelint-disable no-descending-specificity --
+   `.chain-page-empty h2/p` target a distinct DOM scope from
+   `.agent-text-block h2:first-child` / `.message-content p:last-child`;
+   rules stay with the chain-page-empty styles. */
 .chain-page-empty h2 {
   font-size: 18px;
   font-weight: 600;
@@ -8652,6 +8796,7 @@ html * {
   font-size: 14px;
   line-height: 1.5;
 }
+/* stylelint-enable no-descending-specificity */
 
 /* Header — name (inline-editable) + meta line. */
 .chain-page-header {
@@ -8728,7 +8873,7 @@ html * {
   min-height: 0;
 }
 
-@media (max-width: 900px) {
+@media (width <= 900px) {
   .chain-page-body {
     grid-template-columns: 1fr;
     grid-template-rows: auto 1fr;
@@ -8779,11 +8924,6 @@ html * {
   transition: border-color 200ms ease, background-color 200ms ease;
 }
 
-.chain-member-card:hover:not(:disabled) {
-  background: var(--bg-tertiary);
-  border-color: var(--accent-blue);
-}
-
 .chain-member-card:disabled {
   cursor: default;
   opacity: 0.6;
@@ -8796,7 +8936,12 @@ html * {
  * the primary signal and use only a subtle background tint on the
  * card, no accent border. */
 .chain-member--latest .chain-member-card {
-  background: var(--bg-tertiary, rgba(0, 0, 0, 0.025));
+  background: var(--bg-tertiary, rgb(0 0 0 / 2.5%));
+}
+
+.chain-member-card:hover:not(:disabled) {
+  background: var(--bg-tertiary);
+  border-color: var(--accent-blue);
 }
 
 .chain-member-row1 {
@@ -8867,6 +9012,7 @@ html * {
   padding: 0;
   display: flex;
   flex-direction: column;
+
   /* REQ-CHN-006: visual independence — vertical gap between cards, no
    * thread/reply ligatures. */
   gap: 14px;
@@ -8919,6 +9065,7 @@ html * {
   flex-shrink: 0;
   font-weight: 700;
   color: var(--accent-blue);
+
   /* Fixed-ish gutter so Q: / A: labels align across pair cards. */
   width: 18px;
   line-height: 1.55;
@@ -8931,7 +9078,7 @@ html * {
 
 .chain-qa-pair-question {
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
   line-height: 1.55;
 }
 
@@ -8951,21 +9098,31 @@ html * {
   color: var(--text-primary);
   line-height: 1.55;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 /* When the answer is rendered through ReactMarkdown the children are real
  * block elements (p, ul, h*, pre, etc.); pre-wrap on the parent would
  * double-count whitespace, and the browser's default block margins are too
  * loose for the compact card layout. Tighten everything. */
+/* stylelint-disable no-descending-specificity --
+   `.chain-qa-markdown *` rules target a distinct DOM scope from the global
+   `.message-content`, `.agent-text-block`, and `.codex-login-steps` rules
+   earlier in the file. Different components, orthogonal properties; keep
+   all `.chain-qa-markdown` rules grouped. */
 .chain-qa-markdown { white-space: normal; }
 .chain-qa-markdown > :first-child { margin-top: 0; }
 .chain-qa-markdown > :last-child { margin-bottom: 0; }
-.chain-qa-markdown p { margin: 0 0 0.6em 0; }
+.chain-qa-markdown p { margin: 0 0 0.6em; }
 .chain-qa-markdown p:last-child { margin-bottom: 0; }
+
 .chain-qa-markdown ul,
-.chain-qa-markdown ol { margin: 0 0 0.6em 0; padding-left: 1.4em; }
+.chain-qa-markdown ol {
+  margin: 0 0 0.6em;
+  padding-left: 1.4em;
+}
 .chain-qa-markdown li { margin: 0.15em 0; }
+
 .chain-qa-markdown h1,
 .chain-qa-markdown h2,
 .chain-qa-markdown h3,
@@ -8975,12 +9132,14 @@ html * {
   margin: 0.6em 0 0.3em;
   line-height: 1.3;
 }
+
 .chain-qa-markdown a {
   color: var(--accent-blue);
   text-decoration: underline;
   text-underline-offset: 2px;
   word-break: break-all;
 }
+
 .chain-qa-markdown code {
   font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
   font-size: 0.92em;
@@ -8988,6 +9147,7 @@ html * {
   padding: 1px 4px;
   border-radius: 3px;
 }
+
 .chain-qa-markdown pre {
   margin: 0.6em 0;
   padding: 8px 10px;
@@ -8997,7 +9157,13 @@ html * {
   font-size: 12px;
   line-height: 1.45;
 }
-.chain-qa-markdown pre code { background: transparent; padding: 0; font-size: inherit; }
+
+.chain-qa-markdown pre code {
+  background: transparent;
+  padding: 0;
+  font-size: inherit;
+}
+
 .chain-qa-markdown blockquote {
   margin: 0.4em 0;
   padding: 2px 10px;
@@ -9006,11 +9172,13 @@ html * {
 }
 .chain-qa-markdown strong { font-weight: 600; }
 .chain-qa-markdown em { font-style: italic; }
+
 .chain-qa-markdown hr {
   border: 0;
   border-top: 1px solid var(--border-subtle);
   margin: 0.8em 0;
 }
+/* stylelint-enable no-descending-specificity */
 
 .chain-qa-answer--placeholder {
   color: var(--text-muted);
@@ -9068,7 +9236,7 @@ html * {
   color: var(--text-muted);
   font-size: 13px;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .chain-qa-failure {
@@ -9081,21 +9249,6 @@ html * {
 .chain-qa-failure-label {
   color: var(--accent-red);
   font-weight: 600;
-}
-
-.btn-link {
-  background: none;
-  border: none;
-  color: var(--accent-blue);
-  cursor: pointer;
-  padding: 0;
-  font-size: inherit;
-  font-family: inherit;
-  text-decoration: underline;
-}
-
-.btn-link:hover {
-  text-decoration: none;
 }
 
 .chain-qa-meta {
@@ -9328,7 +9481,7 @@ html * {
   display: flex;
   flex-direction: column;
   z-index: 10;
-  box-shadow: -4px 0 12px rgba(0, 0, 0, 0.12);
+  box-shadow: -4px 0 12px rgb(0 0 0 / 12%);
 }
 
 .notes-panel-header {
@@ -9343,6 +9496,9 @@ html * {
   color: var(--text-primary);
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Distinct DOM scope from `.prose-reader-annotation-actions button:first-child`;
+   rule stays with the notes-panel-header styles. */
 .notes-panel-header button {
   background: transparent;
   border: none;
@@ -9391,13 +9547,13 @@ html * {
   border-radius: 3px;
 }
 
-.notes-panel-note-anchor:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 10%, transparent);
-}
-
 .notes-panel-note-anchor:disabled {
   color: var(--text-muted);
   cursor: default;
+}
+
+.notes-panel-note-anchor:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 10%, transparent);
 }
 
 .notes-panel-note-delete {
@@ -9432,7 +9588,7 @@ html * {
   font-size: 13px;
   color: var(--text-primary);
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .notes-panel-actions {
@@ -9443,6 +9599,9 @@ html * {
   background: var(--bg-secondary);
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Distinct DOM scope from `.prose-reader-annotation-actions button:first-child`;
+   rule stays with the notes-panel-actions styles. */
 .notes-panel-actions button {
   flex: 1;
   padding: 8px 12px;
@@ -9478,7 +9637,7 @@ html * {
 .annotation-overlay {
   position: absolute;
   inset: 0;
-  background: rgba(0, 0, 0, 0.4);
+  background: rgb(0 0 0 / 40%);
   z-index: 20;
   display: flex;
   align-items: center;
@@ -9493,7 +9652,7 @@ html * {
   width: min(480px, 100%);
   display: flex;
   flex-direction: column;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 10px 30px rgb(0 0 0 / 40%);
 }
 
 .annotation-dialog-header {
@@ -9508,6 +9667,9 @@ html * {
   font-weight: 600;
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Distinct DOM scope from `.prose-reader-annotation-actions button:first-child`;
+   rule stays with the annotation-dialog-header styles. */
 .annotation-dialog-header button {
   background: transparent;
   border: none;
@@ -9556,6 +9718,9 @@ html * {
   border-top: 1px solid var(--border-color);
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Distinct DOM scope from `.prose-reader-annotation-actions button:first-child`;
+   rule stays with the annotation-dialog-actions styles. */
 .annotation-dialog-actions button {
   padding: 6px 14px;
   border-radius: 4px;
@@ -9566,11 +9731,19 @@ html * {
   color: var(--text-secondary);
 }
 
+.annotation-dialog-actions button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .annotation-dialog-actions button:hover:not(:disabled) {
   color: var(--text-primary);
   border-color: var(--text-secondary);
 }
 
+/* stylelint-disable-next-line no-descending-specificity --
+   Distinct DOM scope from `.notes-panel-actions button.primary:hover`;
+   rule stays with the annotation-dialog-actions styles. */
 .annotation-dialog-actions button.primary {
   background: var(--accent-blue, #3b82f6);
   border-color: var(--accent-blue, #3b82f6);
@@ -9579,11 +9752,6 @@ html * {
 
 .annotation-dialog-actions button.primary:hover:not(:disabled) {
   background: color-mix(in srgb, var(--accent-blue, #3b82f6) 80%, black);
-}
-
-.annotation-dialog-actions button:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
 }
 
 /* ============================================================
@@ -9681,7 +9849,7 @@ html * {
 
 /* Pending kill / timed-out: amber (attention). */
 .bash-status-kill-pending-kernel,
-.tmux-status-timed_out {
+.tmux-status-timed-out {
   background: color-mix(in srgb, var(--accent-yellow, #d69e2e) 22%, var(--bg-secondary));
   color: var(--accent-yellow, #d69e2e);
 }
@@ -9757,7 +9925,7 @@ html * {
 .bash-lines,
 .tmux-stream-content {
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
   margin: 4px 0;
   padding: 6px 8px;
   background: var(--code-bg);
@@ -9835,17 +10003,21 @@ html * {
   background: var(--fg-muted, #888);
   transition: background 150ms ease;
 }
+
 .browser-view-panel__status[data-status='live'] {
   background: var(--accent-success, #4caf50);
   box-shadow: 0 0 4px var(--accent-success, #4caf50);
 }
+
 .browser-view-panel__status[data-status='connecting'] {
   background: var(--accent-warn, #e0a800);
 }
+
 .browser-view-panel__status[data-status='ended'],
 .browser-view-panel__status[data-status='no-session'] {
   background: var(--fg-muted, #888);
 }
+
 .browser-view-panel__status[data-status='error'] {
   background: var(--accent-danger, #d04444);
 }
@@ -9882,6 +10054,7 @@ html * {
   padding: 2px 6px;
   border-radius: 3px;
 }
+
 .browser-view-panel__close:hover {
   background: var(--surface-3, #333);
   color: var(--fg-default, #fff);
@@ -9902,6 +10075,7 @@ html * {
   max-height: 100%;
   width: auto;
   height: auto;
+
   /* Crisp pixels for the JPEG-decoded bitmap; without this, browsers can
    * smooth in a way that looks blurry on a 1:1 viewport. */
   image-rendering: auto;
@@ -9916,13 +10090,14 @@ html * {
   align-items: center;
   justify-content: center;
   gap: 4px;
-  background: rgba(0, 0, 0, 0.6);
+  background: rgb(0 0 0 / 60%);
   color: var(--fg-muted, #aaa);
   font-size: 13px;
   pointer-events: none;
   text-align: center;
   padding: 16px;
 }
+
 .browser-view-panel__overlay-sub {
   font-size: 11px;
   color: var(--fg-muted, #888);
@@ -9932,11 +10107,12 @@ html * {
   position: fixed;
   inset: 0;
   z-index: 60;
-  background: rgba(0, 0, 0, 0.85);
+  background: rgb(0 0 0 / 85%);
   display: flex;
   align-items: stretch;
   justify-content: stretch;
 }
+
 .browser-view-overlay > .browser-view-panel {
   width: 100%;
   height: 100%;
@@ -9947,6 +10123,7 @@ html * {
   justify-content: flex-end;
   padding: 4px 12px 0;
 }
+
 .browser-view-launcher-btn {
   background: var(--surface-2, #222);
   color: var(--fg-muted, #aaa);
@@ -9957,6 +10134,7 @@ html * {
   cursor: pointer;
   transition: background 120ms ease, color 120ms ease;
 }
+
 .browser-view-launcher-btn:hover {
   background: var(--surface-3, #2c2c2c);
   color: var(--fg-default, #fff);

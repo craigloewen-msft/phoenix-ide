@@ -3,7 +3,7 @@
 .shortcut-help-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.5);
+  background: rgb(0 0 0 / 50%);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -26,13 +26,20 @@
   max-width: 500px;
   max-height: 80vh;
   overflow-y: auto;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 8px 32px rgb(0 0 0 / 40%);
   animation: shortcut-help-slide-in 150ms ease;
 }
 
 @keyframes shortcut-help-slide-in {
-  from { transform: translateY(8px); opacity: 0; }
-  to { transform: translateY(0); opacity: 1; }
+  from {
+    transform: translateY(8px);
+    opacity: 0;
+  }
+
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
 }
 
 .shortcut-help-title {
