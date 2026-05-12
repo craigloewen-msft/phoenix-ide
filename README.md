@@ -1,6 +1,60 @@
 # Phoenix IDE
 
-LLM-powered coding agent. Rust backend, React frontend, self-hosted.
+Web based, self-hosted LLM-powered coding agent.
+
+Forking encouraged, make your own personal IDE that matches _your_ workflow.
+
+Self hosted means you can poke it when it breaks.
+All data is stored in a single local sqlite db.
+
+Server/client architecture from day 1 means you can run the API half on a remote
+coding VM and access from anywhere!
+
+## Quick Start - LLM Access
+
+Supported Options:
+- API keys -> `ANTHROPIC_API_KEY` and/or `OPENAI_API_KEY`
+- Paid ChatGPT / Codex -> in-app login!
+    - "We want people to be able to use Codex, and their ChatGPT subscription,
+      wherever they like!" - [from OpenAI themselves](https://x.com/romainhuet/status/2038699202834841962)
+    - Browser and device code supported.
+- LLM gateway / custom endpoint -> `LLM_GATEWAY`, or `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`
+
+See the env var section for more details (or point your preferred coding agent
+at the repo)
+
+## Quick Start - Run it
+
+
+```bash
+# Start everything (backend build + frontend dev server)
+./dev.py up
+
+# Other lifecycle commands
+./dev.py down        # stop services
+./dev.py restart     # restart services
+./dev.py status      # show running state
+./dev.py check       # pre-commit checks (fmt, clippy, tests)
+
+# Optional: run the dev backend over HTTPS with h2 ALPN enabled
+./dev.py up --https
+```
+
+
+### Single-shot CLI
+
+```bash
+# Runs via uv — no manual dependency install needed
+./phoenix-client.py -d /tmp "Create hello.txt with 'Hello World'"
+./phoenix-client.py -c <conversation-slug> "Now modify it"
+```
+
+## Architecture
+
+Rust backend serves the API and, in production, embeds the React frontend via `rust-embed`.
+SQLite persists conversations and messages. A bedrock state machine drives the conversation
+lifecycle (Idle → Processing → ToolExecuting → …). Tools are modular and LLM-invokable.
+Multi-provider LLM support: the Anthropic and OpenAI APIs, a ChatGPT/Codex bridge, or an LLM gateway.
 
 ## Philosophy
 
@@ -22,60 +76,34 @@ clearly without wasting visual elements. Status is shown inline with
 symbols and color, not buried in separate screens or modals. Progressive
 disclosure: essentials visible by default, details on demand.
 
-## Quick Start
-
-```bash
-# Start everything (backend build + frontend dev server)
-./dev.py up
-
-# Other lifecycle commands
-./dev.py down        # stop services
-./dev.py restart     # restart services
-./dev.py status      # show running state
-./dev.py check       # pre-commit checks (fmt, clippy, tests)
-
-# Optional: run the dev backend over HTTPS with h2 ALPN enabled
-./dev.py up --https
-```
-
-### Single-shot CLI
-
-```bash
-# Runs via uv — no manual dependency install needed
-./phoenix-client.py -d /tmp "Create hello.txt with 'Hello World'"
-./phoenix-client.py -c <conversation-slug> "Now modify it"
-```
-
-## Architecture
-
-Rust backend serves the API and, in production, embeds the React frontend via `rust-embed`.
-SQLite persists conversations and messages. A bedrock state machine drives the conversation
-lifecycle (Idle → Processing → ToolExecuting → …). Tools are modular and LLM-invokable.
-Multi-provider LLM support routes through either the Anthropic API or an exe.dev gateway.
-
 ## Tools
 
 | Tool | Description | Spec |
 |------|-------------|------|
 | bash | Shell command execution with timeout, truncation, background mode | [spec](specs/bash/executive.md) |
 | patch | Structured file editing — create, modify, delete with fuzzy matching | [spec](specs/patch/executive.md) |
+| read_file | Read a file, or a line range of one (any path the server process can access) | — |
+| search | grep + glob over a directory tree, ripgrep-style (any path the server process can access) | — |
 | keyword_search | Semantic code search using LLM-filtered results | [spec](specs/keyword_search/executive.md) |
 | think | Reasoning scratchpad with zero side effects | [spec](specs/think/executive.md) |
-| browser | Headless browser — navigate, eval JS, screenshot, console logs | [spec](specs/browser-tool/executive.md) |
+| browser (`browser_*`) | Headless browser — navigate, eval JS, screenshot, click/type/keypress, resize, console logs | [spec](specs/browser-tool/executive.md) |
 | read_image | Read and encode image files for vision models | — |
-| subagent | Parallel task delegation to child agents | — |
+| tmux | Drive a persistent tmux session for long-lived / interactive processes | [spec](specs/tmux-integration/executive.md) |
+| terminal_last_command / terminal_command_history | Inspect the in-app terminal's last command and history | [spec](specs/terminal/executive.md) |
+| spawn_agents | Parallel task delegation to child agents | [spec](specs/subagents/executive.md) |
+| ask_user_question | Ask the user a structured multiple-choice question mid-run | [spec](specs/ask-user-question/executive.md) |
+| skill | Invoke a user-defined skill (SKILL.md instruction set) | [spec](specs/skills/executive.md) |
+| propose_task | Propose a task file (task-authoring conversations only) | — |
+| MCP tools | Tools exposed by configured MCP servers, registered dynamically at startup | — |
 
 ## Production Deployment
 
+Designed to run as a background service: a single static binary that serves the HTTP API with the React UI embedded.
+
 ```bash
-./dev.py prod deploy   # build release + deploy (auto-detects Linux native vs macOS+Lima)
+./dev.py prod deploy   # build release + deploy (launchd on macOS; systemd, or daemon mode if no systemd, on Linux)
 ./dev.py prod status   # check running production instance
 ./dev.py prod stop     # stop production instance
-
-# Lima VM lifecycle (macOS only)
-./dev.py lima create   # provision VM
-./dev.py lima shell    # SSH into VM
-./dev.py lima destroy  # tear down VM
 ```
 
 ### Optional HTTPS Quick Start
@@ -124,25 +152,95 @@ https://github.com/scottopell/phoenix-ide/releases/latest/download/phoenix_ide-x
 
 ## Environment Variables
 
+Everything Phoenix reads. The server reads its config from the environment at
+startup; `./dev.py` and the production deploy paths populate most of these for
+you (dev mode auto-detects an LLM gateway; prod reads `.phoenix-ide.env` from the repo root of the checkout you deploy from).
+
+### Core server
+
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `LLM_GATEWAY` | exe.dev LLM gateway URL | — |
-| `ANTHROPIC_API_KEY` | Direct Anthropic API key (alternative to gateway) | — |
-| `PHOENIX_PORT` | Server port | `8000` |
-| `PHOENIX_DB_PATH` | SQLite database path | `~/.phoenix-ide/phoenix.db` |
+| `PHOENIX_PORT` | HTTP(S) listen port | `8000` |
+| `PHOENIX_DB_PATH` | SQLite database path. If the path contains `prod`, startup logs "production mode" | `$HOME/.phoenix-ide/phoenix.db` |
+| `PHOENIX_PASSWORD` | Optional auth password (REQ-AUTH-001). Empty/unset disables password auth | — (disabled) |
+| `RUST_LOG` | `tracing` filter (`info`, `debug`, `phoenix_ide=debug`, …) | env-default filter |
+| `HOME` / `USERPROFILE` | Home dir — used for the default DB path, built-in-skill extraction, working-dir resolution, tmux sockets | OS home; `/tmp` fallback |
+
+### LLM providers and gateway
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `LLM_GATEWAY` | LLM gateway base URL (e.g. exe.dev gateway) | — |
+| `ANTHROPIC_API_KEY` | Direct Anthropic API key | — |
+| `ANTHROPIC_BASE_URL` | Override the Anthropic API base URL | — |
+| `OPENAI_API_KEY` | Direct OpenAI API key | — |
+| `OPENAI_BASE_URL` | Override the OpenAI API base URL | — |
+| `DEFAULT_MODEL` | Preferred default model ID (used only if it actually registers) | first registered model |
+| `LLM_API_KEY_HELPER` | Command that prints a fresh API key/token on stdout (e.g. `claude` OAuth helper) | — |
+| `LLM_API_KEY_HELPER_TTL_MS` | How long a helper-produced credential is cached | `7200000` (2 h) |
+| `LLM_CUSTOM_HEADERS` | Extra request headers — newline-separated `Key: value` (literal `\n` accepted); a `provider` header is auto-injected | — |
+| `LLM_REQUEST_TAGS` | Comma-separated `key=value` request tags | — |
+| `LLM_AUTH_HEADER` | `bearer` → send the key as `Authorization: Bearer …`; anything else → provider's native API-key header | api-key style |
+| `OPENAI_USE_CODEX_AUTH` | `1`/`true`/`yes`/`on` → route OpenAI models through ChatGPT/Codex credentials instead of `OPENAI_API_KEY` | off |
+| `CODEX_HOME` | Where the Codex CLI keeps `auth.json` (read when the ChatGPT bridge is active) | `$HOME/.codex` |
+| `PHOENIX_ENABLE_MOCK_MODEL` | `1` → register the deterministic mock provider (testing only) | off |
+
+If none of `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `LLM_GATEWAY`, or
+`LLM_API_KEY_HELPER` (and no ChatGPT/Codex credential) is present, the server
+starts with no models and logs a warning.
+
+### TLS
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
 | `PHOENIX_TLS` | HTTPS mode: `auto`/`on`/`true`/`1`, `manual`, or `off`/`none`/`false`/`0` | `off` |
 | `PHOENIX_TLS_HOSTS` | Comma-separated extra DNS/IP SANs for `PHOENIX_TLS=auto` | `localhost,127.0.0.1,::1` |
-| `PHOENIX_TLS_DIR` | Managed local CA and auto-issued leaf certificate directory | parent of `PHOENIX_DB_PATH` + `/tls` |
-| `PHOENIX_TLS_CERT_PATH` | Manual TLS certificate PEM path; with key path, enables manual TLS even if `PHOENIX_TLS` is unset | — |
-| `PHOENIX_TLS_KEY_PATH` | Manual TLS private key PEM path; required with cert path | — |
-| `PHOENIX_PUBLIC_URL` | Display URL used by `./dev.py prod status`/deploy output; not read by the Rust server | derived from TLS mode |
-| `RUST_LOG` | Log level (`info`, `debug`, …) | — |
+| `PHOENIX_TLS_DIR` | Managed local-CA + auto-issued leaf certificate directory | parent of `PHOENIX_DB_PATH` + `/tls` |
+| `PHOENIX_TLS_CERT_PATH` | Manual TLS certificate PEM path; together with the key path, enables manual TLS even if `PHOENIX_TLS` is unset | — |
+| `PHOENIX_TLS_KEY_PATH` | Manual TLS private-key PEM path; required alongside the cert path | — |
 
 TLS is opt-in. `PHOENIX_TLS=auto` creates a private Phoenix CA in
 `PHOENIX_TLS_DIR` if one is not already present, then rotates the server leaf
 certificate on startup. `PHOENIX_TLS=manual` serves the cert/key paths exactly as
 configured; this is what `./dev.py tls install` writes for remote production
 hosts. See [TLS.md](TLS.md) for the complete trust and deployment workflow.
+
+### Tools and runtime
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `PHOENIX_DATA_DIR` | Base dir for runtime data — currently the per-conversation tmux socket dir (`$PHOENIX_DATA_DIR/tmux-sockets/`) | `$HOME/.phoenix-ide` |
+| `PHOENIX_CHROME_EXECUTABLE` | Explicit Chrome/Chromium path for the `browser` tool; falls back to auto-detection | auto-detect |
+| `PHOENIX_PARENT_TOOL_CYCLE_CAP` | Max tool cycles a parent agent may run before yielding (non-negative int; `0` disables the cap) | built-in default |
+| `PATH` | Used to locate `tmux`, Chrome, and shell binaries; inherited into the in-app terminal | inherited |
+| `SHELL` | Shell the in-app terminal launches | `/bin/bash` |
+
+The in-app terminal is given a **deliberately minimal** environment (it never
+inherits the server's env, to avoid leaking secrets): `TERM`, `COLORTERM`,
+`HOME`, `USER`/`LOGNAME`, `SHELL`, `PATH`, `LANG`, plus shell-integration hints
+(`TERM_PROGRAM=phoenix-ide`, `ITERM_SHELL_INTEGRATION_INSTALLED=Yes`). `USER`
+falls back to `LOGNAME`.
+
+### Zero-downtime restart (set by socket activation, not by you)
+
+| Variable | Purpose |
+|----------|---------|
+| `LISTEN_FDS` / `LISTEN_PID` | systemd-style socket passing — the listening socket survives an in-place binary swap (`./dev.py restart`, `prod deploy`). Managed automatically; the binary clears them after adopting the fd. |
+
+### Tests only (`cargo test`)
+
+| Variable | Purpose |
+|----------|---------|
+| `PHOENIX_SKIP_BROWSER_TESTS` | `1` → skip browser-tool tests (no Chrome available) |
+| `PHOENIX_SKIP_NETWORK_TESTS` | `1` → skip tests that need outbound network |
+
+### Dev/build tooling only (read by `./dev.py` / Vite, **not** the server)
+
+| Variable | Purpose |
+|----------|---------|
+| `PHOENIX_PUBLIC_URL` | Display URL shown in `./dev.py prod status` / deploy output |
+| `PHOENIX_VERSION` | Version string `./dev.py` bakes into the systemd/prod env (the server reports its own `CARGO_PKG_VERSION`) |
+| `VITE_API_PORT` / `VITE_API_SCHEME` / `VITE_API_PROXY_SECURE` | How the Vite dev server proxies `/api` to Phoenix |
 
 ## API Endpoints
 

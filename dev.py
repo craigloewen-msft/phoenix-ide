@@ -178,10 +178,6 @@ PROD_DB_PATH = Path.home() / ".phoenix-ide" / "prod.db"
 PROD_ENV_FILE = Path("/etc/phoenix-ide/phoenix.env")
 PROD_PORT = 8031
 
-# Lima VM configuration (dev environment only — create/shell/destroy)
-LIMA_VM_NAME = "phoenix-ide"
-LIMA_YAML = ROOT / "lima" / "phoenix-ide.yaml"
-
 # launchd (native macOS) configuration
 LAUNCHD_LABEL = "com.phoenix-ide.server"
 LAUNCHD_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
@@ -2631,11 +2627,8 @@ def native_prod_deploy(version: str | None = None):
     if env_file_loaded:
         print(f"  Loaded env from {env_file_loaded}")
 
-    # Auto-detect gateway only if env file didn't provide LLM config (mirrors launchd).
-    if env_overrides.get("LLM_API_KEY_HELPER") or env_overrides.get("LLM_GATEWAY"):
-        gateway = None
-    else:
-        gateway = get_llm_gateway()
+    # Auto-detect gateway only if the env file didn't already provide LLM config (mirrors launchd).
+    gateway = None if _env_provides_llm_config(env_overrides) else get_llm_gateway()
 
     env_file_path = _install_prod_env_file(env_overrides, service_user)
     if env_file_path:
@@ -2808,6 +2801,32 @@ def _load_env_file(env: dict[str, str], filename: str = ".phoenix-ide.env") -> s
     return str(env_file)
 
 
+def _env_provides_llm_config(env: dict[str, str]) -> bool:
+    """True if `env` already specifies how to reach an LLM, so the deploy paths
+    should not auto-detect and inject a local gateway. Counts a credential
+    helper, an explicit gateway, or a direct provider API key."""
+    return any(
+        env.get(k)
+        for k in ("LLM_API_KEY_HELPER", "LLM_GATEWAY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+    )
+
+
+def _llm_mode_summary(env: dict[str, str], auto_gateway: str | None) -> str:
+    """Human-readable description of how the deployed server will reach an LLM,
+    for the post-deploy summary line. `auto_gateway` is the gateway the deploy
+    auto-detected (None when `env` already provided LLM config)."""
+    if env.get("LLM_API_KEY_HELPER"):
+        return "api_key_helper (from .phoenix-ide.env)"
+    if env.get("LLM_GATEWAY"):
+        return f"gateway ({env['LLM_GATEWAY']}, from .phoenix-ide.env)"
+    keys = [k for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY") if env.get(k)]
+    if keys:
+        return f"{' + '.join(keys)} (from .phoenix-ide.env)"
+    if auto_gateway:
+        return f"gateway ({auto_gateway}, auto-detected)"
+    return "none detected — server has no LLM configured"
+
+
 def _configure_llm_env(env: dict[str, str]) -> str:
     """Configure LLM environment variables. Returns a human-readable mode string.
 
@@ -2890,7 +2909,7 @@ def prod_daemon_deploy():
     prod_dir = Path.home() / ".phoenix-ide"
     prod_dir.mkdir(parents=True, exist_ok=True)
 
-    prod_db_path = prod_dir / "prod.db"  # Consistent with native/lima
+    prod_db_path = prod_dir / "prod.db"
     prod_log_path = prod_dir / "prod.log"
     prod_pid_path = prod_dir / "prod.pid"
 
@@ -3337,10 +3356,8 @@ def launchd_prod_deploy(version: str | None = None):
     if env_file:
         print(f"  Loaded env from {env_file}")
 
-    # Auto-detect gateway only if env file didn't provide LLM config
-    gateway = None
-    if not env_overrides.get("LLM_API_KEY_HELPER") and not env_overrides.get("LLM_GATEWAY"):
-        gateway = get_llm_gateway()
+    # Auto-detect gateway only if the env file didn't already provide LLM config
+    gateway = None if _env_provides_llm_config(env_overrides) else get_llm_gateway()
 
     # Generate and write plist
     plist_content = generate_launchd_plist(version, gateway, env_overrides)
@@ -3371,12 +3388,7 @@ def launchd_prod_deploy(version: str | None = None):
             print("WARNING: Server started but health check failed after 10s", file=sys.stderr)
 
     write_deployed_sha()
-    if env_overrides.get("LLM_API_KEY_HELPER"):
-        llm_mode = "api_key_helper (from .phoenix-ide.env)"
-    elif gateway:
-        llm_mode = f"gateway ({gateway})"
-    else:
-        llm_mode = "no gateway detected"
+    llm_mode = _llm_mode_summary(env_overrides, gateway)
     print(f"\n✓ Deployed {version} to production (launchd)")
     if health_version:
         print(f"  Version: {health_version}")
@@ -3596,128 +3608,6 @@ def cmd_prod_override_unset(name: str):
 
 
 # =============================================================================
-# Lima VM Commands
-# =============================================================================
-
-def lima_shell_quiet(cmd: str, check=True) -> subprocess.CompletedProcess:
-    """Run a command inside the Lima VM, capturing output."""
-    return subprocess.run(
-        ["limactl", "shell", "--workdir", "/", LIMA_VM_NAME, "--", "bash", "-lc", cmd],
-        check=check, capture_output=True, text=True,
-    )
-
-
-def lima_is_running() -> bool:
-    """Check if the Lima VM is running."""
-    result = subprocess.run(
-        ["limactl", "list", "--json"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        return False
-    for line in result.stdout.strip().splitlines():
-        try:
-            vm = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if vm.get("name") == LIMA_VM_NAME and vm.get("status") == "Running":
-            return True
-    return False
-
-
-def lima_vm_exists() -> bool:
-    """Check if the Lima VM exists (any status)."""
-    result = subprocess.run(
-        ["limactl", "list", "--json"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        return False
-    for line in result.stdout.strip().splitlines():
-        try:
-            vm = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if vm.get("name") == LIMA_VM_NAME:
-            return True
-    return False
-
-
-def lima_ensure_running():
-    """Start VM if stopped, error if not created."""
-    if lima_is_running():
-        return
-    if not lima_vm_exists():
-        print("Lima VM does not exist. Run './dev.py lima create' first.", file=sys.stderr)
-        sys.exit(1)
-    print("Starting Lima VM...")
-    subprocess.run(["limactl", "start", LIMA_VM_NAME], check=True)
-
-
-def cmd_lima_create():
-    """Create and provision the Lima VM."""
-    # Check limactl exists
-    result = subprocess.run(["limactl", "--version"], capture_output=True)
-    if result.returncode != 0:
-        print("limactl not found. Install Lima: brew install lima", file=sys.stderr)
-        sys.exit(1)
-
-    if lima_vm_exists():
-        print(f"VM '{LIMA_VM_NAME}' already exists.")
-        if not lima_is_running():
-            print("Starting VM...")
-            subprocess.run(["limactl", "start", LIMA_VM_NAME], check=True)
-        print("VM is running.")
-        return
-
-    print(f"Creating Lima VM '{LIMA_VM_NAME}' from {LIMA_YAML}...")
-    subprocess.run(
-        ["limactl", "create", f"--name={LIMA_VM_NAME}", str(LIMA_YAML)],
-        check=True,
-    )
-
-    print("Starting VM...")
-    subprocess.run(["limactl", "start", LIMA_VM_NAME], check=True)
-
-    # Verify provisioning
-    print("\nVerifying provisioning...")
-    result = lima_shell_quiet("rustc --version", check=False)
-    if result.returncode == 0:
-        print(f"  Rust: {result.stdout.strip()}")
-    else:
-        print("  WARNING: Rust not found. Provisioning may have failed.", file=sys.stderr)
-
-    result = lima_shell_quiet("uname -r", check=False)
-    if result.returncode == 0:
-        print(f"  Kernel: {result.stdout.strip()}")
-
-    result = lima_shell_quiet("node --version", check=False)
-    if result.returncode == 0:
-        print(f"  Node: {result.stdout.strip()}")
-
-    print(f"\nVM '{LIMA_VM_NAME}' is ready.")
-
-
-def cmd_lima_shell():
-    """Open an interactive shell in the Lima VM."""
-    lima_ensure_running()
-    os.execvp("limactl", [
-        "limactl", "shell", "--workdir", "/", LIMA_VM_NAME,
-    ])
-
-
-def cmd_lima_destroy():
-    """Delete the Lima VM."""
-    if not lima_vm_exists():
-        print(f"VM '{LIMA_VM_NAME}' does not exist.")
-        return
-
-    print(f"Deleting VM '{LIMA_VM_NAME}'...")
-    subprocess.run(["limactl", "delete", LIMA_VM_NAME, "--force"], check=True)
-    print("VM deleted.")
-
-
-# =============================================================================
 # Main
 # =============================================================================
 
@@ -3805,13 +3695,6 @@ def main():
     override_unset_parser = prod_sub.add_parser("unset", help="Remove environment override")
     override_unset_parser.add_argument("name", help="Environment variable name to remove")
 
-    # lima
-    lima_parser = sub.add_parser("lima", help="Lima VM management")
-    lima_sub = lima_parser.add_subparsers(dest="lima_command", required=True)
-    lima_sub.add_parser("create", help="Create and provision Lima VM")
-    lima_sub.add_parser("shell", help="Open shell in Lima VM")
-    lima_sub.add_parser("destroy", help="Delete Lima VM")
-
     # tasks
     tasks_parser = sub.add_parser("tasks", help="Task management")
     tasks_sub = tasks_parser.add_subparsers(dest="tasks_command", required=True)
@@ -3874,13 +3757,6 @@ def main():
             cmd_prod_override_set(args.name, args.value)
         elif args.prod_command == "unset":
             cmd_prod_override_unset(args.name)
-    elif args.command == "lima":
-        if args.lima_command == "create":
-            cmd_lima_create()
-        elif args.lima_command == "shell":
-            cmd_lima_shell()
-        elif args.lima_command == "destroy":
-            cmd_lima_destroy()
     elif args.command == "tasks":
         if args.tasks_command == "validate":
             if not cmd_tasks_validate():
