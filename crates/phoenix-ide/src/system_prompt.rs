@@ -590,16 +590,25 @@ pub fn build_system_prompt_with_options(
                      for source files -- you can read files, search, analyze, and \
                      discuss the codebase, but you cannot modify code.\n\n\
                      Workflow for proposing work:\n\
-                     1. Find or draft a task file under `{tasks_dir_name}/`.\n   \
-                        - To reuse an existing task, locate it with `keyword_search` \
-                        or by browsing `{tasks_dir_name}/` with `read_file`.\n   \
-                        - To draft a new task, use `patch` with operation \
-                        `overwrite` to create a file under `{tasks_dir_name}/`. The \
-                        filename must follow the taskmd 1.0 convention: \
-                        `NNNNN-pX-status--slug.md` where status is one of \
-                        `ready`, `in-progress`, or `brainstorming`. The body is \
-                        free-form markdown -- start with an `# H1` title, then the \
-                        plan.\n\
+                     1. Draft (or reuse) a task file. The body is free-form \
+                        markdown -- start with an `# H1` title, then the plan.\n   \
+                        Use the taskmd convention: name the file \
+                        `NNNNN-pX-status--slug.md` (status one of `ready`, \
+                        `in-progress`, or `brainstorming`) under `{tasks_dir_name}/`. \
+                        It's just a filename -- no tooling needed -- and it gives \
+                        the task a stable id/priority/status/slug plus an automatic \
+                        `ready` -> `in-progress` rename on approval, so prefer it. \
+                        To draft one, use `patch` with operation `overwrite` (the \
+                        Explore-mode `patch` allowlist is scoped to \
+                        `{tasks_dir_name}/`).\n   \
+                        If you genuinely can't follow that convention, any other \
+                        `.md` file is still accepted as a plain brief -- but it \
+                        carries no metadata and gets no status rename, so it's \
+                        strictly less useful; reach for it only as a fallback. A \
+                        taskmd-pattern filename is accepted ONLY under \
+                        `{tasks_dir_name}/`; a plain `.md` file may live anywhere \
+                        in the worktree (e.g. point `propose_task` at an existing \
+                        `docs/plan.md`).\n\
                      2. Call `propose_task` with `task_file` set to the path \
                         (e.g. `{tasks_dir_name}/12345-p2-ready--my-slug.md`). The \
                         user will review and can approve, request revisions, or \
@@ -615,9 +624,6 @@ pub fn build_system_prompt_with_options(
                 base_branch,
                 worktree_path,
             } => {
-                let task_prefix = taskmd_core::ids::prefix_for(
-                    &std::path::PathBuf::from(&worktree_path).join(tasks_dir_name),
-                );
                 let _ = write!(
                     prompt,
                     "\n\nYou are in Work mode on branch {branch_name}, targeting \
@@ -625,17 +631,16 @@ pub fn build_system_prompt_with_options(
                      Your working directory is {worktree_path}. All file edits and \
                      bash commands MUST stay inside this worktree. Do NOT modify \
                      files in the main checkout or repo root.\n\
-                     Your task ID prefix is {task_prefix}. Task files in this worktree \
-                     use IDs starting with {task_prefix} (e.g., {task_prefix}001).\n\
                      Use bash and the patch tool to make changes.\n\n\
-                     When the task is complete, update its task file's status to \
-                     `done` yourself: rename the file from `...-{{status}}--{{slug}}.md` \
-                     to `...-done--{{slug}}.md` (the filename is the sole source of \
-                     truth for task status -- nothing renames it for you) and commit \
-                     that rename on this branch alongside your work. Then let the user \
-                     know it's ready; they review and merge the branch into \
-                     {base_branch} via a pull request -- Phoenix does not perform the \
-                     merge and does not touch the task file."
+                     When the task is complete, let the user know it's ready; they \
+                     review and merge the branch into {base_branch} via a pull \
+                     request -- Phoenix does not perform the merge. If your task \
+                     file follows the taskmd convention (`NNNNN-pX-status--slug.md`), \
+                     also mark it done yourself before handing off: rename the file \
+                     from `...-{{status}}--{{slug}}.md` to `...-done--{{slug}}.md` \
+                     (the filename is the sole source of truth for task status -- \
+                     nothing renames it for you) and commit that rename on this \
+                     branch alongside your work."
                 );
             }
             ModeContext::Direct => {
@@ -1196,10 +1201,13 @@ mod tests {
         assert!(prompt.contains("task-42-fix-bug"));
         assert!(prompt.contains("/home/user/project/worktrees/abc123"));
         assert!(prompt.contains("MUST stay inside this worktree"));
-        // The agent owns the task-status rename; nothing does it automatically.
-        assert!(prompt.contains("update its task file's status to"));
+        // The agent owns the task-status rename (taskmd files only); nothing
+        // does it automatically.
+        assert!(prompt.contains("mark it done yourself"));
         assert!(prompt.contains("Phoenix does not perform the merge"));
-        assert!(prompt.contains("Your task ID prefix is"));
+        // The Work block no longer hands out a taskmd ID prefix — task files
+        // need not be taskmd files at all (task 13009).
+        assert!(!prompt.contains("task ID prefix"));
     }
 
     // -------------------------------------------------------------------------
