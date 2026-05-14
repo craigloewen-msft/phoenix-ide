@@ -35,6 +35,46 @@ use tokio_util::sync::CancellationToken;
 /// Primary enforcement is max turns (REQ-PROJ-008). This catches stuck tool execution.
 const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_mins(20);
 
+/// Decide whether `path` is inside the worktree rooted at `root`.
+///
+/// Three stages, each closing a class of bypass:
+///
+/// 1. Reject non-absolute paths. Relative overrides are ambiguous (no
+///    defined resolution base) and not worth modelling.
+/// 2. Canonicalise `root`. The worktree must exist; if it doesn't,
+///    the comparison is meaningless and we reject (fail closed).
+/// 3. Canonicalise the deepest existing ancestor of `path` and check
+///    that ancestor lies inside the canonical root. `canonicalize`
+///    resolves `..` and symlinks together (it's a `realpath` call),
+///    so neither construct can escape:
+///    `/worktree/../escape` -> ancestor `/worktree/..` -> canonical
+///    `/parent_of_worktree` -> rejected.
+///    `/worktree/escape/newdir` where `escape` symlinks to `/outside`
+///    -> ancestor `/worktree/escape` -> canonical `/outside` ->
+///    rejected.
+///    Conversely, an in-worktree path that just happens to use `..`
+///    to traverse internally (e.g. `/worktree/src/../tests`)
+///    canonicalises back to a subpath of the worktree -> accepted.
+fn path_is_within(path: &str, root: &str) -> bool {
+    use std::path::{Path, PathBuf};
+    let raw_path = Path::new(path);
+    if !raw_path.is_absolute() {
+        return false;
+    }
+    let Ok(canon_root) = std::fs::canonicalize(Path::new(root)) else {
+        return false;
+    };
+    let mut anchor = PathBuf::from(raw_path);
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(&anchor) {
+            return canon == canon_root || canon.starts_with(&canon_root);
+        }
+        if !anchor.pop() {
+            return false;
+        }
+    }
+}
+
 /// Default cap on consecutive LLM requests within a single parent-conversation
 /// user turn. Distinct from sub-agent `max_turns`: this resets on every
 /// `Event::UserMessage`, so a long conversation is never penalised — only a
@@ -1031,8 +1071,9 @@ where
                 if !parent_allows_work {
                     let result = ToolResult::error(
                         tool_use_id.clone(),
-                        "Work sub-agents require the parent to be in Work mode. \
-                         Use mode: \"explore\" or omit mode for read-only sub-agents."
+                        "Work sub-agents require the parent to be in a write-capable mode \
+                         (Work, Branch, or Direct). Use mode: \"explore\" or omit mode \
+                         for read-only sub-agents."
                             .to_string(),
                     );
                     return Ok(Some(Event::ToolComplete {
@@ -1069,6 +1110,45 @@ where
                 tool_use_id,
                 result,
             }));
+        }
+
+        // cwd-scoping guard (REQ-PROJ-008): a Work sub-agent's overridden
+        // `cwd` must stay inside the parent's worktree. Without this guard
+        // a Work sub-agent could write outside the worktree because its
+        // own runtime would see a different working_dir than the parent.
+        // Direct parents have no worktree to scope against -- writes there
+        // are unscoped by design -- so the check only fires for parents
+        // that own a worktree (Work/Branch).
+        let parent_worktree_path: Option<&str> = match self.context.mode_context.as_ref() {
+            Some(
+                ModeContext::Work { worktree_path, .. } | ModeContext::Branch { worktree_path, .. },
+            ) => Some(worktree_path.as_str()),
+            _ => None,
+        };
+        if let Some(worktree_root) = parent_worktree_path {
+            for task in &input.tasks {
+                let mode = task.mode.unwrap_or_default();
+                if mode != SubAgentMode::Work {
+                    continue;
+                }
+                let Some(override_cwd) = task.cwd.as_deref() else {
+                    continue;
+                };
+                if !path_is_within(override_cwd, worktree_root) {
+                    let result = ToolResult::error(
+                        tool_use_id.clone(),
+                        format!(
+                            "Work sub-agent cwd '{override_cwd}' must be inside the parent's \
+                             worktree '{worktree_root}'. Omit `cwd` to inherit the worktree, \
+                             or pass an absolute path that resolves under it."
+                        ),
+                    );
+                    return Ok(Some(Event::ToolComplete {
+                        tool_use_id,
+                        result,
+                    }));
+                }
+            }
         }
 
         // Generate agent IDs and prepare spawn specs
@@ -4617,5 +4697,316 @@ mod steer_drain_detector_tests {
         .expect("non-idempotent PersistMessage must succeed");
 
         assert_eq!(storage.get_all_messages("conv-non-idem").len(), 1);
+    }
+}
+
+// ============================================================
+// Work-sub-agent cwd-scoping guard (REQ-PROJ-008)
+// ============================================================
+//
+// Distilled from specs/subagents/subagents.allium
+// (SpawnRejectedWorkCwdOutsideWorktree). A Work sub-agent's overridden
+// `cwd` must stay inside the parent's worktree -- without the guard, the
+// sub-agent's runtime would see a different working_dir than the parent
+// and writes could escape projects.allium's WriteBlockedOutsideWorktree.
+
+#[cfg(test)]
+mod work_subagent_cwd_guard_tests {
+    use super::*;
+    use crate::db::ToolOutcome;
+    use crate::llm::ModelRegistry;
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::state_machine::state::{SpawnAgentsInput, SubAgentMode, SubAgentTask, ToolInput};
+    use crate::state_machine::ConvContext;
+    use crate::system_prompt::ModeContext;
+    use crate::tools::BrowserSessionManager;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    fn runtime_in_work_mode(
+        worktree_path: &std::path::Path,
+    ) -> ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
+        let storage = Arc::new(InMemoryStorage::new());
+        let mut context = ConvContext::new(
+            "cwd-guard-conv",
+            worktree_path.to_path_buf(),
+            "test-model",
+            200_000,
+        );
+        context.mode_context = Some(ModeContext::Work {
+            branch_name: "task-99999-x".to_string(),
+            base_branch: "main".to_string(),
+            worktree_path: worktree_path.to_string_lossy().to_string(),
+        });
+        context.mode = crate::state_machine::state::ModeKind::Managed;
+
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let broadcaster = SseBroadcaster::new(128, 0);
+
+        ConversationRuntime::new(
+            context,
+            ConvState::Idle,
+            storage,
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            broadcaster,
+        )
+    }
+
+    fn spawn_tool(input: SpawnAgentsInput) -> ToolCall {
+        ToolCall::new("tool-spawn-1", ToolInput::SpawnAgents(input))
+    }
+
+    fn tool_result_text(result: &ToolResult) -> String {
+        match &result.outcome {
+            ToolOutcome::Success { output, .. } | ToolOutcome::Error { output, .. } => {
+                output.clone()
+            }
+            ToolOutcome::Cancelled { message } => message.clone(),
+        }
+    }
+
+    /// Work sub-agent with a `cwd` pointing outside the parent's worktree
+    /// is rejected with an error tool result -- the spawn never reaches
+    /// the `RuntimeManager`.
+    #[tokio::test]
+    async fn rejects_work_subagent_cwd_outside_worktree() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let outside = TempDir::new().expect("outside tempdir");
+
+        let mut rt = runtime_in_work_mode(worktree.path());
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "do unsafe writes".to_string(),
+                    cwd: Some(outside.path().to_string_lossy().to_string()),
+                    mode: Some(SubAgentMode::Work),
+                    model: None,
+                    max_turns: None,
+                }],
+            }))
+            .await
+            .expect("handle_spawn_agents_tool returned error");
+
+        match result {
+            Some(Event::ToolComplete { result, .. }) => {
+                assert!(result.is_error(), "rejection must surface as a tool error");
+                let msg = tool_result_text(&result);
+                assert!(
+                    msg.contains("inside the parent's worktree"),
+                    "error message should explain the cwd-scoping rule, got: {msg}"
+                );
+            }
+            other => panic!("expected ToolComplete with error, got {other:?}"),
+        }
+        assert_eq!(
+            rt.active_work_subagents, 0,
+            "rejected spawn must not increment active_work_subagents"
+        );
+    }
+
+    /// A Work sub-agent whose `cwd` is inside the worktree is NOT rejected
+    /// by the scoping guard. (It will still fail downstream because no
+    /// `spawn_tx` is wired in this test runtime, but that failure is
+    /// distinguishable from the scoping rejection.)
+    #[tokio::test]
+    async fn accepts_work_subagent_cwd_inside_worktree() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let nested = worktree.path().join("sub/dir");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+
+        let mut rt = runtime_in_work_mode(worktree.path());
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "do scoped writes".to_string(),
+                    cwd: Some(nested.to_string_lossy().to_string()),
+                    mode: Some(SubAgentMode::Work),
+                    model: None,
+                    max_turns: None,
+                }],
+            }))
+            .await
+            .expect("handle_spawn_agents_tool returned error");
+
+        match result {
+            Some(Event::ToolComplete { result, .. }) => {
+                let msg = tool_result_text(&result);
+                assert!(
+                    !msg.contains("inside the parent's worktree"),
+                    "in-worktree cwd should not trip the scoping guard; got: {msg}"
+                );
+            }
+            Some(Event::SpawnAgentsComplete { .. }) => {
+                // Test runtime has no spawn channel wired, so we don't
+                // normally reach SpawnAgentsComplete -- but if some future
+                // refactor wires it, that's still a "did not reject" pass.
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// Symlinks that escape the worktree are rejected -- the guard
+    /// canonicalises both sides before comparing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_work_subagent_cwd_via_escaping_symlink() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let outside = TempDir::new().expect("outside tempdir");
+        let symlink = worktree.path().join("escape");
+        std::os::unix::fs::symlink(outside.path(), &symlink).expect("create symlink");
+
+        let mut rt = runtime_in_work_mode(worktree.path());
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "follow the symlink".to_string(),
+                    cwd: Some(symlink.to_string_lossy().to_string()),
+                    mode: Some(SubAgentMode::Work),
+                    model: None,
+                    max_turns: None,
+                }],
+            }))
+            .await
+            .expect("handle_spawn_agents_tool returned error");
+
+        match result {
+            Some(Event::ToolComplete { result, .. }) => {
+                assert!(result.is_error());
+            }
+            other => panic!("expected symlink escape to be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_is_within_requires_root_to_exist() {
+        // Worktree root that doesn't canonicalise -> fail closed. A
+        // non-existent root would make the comparison meaningless.
+        assert!(!path_is_within(
+            "/nonexistent/root/sub",
+            "/nonexistent/root"
+        ));
+    }
+
+    #[test]
+    fn path_is_within_accepts_nonexistent_leaf_under_real_root() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let path_in = worktree.path().join("not/yet/created");
+        // Deepest existing ancestor of `path_in` is the worktree itself,
+        // which canonicalises and starts_with itself.
+        assert!(path_is_within(
+            path_in.to_str().unwrap(),
+            worktree.path().to_str().unwrap()
+        ));
+    }
+
+    #[test]
+    fn path_is_within_rejects_parent_dir_traversal_that_escapes() {
+        // `/worktree/../escape` -> canonical /parent_of_worktree, which
+        // is not a subpath of the worktree -> rejected. Canonicalise
+        // handles the `..` directly (it's a `realpath` call).
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let bad = format!("{}/../escape", worktree.path().display());
+        assert!(!path_is_within(&bad, worktree.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn path_is_within_accepts_internal_parent_dir_traversal() {
+        // `/worktree/src/../tests` is a legitimate in-worktree path --
+        // canonicalisation resolves it to `/worktree/tests`, which is a
+        // subpath of the worktree. Don't blanket-reject `..`.
+        let worktree = TempDir::new().expect("worktree tempdir");
+        std::fs::create_dir_all(worktree.path().join("src")).expect("src dir");
+        let inner = format!("{}/src/../tests", worktree.path().display());
+        assert!(path_is_within(&inner, worktree.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn path_is_within_rejects_relative_paths() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        assert!(!path_is_within(
+            "sub/dir",
+            worktree.path().to_str().unwrap()
+        ));
+        assert!(!path_is_within("./sub", worktree.path().to_str().unwrap()));
+    }
+
+    /// The intermediate-symlink escape: `/worktree/escape` is a symlink
+    /// to `/outside`, override cwd is `/worktree/escape/newdir` (does
+    /// not exist yet). Without the deepest-existing-ancestor canonical
+    /// resolution, the leaf's canonicalisation fails and a lexical
+    /// `starts_with` would accept the path. Resolving the deepest
+    /// existing ancestor (the symlink itself, which canonicalises to
+    /// `/outside`) rejects it.
+    #[cfg(unix)]
+    #[test]
+    fn path_is_within_rejects_intermediate_symlink_escape() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let outside = TempDir::new().expect("outside tempdir");
+        let escape = worktree.path().join("escape");
+        std::os::unix::fs::symlink(outside.path(), &escape).expect("create symlink");
+        let bypass = escape.join("newdir");
+        assert!(!path_is_within(
+            bypass.to_str().unwrap(),
+            worktree.path().to_str().unwrap()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_parent_dir_traversal_in_override() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        // Sibling dir that EXISTS on disk, so canonicalize succeeds for
+        // both sides -- the only thing keeping this safe is the `..`
+        // rejection up front.
+        let outside = TempDir::new().expect("outside tempdir");
+        let traversing = format!(
+            "{}/../{}",
+            worktree.path().display(),
+            outside
+                .path()
+                .file_name()
+                .expect("outside dir name")
+                .to_string_lossy()
+        );
+
+        let mut rt = runtime_in_work_mode(worktree.path());
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "traverse out".to_string(),
+                    cwd: Some(traversing),
+                    mode: Some(SubAgentMode::Work),
+                    model: None,
+                    max_turns: None,
+                }],
+            }))
+            .await
+            .expect("handle_spawn_agents_tool returned error");
+
+        match result {
+            Some(Event::ToolComplete { result, .. }) => {
+                assert!(result.is_error(), "rejection must surface as a tool error");
+                let msg = tool_result_text(&result);
+                assert!(
+                    msg.contains("inside the parent's worktree"),
+                    "error message should explain the cwd-scoping rule, got: {msg}"
+                );
+            }
+            other => panic!("expected ..-traversal to be rejected, got {other:?}"),
+        }
     }
 }
