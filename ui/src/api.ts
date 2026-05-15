@@ -96,6 +96,16 @@ export interface Conversation {
    *  the manager's `HashMap` and updated by `browser_session_state` events
    *  on this conversation's stream. Always populated by the server. */
   browser_session_active: boolean;
+  /** True when this conversation's in-app terminal is backed by a
+   *  per-conversation tmux session (server has tmux on PATH). The composer
+   *  uses this to label terminal-selection snippets with the tmux pane id,
+   *  so the LLM can follow up via the existing `tmux` tool to capture more
+   *  of the pane on demand. Server populates from
+   *  `TmuxRegistry::binary_available()` on every payload — SSE init *and*
+   *  list-endpoint serialization route through `enrich_conversation_with_runtime`,
+   *  so the 5s poll's snapshot upsert never clobbers a true value back to
+   *  false (regression history: PR #92). */
+  terminal_uses_tmux: boolean;
 }
 
 export type PrUnavailableReason = 'gh_missing' | 'not_authenticated' | 'not_git_repo' | 'command_failed';

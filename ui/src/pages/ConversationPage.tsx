@@ -6,7 +6,7 @@ import { isAgentWorking, isCancellingState, parseConversationState } from '../ut
 import { copyToClipboard } from '../utils/clipboard';
 import { cacheDB } from '../cache';
 import { MessageList } from '../components/MessageList';
-import { InputArea } from '../components/InputArea';
+import { ConnectedInputArea } from '../components/InputArea';
 import type { InputAreaHandle } from '../components/InputArea';
 import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
@@ -28,7 +28,13 @@ import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkActions } from '../components/WorkActions';
 import { useConversationAtom, useConversationSnapshot, useCreateConversationWithStore } from '../conversation';
-import { useResizablePane, useIsDesktop, useIsWideDesktop } from '../hooks';
+import {
+  useResizablePane,
+  useIsDesktop,
+  useIsWideDesktop,
+  useDraftActions,
+  DraftLifecycle,
+} from '../hooks';
 
 // Conditional overlays / heavy panels — code-split so the default render path
 // (chat view with no overlay open) doesn't pay their bundle cost.
@@ -93,6 +99,9 @@ export function ConversationPage() {
     <ReviewNotesProvider scopeKey={slug}>
       <DiffViewerStateProvider scopeKey={slug}>
         <BrowserViewWrapper slug={slug}>
+          {/* Mounted above ConversationPageContent's viewer early-returns
+              so draft persistence survives composer unmounts. */}
+          {slug && <DraftLifecycle slug={slug} />}
           <ConversationPageContent />
         </BrowserViewWrapper>
       </DiffViewerStateProvider>
@@ -208,6 +217,20 @@ function ConversationPageContent() {
   const sendingMessagesRef = useRef<Set<string>>(new Set());
   const inputRef = useRef<InputAreaHandle>(null);
 
+  const { setDraft: setDraftCb, appendDraft: appendDraftCb } = useDraftActions(slug!);
+
+  // Monotonic focus-request counter. Any time we mutate the draft from
+  // outside the textarea (terminal selection, prose-reader notes, retry,
+  // seed hydration, skill insert), we bump this so InputArea's focus
+  // effect fires — including across an unmount/remount on narrow viewports.
+  // Reset on slug change in the per-slug reset block below — otherwise a
+  // non-zero token from the previous conversation would steal focus on the
+  // next remount of <InputArea> without an explicit request.
+  const [focusToken, setFocusToken] = useState(0);
+  const requestComposerFocus = useCallback(() => {
+    setFocusToken((t) => t + 1);
+  }, []);
+
   // App state for offline support
   const { isOnline, queueOperation } = useAppMachine();
 
@@ -263,6 +286,7 @@ function ConversationPageContent() {
     setShowFirstTaskWelcome(false);
     setContextExhaustedExpanded(true);
     setAbandoningContextExhausted(false);
+    setFocusToken(0);
     // Ref resets — immediate, no re-render.
     sendingMessagesRef.current = new Set();
     seedHydratedRef.current = null;
@@ -409,36 +433,32 @@ function ConversationPageContent() {
 
   // availableModels is populated by the shared useModels() poller above.
 
-  // REQ-SEED-001: hydrate the input area from `seed-draft:<id>` localStorage
-  // when a seeded conversation first mounts, then clear the key so revisits
-  // don't re-hydrate it. We push the draft into InputArea via its imperative
-  // `setDraft` handle, which routes through `useDraft` so persistence picks
-  // up normally from there.
+  // REQ-SEED-001: hydrate the draft from `seed-draft:<id>` localStorage when
+  // a seeded conversation first mounts, then clear the key so revisits don't
+  // re-hydrate it. Dispatches through `setDraftCb` into `DraftStore`;
+  // `<DraftLifecycle>` mirrors the value to `phoenix:draft:<id>` after that.
   // (`seedHydratedRef` is declared with the per-slug reset block above so it
   //  resets to null on slug change.)
   useEffect(() => {
     if (!conversationId) return;
     if (seedHydratedRef.current === conversationId) return;
     const key = `seed-draft:${conversationId}`;
-    let draft: string | null = null;
+    let seed: string | null = null;
     try {
-      draft = localStorage.getItem(key);
+      seed = localStorage.getItem(key);
     } catch {
       // ignore
     }
-    if (!draft) return;
+    if (!seed) return;
     seedHydratedRef.current = conversationId;
-    // Defer to the next tick so InputArea has mounted and inputRef is set.
-    const handle = window.setTimeout(() => {
-      inputRef.current?.setDraft(draft!);
-      try {
-        localStorage.removeItem(key);
-      } catch {
-        // ignore
-      }
-    }, 0);
-    return () => window.clearTimeout(handle);
-  }, [conversationId]);
+    setDraftCb(seed);
+    requestComposerFocus();
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      // ignore
+    }
+  }, [conversationId, setDraftCb, requestComposerFocus]);
 
   // Auto-open/close task approval overlay on state transitions
   useEffect(() => {
@@ -627,8 +647,9 @@ function ConversationPageContent() {
     // instead of directly resending (the banner truncates content and
     // the user may want to fix the issue that caused the failure).
     dismiss(localId);
-    inputRef.current?.setDraft(msg.text);
-  }, [queuedMessages, dismiss]);
+    setDraftCb(msg.text);
+    requestComposerFocus();
+  }, [queuedMessages, dismiss, setDraftCb, requestComposerFocus]);
 
   const handleCancel = async () => {
     if (!conversationId || !isAgentWorking(atom.phase)) return;
@@ -757,27 +778,83 @@ function ConversationPageContent() {
     fileExplorer.closeFile();
   }, [fileExplorer]);
 
-  const handleSendNotes = useCallback(
-    (formattedNotes: string) => {
-      if (inputRef.current) {
-        // InputArea is mounted (mobile path) — update via React state.
-        inputRef.current.appendToDraft(formattedNotes);
-      } else if (conversationId) {
-        // Desktop early-return renders ProseReader instead of InputArea,
-        // so inputRef.current is null. Write directly to localStorage so
-        // InputArea picks it up when it mounts after the prose reader closes.
-        const key = `phoenix:draft:${conversationId}`;
-        try {
-          const existing = localStorage.getItem(key) ?? '';
-          const next = existing.trim() ? existing + '\n\n' + formattedNotes : formattedNotes;
-          localStorage.setItem(key, next);
-        } catch (e) {
-          console.warn('Failed to save notes to draft:', e);
+  // Task 02672: terminal selection → composer draft.
+  // TerminalPanel fires this when the user presses Cmd/Ctrl+Shift+L with
+  // text selected. We fence the selection so it stays distinguishable from
+  // the user's in-flight prose, prefix it with a label that names the source
+  // (tmux pane when the conversation is tmux-backed, plain "terminal"
+  // otherwise) plus the cwd, append to the existing draft (never replace),
+  // and focus the composer so the user can immediately type a follow-up.
+  //
+  // Naming the tmux pane (`main:1.0` — first window 1 since `base-index 1`,
+  // first pane 0; see crates/phoenix-ide/src/tools/tmux/server.conf) is
+  // deliberate: the LLM can then call the existing `tmux` tool (e.g.
+  // `capture-pane -p -t main:1.0 -S -200`) to pull the rest of the pane
+  // on follow-up — Phoenix injects the correct socket so no further
+  // coordinates are needed. Drifts if the user splits the pane or opens
+  // additional windows; threading the live pane id through SSE is a
+  // future refinement.
+  const handleSendTerminalSelection = useCallback(
+    (selection: string) => {
+      if (!selection) return;
+      const trimmed = selection.replace(/\s+$/u, '');
+      if (!trimmed) return;
+      const cwdHint = conversation?.cwd ? ` (cwd: \`${conversation.cwd}\`)` : '';
+      const sourceLabel = conversation?.terminal_uses_tmux
+        ? 'From tmux pane `main:1.0`'
+        : 'From terminal';
+      // Fence length must exceed the longest backtick run in the selection
+      // (CommonMark §4.5) so output containing literal triple-backticks —
+      // markdown snippets, AI tool transcripts — doesn't close the fence
+      // early.
+      let longestRun = 0;
+      let run = 0;
+      for (let i = 0; i < trimmed.length; i++) {
+        if (trimmed.charCodeAt(i) === 0x60 /* ` */) {
+          run += 1;
+          if (run > longestRun) longestRun = run;
+        } else {
+          run = 0;
         }
       }
+      const fence = '`'.repeat(Math.max(3, longestRun + 1));
+      // Trailing `\n` keeps the closing fence on its own line per
+      // CommonMark §4.5 — without it, the next character the user types
+      // lands on the fence's line and extends the code block.
+      const fenced = `${sourceLabel}${cwdHint}:\n${fence}\n${trimmed}\n${fence}\n`;
+      appendDraftCb(fenced);
+      requestComposerFocus();
+    },
+    [conversation?.cwd, conversation?.terminal_uses_tmux, appendDraftCb, requestComposerFocus]
+  );
+
+  // External "set this as the draft" trigger fired by surfaces that don't
+  // hold a ref to the composer (skill viewer, message context menu).
+  // Dispatching into `DraftStore` works regardless of whether `<InputArea>`
+  // is currently mounted — narrow-desktop fullscreen flows unmount it.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const text = (e as CustomEvent<{ text: string }>).detail?.text;
+      if (!text) return;
+      setDraftCb(text);
+      requestComposerFocus();
+    };
+    window.addEventListener('phoenix:insert-draft', handler);
+    return () => window.removeEventListener('phoenix:insert-draft', handler);
+  }, [setDraftCb, requestComposerFocus]);
+
+  const handleSendNotes = useCallback(
+    (formattedNotes: string) => {
+      // Dispatching into `DraftStore` works the same whether `<InputArea>`
+      // is currently mounted (right-pane / mobile-overlay flow) or unmounted
+      // (narrow-desktop fullscreen flow — the viewer closes immediately
+      // below). `requestComposerFocus()` is a token bump that InputArea
+      // consumes on its next render, including after a remount.
+      appendDraftCb(formattedNotes);
+      requestComposerFocus();
       fileExplorer.closeFile();
     },
-    [fileExplorer, conversationId]
+    [fileExplorer, appendDraftCb, requestComposerFocus]
   );
 
   const handleOpenFileFromPatch = useCallback(
@@ -1142,8 +1219,9 @@ function ConversationPageContent() {
             />
           </Suspense>
         )}
-        <InputArea
+        <ConnectedInputArea
           ref={inputRef}
+          slug={slug!}
           conversationId={conversationId}
           convState={convStateForChildren}
           images={images}
@@ -1151,6 +1229,7 @@ function ConversationPageContent() {
           isOffline={isOffline}
           failedMessages={failedMessages}
           convModeLabel={conversation.conv_mode_label}
+          focusToken={focusToken}
           onSend={handleSend}
           onCancel={handleCancel}
           onRetry={handleRetry}
@@ -1194,8 +1273,9 @@ function ConversationPageContent() {
             />
           </Suspense>
         )}
-        <InputArea
+        <ConnectedInputArea
           ref={inputRef}
+          slug={slug!}
           conversationId={conversationId}
           convState={convStateForChildren}
           images={images}
@@ -1203,6 +1283,7 @@ function ConversationPageContent() {
           isOffline={isOffline}
           failedMessages={failedMessages}
           convModeLabel={conversation.conv_mode_label}
+          focusToken={focusToken}
           onSend={handleSend}
           onCancel={handleCancel}
           onRetry={handleRetry}
@@ -1256,6 +1337,7 @@ function ConversationPageContent() {
               homeDir={conversation.home_dir ?? undefined}
               onAssistSetup={handleAssistShellSetup}
               showError={showError}
+              onSendSelectionToDraft={handleSendTerminalSelection}
             />
           </Suspense>
         </>

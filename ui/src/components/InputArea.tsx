@@ -12,7 +12,7 @@ import {
 } from 'react';
 // Icon buttons removed from action row -- file browse via sidebar, image attach via paste/drag
 import type { QueuedMessage } from '../hooks';
-import { useDraft, useScopedState } from '../hooks';
+import { useDraftActions, useDraftValue, useScopedState } from '../hooks';
 import type { ConversationState, ImageData, SkillEntry } from '../api';
 import { api, ExpansionError } from '../api';
 import { isAgentWorking, isCancellingState } from '../utils';
@@ -28,8 +28,7 @@ import type { AutocompleteItem, TriggerState } from './InlineAutocomplete';
 import { fuzzyMatch } from './CommandPalette/fuzzyMatch';
 
 export interface InputAreaHandle {
-  appendToDraft: (text: string) => void;
-  setDraft: (text: string) => void;
+  focus: () => void;
 }
 
 interface InputAreaProps {
@@ -46,6 +45,20 @@ interface InputAreaProps {
   failedMessages: QueuedMessage[];
   /** Conversation mode label (e.g. "Explore", "Work", "Direct") */
   convModeLabel?: string | undefined;
+  /** Controlled draft text. This component is purely presentational —
+   *  the source of truth lives in `DraftStore`, fed in by
+   *  `<ConnectedInputArea>`. */
+  draft: string;
+  /** Called for every draft mutation (keystroke, autocomplete apply, voice
+   *  commit, paste). */
+  onDraftChange: (text: string) => void;
+  /**
+   * Monotonic counter bumped by the parent when it wants the textarea
+   * focused (terminal selection arrival, retry-of-failed, skill insert,
+   * prose-reader send-notes). Survives unmount/remount: a parent bump while
+   * InputArea is unmounted lands as a fresh effect tick on re-mount.
+   */
+  focusToken?: number;
   /**
    * Called when the user sends a message.
    * May reject with an expansion error (REQ-IR-007) — the component will
@@ -65,6 +78,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   isOffline,
   failedMessages,
   convModeLabel,
+  draft,
+  onDraftChange,
+  focusToken,
   onSend,
   onCancel,
   onRetry,
@@ -72,32 +88,24 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 }, ref) {
   const agentWorking = isAgentWorking(convState);
   const isCancelling = isCancellingState(convState);
-  const [draft, setDraft, clearDraft] = useDraft(conversationId);
+  const setDraft = onDraftChange;
+  const clearDraft = useCallback(() => onDraftChange(''), [onDraftChange]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const voiceSupported = isWebSpeechSupported();
 
   useImperativeHandle(ref, () => ({
-    appendToDraft: (text: string) => {
-      setDraft(draft.trim() ? draft + '\n\n' + text : text);
+    focus: () => {
+      textareaRef.current?.focus();
     },
-    setDraft: (text: string) => {
-      setDraft(text);
-    },
-  }), [draft, setDraft]);
+  }), []);
 
-  // Listen for external insert-draft events (e.g., from SkillViewer)
+  // Consume parent's focus-token bumps. Skipping the initial 0 means
+  // mounting alone doesn't steal focus — the parent has to explicitly ask.
   useEffect(() => {
-    const handler = (e: Event) => {
-      const text = (e as CustomEvent<{ text: string }>).detail?.text;
-      if (text) {
-        setDraft(text);
-        textareaRef.current?.focus();
-      }
-    };
-    window.addEventListener('phoenix:insert-draft', handler);
-    return () => window.removeEventListener('phoenix:insert-draft', handler);
-  }, [setDraft]);
+    if (!focusToken) return;
+    textareaRef.current?.focus();
+  }, [focusToken]);
 
   // Voice input: base text (accumulated finals) + interim (current partial)
   const [voiceBase, setVoiceBase] = useScopedState<string | null>(conversationId, null); // null = not recording
@@ -732,4 +740,21 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     </footer>
   );
 });
+
+/**
+ * Subscribes to the draft slice and feeds the presentational `<InputArea>`.
+ * Hosting the subscription in this wrapper keeps the re-render scoped to
+ * the composer subtree — sibling components don't see keystroke churn.
+ */
+export type ConnectedInputAreaProps = Omit<InputAreaProps, 'draft' | 'onDraftChange'> & {
+  slug: string;
+};
+
+export const ConnectedInputArea = forwardRef<InputAreaHandle, ConnectedInputAreaProps>(
+  function ConnectedInputArea({ slug, ...rest }, ref) {
+    const draft = useDraftValue(slug);
+    const { setDraft } = useDraftActions(slug);
+    return <InputArea ref={ref} {...rest} draft={draft} onDraftChange={setDraft} />;
+  },
+);
 
