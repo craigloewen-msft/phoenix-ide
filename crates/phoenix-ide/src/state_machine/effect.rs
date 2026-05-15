@@ -337,8 +337,11 @@ pub fn compute_bash_display_data(blocks: &[ContentBlock], cwd: &Path) -> Option<
     for block in blocks {
         if let ContentBlock::ToolUse { id, name, input } = block {
             if name == "bash" {
-                if let Some(command) = input.get("command").and_then(|c| c.as_str()) {
-                    let display = display_command(command, &cwd_str);
+                let display = serde_json::from_value::<crate::tools::BashToolInput>(input.clone())
+                    .ok()
+                    .and_then(|input| bash_input_display(&input, &cwd_str))
+                    .or_else(|| legacy_bash_input_display(input, &cwd_str));
+                if let Some(display) = display {
                     bash_displays.push(serde_json::json!({
                         "tool_use_id": id,
                         "display": display
@@ -352,5 +355,50 @@ pub fn compute_bash_display_data(blocks: &[ContentBlock], cwd: &Path) -> Option<
         None
     } else {
         Some(serde_json::json!({ "bash": bash_displays }))
+    }
+}
+
+fn bash_input_display(input: &crate::tools::BashToolInput, cwd: &str) -> Option<String> {
+    match input.op {
+        crate::tools::BashOp::Run => input.cmd.as_deref().map(|cmd| display_command(cmd, cwd)),
+        crate::tools::BashOp::Peek => input
+            .handle
+            .as_deref()
+            .map(|handle| format!("peek {handle}")),
+        crate::tools::BashOp::Wait => input.handle.as_deref().map(|handle| {
+            let suffix = input
+                .wait_seconds
+                .map(|seconds| format!(" (up to {seconds}s)"))
+                .unwrap_or_default();
+            format!("wait {handle}{suffix}")
+        }),
+        crate::tools::BashOp::Kill => input.handle.as_deref().map(|handle| {
+            let signal = input.signal.as_deref().unwrap_or("TERM");
+            format!("kill {handle} ({signal})")
+        }),
+    }
+}
+fn legacy_bash_input_display(input: &Value, cwd: &str) -> Option<String> {
+    input
+        .get("command")
+        .or_else(|| input.get("cmd"))
+        .and_then(Value::as_str)
+        .map(|cmd| display_command(cmd, cwd))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_bash_display_data_strips_cwd_for_legacy_command() {
+        let blocks = vec![ContentBlock::ToolUse {
+            id: "tool-1".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({ "command": "cd /repo && cargo test" }),
+        }];
+
+        let display = compute_bash_display_data(&blocks, Path::new("/repo")).unwrap();
+        assert_eq!(display["bash"][0]["display"], "cargo test");
     }
 }

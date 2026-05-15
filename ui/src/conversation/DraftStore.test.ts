@@ -22,6 +22,26 @@ describe('draftReducer', () => {
     });
   });
 
+  describe('set_draft_if_empty', () => {
+    it('sets the draft when current draft is empty', () => {
+      const atom = { draft: '' };
+      const next = draftReducer(atom, { type: 'set_draft_if_empty', text: 'seed' });
+      expect(next.draft).toBe('seed');
+    });
+
+    it('does not replace existing visible content', () => {
+      const atom = { draft: 'existing' };
+      const next = draftReducer(atom, { type: 'set_draft_if_empty', text: 'seed' });
+      expect(next).toBe(atom);
+    });
+
+    it('sets the draft when current draft is whitespace-only', () => {
+      const atom = { draft: '   ' };
+      const next = draftReducer(atom, { type: 'set_draft_if_empty', text: 'seed' });
+      expect(next.draft).toBe('seed');
+    });
+  });
+
   describe('append_draft', () => {
     it('inserts a blank-line separator when existing draft has visible content', () => {
       const atom = { draft: 'first thought' };
