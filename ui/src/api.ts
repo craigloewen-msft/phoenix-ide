@@ -182,6 +182,12 @@ export type ConversationState =
   | { type: 'awaiting_recovery'; message: string; recovery_kind: string }
   | { type: 'terminal' };
 
+/** Mirror of the backend `ConvState::allows_model_change`: true only for
+ *  `idle` and `error`. */
+export function canChangeModelInState(state: ConversationState): boolean {
+  return state.type === 'idle' || state.type === 'error';
+}
+
 /** Derive the coarse display category from a conversation's raw state type string.
  *  Internal fallback — prefer `getConvDisplayState` which reads `presentation_mode`. */
 function getDisplayState(stateType: string | undefined): 'idle' | 'working' | 'error' | 'terminal' | 'awaiting-approval' {
