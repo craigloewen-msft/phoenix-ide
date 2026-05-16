@@ -37,6 +37,12 @@ As a user watching an agent work on a web app, I want to see what the agent is a
 
 **Motivation:** The agent's headless Chromium is invisible to the user by default. When the agent is iterating on a UI bug, building a feature, or scraping a page, the natural collaborative loop is "agent does X, user sees the result, user nudges." Without a live view, every step requires either a screenshot tool call (slow, snapshot-only) or the user opening the dev server URL in their own browser (different from what the agent sees, no shared frame of reference). A view-only mirror over CDP screencast closes that loop without introducing input arbitration questions.
 
+### US-5: Systematic Web Performance Testing (Specialized)
+
+As an AI agent optimizing a web app, I need to measure performance under a reproducible scenario, capture raw per-run samples around a baseline, and attribute cost to a root cause, so I can apply the scientific method (baseline → change → significance test) rather than guessing.
+
+**Motivation:** Browser performance swings 5x by machine, thermal state, and GC timing. An optimization "hunt" is only valid if the scenario is reproducible, the metric is low-noise, and the variance is owned by the caller computing significance — not hidden behind a harness mean. The agent needs: a deterministic scenario driver (fixed app state + synthetic input + deterministic readiness signal), CPU throttling to normalize the host, macro counters and React commit metrics as the headline numbers, a multi-run loop that returns **raw per-run samples** (never pre-averaged), forced-GC heap reads, and root-cause tools (CPU sampling profile, why-did-render, long-task extraction, heap-snapshot diff). Without these the method collapses regardless of how nice the API is.
+
 ---
 
 ## Core Requirements (MVP)
@@ -328,6 +334,123 @@ THE `ToolContext.browser()` method SHALL:
 
 ---
 
+## Performance Profiling Requirements
+
+### REQ-BT-019: Systematic Web Performance Testing
+
+A single `browser_profile` tool exposes performance measurement and root-cause analysis through an `action` discriminator. The tool is stateful: profiling/tracing/coverage sessions have explicit start→stop lifecycles with preconditions enforced (see `browser-profiling.allium`). Sub-requirements are tiered by what the scientific method needs, not by implementation ease.
+
+#### Tier 0 — Method-critical (the method collapses without these)
+
+**REQ-BT-019.1 — Deterministic scenario driver.**
+THE SYSTEM SHALL accept a declarative scenario (an ordered list of steps: navigate, reload, click, type, key, eval, wait-for-selector, wait-for-user-timing-mark, wait-for-eval-predicate) and execute it to a deterministic readiness signal.
+WHEN a readiness step's condition is not met within its timeout THE SYSTEM SHALL fail the run and report which step blocked, rather than returning a measurement against an indeterminate state.
+
+**REQ-BT-019.2 — CPU throttling.**
+THE SYSTEM SHALL set a fixed CPU throttling rate (`Emulation.setCPUThrottlingRate`) for the duration of a scenario and restore the prior rate afterward, so measurements are comparable across hosts and thermal states. A rate of `1` means no throttling.
+
+**REQ-BT-019.3 — Macro counter snapshot.**
+THE SYSTEM SHALL capture `Performance.getMetrics` before and after each scenario run and report the delta and absolute for at least: ScriptDuration, TaskDuration, LayoutCount, RecalcStyleCount, JSHeapUsedSize, Nodes, JSEventListeners.
+
+**REQ-BT-019.4 — React commit metrics.**
+WHEN React is present THE SYSTEM SHALL report, per scenario run, the React commit count and summed `actualDuration`, split by mount vs update phase and keyed by component. This is collected via the existing `__phoenix` helper (REQ-BT-017) extended with a commit hook installed before React loads.
+
+**REQ-BT-019.5 — Multi-run with raw per-run samples (hard constraint).**
+THE SYSTEM SHALL repeat a scenario N times (N caller-configurable, with optional warmup runs excluded from results) and return the **raw per-run sample array**.
+THE SYSTEM SHALL NOT return a pre-averaged or otherwise statistically reduced result in place of the raw samples. Significance, mean, and variance are owned by the caller, not the harness.
+
+**REQ-BT-019.6 — Forced GC then heap read.**
+THE SYSTEM SHALL, on request, force garbage collection (`HeapProfiler.collectGarbage`) and then read JSHeapUsedSize, so the memory metric is deterministic rather than GC-timing noise.
+
+#### Tier 1 — Root-cause (turns "symptom found" into "root cause found")
+
+**REQ-BT-019.7 — CPU sampling profile.**
+THE SYSTEM SHALL start/stop a `Profiler` CPU sampling session and persist the profile to a file loadable in Chrome DevTools.
+THE SYSTEM SHALL additionally return, inline on stop, an agent-readable hot-function ranking: top-N by self time aggregated per function (the non-double-counting "where is CPU spent" metric) and top-N call-tree nodes by total time (self + descendants, labelled as possibly double-counting recursion). A profile file an agent cannot parse is an artifact, not an answer; the file is still kept for a human/DevTools deep-dive.
+THE SYSTEM SHALL provide a `cpu_summary` action that re-renders that ranking from a saved profile path without a browser (so an earlier or externally-captured profile can be re-read). WHEN sampling data (`samples`/`timeDeltas`) is absent THE SYSTEM SHALL fall back to `hitCount` weighting and label it as relative weight, not absolute time — never present hit counts as milliseconds.
+
+**REQ-BT-019.8 — Why-did-render.**
+WHEN React is present THE SYSTEM SHALL report, per commit, which components re-rendered and a best-effort attribution of the cause (changed props/state/hooks keys) derived from the fiber alternate.
+
+**REQ-BT-019.9 — Timeline trace + long-task extraction.**
+THE SYSTEM SHALL start/stop a `Tracing` session (default categories include `devtools.timeline`, `disabled-by-default-v8.cpu_profiler`, `blink.user_timing`), persist the trace to a `chrome://tracing`-loadable file, AND extract tasks longer than 50 ms into a summary.
+
+**REQ-BT-019.10 — Heap-snapshot diff.**
+THE SYSTEM SHALL take heap snapshots and, given a baseline snapshot and a post-scenario snapshot, report retained-size growth and detached-DOM-node count, so a leak across repeated mount/unmount is detectable.
+
+#### Tier 2 — Supporting (cheap, folded in)
+
+**REQ-BT-019.11 — JS coverage.**
+THE SYSTEM SHALL start/stop `Profiler` precise coverage and persist per-script coverage.
+
+**REQ-BT-019.12 — Trace persisted to disk.**
+THE SYSTEM SHALL write traces (REQ-BT-019.9) as `{"traceEvents":[...]}` JSON for human audit.
+
+#### Hardening — pit-of-success (a misread sample is worse than no sample)
+
+These exist because the tool is consumed by LLM agents doing performance work, where a plausible-looking wrong number is the dominant failure mode. The governing rule: a measurement that was not actually taken MUST NOT be representable as a value that looks taken. Loud-wrong or labeled-absent always beats silent-wrong.
+
+**REQ-BT-019.13 — No silent "not measured" for React metrics.**
+THE SYSTEM SHALL distinguish, in every run sample, three React states: `measured` (a profiling-capable build, `actualDuration` available), `absent` (no React on the page), and `no_profiling_build` (React present but a production build that does not expose `actualDuration`).
+WHEN the state is not `measured` THE SYSTEM SHALL report the React timing field as null (not `0`) and carry the state discriminator, so "zero React cost" and "React cost not measured" are not the same value. Commit *count* MAY still be reported when React is present (the commit hook fires regardless of build), with the timing field null.
+
+**REQ-BT-019.14 — Counter-reset safety.**
+`Performance.getMetrics` counters are cumulative since document load and reset on navigation. THE SYSTEM SHALL NOT compute a before/after delta across a navigation within a run.
+THE SYSTEM SHALL reject a `run_scenario` whose `steps` contain a `navigate` or `reload` step (these belong in the per-run `reset`, REQ-BT-019.18, which executes before the before-snapshot), with an error that names the offending step and explains the counter reset — rather than returning a negative or meaningless delta.
+
+**REQ-BT-019.15 — Forced-GC heap inside the run loop, default-on.**
+THE SYSTEM SHALL, by default, force a full GC (`HeapProfiler.collectGarbage`) once per run and read `JSHeapUsedSize` only at that post-GC point — the single consistent point in the GC cycle (the V8 analog of a post-mark live-heap read).
+THE SYSTEM SHALL take the GC strictly outside the duration bracket (snapshot the duration counters, then GC, then read heap) so the collect pause does not inflate ScriptDuration/TaskDuration.
+WHEN per-run GC is explicitly disabled THE SYSTEM SHALL report the heap field as null plus a flag — never a populated mid-cycle sample under the same key as a real metric.
+
+**REQ-BT-019.16 — Method-safe defaults and methodology warnings.**
+THE SYSTEM SHALL default `warmup` to at least 1 (cold JIT/first-paint excluded by default).
+THE SYSTEM SHALL emit a `methodology_warnings` list alongside (never in place of) the raw samples, populated when the run was unguarded in a way that invalidates a naive reading: no CPU throttle, `warmup` explicitly 0, no readiness step present in `steps`, per-run GC disabled, or per-run reset disabled. This is metadata, not a statistical reduction — REQ-BT-019.5 still holds.
+
+**REQ-BT-019.17 — why_render: label, do not diagnose.**
+THE SYSTEM SHALL classify each changed prop reported by `why_render` as `reference_changed` vs `value_changed` where cheaply determinable, and annotate that the comparison is a shallow reference compare.
+**Rationale:** inline object/array/function props mint a new reference every render (the most common React pattern); a bare `!==` reports them as "changed" and an agent reads that as a root cause. Labeling stops the #1 false positive being stated as fact.
+
+**REQ-BT-019.18 — Determinism by construction (per-run reset + readiness-anchored window).**
+THE SYSTEM SHALL, before each run, reset to a fixed state, by default: an explicit `reset` (`navigate{url}` or `reload`) if supplied, otherwise a reload of the current URL. `reset: "none"` opts out and MUST emit a `methodology_warnings` entry. State bleed across runs SHALL NOT be the silent default.
+THE SYSTEM SHALL treat the `reset` AND the first readiness step (`wait_selector`/`wait_timing`/`wait_eval`) as **untimed setup**: page load, framework mount, and async settle happen BEFORE the measured window opens. The window opens only once readiness is satisfied (REQ-BT-019.20). A scenario with no readiness step opens the window immediately after reset and MUST emit a `methodology_warnings` entry (the mount/settle is then unavoidably in-window — the F3 footgun).
+
+**REQ-BT-019.20 — Page-anchored measurement window (F3/F5 root-cause fix).**
+The measured window SHALL be defined IN THE PAGE, not inferred from two host-side `Performance.getMetrics` round-trips. A document-start-injected harness SHALL install a `longtask` `PerformanceObserver` and expose reset/read entry points.
+- **Open:** immediately after the first readiness step satisfies, the harness resets in-page accumulators — `t0 = performance.now()`, longtask sum/count zeroed, the `__phoenix` React commit buffer cleared.
+- **Close:** after the remaining (measured) steps, the harness reads the accumulators in one in-page call.
+**Rationale:** host-bracketed CDP counter deltas are unanchored to the page's own scheduling and collapse to ~0 when a renderer-blocking burst delays the *before* read past itself (F5), or capture the mount when it lands between the two reads (F3). A page-anchored window is immune to renderer-block and CDP timing because the boundaries are `performance.now()` marks the page sets itself. This mirrors the validated consuming methodology.
+
+**REQ-BT-019.19 — Canonical per-run sample schema (the contract consumers adapt to).**
+The raw per-run sample emitted by `run_scenario` has a canonical key set. THESE NAMES ARE AUTHORITATIVE; a downstream statistics/significance consumer adapts its extraction to these — the harness does not rename to match a consumer, and (per REQ-BT-019-NG-STATS) does not reduce. The canonical keys are:
+
+| key | meaning | null when |
+|-----|---------|-----------|
+| `run_index` | 0-based post-warmup run ordinal | never |
+| `script_ms` | sum of `longtask` durations within the page-anchored window (ms) — REQ-BT-019.20, NOT a CDP `ScriptDuration` delta | never |
+| `long_tasks` | count of `longtask` entries (>50 ms) within the window | never |
+| `wall_ms` | `performance.now()` span of the measured window | never |
+| `dom_nodes` | `document.getElementsByTagName('*').length` at window close (absolute) | never |
+| `gc_ran` | whether a forced GC ran this run (REQ-BT-019.15) | never |
+| `js_heap_used` | post-full-GC live-heap bytes — a one-shot gauge read once post-GC (F5 does not apply to gauges) | `gc_ran=false` |
+| `react_status` | `measured` \| `absent` \| `no_profiling_build` | never |
+| `react_commits` | commit count over the window (React present) | `react_status=absent` |
+| `react_actual_ms` | summed per-commit ROOT-fiber `actualDuration` over the window, ms (REQ-BT-019.4 — never a per-fiber sum) | `react_status≠measured` |
+
+The pre-REQ-BT-019.20 CDP-counter delta keys (`script_duration`, `task_duration`, `layout_count`, `recalc_style_count`, `nodes`, `js_event_listeners`) are **removed**: F5 proved the host-bracketed counter delta reads ~0 for real in-window work. The standalone `metrics` action still exposes a one-shot `Performance.getMetrics` snapshot (a gauge read, honest); only the per-run *windowed delta* use was unsound. A consumer keying off the old names, or off other names while silently skipping absent metrics, reduces to "heap only" — a methodology failure that looks like success; the fix belongs in the consumer's extraction table. Any change to a key here is breaking and MUST update this table.
+
+#### Non-goals (this requirement)
+
+- **REQ-BT-019-NG-NETEMU** — Network emulation (`Network.emulateNetworkConditions`, table item 2.1) is deferred. It introduces a stateful mode that interacts with scenario determinism and is the least method-critical item; tracked separately.
+- **REQ-BT-019-NG-STATS** — The harness does not compute significance, p-values, means, or variance. Per REQ-BT-019.5 the caller (skill) owns all statistics. A harness that reduces samples is non-conforming.
+- **REQ-BT-019-NG-AUTOSCENARIO** — The harness does not infer a scenario from the page. The scenario is always caller-supplied (REQ-BT-019.1); a "guess what to measure" mode is out of scope.
+
+**Rationale:** Lading-style rigor = reproducible scenario + baseline-before-change + significance threshold + variance. Each tier is ordered by what that method requires. Tier 0 items are individually load-bearing: drop the scenario driver and runs aren't comparable; drop throttling and the host dominates; pre-average the samples and the caller can't test significance.
+
+**User Stories:** US-5, US-1, US-2
+
+---
+
 ## Extended Requirements (Post-MVP)
 
 ### REQ-BT-020: Service Worker Inspection
@@ -536,6 +659,7 @@ The auto-mount trigger is the server-authoritative `browser_session_state` lifec
 | REQ-BT-016: Keyboard Shortcut Input | US-2 | ✅ |
 | REQ-BT-017: React Component Access | US-1, US-2 | ✅ |
 | REQ-BT-018: Live Browser View Side Panel | US-4, US-1, US-2 | ✅ |
+| REQ-BT-019: Systematic Web Performance Testing | US-5, US-1, US-2 | 🟡 |
 | REQ-BT-020: Service Worker Inspection | US-3 | ❌ |
 | REQ-BT-021: Network Request Source | US-3 | ❌ |
 | REQ-BT-022: Offline Mode Simulation | US-3 | ❌ |
