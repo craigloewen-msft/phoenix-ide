@@ -70,11 +70,13 @@ pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     slug TEXT UNIQUE,
+    -- cwd is immutable post-creation. The only writers are the
+    -- recovery/teardown fallbacks via update_conversation_cwd_recovery_only
+    -- (task 13012); nothing else may mutate it.
     cwd TEXT NOT NULL,
     parent_conversation_id TEXT,
     user_initiated BOOLEAN NOT NULL,
     state TEXT NOT NULL DEFAULT '{"type":"idle"}',
-    state_data TEXT,
     state_updated_at TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -131,7 +133,7 @@ UPDATE conversations SET state = '{"type":"idle"}' WHERE state = 'idle';
 
 -- Convert all other non-JSON states to idle (they would be reset on startup anyway)
 -- This handles: awaiting_llm, llm_requesting, tool_executing, etc.
-UPDATE conversations SET state = '{"type":"idle"}', state_data = NULL 
+UPDATE conversations SET state = '{"type":"idle"}'
 WHERE state NOT LIKE '{%}';
 "#;
 

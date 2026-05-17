@@ -107,6 +107,30 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
+        // Drop the dead state_data column (task 02667). Ignored on fresh DBs
+        // where SCHEMA no longer creates it; drops it on upgraded DBs that
+        // still carry it from the pre-typed-state schema. Never read or
+        // written by any query.
+        // DROP COLUMN needs SQLite >= 3.35. SQLite is bundled via sqlx's
+        // `sqlite` feature (libsqlite3-sys, build-controlled and modern), so
+        // the host SQLite version is not a factor here. The benign case is a
+        // fresh DB where the column never existed ("no such column"); a real
+        // failure on an upgraded DB leaves the dead column in place (harmless
+        // — never read/written — but worth a warn so it's not invisible).
+        if let Err(e) = sqlx::raw_sql("ALTER TABLE conversations DROP COLUMN state_data")
+            .execute(&self.pool)
+            .await
+        {
+            if e.to_string().contains("no such column") {
+                tracing::debug!("state_data column already absent; nothing to drop");
+            } else {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to drop dead state_data column on an upgraded DB; it will remain (unused)"
+                );
+            }
+        }
+
         // Try to add model column - ignore error if it already exists
         let _ = sqlx::raw_sql("ALTER TABLE conversations ADD COLUMN model TEXT")
             .execute(&self.pool)
@@ -663,8 +687,28 @@ impl Database {
         Ok(count > 0)
     }
 
-    /// Update conversation working directory (e.g., after worktree creation).
-    pub async fn update_conversation_cwd(&self, id: &str, cwd: &str) -> DbResult<()> {
+    /// Update a conversation's working directory.
+    ///
+    /// Conversation `cwd` is immutable post-creation. The only legitimate
+    /// mutations are recovery/teardown fallbacks: promoting an Explore
+    /// worktree in place at task approval, and pointing a terminal
+    /// conversation at the repo root after its worktree is deleted. The
+    /// `_recovery_only` suffix exists so this mutation is not casually
+    /// reachable — see task 13012 and `cwd_immutability_tests`.
+    pub async fn update_conversation_cwd_recovery_only(&self, id: &str, cwd: &str) -> DbResult<()> {
+        // Expected invariant: callers (repo_root, worktree_path — both
+        // git-derived) pass a non-empty absolute path. This is the only
+        // mutation path and runs during recovery/teardown, so a panic here
+        // would be worse than tolerating an unexpected value — log loudly
+        // and still perform the write rather than crashing recovery.
+        if cwd.is_empty() || !std::path::Path::new(cwd).is_absolute() {
+            tracing::error!(
+                conv_id = %id,
+                cwd,
+                "update_conversation_cwd_recovery_only called with a non-absolute or empty cwd; \
+                 proceeding but this violates the cwd contract (task 13012)"
+            );
+        }
         let now = Utc::now();
         let result =
             sqlx::query("UPDATE conversations SET cwd = ?1, updated_at = ?2 WHERE id = ?3")
@@ -3178,5 +3222,74 @@ mod tests {
         // Missing conversation surfaces as a typed error, not silent no-op.
         let err = db.set_chain_name("ghost", Some("x")).await.unwrap_err();
         matches!(err, DbError::ConversationNotFound(_));
+    }
+
+    /// Task 02667: a fresh DB's `conversations` table must not carry the
+    /// dead `state_data` column (SCHEMA no longer creates it).
+    #[tokio::test]
+    async fn fresh_db_has_no_state_data_column() {
+        let db = Database::open_in_memory().await.unwrap();
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        assert!(
+            !columns.iter().any(|c| c == "state_data"),
+            "fresh schema must not create state_data, got: {columns:?}"
+        );
+    }
+
+    /// Task 02667: an upgraded DB that still carries `state_data` from the
+    /// pre-typed-state schema gets the column dropped by `run_migrations`.
+    #[tokio::test]
+    async fn state_data_column_is_dropped_on_upgrade() {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+
+        // Pre-2667 shape: conversations table still has state_data. SCHEMA's
+        // CREATE TABLE IF NOT EXISTS will not overwrite this.
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (\
+                id TEXT PRIMARY KEY, \
+                slug TEXT UNIQUE, \
+                cwd TEXT NOT NULL DEFAULT '/tmp', \
+                parent_conversation_id TEXT, \
+                user_initiated BOOLEAN NOT NULL DEFAULT 1, \
+                state TEXT NOT NULL DEFAULT '{\"type\":\"idle\"}', \
+                state_data TEXT, \
+                state_updated_at TEXT NOT NULL DEFAULT '2025-01-01', \
+                created_at TEXT NOT NULL DEFAULT '2025-01-01', \
+                updated_at TEXT NOT NULL DEFAULT '2025-01-01', \
+                archived BOOLEAN NOT NULL DEFAULT 0\
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let db = Database { pool };
+        db.run_migrations().await.unwrap();
+
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        assert!(
+            !columns.iter().any(|c| c == "state_data"),
+            "state_data should be dropped on upgrade, got: {columns:?}"
+        );
     }
 }
