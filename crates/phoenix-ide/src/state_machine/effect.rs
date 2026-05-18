@@ -84,6 +84,50 @@ pub fn tool_result_message_id(tool_use_id: &str) -> String {
 /// silently coupled through a duplicated string literal.
 pub const STATE_CHANGE_EVENT_TYPE: &str = "state_change";
 
+/// Symbolic label for a `state_change` notification's intended state.
+///
+/// Scope: this replaces the bare `&str` literals previously hand-typed at
+/// every `notify_state_change` call site, so a typo or a label no longer
+/// in the known set is a compile error and the full set is greppable.
+///
+/// It is NOT a binding between the label and the conversation's actual
+/// state: `notify_state_change` takes this value independently of the
+/// `ParentState` the transition produces, so passing the wrong variant
+/// still compiles. It also does not affect the wire payload — the
+/// executor reconstructs `SseEvent::StateChange` from `self.state`
+/// directly and discards the effect's `data`/label (the tracked
+/// `Effect::NotifyClient { data: _ }` drop, REQ-BED follow-up). Deriving
+/// the label from the typed state is that follow-up's job, not this
+/// enum's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateType {
+    Idle,
+    LlmRequesting,
+    ToolExecuting,
+    AwaitingSubAgents,
+    AwaitingTaskApproval,
+    AwaitingUserResponse,
+    AwaitingContinuation,
+    AwaitingRecovery,
+    Error,
+}
+
+impl StateType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            StateType::Idle => "idle",
+            StateType::LlmRequesting => "llm_requesting",
+            StateType::ToolExecuting => "tool_executing",
+            StateType::AwaitingSubAgents => "awaiting_sub_agents",
+            StateType::AwaitingTaskApproval => "awaiting_task_approval",
+            StateType::AwaitingUserResponse => "awaiting_user_response",
+            StateType::AwaitingContinuation => "awaiting_continuation",
+            StateType::AwaitingRecovery => "awaiting_recovery",
+            StateType::Error => "error",
+        }
+    }
+}
+
 /// Effects to be executed after state transition
 #[derive(Debug, Clone)]
 pub enum Effect {
@@ -285,10 +329,10 @@ impl Effect {
     /// Create a `state_change` notification with the state as an object
     /// This merges the state type with the additional data into a single object
     #[allow(clippy::needless_pass_by_value)] // data is consumed by json! macro
-    pub fn notify_state_change(state_type: &str, mut data: Value) -> Self {
+    pub fn notify_state_change(state_type: StateType, mut data: Value) -> Self {
         // Merge type into the data object to create a state-like structure
         if let Some(obj) = data.as_object_mut() {
-            obj.insert("type".to_string(), serde_json::json!(state_type));
+            obj.insert("type".to_string(), serde_json::json!(state_type.as_str()));
         }
         Effect::NotifyClient {
             event_type: STATE_CHANGE_EVENT_TYPE.to_string(),
@@ -396,6 +440,36 @@ fn legacy_bash_input_display(input: &Value, cwd: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_type_as_str_is_stable_and_unique() {
+        // Pins each label so a typo in `as_str` (which would silently
+        // recreate the magic-string drift this enum exists to prevent)
+        // fails the build. Values mirror `ConvState`'s snake_case serde
+        // `type` discriminants.
+        let table = [
+            (StateType::Idle, "idle"),
+            (StateType::LlmRequesting, "llm_requesting"),
+            (StateType::ToolExecuting, "tool_executing"),
+            (StateType::AwaitingSubAgents, "awaiting_sub_agents"),
+            (StateType::AwaitingTaskApproval, "awaiting_task_approval"),
+            (StateType::AwaitingUserResponse, "awaiting_user_response"),
+            (StateType::AwaitingContinuation, "awaiting_continuation"),
+            (StateType::AwaitingRecovery, "awaiting_recovery"),
+            (StateType::Error, "error"),
+        ];
+        for (variant, expected) in table {
+            assert_eq!(variant.as_str(), expected, "label drift for {variant:?}");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (variant, _) in table {
+            assert!(
+                seen.insert(variant.as_str()),
+                "duplicate label {:?}",
+                variant.as_str()
+            );
+        }
+    }
 
     #[test]
     fn compute_bash_display_data_strips_cwd_for_legacy_command() {
