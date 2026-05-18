@@ -2873,7 +2873,7 @@ mod tests {
             max_turns: 0,
             desired_base_branch: None,
             mode: ModeKind::Managed,
-            tasks_dir_name: crate::tasks_dir::DEFAULT_TASKS_DIR_NAME.to_string(),
+            tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
         };
 
         let result = handle_context_exhaustion(
@@ -2987,7 +2987,7 @@ mod tests {
             max_turns: 0,
             desired_base_branch: None,
             mode: ModeKind::Managed,
-            tasks_dir_name: crate::tasks_dir::DEFAULT_TASKS_DIR_NAME.to_string(),
+            tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
         };
 
         let result = transition(
@@ -3089,7 +3089,7 @@ mod tests {
             max_turns: 0,
             desired_base_branch: None,
             mode: ModeKind::Managed,
-            tasks_dir_name: crate::tasks_dir::DEFAULT_TASKS_DIR_NAME.to_string(),
+            tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
         };
 
         // attempt == MAX_RETRY_ATTEMPTS (3), retryable error → retries exhausted
@@ -3138,7 +3138,7 @@ mod tests {
             max_turns: 0,
             desired_base_branch: None,
             mode: ModeKind::Managed,
-            tasks_dir_name: crate::tasks_dir::DEFAULT_TASKS_DIR_NAME.to_string(),
+            tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
         };
 
         // Non-retryable error at attempt 1 → immediate failure
