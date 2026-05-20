@@ -1,0 +1,84 @@
+id: StreamingMessage-reparse-growing-buffer
+target: ui/src/components/StreamingMessage.tsx:StreamingMessage
+technique: reparse-growing-buffer
+scenario: sse-streaming
+date: 2026-05-15
+status: failure
+verdict: rejected
+
+# First completed hunt. Outcome: the statically-suspected O(n^2) reparse is
+# REFUTED BY MEASUREMENT. This is the suite working as designed — a code
+# smell that looked like a bug is killed by the measurement gate before any
+# optimization is written. A recorded rejection so find-target does not
+# re-pick this target without a genuinely new angle.
+
+hypothesis: >
+  StreamingMessage.tsx:62 calls parseStreamingBlocks(displayText) on every
+  rAF-driven render, displayText = the entire accumulated stream
+  (StreamingMessage.tsx:43/47). Static reading predicts the whole growing
+  buffer is re-parsed each frame -> per-message scripting cost O(n^2) in
+  stream length.
+
+method:
+  harness: skills/phoenix-perf-shared/scripts/run-scenario (agent-browser)
+  app: running dev server, mock model (PHOENIX_ENABLE_MOCK_MODEL=1)
+  scenario: resources/scenarios/sse-streaming.yaml
+  per_run_isolation: >
+    Each run uses a BRAND-NEW mock conversation + a hard document load, with
+    probes reset AFTER app-ready so the React mount and the deterministic
+    seed are excluded from the measured window identically every run. This
+    isolation is what made the instrument valid (see harness_fix below).
+  signal: react_commit_ms (summed React commit actualDuration; React
+    DevTools global hook present under Vite). n=4 per size, warmup=1.
+  determinism: mock [[perf:N]] marker -> exactly N deterministic words.
+
+measurements:
+  # raw react_commit_ms per run (un-averaged), by deterministic stream length
+  words_200:  [24.9, 26.3, 27.1, 22.8]   # median 25.6
+  words_800:  [44.7, 42.0, 46.8, 41.4]   # median 43.4
+  words_1800: [51.1, 62.5, 54.8, 52.7]   # median 53.8
+  scaling:
+    words_x4_200_to_800:  "react_commit_ms x1.70 (O(n^2) predicts ~x16; linear ~x4)"
+    words_x9_200_to_1800: "react_commit_ms x2.10"
+    commit_count: "23 -> ~29 -> ~37 (barely grows; rAF coalesces frames)"
+  variance: low and unimodal at every size (no bimodality).
+
+verdict_rationale: |
+  react_commit_ms scales markedly SUB-LINEARLY with stream length. O(n^2)
+  would require roughly x16 for x4 words; even linear would require x4;
+  measured is x1.70. The rAF gate coalesces commits so longer streams add
+  frames slowly, and parseStreamingBlocks over a few-KB string is cheap
+  relative to React commit / markdown render. The hot path the static smell
+  implied does not exist at realistic sizes. REJECTED: there is no measured
+  performance problem here; an incremental-parse rewrite would add
+  complexity for no measurable gain (Greybeard + Skeptic both reject).
+  Limitation: n=4 per size — small, but the refutation margin (x1.70 vs the
+  x16 the hypothesis requires) is far larger than any plausible n=4 noise,
+  and variance was low and unimodal. A larger N would tighten the curve,
+  not flip its shape.
+
+harness_fix: |
+  The first attempt produced bimodal, incoherent samples
+  (200w: [78, 696, 74, 696]). Root cause was NOT "accumulated history"
+  (that would rise monotonically, not alternate). True root cause: the
+  scenario reused one conversation AND `navigate` to the same URL reloaded
+  nondeterministically, so some runs included the full React mount (~696ms)
+  in the window and some did not. Fixed structurally in run-scenario: a
+  generic `reset:` block — per-run fresh backend conversation
+  (POST /api/conversations/new) + hard document load + probe-reset AFTER
+  app-ready. Bimodality vanished ([24.9,26.3,27.1,22.8]); the instrument is
+  now valid. This isolation is generic to every scenario, not patched for
+  this one.
+
+lessons: |
+  1. A static O(n^2)-looking pattern is a HYPOTHESIS, not a defect. The
+     measurement gate refuted it; recording the rejection prevents the next
+     find-target run (and the next engineer) from "fixing" a non-problem.
+  2. Instrument validity precedes any result. Incoherent samples were the
+     instrument telling the truth — chasing the wrong root cause
+     ("accumulated history") nearly produced a plausible-but-invalid story;
+     the alternation signature forced the correct root cause (mount in/out
+     of window) and a structural fix.
+  3. Re-pick StreamingMessage only with a NEW angle (e.g. very long single
+     messages >> 1800 words, or measured layout/paint cost, not commit_ms),
+     not the reparse-growing-buffer technique again.

@@ -1,0 +1,89 @@
+# Scenario: switch INTO a large conversation (the user's reported pain:
+# "slow to switch / load on bigger convos"). Driven by run-scenario
+# (agent-browser).
+#
+# Exercises MessageList / MessageListBody with NO virtualization: the cost
+# of rendering a large non-virtualized message DOM on a client-side switch.
+#
+# ISOLATION: reset hard-loads the conversation LIST and resets probes AFTER
+# it is ready, so the list mount is excluded from the window. The MEASURED
+# action is the SPA switch into the big fixture (click its list row) — this
+# is exactly the user's "switch" path, and the per-frame React render +
+# layout of the big list lands inside the window.
+#
+# FIXTURE: fixture-turn-one — 47 deterministic large mock messages
+# ([[perf:600-700]] turns). Immutable for the load test (reused on purpose,
+# not mutated): a fixed-size big conversation = a stable fingerprint.
+#
+# METRICS: script_ms + long_tasks (layout/paint over the big DOM) and
+# react_commit_ms (rendering ~47 message subtrees). dom_nodes is expected
+# to legitimately differ here (small list vs big conv) — for THIS scenario
+# dom_nodes IS signal, unlike sse-streaming where it was an artifact.
+
+name: conversation-load
+covers:
+  - ui/src/components/MessageList.tsx
+  - ui/src/components/MessageComponents.tsx
+  - ui/src/pages/ConversationPage.tsx
+
+params:
+  base_url: "{UI_URL}"
+  fixture: "fixture-turn-one"       # the big conversation to switch INTO
+
+runs: 20
+warmup: 3
+
+reset:
+  url: "{base_url}/"                # the conversation LIST
+  wait_app_ready:
+    expr: >
+      document.querySelectorAll('li.conv-item').length > 0
+      && document.readyState === 'complete'
+    timeout_ms: 60000
+
+steps:
+  # Clear persisted scroll state for the fixture so EVERY run measures the
+  # canonical cold "switch -> land pinned at bottom" path (the user's actual
+  # complaint), not a stale REQ-CONV-013 restore to a previous run's saved
+  # offset. Without this the agent-browser profile's localStorage leaks
+  # scroll positions across runs -> non-deterministic, and (with bottom-
+  # anchored virtualization) the restore-coverage logic correctly disables
+  # windowing for a stale near-top offset. Build-agnostic; both arms benefit.
+  - eval: >
+      (() => {
+        try {
+          localStorage.removeItem('phoenix:scroll:{fixture}');
+          localStorage.removeItem('phoenix:msgcount:{fixture}');
+        } catch (e) {}
+      })()
+  # SPA switch into the big conversation. The list row has no stable
+  # selector and its text is "<slug>Direct" (slug+badge), and the row is
+  # far down a 100+ item list — so locate it by slug-prefix and fire its
+  # click programmatically (React's delegated onClick still routes).
+  - eval: >
+      (() => {
+        const row = [...document.querySelectorAll('li.conv-item')].find(
+          li => li.querySelector('.conv-item-slug')
+                && li.querySelector('.conv-item-slug').textContent.startsWith('{fixture}'));
+        if (!row) throw new Error('fixture row not found: {fixture}');
+        row.scrollIntoView();
+        (row.querySelector('.conv-item-main') || row).click();
+      })()
+  # Readiness — BUILD-EQUIVALENT "switch render complete":
+  #   - url is the fixture
+  #   - >=5 real .message rendered: the heavy render commit has landed (in
+  #     the non-virtualized build all 47 commit together so this == fully
+  #     rendered; in the windowed build the ~12-row window has committed).
+  #     The window measurement (longtask/commit accumulators read here)
+  #     therefore captures the full per-build render cost in both arms.
+  #   - not streaming
+  # Pinned-to-bottom / no-scroll-jump are NOT asserted here on purpose: the
+  # genuine cold switch (no saved scroll) does not pixel-pin within the
+  # window even in the baseline build, so requiring it would make the
+  # predicate non-build-equivalent. Those properties are the REGRESSION
+  # surface and are verified explicitly in QA-2 behavior checks instead.
+  # Independent of per-message DOM count, so a collapsed top spacer (one
+  # element for many old messages) does not break it.
+  - wait-for-eval-predicate:
+      expr: "location.pathname.endsWith('/{fixture}') && document.querySelectorAll('.message').length>=5 && !document.querySelector('.streaming-message')"
+      timeout_ms: 60000

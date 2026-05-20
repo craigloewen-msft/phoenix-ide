@@ -11,6 +11,10 @@ import {
 } from './MessageComponents';
 import { StreamingMessage } from './StreamingMessage';
 import { MessageContextMenu } from './MessageContextMenu';
+import {
+  useBottomAnchoredWindow,
+  COLLAPSED_EST_PX,
+} from '../hooks/useBottomAnchoredWindow';
 
 const ChevronRight = () => (
   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -59,6 +63,15 @@ function extractSkillArgs(trigger: string, name: string): string {
   return trigger.replace(new RegExp(`^/?${name}\\s*`), '').trim();
 }
 
+function isRenderableHistoricalMessage(msg: Message): boolean {
+  const type = msg.message_type || msg.type;
+  if (type === 'tool') return false;
+  if (type === 'system') {
+    return Boolean((msg.content as { text?: string })?.text);
+  }
+  return type === 'user' || type === 'skill' || type === 'agent';
+}
+
 interface MessageListBodyProps {
   messages: Message[];
   pendingMessages: QueuedMessage[];
@@ -67,6 +80,10 @@ interface MessageListBodyProps {
   onRetry: (localId: string) => void;
   onCancelSteering?: ((localId: string) => void) | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+  /** Number of renderable historical rows collapsed into the top spacer. */
+  collapsedRenderableCount: number;
+  /** Message IDs whose renderable rows are collapsed. Tool rows never render standalone. */
+  collapsedRenderableIds: Set<string>;
 }
 
 /**
@@ -84,22 +101,38 @@ const MessageListBody = memo(function MessageListBody({
   onRetry,
   onCancelSteering,
   onOpenFile,
+  collapsedRenderableCount,
+  collapsedRenderableIds,
 }: MessageListBodyProps) {
   // Tracks whether the previous rendered message was an agent message, so
   // we can suppress the "Phoenix HH:MM" header on consecutive agent messages
   // within the same turn. Any user / skill message resets the run; system
   // messages and tool messages (which don't render as their own block here)
   // leave the run intact — they don't represent a new turn.
+  //
+  // inAgentRun is advanced over the FULL message list (before the window
+  // slice) so a row reveals with the SAME header it would have had
+  // non-virtualized — the window boundary must not change turn grouping.
   let inAgentRun = false;
   return (
     <>
+      {collapsedRenderableCount > 0 && (
+        <div
+          className="message-collapsed-spacer"
+          style={{ height: collapsedRenderableCount * COLLAPSED_EST_PX }}
+          aria-hidden="true"
+        />
+      )}
       {messages.map((msg) => {
         const type = msg.message_type || msg.type;
+        const rendered = !collapsedRenderableIds.has(msg.message_id);
         if (type === 'user') {
           inAgentRun = false;
+          if (!rendered) return null;
           return <UserMessage key={msg.sequence_id} message={msg} />;
         } else if (type === 'skill') {
           inAgentRun = false;
+          if (!rendered) return null;
           const skillContent = msg.content as { name?: string; trigger?: string };
           const skillTrigger = skillContent.trigger || '';
           const triggerArgs = extractSkillArgs(skillTrigger, skillContent.name || '');
@@ -126,6 +159,7 @@ const MessageListBody = memo(function MessageListBody({
         } else if (type === 'agent') {
           const isFirstInTurn = !inAgentRun;
           inAgentRun = true;
+          if (!rendered) return null;
           return (
             <AgentMessage
               key={msg.sequence_id}
@@ -137,6 +171,7 @@ const MessageListBody = memo(function MessageListBody({
           );
         }
         if (type === 'system') {
+          if (!rendered) return null;
           const text = (msg.content as { text?: string })?.text;
           if (text) {
             return (
@@ -177,12 +212,14 @@ export function MessageList({
   streamingBuffer,
 }: MessageListProps) {
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
-  const [showJumpToNewest, setShowJumpToNewest] = useState(false);
+  const [jumpToNewestState, setJumpToNewestState] = useState<{
+    conversationId: string | undefined;
+    visible: boolean;
+  }>({ conversationId, visible: false });
   const mainRef = useRef<HTMLElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const isPinnedToBottom = useRef(true); // Start pinned to bottom
-  const scrollRestored = useRef(false);
-  const initialMessageCount = useRef<number | null>(null);
+  const lastRestoredConversationId = useRef<string | undefined>(undefined);
   const lastScrollTop = useRef(0);
   const prevMessagesHeight = useRef(0);
   // Tracks message count between renders so the ResizeObserver knows whether a
@@ -193,12 +230,65 @@ export function MessageList({
   // 'soft'  = new non-system message → scroll only if pinned.
   // 'none'  = no new message this render.
   const scrollTriggerRef = useRef<'none' | 'soft' | 'force'>('none');
+  const lastConversationIdRef = useRef<string | undefined>(conversationId);
+
+  if (lastConversationIdRef.current !== conversationId) {
+    lastConversationIdRef.current = conversationId;
+    prevMessagesHeight.current = 0;
+    prevMessageCountRef.current = messages.length;
+    scrollTriggerRef.current = 'none';
+    lastScrollTop.current = mainRef.current?.scrollTop ?? 0;
+    isPinnedToBottom.current = true;
+  }
+
+  // Saved scroll pixel for REQ-CONV-013, read synchronously and memoized per
+  // conversation so the bottom-anchored window can widen far enough that the
+  // restored scrollTop lands inside REAL rendered content (not the estimated
+  // spacer). Recomputed on conversationId change, same render-time pattern as
+  // the rest of this component.
+  const savedScrollLookupRef = useRef<{ id: string | undefined; pos: number | null }>({
+    id: undefined,
+    pos: null,
+  });
+  if (savedScrollLookupRef.current.id !== conversationId) {
+    let pos: number | null = null;
+    if (conversationId) {
+      try {
+        const raw = localStorage.getItem(`${SCROLL_KEY_PREFIX}${conversationId}`);
+        pos = raw !== null ? parseInt(raw, 10) : null;
+        if (pos !== null && Number.isNaN(pos)) pos = null;
+      } catch { pos = null; }
+    }
+    savedScrollLookupRef.current = { id: conversationId, pos };
+  }
+
+  const renderableMessages = useMemo(
+    () => messages.filter(isRenderableHistoricalMessage),
+    [messages],
+  );
+
+  const { firstRenderedIndex } = useBottomAnchoredWindow({
+    messageCount: renderableMessages.length,
+    conversationId,
+    scrollRootRef: mainRef,
+    savedScrollPos: savedScrollLookupRef.current.pos,
+  });
+
+  const collapsedRenderableIds = useMemo(
+    () => new Set(renderableMessages.slice(0, firstRenderedIndex).map((msg) => msg.message_id)),
+    [firstRenderedIndex, renderableMessages],
+  );
+
   if (messages.length > prevMessageCountRef.current) {
     const newMsgs = messages.slice(prevMessageCountRef.current);
     const hasSystem = newMsgs.some(m => (m.message_type || m.type) === 'system');
     scrollTriggerRef.current = hasSystem ? 'force' : 'soft';
     prevMessageCountRef.current = messages.length;
   }
+
+  const showJumpToNewest = jumpToNewestState.conversationId === conversationId
+    ? jumpToNewestState.visible
+    : false;
 
   // Check if user is near bottom of scroll
   const checkIfPinnedToBottom = useCallback(() => {
@@ -213,13 +303,20 @@ export function MessageList({
     isPinnedToBottom.current = checkIfPinnedToBottom();
     const el = mainRef.current;
     if (el) lastScrollTop.current = el.scrollTop;
-    if (isPinnedToBottom.current) setShowJumpToNewest(false);
-  }, [checkIfPinnedToBottom]);
+    if (isPinnedToBottom.current) {
+      setJumpToNewestState((prev) => (
+        prev.conversationId === conversationId && !prev.visible
+          ? prev
+          : { conversationId, visible: false }
+      ));
+    }
+  }, [checkIfPinnedToBottom, conversationId]);
 
   // Scroll to bottom helper
   const scrollToBottom = useCallback(() => {
     if (mainRef.current) {
       mainRef.current.scrollTop = mainRef.current.scrollHeight;
+      lastScrollTop.current = mainRef.current.scrollTop;
     }
   }, []);
 
@@ -245,9 +342,14 @@ export function MessageList({
         if (shouldAct) {
           if (isPinnedToBottom.current || trigger === 'force') {
             mainRef.current!.scrollTop = mainRef.current!.scrollHeight;
+            lastScrollTop.current = mainRef.current!.scrollTop;
             if (trigger === 'force') isPinnedToBottom.current = true;
           } else {
-            setShowJumpToNewest(true);
+            setJumpToNewestState((prev) => (
+              prev.conversationId === conversationId && prev.visible
+                ? prev
+                : { conversationId, visible: true }
+            ));
           }
         }
         prevMessagesHeight.current = newHeight;
@@ -256,7 +358,7 @@ export function MessageList({
 
     observer.observe(messagesEl);
     return () => observer.disconnect();
-  }, []);
+  }, [conversationId]);
 
   // Save scroll position on unmount / visibility change (REQ-CONV-013)
   useEffect(() => {
@@ -283,36 +385,36 @@ export function MessageList({
   // fires ResizeObserver, so isPinnedToBottom is correctly set before the
   // observer decides whether to auto-scroll — no rAF, no flash to bottom first.
   useLayoutEffect(() => {
-    if (!conversationId || messages.length === 0 || scrollRestored.current) return;
-    scrollRestored.current = true;
-    const savedPos = localStorage.getItem(`${SCROLL_KEY_PREFIX}${conversationId}`);
-    const savedCount = localStorage.getItem(`${MSGCOUNT_KEY_PREFIX}${conversationId}`);
+    if (!conversationId || messages.length === 0 || lastRestoredConversationId.current === conversationId) return;
+    lastRestoredConversationId.current = conversationId;
+    let savedPos: string | null = null;
+    let savedCount: string | null = null;
+    try {
+      savedPos = localStorage.getItem(`${SCROLL_KEY_PREFIX}${conversationId}`);
+      savedCount = localStorage.getItem(`${MSGCOUNT_KEY_PREFIX}${conversationId}`);
+    } catch {
+      return;
+    }
     if (savedPos !== null) {
       const pos = parseInt(savedPos, 10);
-      const prevCount = savedCount ? parseInt(savedCount, 10) : messages.length;
+      if (Number.isNaN(pos)) return;
+      const parsedCount = savedCount ? parseInt(savedCount, 10) : messages.length;
+      const prevCount = Number.isNaN(parsedCount) ? messages.length : parsedCount;
       const el = mainRef.current;
       if (el) {
         el.scrollTop = pos;
         lastScrollTop.current = pos;
         isPinnedToBottom.current = checkIfPinnedToBottom();
         if (messages.length > prevCount && !isPinnedToBottom.current) {
-          setShowJumpToNewest(true);
+          setJumpToNewestState((prev) => (
+            prev.conversationId === conversationId && prev.visible
+              ? prev
+              : { conversationId, visible: true }
+          ));
         }
       }
     }
-    initialMessageCount.current = messages.length;
   }, [conversationId, messages.length, checkIfPinnedToBottom]);
-
-  // Reset all scroll state when conversation changes
-  useEffect(() => {
-    scrollRestored.current = false;
-    prevMessagesHeight.current = 0;
-    prevMessageCountRef.current = 0;
-    scrollTriggerRef.current = 'none';
-    isPinnedToBottom.current = true;
-    setShowJumpToNewest(false);
-    initialMessageCount.current = null;
-  }, [conversationId]);
 
 
 
@@ -369,6 +471,8 @@ export function MessageList({
               onRetry={onRetry}
               onCancelSteering={onCancelSteering}
               onOpenFile={onOpenFile}
+              collapsedRenderableCount={firstRenderedIndex}
+              collapsedRenderableIds={collapsedRenderableIds}
             />
           )}
           {/* Streaming text — cleared atomically when sse_message arrives (REQ-CONV-019).
@@ -380,7 +484,14 @@ export function MessageList({
       {showJumpToNewest && (
         <button
           className="jump-to-newest"
-          onClick={() => { scrollToBottom(); setShowJumpToNewest(false); }}
+          onClick={() => {
+            scrollToBottom();
+            setJumpToNewestState((prev) => (
+              prev.conversationId === conversationId && !prev.visible
+                ? prev
+                : { conversationId, visible: false }
+            ));
+          }}
         >
           ↓ New messages
         </button>

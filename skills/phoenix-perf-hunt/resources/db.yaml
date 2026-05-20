@@ -1,0 +1,36 @@
+entries:
+  - id: StreamingMessage-reparse-growing-buffer
+    target: ui/src/components/StreamingMessage.tsx:StreamingMessage
+    technique: reparse-growing-buffer
+    scenario: sse-streaming
+    status: failure
+    verdict: rejected
+    file: resources/db/StreamingMessage-reparse-growing-buffer.yaml
+  - id: StreamingMessage-memo-completed-blocks
+    target: ui/src/components/StreamingMessage.tsx:StreamingBlock
+    technique: memo-completed-blocks
+    scenario: sse-streaming
+    status: failure
+    verdict: rejected
+    file: resources/db/StreamingMessage-memo-completed-blocks.yaml
+  - id: StreamingMessage-open-tail-plaintext
+    target: ui/src/components/StreamingMessage.tsx:StreamingBlock
+    technique: open-tail-plaintext
+    scenario: sse-streaming
+    status: failure
+    verdict: rejected
+    file: resources/db/StreamingMessage-open-tail-plaintext.yaml
+  - id: MessageList-virtualize-render
+    target: ui/src/components/MessageList.tsx:MessageListBody
+    technique: render-virtualization
+    scenario: conversation-load
+    status: failure
+    verdict: rejected
+    file: resources/db/MessageList-virtualize-render.yaml
+  - id: MessageList-bottom-anchored-window
+    target: ui/src/components/MessageList.tsx:MessageListBody
+    technique: bottom-anchored-render-virtualization
+    scenario: conversation-load
+    status: success
+    verdict: approved
+    file: resources/db/MessageList-bottom-anchored-window.yaml
