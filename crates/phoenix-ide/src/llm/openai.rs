@@ -123,7 +123,7 @@ pub async fn complete(
         LlmError::invalid_response(format!("Failed to parse response: {e} - body: {body}"))
     })?;
 
-    Ok(normalize_responses_api_response(responses_response))
+    normalize_responses_api_response(responses_response)
 }
 
 // ---------------------------------------------------------------------------
@@ -426,7 +426,7 @@ impl ResponsesStreamAccumulator {
         Ok(())
     }
 
-    fn into_response(self) -> LlmResponse {
+    fn into_response(self) -> Result<LlmResponse, LlmError> {
         tracing::debug!(
             output_items = self.output_items.len(),
             input_tokens = self.input_tokens,
@@ -534,7 +534,7 @@ pub async fn complete_streaming(
         acc.process_event(&event.event_type, &event.data, chunk_tx)?;
     }
 
-    Ok(acc.into_response())
+    acc.into_response()
 }
 
 /// Translate `LlmRequest` to `ResponsesApiRequest`.
@@ -674,13 +674,11 @@ fn translate_to_responses_request(
                 let output = if images.is_empty() {
                     ResponsesApiFunctionOutput::Text(text)
                 } else {
-                    let mut parts = vec![ResponsesApiOutputPart::Text { text }];
+                    let mut parts = vec![ResponsesApiContentPart::InputText { text }];
                     for img in images {
                         let ImageSource::Base64 { media_type, data } = img;
-                        parts.push(ResponsesApiOutputPart::ImageUrl {
-                            image_url: ResponsesApiImageUrl {
-                                url: format!("data:{media_type};base64,{data}"),
-                            },
+                        parts.push(ResponsesApiContentPart::InputImage {
+                            image_url: format!("data:{media_type};base64,{data}"),
                         });
                     }
                     ResponsesApiFunctionOutput::Parts(parts)
@@ -751,7 +749,7 @@ fn translate_to_responses_request(
 }
 
 /// Normalize `ResponsesApiResponse` to `LlmResponse`.
-fn normalize_responses_api_response(resp: ResponsesApiResponse) -> LlmResponse {
+fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmResponse, LlmError> {
     let mut content = Vec::new();
 
     for output in resp.output {
@@ -759,11 +757,25 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> LlmResponse {
             "message" => {
                 if let Some(output_content) = output.content {
                     for item in output_content {
-                        if item.r#type == "output_text" {
-                            if let Some(text) = item.text {
-                                if !text.is_empty() {
-                                    content.push(ContentBlock::Text { text });
-                                }
+                        let text = match item.r#type.as_str() {
+                            "output_text" => item.text,
+                            // A refusal is the model's actual reply — it
+                            // declined. Surface it as text (Anthropic returns
+                            // refusals as plain text too) so the turn is
+                            // non-empty and the billed-but-empty guard below
+                            // does not retry a final answer.
+                            "refusal" => item.refusal,
+                            other => {
+                                tracing::debug!(
+                                    part_type = %other,
+                                    "ignoring unknown message content part"
+                                );
+                                None
+                            }
+                        };
+                        if let Some(text) = text {
+                            if !text.is_empty() {
+                                content.push(ContentBlock::Text { text });
                             }
                         }
                     }
@@ -798,7 +810,25 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> LlmResponse {
         .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
     let end_turn = resp.status == "completed" && !has_tool_calls;
 
-    LlmResponse {
+    // Billed-but-empty guard: OpenAI reported output tokens but the
+    // assembled response carried no content block — the message was
+    // lost, most often a gateway dropping the output array. Surface a
+    // retryable server error instead of persisting an empty agent turn
+    // the user was billed for. Complements the response.completed
+    // output-recovery fallback, which handles the partial-loss case.
+    if content.is_empty() && resp.usage.output_tokens > 0 {
+        tracing::error!(
+            output_tokens = resp.usage.output_tokens,
+            status = %resp.status,
+            "responses_api returned empty content with output tokens billed"
+        );
+        return Err(LlmError::server_error(format!(
+            "OpenAI returned empty response ({} output tokens billed, status={})",
+            resp.usage.output_tokens, resp.status
+        )));
+    }
+
+    Ok(LlmResponse {
         content,
         end_turn,
         usage: {
@@ -816,7 +846,7 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> LlmResponse {
                 cache_read_tokens: cached,
             }
         },
-    }
+    })
 }
 
 // ===========================================================================
@@ -1004,24 +1034,16 @@ pub(crate) enum ResponsesApiContentPart {
     InputImage { image_url: String }, // "data:{media_type};base64,{data}"
 }
 
-/// Function call output: plain string when text-only, array of parts when images present
+/// Function call output: plain string when text-only, array of parts when images present.
+///
+/// The Responses API treats a `function_call_output` payload as model *input*,
+/// so its content parts use the same `input_text`/`input_image` discriminants as
+/// `ResponsesApiContentPart` — not `text`/`image_url`, which the API rejects.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub(crate) enum ResponsesApiFunctionOutput {
     Text(String),
-    Parts(Vec<ResponsesApiOutputPart>),
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ResponsesApiOutputPart {
-    Text { text: String },
-    ImageUrl { image_url: ResponsesApiImageUrl },
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ResponsesApiImageUrl {
-    pub(crate) url: String, // "data:{media_type};base64,{data}"
+    Parts(Vec<ResponsesApiContentPart>),
 }
 
 #[derive(Debug, Serialize)]
@@ -1057,6 +1079,8 @@ pub(crate) struct ResponsesApiContent {
     pub(crate) r#type: String,
     #[serde(default)]
     pub(crate) text: Option<String>,
+    #[serde(default)]
+    pub(crate) refusal: Option<String>,
 }
 
 /// `usage.input_tokens_details` on the Responses API wire. Only the cached
@@ -1092,6 +1116,38 @@ mod tests {
             max_tokens: None,
             cache_key: PromptCacheKey::stable("test"),
         }
+    }
+
+    /// A tool result carrying an image (e.g. `read_image`) serialises its
+    /// `function_call_output` parts with the Responses API's `input_text` /
+    /// `input_image` discriminants. Regression guard: the API rejects the
+    /// Chat-Completions-style `text` / `image_url` types with HTTP 400.
+    #[test]
+    fn tool_result_image_serialises_with_responses_api_part_types() {
+        use crate::llm::types::{ContentBlock, ImageSource, LlmMessage, MessageRole};
+
+        let mut req = empty_request();
+        req.messages = vec![LlmMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: "here is the screenshot".to_string(),
+                images: vec![ImageSource::Base64 {
+                    media_type: "image/png".to_string(),
+                    data: "aGVsbG8=".to_string(),
+                }],
+                is_error: false,
+            }],
+        }];
+
+        let translated = translate_to_responses_request("gpt-5.5", &req, false);
+        let json = serde_json::to_value(&translated).unwrap();
+        let parts = &json["input"][0]["output"];
+
+        assert_eq!(parts[0]["type"], "input_text");
+        assert_eq!(parts[0]["text"], "here is the screenshot");
+        assert_eq!(parts[1]["type"], "input_image");
+        assert_eq!(parts[1]["image_url"], "data:image/png;base64,aGVsbG8=");
     }
 
     #[test]
@@ -1473,7 +1529,8 @@ mod tests {
                     cached_tokens: acc.cached_tokens,
                 },
             },
-        });
+        })
+        .expect("a response with a message item normalizes");
         assert_eq!(resp.usage.cache_read_tokens, 800);
         assert_eq!(resp.usage.input_tokens, 200);
         assert_eq!(resp.usage.cache_creation_tokens, 0);
@@ -1482,19 +1539,78 @@ mod tests {
 
     /// A gateway that omits `input_tokens_details` must not panic or shift
     /// accounting: cached defaults to 0 and `input_tokens` is unchanged.
+    /// output_tokens is 0 here — an empty, unbilled response, so the
+    /// billed-but-empty guard does not fire.
     #[test]
     fn responses_api_usage_without_cached_details_defaults_to_zero() {
         let usage: ResponsesApiUsage =
-            serde_json::from_str(r#"{"input_tokens":10,"output_tokens":2}"#).unwrap();
+            serde_json::from_str(r#"{"input_tokens":10,"output_tokens":0}"#).unwrap();
         assert_eq!(usage.input_tokens_details.cached_tokens, 0);
         let resp = normalize_responses_api_response(ResponsesApiResponse {
             status: "completed".to_string(),
             output: vec![],
             usage,
-        });
+        })
+        .expect("an empty, unbilled response normalizes");
         assert_eq!(resp.usage.input_tokens, 10);
         assert_eq!(resp.usage.cache_read_tokens, 0);
-        assert_eq!(resp.usage.context_window_used(), 12);
+        assert_eq!(resp.usage.context_window_used(), 10);
+    }
+
+    /// Billed-but-empty guard: OpenAI reporting output tokens for a
+    /// response with no content block means the assembled message was
+    /// lost in transit (a gateway dropping the output array). Normalization
+    /// must surface a retryable error, not a silently-empty agent turn.
+    #[test]
+    fn responses_api_empty_content_with_billed_tokens_is_retryable_error() {
+        let err = normalize_responses_api_response(ResponsesApiResponse {
+            status: "completed".to_string(),
+            output: vec![],
+            usage: ResponsesApiUsage {
+                input_tokens: 1000,
+                output_tokens: 42,
+                input_tokens_details: ResponsesApiInputTokensDetails { cached_tokens: 0 },
+            },
+        })
+        .expect_err("empty content with billed output tokens must fail");
+        assert_eq!(err.kind, crate::llm::LlmErrorKind::ServerError);
+        assert!(
+            err.kind.is_retryable(),
+            "a lost-message response must be retryable so the executor retries"
+        );
+    }
+
+    /// A `refusal` message part is the model's actual reply — it declined.
+    /// It must surface as non-empty text content so the billed-but-empty
+    /// guard does not mistake a final answer for a lost message and retry.
+    #[test]
+    fn responses_api_refusal_message_surfaces_as_text_not_retried() {
+        let resp = normalize_responses_api_response(ResponsesApiResponse {
+            status: "completed".to_string(),
+            output: vec![ResponsesApiOutput {
+                r#type: "message".to_string(),
+                content: Some(vec![ResponsesApiContent {
+                    r#type: "refusal".to_string(),
+                    text: None,
+                    refusal: Some("I can't help with that.".to_string()),
+                }]),
+                name: None,
+                arguments: None,
+                call_id: None,
+            }],
+            usage: ResponsesApiUsage {
+                input_tokens: 1000,
+                output_tokens: 7,
+                input_tokens_details: ResponsesApiInputTokensDetails { cached_tokens: 0 },
+            },
+        })
+        .expect("a refusal is valid content, not a billed-but-empty failure");
+        assert!(resp.end_turn);
+        assert_eq!(resp.content.len(), 1);
+        match &resp.content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "I can't help with that."),
+            other => panic!("expected refusal surfaced as Text, got {other:?}"),
+        }
     }
 
     /// If both `response.output_item.done` and `response.completed` carry
