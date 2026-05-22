@@ -307,10 +307,9 @@ body {
 /* Breadcrumb tooltip */
 .breadcrumb-tooltip {
   position: fixed;
-  bottom: calc(var(--breadcrumb-height) + 24px);
 
-  /* left is set dynamically via inline style */
-  width: 280px;
+  /* left/top are set dynamically via inline style */
+  width: min(280px, calc(100vw - 16px));
   background: var(--bg-primary);
   border: 1px solid var(--border-color);
   border-radius: 6px;
