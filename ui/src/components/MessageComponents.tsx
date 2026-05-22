@@ -56,6 +56,17 @@ const ChevronUpIcon = () => (
   </svg>
 );
 
+type MarkdownTableProps = React.ComponentPropsWithoutRef<'table'> & { node?: unknown };
+
+function MarkdownTable({ node, children, ...props }: MarkdownTableProps) {
+  void node;
+  return (
+    <div className="markdown-table-scroll">
+      <table {...props}>{children}</table>
+    </div>
+  );
+}
+
 // Stable plugin array -- avoids creating a new array reference on every render
 const REMARK_PLUGINS = [remarkGfm];
 
@@ -549,6 +560,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = tr
       };
       return <li>{processChildren(children)}</li>;
     },
+    table: MarkdownTable,
   }), [onOpenFile, syntaxStyle]);
 
   // Check if there's any renderable content
