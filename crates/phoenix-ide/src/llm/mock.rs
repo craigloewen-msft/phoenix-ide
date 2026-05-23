@@ -22,10 +22,18 @@ enum Scenario {
     ThinkThenRespond,
     MultiToolCall,
     LongStreaming,
+    /// Marker-only (not in hash rotation): emits a `patch` `tool_use` that
+    /// overwrites `e2e-mock-patch-out.txt` in the conversation's cwd.
+    /// Authored for E2E tests; see `[[scenario:patch]]` callers.
+    PatchToolCall,
 }
 
 impl Scenario {
     fn from_message(request: &LlmRequest) -> Self {
+        // Explicit selection via `[[scenario:NAME]]` marker wins over hashing.
+        if let Some(s) = parse_scenario(request) {
+            return s;
+        }
         // Use the last user message to pick a scenario deterministically.
         let hash: usize = request
             .messages
@@ -58,6 +66,45 @@ impl Scenario {
             6 => Self::LongStreaming,
             _ => unreachable!(),
         }
+    }
+}
+
+/// Scenario-fixture marker: a user message containing `[[scenario:NAME]]`
+/// forces selection of a specific scripted response, bypassing the hash-based
+/// roulette. Symmetric with `[[perf:N]]` — both make the mock authorable for
+/// E2E tests. Recognized NAMEs: `plain_text`, `markdown`, `bash`, `read_file`,
+/// `think`, `multi_tool`, `long`, `patch`. Dev-only: mock is opt-in
+/// (`PHOENIX_ENABLE_MOCK_MODEL=1`).
+fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
+    let text = request.messages.iter().rev().find_map(|m| {
+        if m.role == super::types::MessageRole::User {
+            Some(
+                m.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            )
+        } else {
+            None
+        }
+    })?;
+    let start = text.find("[[scenario:")? + "[[scenario:".len();
+    let rest = text.get(start..)?;
+    let end = rest.find("]]")?;
+    let name = rest.get(..end)?.trim();
+    match name {
+        "plain_text" => Some(Scenario::PlainText),
+        "markdown" => Some(Scenario::Markdown),
+        "bash" => Some(Scenario::BashToolCall),
+        "read_file" => Some(Scenario::ReadFileToolCall),
+        "think" => Some(Scenario::ThinkThenRespond),
+        "multi_tool" => Some(Scenario::MultiToolCall),
+        "long" => Some(Scenario::LongStreaming),
+        "patch" => Some(Scenario::PatchToolCall),
+        _ => None,
     }
 }
 
@@ -266,7 +313,7 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
                         id: tool_use_id(),
                         name: "think".to_string(),
                         input: serde_json::json!({
-                            "thought": think_text
+                            "thoughts": think_text
                         }),
                     },
                     ContentBlock::Text {
@@ -309,6 +356,27 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
             }],
             LONG_TEXT.to_string(),
         ),
+
+        Scenario::PatchToolCall => {
+            let text = "I'll create the file via patch overwrite.".to_string();
+            (
+                vec![
+                    ContentBlock::Text { text: text.clone() },
+                    ContentBlock::ToolUse {
+                        id: tool_use_id(),
+                        name: "patch".to_string(),
+                        input: serde_json::json!({
+                            "path": "e2e-mock-patch-out.txt",
+                            "patches": [{
+                                "operation": "overwrite",
+                                "newText": "hello from mock patch scenario\n",
+                            }],
+                        }),
+                    },
+                ],
+                text,
+            )
+        }
     }
 }
 
@@ -424,6 +492,39 @@ mod tests {
         );
         assert_eq!(parse_perf_words(&user_req("no marker here")), None);
         assert_eq!(parse_perf_words(&user_req("[[perf:bad]]")), None);
+    }
+
+    #[test]
+    fn scenario_marker_recognizes_each_name() {
+        let cases = [
+            ("[[scenario:plain_text]] hi", Scenario::PlainText),
+            ("[[scenario:markdown]]", Scenario::Markdown),
+            ("[[scenario:bash]]", Scenario::BashToolCall),
+            ("[[scenario:read_file]]", Scenario::ReadFileToolCall),
+            ("[[scenario:think]]", Scenario::ThinkThenRespond),
+            ("[[scenario:multi_tool]]", Scenario::MultiToolCall),
+            ("[[scenario:long]]", Scenario::LongStreaming),
+            ("[[scenario:patch]]", Scenario::PatchToolCall),
+        ];
+        for (text, expected) in cases {
+            let req = user_req(text);
+            let got = parse_scenario(&req).unwrap_or_else(|| panic!("no match for {text}"));
+            assert!(
+                std::mem::discriminant(&got) == std::mem::discriminant(&expected),
+                "wrong variant for {text}"
+            );
+        }
+        assert!(parse_scenario(&user_req("no marker here")).is_none());
+        assert!(parse_scenario(&user_req("[[scenario:bogus]]")).is_none());
+    }
+
+    #[test]
+    fn scenario_marker_overrides_hash() {
+        // The hash for "[[scenario:plain_text]]" alone would not naturally
+        // pick PlainText for every value; verify the marker forces it.
+        let req = user_req("[[scenario:bash]] something something");
+        let picked = Scenario::from_message(&req);
+        assert!(matches!(picked, Scenario::BashToolCall));
     }
 
     #[test]
