@@ -12,7 +12,7 @@
  * - SubAgentStatus: Renders sub-agent progress indicator
  */
 
-import React, { memo, useState, useMemo, useCallback, useRef } from 'react';
+import React, { memo, useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -55,6 +55,51 @@ const ChevronUpIcon = () => (
     <polyline points="18 15 12 9 6 15" />
   </svg>
 );
+
+type DeferredSyntaxHighlighterProps = {
+  language: string;
+  syntaxStyle: typeof oneDark;
+  children: React.ReactNode;
+} & Omit<React.ComponentProps<typeof SyntaxHighlighter>, 'language' | 'style' | 'children' | 'PreTag'>;
+
+function scheduleIdleCallback(callback: () => void): () => void {
+  const idleWindow = window as typeof window & {
+    requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
+    cancelIdleCallback?: (handle: number) => void;
+  };
+  if (idleWindow.requestIdleCallback && idleWindow.cancelIdleCallback) {
+    const handle = idleWindow.requestIdleCallback(callback, { timeout: 1500 });
+    return () => idleWindow.cancelIdleCallback?.(handle);
+  }
+  const handle = window.setTimeout(callback, 1500);
+  return () => window.clearTimeout(handle);
+}
+
+function DeferredSyntaxHighlighter({ language, syntaxStyle, children, ...props }: DeferredSyntaxHighlighterProps) {
+  const [highlight, setHighlight] = useState(false);
+  const code = String(children).replace(/\n$/, '');
+
+  useEffect(() => scheduleIdleCallback(() => setHighlight(true)), []);
+
+  if (!highlight) {
+    return (
+      <div className="deferred-code-pre">
+        <code className={`deferred-code language-${language}`} {...props}>{code}</code>
+      </div>
+    );
+  }
+
+  return (
+    <SyntaxHighlighter
+      style={syntaxStyle}
+      language={language}
+      PreTag="div"
+      {...props}
+    >
+      {code}
+    </SyntaxHighlighter>
+  );
+}
 
 type MarkdownTableProps = React.ComponentPropsWithoutRef<'table'> & { node?: unknown };
 
@@ -513,18 +558,18 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = tr
   const markdownComponents = useMemo(() => ({
     // Custom code block rendering with syntax highlighting
     // Inline code with file paths becomes clickable
-    code: ({ inline, className, children, ...props }: { inline?: boolean | undefined; className?: string | undefined; children?: React.ReactNode }) => {
+    code: ({ inline, className, children, node, ...props }: { inline?: boolean | undefined; className?: string | undefined; children?: React.ReactNode; node?: unknown }) => {
+      void node;
       const match = /language-(\w+)/.exec(className || '');
-      if (!inline && match) {
+      if (!inline && match?.[1]) {
         return (
-          <SyntaxHighlighter
-            style={syntaxStyle}
+          <DeferredSyntaxHighlighter
+            syntaxStyle={syntaxStyle}
             language={match[1]}
-            PreTag="div"
             {...props}
           >
-            {String(children).replace(/\n$/, '')}
-          </SyntaxHighlighter>
+            {children}
+          </DeferredSyntaxHighlighter>
         );
       }
       // For inline code, check if it looks like a file path and make it clickable
