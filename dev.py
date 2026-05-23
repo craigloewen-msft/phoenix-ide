@@ -2939,6 +2939,25 @@ def _env_provides_llm_config(env: dict[str, str]) -> bool:
     )
 
 
+def _detect_codex_auth(env: dict[str, str]) -> str | None:
+    """Return a human-readable summary if the server will find a ChatGPT/Codex
+    bridge auth file at startup, else None. Mirrors
+    `codex_credential::resolve_active_auth_path` in the Rust binary: prefer
+    Phoenix's own `~/.phoenix-ide/codex-auth.json` (written by the in-app
+    `/codex/login` flow), then Codex CLI's `~/.codex/auth.json` when piggyback
+    mode (`OPENAI_USE_CODEX_AUTH=1`) is enabled."""
+    phoenix_auth = Path.home() / ".phoenix-ide" / "codex-auth.json"
+    if phoenix_auth.exists():
+        return f"chatgpt bridge ({phoenix_auth})"
+    piggyback_raw = env.get("OPENAI_USE_CODEX_AUTH") or os.environ.get("OPENAI_USE_CODEX_AUTH", "")
+    if piggyback_raw.lower() in ("1", "true", "yes", "on"):
+        codex_home = env.get("CODEX_HOME") or os.environ.get("CODEX_HOME")
+        codex_auth = Path(codex_home) / "auth.json" if codex_home else Path.home() / ".codex" / "auth.json"
+        if codex_auth.exists():
+            return f"chatgpt bridge ({codex_auth}, OPENAI_USE_CODEX_AUTH=1)"
+    return None
+
+
 def _llm_mode_summary(env: dict[str, str], auto_gateway: str | None) -> str:
     """Human-readable description of how the deployed server will reach an LLM,
     for the post-deploy summary line. `auto_gateway` is the gateway the deploy
@@ -2952,6 +2971,9 @@ def _llm_mode_summary(env: dict[str, str], auto_gateway: str | None) -> str:
         return f"{' + '.join(keys)} (from .phoenix-ide.env)"
     if auto_gateway:
         return f"gateway ({auto_gateway}, auto-detected)"
+    codex = _detect_codex_auth(env)
+    if codex:
+        return codex
     return "none detected — server has no LLM configured"
 
 
@@ -3363,17 +3385,24 @@ def capture_login_shell_path() -> tuple[str, str]:
 
 
 def print_launchd_path_report(path_str: str, source: str) -> None:
-    """Print PATH dirs + tool-resolution probe for the launchd plist."""
+    """Print one-line PATH summary; show full dirs + per-tool paths only when
+    a probe tool is MISSING (the case worth eyeballing the deploy log for)."""
     import shutil as _shutil
     dirs = [d for d in path_str.split(":") if d]
-    print(f"  PATH for launchd plist captured via {source} ({len(dirs)} dirs):")
+    resolved = {t: _shutil.which(t, path=path_str) for t in _LAUNCHD_PATH_PROBE_TOOLS}
+    missing = [t for t, p in resolved.items() if not p]
+    print(f"  PATH for launchd plist: {len(dirs)} dirs via {source}")
+    if not missing:
+        print(f"  Tools resolved: {len(_LAUNCHD_PATH_PROBE_TOOLS)}/{len(_LAUNCHD_PATH_PROBE_TOOLS)} ({', '.join(_LAUNCHD_PATH_PROBE_TOOLS)})")
+        return
+    print(f"  Tools MISSING from PATH: {', '.join(missing)}")
+    print("  PATH dirs:")
     for d in dirs:
         print(f"    {d}")
-    print("  Resolved tools:")
     width = max(len(t) for t in _LAUNCHD_PATH_PROBE_TOOLS)
-    for tool in _LAUNCHD_PATH_PROBE_TOOLS:
-        resolved = _shutil.which(tool, path=path_str)
-        print(f"    {tool:<{width}} -> {resolved if resolved else 'MISSING'}")
+    print("  Tool resolution:")
+    for tool, path in resolved.items():
+        print(f"    {tool:<{width}} -> {path if path else 'MISSING'}")
 
 
 def generate_launchd_plist(
