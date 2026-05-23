@@ -257,9 +257,15 @@ THE `tmux` tool's description SHALL state explicitly:
 - The full tmux CLI is available; common subcommands include
   `new-window`, `capture-pane`, `send-keys`, `list-windows`,
   `kill-window`.
-- Use `tmux` for processes that need a TTY, that should survive Phoenix
-  restart, or that you want to interact with via stdin. Use `bash` for
-  one-shot non-interactive commands.
+- Use `tmux_run` for starting dev servers, watchers, REPLs, or other
+  inspectable shell commands. It chooses the current project/worktree
+  directory, wraps the command with `bash -lc`, prints a visible exit marker,
+  and keeps the pane inspectable after exit by default.
+- Use raw `tmux` for detailed tmux operations such as `capture-pane`,
+  `send-keys`, `list-windows`, and `kill-window`. Raw tmux is pass-through
+  except for Phoenix's socket/config injection; it does not enforce a cwd for
+  newly-created windows or panes.
+- Use `bash` for one-shot non-interactive commands.
 
 **Rationale:** The agent must know when to reach for which tool. A pit-of-
 success description leads agents to the right choice without trial-and-
@@ -368,6 +374,75 @@ AND the tool instance SHALL be reusable across conversations
 same accessor shape (`async + Result + Arc<RwLock<...>>`). The registry
 handles socket-path resolution, server-state probing, and lifecycle on
 conversation-delete.
+
+---
+
+### REQ-TMUX-014: `tmux_run` Agent Tool — Inspectable Shell Commands
+
+THE SYSTEM SHALL register an agent tool named `tmux_run` whose schema accepts:
+- `cmd` (required string): shell command to run via `bash -lc`
+- `name` (optional string): tmux window name
+- `keep_open_on_exit` (optional bool, default true): whether the pane remains
+  inspectable after the command exits
+- `readiness` (optional tagged object, default `{ "mode": "return_immediately" }`)
+
+WHEN `readiness.mode = "return_immediately"`
+THE SYSTEM SHALL reject any sibling readiness timeout or text fields
+
+WHEN `readiness.mode = "wait_for_text"`
+THE SYSTEM SHALL require non-empty `text` after trimming
+AND SHALL require `timeout_seconds` in `1..=TMUX_TOOL_MAX_WAIT_SECONDS`
+
+WHEN the agent calls `tmux_run`
+THE SYSTEM SHALL resolve the command directory to the conversation's effective
+file root: `ToolContext.worktree_path` for worktree-scoped conversations, or
+`ToolContext.working_dir` for Direct conversations
+AND SHALL create a new tmux window in the conversation's `main` session with
+`-c <effective-file-root>`
+AND SHALL run the command through `bash -lc`
+AND SHALL search the raw tmux pane capture for readiness text and exit markers
+before truncating the snippet returned to the agent
+AND SHALL keep the pane inspectable after exit by default
+
+WHEN `keep_open_on_exit = false` and readiness waiting is requested
+THE SYSTEM SHALL keep the window available until the final readiness / exit
+observation is captured
+AND THEN SHALL close the window after observing command completion
+
+WHEN `name` contains `:`, `|`, newline, or carriage return
+THE SYSTEM SHALL reject the input with `invalid_window_name` before creating a
+tmux window
+
+THE `tmux_run` tool SHALL return responses with this shape:
+
+```json
+{
+  "status": "started" | "ready" | "exited" | "readiness_timed_out" | "start_failed",
+  "window_name": "<tmux-window-name>",
+  "window_id": "<unique-tmux-window-id>",
+  "cwd": "<absolute-effective-file-root>",
+  "command": "<cmd>",
+  "exit_code": <int | null>,
+  "captured_output": {
+    "stdout": "<recent pane output or readiness evidence>",
+    "stderr": "<tmux capture stderr>",
+    "truncated": <bool>
+  }
+}
+```
+
+THE `window_id` field SHALL be a unique tmux target for the created window.
+Agents SHOULD use `window_id` for later raw tmux `capture-pane`, `send-keys`,
+or `kill-window` operations; `window_name` is human-readable but not unique.
+
+THE `captured_output.truncated` field SHALL describe only the bounded snippet
+returned by that single tool call. It SHALL NOT imply that the tmux pane or
+window scrollback has been truncated; the agent can inspect later via raw tmux
+using `window_id`.
+
+**Rationale:** `tmux_run` is a pit-of-success wrapper for the common “start a
+server/watch command in the shared inspectable surface” use case. Raw tmux
+remains available for detailed tmux operations.
 
 ---
 
