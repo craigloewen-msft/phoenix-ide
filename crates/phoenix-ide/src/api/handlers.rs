@@ -1393,12 +1393,21 @@ async fn stream_conversation(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    let messages = state
+    // Subscribe and snapshot replay coverage before reading DB messages, then
+    // read messages last. If a persisted message races stream-open, it is
+    // therefore either included in the final DB snapshot or has a sequence_id
+    // above the init floor and survives the client's live-event replay guard.
+    let handle = state
         .runtime
-        .db()
-        .get_messages(&id)
+        .get_or_create(&id)
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+        .map_err(AppError::Internal)?;
+    tracing::debug!(
+        conv_id = %id,
+        receivers_before = handle.broadcast_tx.receiver_count(),
+        "SSE client subscribing"
+    );
+    let broadcast_rx = handle.broadcast_tx.subscribe();
 
     let last_sequence_id = state
         .runtime
@@ -1406,6 +1415,25 @@ async fn stream_conversation(
         .get_last_sequence_id(&id)
         .await
         .unwrap_or(0);
+
+    // Snapshot the ReplayRing before the DB message read. The later DB read is
+    // the durable catch-up for any persisted Message that commits before init is
+    // constructed; live SSE covers events that commit after that read.
+    let (pending_anchor_sequence_id, pending_truncated, highest_pending_seq, pending_events) =
+        handle.broadcast_tx.snapshot_pending();
+
+    let messages = state
+        .runtime
+        .db()
+        .get_messages(&id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let highest_message_seq = messages.iter().map(|m| m.sequence_id).max().unwrap_or(0);
+    let init_seq = std::cmp::max(
+        std::cmp::max(last_sequence_id, highest_pending_seq),
+        highest_message_seq,
+    );
+    handle.broadcast_tx.observe_seq(init_seq);
 
     let context_window_size = messages
         .iter()
@@ -1415,21 +1443,6 @@ async fn stream_conversation(
 
     // Extract breadcrumbs from the last turn
     let breadcrumbs = extract_breadcrumbs(&messages);
-
-    // Get the conversation handle (subscribes + gives us broadcast_tx for polling)
-    let handle = state
-        .runtime
-        .get_or_create(&id)
-        .await
-        .map_err(AppError::Internal)?;
-    // Diagnostic: log current receiver count so we can detect the
-    // "spinner-forever" scenario where clients subscribe to a dead channel.
-    tracing::debug!(
-        conv_id = %id,
-        receivers_before = handle.broadcast_tx.receiver_count(),
-        "SSE client subscribing"
-    );
-    let broadcast_rx = handle.broadcast_tx.subscribe();
 
     // Derive project_name from the project's canonical_path (repo root dirname).
     let project_name = if let Some(ref project_id) = conversation.project_id {
@@ -1441,24 +1454,6 @@ async fn stream_conversation(
     } else {
         None
     };
-
-    // Snapshot the ReplayRing alongside the DB read so reconnecting clients
-    // can resume mid-turn views (in-flight assistant message, streaming
-    // tokens, current tool phase) instead of blanking out until the next
-    // checkpoint. See `sse_wire.allium` StreamOpened + InitSnapshotMirrorsRing.
-    //
-    // `init_seq` derives from the snapshot's `highest_seq`, not the live
-    // broadcaster counter: a sender that allocated a seq via `next_seq()`
-    // but had not yet appended to the ring at snapshot time would otherwise
-    // have its live event (delivered later via `broadcast_rx`) dropped by
-    // the client's `applyIfNewer` guard. By bounding `last_sequence_id` to
-    // what the snapshot actually covers, that in-flight broadcast's seq
-    // strictly exceeds the floor and passes the guard. This also enforces
-    // the StreamOpened invariant `entry.sequence_id <= last_sequence_id`.
-    let (pending_anchor_sequence_id, pending_truncated, highest_pending_seq, pending_events) =
-        handle.broadcast_tx.snapshot_pending();
-    let init_seq = std::cmp::max(last_sequence_id, highest_pending_seq);
-    handle.broadcast_tx.observe_seq(init_seq);
 
     // Create init event with typed data -- serialization deferred to SSE layer
     let init_event = SseEvent::Init {
@@ -3453,12 +3448,12 @@ async fn shared_sse_stream(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    let messages = state
+    let handle = state
         .runtime
-        .db()
-        .get_messages(&conversation_id)
+        .get_or_create(&conversation_id)
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+        .map_err(AppError::Internal)?;
+    let broadcast_rx = handle.broadcast_tx.subscribe();
 
     let last_sequence_id = state
         .runtime
@@ -3467,6 +3462,22 @@ async fn shared_sse_stream(
         .await
         .unwrap_or(0);
 
+    let (pending_anchor_sequence_id, pending_truncated, highest_pending_seq, pending_events) =
+        handle.broadcast_tx.snapshot_pending();
+
+    let messages = state
+        .runtime
+        .db()
+        .get_messages(&conversation_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let highest_message_seq = messages.iter().map(|m| m.sequence_id).max().unwrap_or(0);
+    let init_seq = std::cmp::max(
+        std::cmp::max(last_sequence_id, highest_pending_seq),
+        highest_message_seq,
+    );
+    handle.broadcast_tx.observe_seq(init_seq);
+
     let context_window_size = messages
         .iter()
         .filter_map(|m| m.usage_data.as_ref())
@@ -3474,13 +3485,6 @@ async fn shared_sse_stream(
         .map_or(0, crate::db::UsageData::context_window_used);
 
     let breadcrumbs = extract_breadcrumbs(&messages);
-
-    let handle = state
-        .runtime
-        .get_or_create(&conversation_id)
-        .await
-        .map_err(AppError::Internal)?;
-    let broadcast_rx = handle.broadcast_tx.subscribe();
 
     let project_name = if let Some(ref project_id) = conversation.project_id {
         state.db.get_project(project_id).await.ok().and_then(|p| {
@@ -3491,15 +3495,6 @@ async fn shared_sse_stream(
     } else {
         None
     };
-
-    // Mirror the ReplayRing into the init payload (sse_wire.allium
-    // InitSnapshotMirrorsRing). Same shape as the primary handler above —
-    // see that site for the rationale on deriving `init_seq` from the
-    // snapshot's `highest_seq` rather than the live counter.
-    let (pending_anchor_sequence_id, pending_truncated, highest_pending_seq, pending_events) =
-        handle.broadcast_tx.snapshot_pending();
-    let init_seq = std::cmp::max(last_sequence_id, highest_pending_seq);
-    handle.broadcast_tx.observe_seq(init_seq);
 
     let init_event = SseEvent::Init {
         sequence_id: init_seq,
@@ -3616,6 +3611,68 @@ mod hard_delete_cascade_tests {
             terminals,
             chain_qa,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_init_db_read_after_replay_snapshot_covers_persist_between_old_reads() {
+        let state = make_test_state().await;
+        let conv_id = "c-sse-gap";
+        state
+            .db
+            .create_conversation(conv_id, "sse-gap", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+
+        let handle = state.runtime.get_or_create(conv_id).await.expect("handle");
+        let mut broadcast_rx = handle.broadcast_tx.subscribe();
+
+        let last_sequence_id_before_persist = state
+            .db
+            .get_last_sequence_id(conv_id)
+            .await
+            .expect("initial last seq");
+        let (pending_anchor_sequence_id, _, highest_pending_seq, _) =
+            handle.broadcast_tx.snapshot_pending();
+        let init_seq_before_db_read =
+            std::cmp::max(last_sequence_id_before_persist, highest_pending_seq);
+
+        let seq = handle.broadcast_tx.next_seq();
+        let msg = state
+            .db
+            .add_message_with_seq(
+                "local-user-1",
+                conv_id,
+                seq,
+                &MessageContent::User(crate::db::UserContent::new("hello")),
+                None,
+                None,
+            )
+            .await
+            .expect("persist message");
+        handle
+            .broadcast_tx
+            .send_persisted_message(msg.clone())
+            .expect("subscribed receiver observes broadcast");
+
+        let messages = state.db.get_messages(conv_id).await.expect("messages");
+        let highest_message_seq = messages.iter().map(|m| m.sequence_id).max().unwrap_or(0);
+        let init_seq = std::cmp::max(init_seq_before_db_read, highest_message_seq);
+
+        assert_eq!(pending_anchor_sequence_id, 0);
+        assert!(
+            messages.iter().any(|m| m.message_id == "local-user-1"),
+            "DB snapshot is taken after replay snapshot, so the raced persist is durable in init"
+        );
+        assert_eq!(init_seq, seq);
+
+        let live = broadcast_rx
+            .recv()
+            .await
+            .expect("live message after subscribe");
+        match live {
+            SseEvent::Message { message } => assert_eq!(message.message_id, msg.message_id),
+            other => panic!("expected live message event, got {other:?}"),
         }
     }
 
