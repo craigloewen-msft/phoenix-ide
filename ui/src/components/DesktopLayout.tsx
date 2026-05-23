@@ -1,4 +1,5 @@
 import { useLocation } from 'react-router-dom';
+import { useEffect } from 'react';
 import {
   useConversationsList,
   useConversationsRefresh,
@@ -11,6 +12,12 @@ import { CommandPalette } from './CommandPalette';
 import { Toast } from './Toast';
 import { PaneDivider } from './PaneDivider';
 import { useToast } from '../hooks/useToast';
+import {
+  consumeNotificationPermissionCue,
+  loadNotificationSettingsAndCatchUp,
+  notifyCatchUp,
+  useNotificationClickNavigationBridge,
+} from '../notifications';
 
 interface DesktopLayoutProps {
   children: React.ReactNode;
@@ -33,7 +40,8 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     collapseThreshold: 120,
   });
   const location = useLocation();
-  const { toasts, dismissToast, showSuccess, showError } = useToast();
+  const { toasts, dismissToast, showSuccess, showError, showInfo } = useToast();
+  useNotificationClickNavigationBridge();
 
   // Task 08684: ConversationStore is the single source of truth.
   // The store-owned `useConversationsRefresh` (mounted in
@@ -43,6 +51,29 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   // `Conversation[]` state, no per-field bridge hooks.
   const { refresh: refreshConversations } = useConversationsRefresh();
   const { active: conversations, archived: archivedConversations } = useConversationsList();
+
+  useEffect(() => {
+    void loadNotificationSettingsAndCatchUp(conversations).catch(() => {});
+  }, [conversations]);
+
+  useEffect(() => {
+    notifyCatchUp(conversations);
+  }, [conversations]);
+
+  useEffect(() => {
+    const handler = () => {
+      if (document.visibilityState === 'visible' && consumeNotificationPermissionCue()) {
+        showInfo('Enable desktop notifications in notification settings to be pulled back when the agent needs you.', 8000);
+      }
+    };
+    document.addEventListener('visibilitychange', handler);
+    window.addEventListener('focus', handler);
+    handler();
+    return () => {
+      document.removeEventListener('visibilitychange', handler);
+      window.removeEventListener('focus', handler);
+    };
+  }, [showInfo]);
 
   // Extract active slug. `useConversationSnapshot` reads the row directly
   // from the store — polling and SSE both write through the same atom,
