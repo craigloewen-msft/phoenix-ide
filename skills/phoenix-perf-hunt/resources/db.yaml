@@ -34,3 +34,45 @@ entries:
     status: success
     verdict: approved
     file: resources/db/MessageList-bottom-anchored-window.yaml
+  - id: InputArea-parent-filter-autocomplete-candidates
+    target: ui/src/components/InputArea.tsx:InputArea + ui/src/components/InlineAutocomplete.tsx:InlineAutocomplete
+    technique: parent-filter-autocomplete-candidates
+    scenario: composer-autocomplete-open
+    status: failure
+    verdict: rejected
+    file: resources/db/InputArea-parent-filter-autocomplete-candidates.yaml
+  - id: InputArea-raf-coalesce-autoresize
+    target: ui/src/components/InputArea.tsx:InputArea autoResize effect
+    technique: raf-coalesce-layout-read-write
+    scenario: composer-typing
+    status: failure
+    verdict: rejected
+    file: resources/db/InputArea-raf-coalesce-autoresize.yaml
+  - id: MessageContextMenu-memo-streaming
+    target: ui/src/components/MessageContextMenu.tsx:MessageContextMenu
+    technique: memo-streaming-stable-props
+    scenario: sse-streaming
+    status: failure
+    verdict: rejected
+    file: resources/db/MessageContextMenu-memo-streaming.yaml
+  - id: MessageRows-content-visibility
+    target: ui/src/index.css:.message
+    technique: content-visibility-message-rows
+    scenario: conversation-load
+    status: failure
+    verdict: rejected
+    file: resources/db/MessageRows-content-visibility.yaml
+  - id: syntaxHighlighter-on-demand-registration
+    target: ui/src/utils/syntaxHighlighter.ts:SyntaxHighlighter
+    technique: on-demand-language-registration
+    scenario: conversation-load
+    status: success
+    verdict: approved
+    file: resources/db/syntaxHighlighter-on-demand-registration.yaml
+  - id: MessageComponents-conditional-gfm
+    target: ui/src/components/MessageComponents.tsx:AgentMessage
+    technique: conditional-gfm-plugin
+    scenario: conversation-load
+    status: success
+    verdict: approved
+    file: resources/db/MessageComponents-conditional-gfm.yaml
