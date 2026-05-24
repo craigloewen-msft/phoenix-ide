@@ -533,6 +533,110 @@ pub enum PrDisplayState {
     Closed,
 }
 
+#[derive(Debug, Serialize, Clone, PartialEq, Eq, Default)]
+pub struct PrCheckSummary {
+    pub passing: u32,
+    pub pending: u32,
+    pub failing: u32,
+    pub skipped: u32,
+    pub unknown: u32,
+    pub failing_names: Vec<String>,
+    pub pending_names: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct PrCheckDetail {
+    pub name: String,
+    pub state: String,
+    pub bucket: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrFeedbackSource {
+    IssueComment,
+    ReviewComment,
+    ReviewSummary,
+    ReviewThread,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrCheckLogSource {
+    CheckUrl,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct PrCheckLogSnippet {
+    pub check_name: String,
+    pub source: PrCheckLogSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    pub snippet: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrFeedbackCoverageSurface {
+    IssueComments,
+    ReviewComments,
+    ReviewSummaries,
+    ReviewThreads,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrFeedbackCoverageStatus {
+    Fetched,
+    Unavailable,
+    AuthFailed,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct PrFeedbackCoverage {
+    pub surface: PrFeedbackCoverageSurface,
+    pub status: PrFeedbackCoverageStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct PrFeedbackItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub source: PrFeedbackSource,
+    pub author: String,
+    pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct PrFeedbackSummary {
+    pub total: u32,
+    pub unresolved: u32,
+    pub items: Vec<PrFeedbackItem>,
+    pub coverage: Vec<PrFeedbackCoverage>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PrAutoFixContextResponse {
+    pub artifact_path: String,
+    pub pr_number: u64,
+    pub message: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PrStatusResponse {
     pub found: bool,
@@ -555,6 +659,12 @@ pub struct PrStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub check_state: Option<PrCheckState>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub check_summary: Option<PrCheckSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feedback_summary: Option<PrFeedbackSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub display_state: Option<PrDisplayState>,
 }
 
@@ -571,6 +681,9 @@ impl PrStatusResponse {
             base: None,
             head: None,
             check_state: None,
+            check_summary: None,
+            feedback_summary: None,
+            updated_at: None,
             display_state: None,
         }
     }
