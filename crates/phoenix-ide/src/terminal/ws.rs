@@ -335,10 +335,8 @@ async fn resolve_exec_plan(
     if !registry.binary_available() {
         return PtyExecPlan::Shell;
     }
-    match registry
-        .ensure_live(conversation_id, worktree_path, cwd)
-        .await
-    {
+    let work_scope = crate::work_scope::WorkScope::resolve(conversation_id, worktree_path);
+    match registry.ensure_live(&work_scope, cwd).await {
         Ok(server_arc) => {
             let server = server_arc.read().await;
             PtyExecPlan::Tmux {
