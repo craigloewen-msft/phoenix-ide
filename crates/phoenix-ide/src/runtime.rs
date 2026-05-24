@@ -818,6 +818,17 @@ pub enum SseEvent {
         /// Zero-based position in the steering queue.
         queue_position: usize,
     },
+    /// Mid-stream quota snapshot from the codex backend's `codex.rate_limits`
+    /// SSE event. Ephemeral — not persisted server-side. The client stores
+    /// the latest snapshot in a module-level store and clears it on codex
+    /// sign-out / account switch (SSE disconnects alone do not invalidate
+    /// the snapshot — the account is unchanged across reconnects). Only
+    /// emitted on the codex bridge path (gated in `openai.rs`
+    /// `process_event`).
+    RateLimitSnapshot {
+        sequence_id: i64,
+        snapshot: crate::llm::QuotaDetails,
+    },
 }
 
 /// Pick the tool registry for a sub-agent runtime on (re-)creation from
