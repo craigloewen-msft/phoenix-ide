@@ -2573,45 +2573,6 @@ pre:hover .copy-btn {
   margin-left: 2px;
 }
 
-/* Purple badge shown when conversation is on a 1M model */
-.model-1m-badge {
-  display: inline-block;
-  font-size: 9px;
-  font-weight: 700;
-  padding: 0 4px;
-  border-radius: 3px;
-  line-height: 16px;
-  letter-spacing: 0.03em;
-  color: #c4a5ff;
-  border: 1px solid color-mix(in srgb, #c4a5ff 45%, transparent);
-  background: color-mix(in srgb, #9b6dff 18%, transparent);
-  vertical-align: 1px;
-}
-
-/* One-click "upgrade to 1M" button next to the model picker. Dashed border
-   signals "affordance, not current state" — complements the solid 1M badge. */
-.model-upgrade-btn {
-  all: unset;
-  cursor: pointer;
-  display: inline-block;
-  font-size: 9px;
-  font-weight: 700;
-  padding: 0 4px;
-  border-radius: 3px;
-  line-height: 14px;
-  letter-spacing: 0.03em;
-  color: #c4a5ff;
-  border: 1px dashed color-mix(in srgb, #c4a5ff 45%, transparent);
-  background: transparent;
-  vertical-align: 1px;
-  transition: background 150ms, border-color 150ms;
-}
-
-.model-upgrade-btn:hover {
-  background: color-mix(in srgb, #9b6dff 18%, transparent);
-  border-style: solid;
-}
-
 /* Model picker popover. The StateBar is anchored to the bottom of the
    viewport on every breakpoint and its ancestors have overflow:hidden
    (for slug ellipsis), which would clip an absolutely-positioned popover.
@@ -3038,6 +2999,27 @@ pre:hover .copy-btn {
   padding: 8px 12px;
   font-size: 12px;
   color: var(--text-muted);
+}
+
+.usage-panel-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.usage-panel-header-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.usage-panel-header-value {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 .usage-stats-section {
