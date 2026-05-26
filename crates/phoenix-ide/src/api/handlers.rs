@@ -21,9 +21,9 @@ use super::types::{
     CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
     ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
     GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
-    NotificationSettingsRequest, ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse,
-    SuccessResponse, SystemPromptResponse, TaskEntry, TasksResponse, UpgradeModelRequest,
-    ValidateCwdResponse,
+    NotificationSettingsRequest, ProjectTasksQuery, ReadFileResponse, RenameRequest, SkillEntry,
+    SkillsResponse, SuccessResponse, SystemPromptResponse, TaskEntry, TasksResponse,
+    UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::db::{
@@ -199,6 +199,8 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/:id/pr-auto-fix-context",
             post(create_pr_auto_fix_context),
         )
+        // Project task files available before a conversation exists
+        .route("/api/tasks", get(list_project_tasks))
         // Git utilities
         .route("/api/git/branches", get(list_git_branches))
         // Environment info
@@ -3149,6 +3151,70 @@ async fn list_conversation_skills(
 // Tasks
 // ============================================================
 
+async fn task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -> Vec<TaskEntry> {
+    let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
+        .to_string_lossy()
+        .into_owned();
+    let tasks_dir = cwd.join(&tasks_dir_name);
+
+    let all_convs = state
+        .runtime
+        .db()
+        .list_conversations()
+        .await
+        .unwrap_or_default();
+    let target_project_id = state
+        .runtime
+        .db()
+        .list_projects()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|p| std::path::Path::new(&p.canonical_path) == cwd)
+        .map(|p| p.id);
+    let task_to_slug: std::collections::HashMap<String, String> = all_convs
+        .iter()
+        .filter(|c| match target_project_id.as_deref() {
+            Some(project_id) => c.project_id.as_deref() == Some(project_id),
+            None => std::path::Path::new(&c.cwd) == cwd,
+        })
+        .filter_map(|c| {
+            let task_id = c.conv_mode.task_id()?;
+            let slug = c.slug.as_deref()?;
+            Some((task_id.to_string(), slug.to_string()))
+        })
+        .collect();
+
+    taskmd_core::tasks::list_tasks(&tasks_dir)
+        .into_iter()
+        .map(|t| {
+            let conversation_slug = task_to_slug.get(&t.id).cloned();
+            TaskEntry {
+                id: t.id,
+                priority: t.priority.to_string(),
+                status: t.status.to_string(),
+                slug: t.slug,
+                path: t.path.to_string_lossy().into_owned(),
+                conversation_slug,
+            }
+        })
+        .collect()
+}
+
+/// List task files from a project's tasks/ directory before a conversation exists.
+async fn list_project_tasks(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectTasksQuery>,
+) -> Result<Json<TasksResponse>, AppError> {
+    let cwd = std::path::PathBuf::from(&query.cwd);
+    if !cwd.exists() || !cwd.is_dir() {
+        return Err(AppError::BadRequest("Directory does not exist".to_string()));
+    }
+    Ok(Json(TasksResponse {
+        tasks: task_entries_for_cwd(&state, &cwd).await,
+    }))
+}
+
 /// List task files from the conversation's project tasks/ directory.
 async fn list_conversation_tasks(
     State(state): State<AppState>,
@@ -3162,43 +3228,9 @@ async fn list_conversation_tasks(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     let cwd = std::path::PathBuf::from(&conversation.cwd);
-    let tasks_dir_name = taskmd_core::discover::discover_or_default(&cwd)
-        .to_string_lossy()
-        .into_owned();
-    let tasks_dir = cwd.join(&tasks_dir_name);
-
-    // Build task_id -> conversation_slug map from active Work conversations
-    let all_convs = state
-        .runtime
-        .db()
-        .list_conversations()
-        .await
-        .unwrap_or_default();
-    let task_to_slug: std::collections::HashMap<String, String> = all_convs
-        .iter()
-        .filter_map(|c| {
-            let task_id = c.conv_mode.task_id()?;
-            let slug = c.slug.as_deref()?;
-            Some((task_id.to_string(), slug.to_string()))
-        })
-        .collect();
-
-    let tasks = taskmd_core::tasks::list_tasks(&tasks_dir)
-        .into_iter()
-        .map(|t| {
-            let conversation_slug = task_to_slug.get(&t.id).cloned();
-            TaskEntry {
-                id: t.id,
-                priority: t.priority.to_string(),
-                status: t.status.to_string(),
-                slug: t.slug,
-                path: t.path.to_string_lossy().into_owned(),
-                conversation_slug,
-            }
-        })
-        .collect();
-
-    Ok(Json(TasksResponse { tasks }))
+    Ok(Json(TasksResponse {
+        tasks: task_entries_for_cwd(&state, &cwd).await,
+    }))
 }
 
 /// Token usage totals for a conversation (own turns + root rollup including sub-agents).
