@@ -11308,3 +11308,350 @@ html * {
   background: var(--bg-tertiary);
 }
 
+/* ============================================================================
+ * Browser console-logs structured response. Dense color-coded table:
+ * right-aligned colored level column + text, 1px row dividers. The header
+ * tally lets the reader scan a 100-entry result at a glance.
+ * ============================================================================ */
+
+.console-logs-response {
+  padding: 6px 10px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  background: var(--bg-primary);
+}
+
+.console-logs-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 4px;
+  font-size: 10.5px;
+  color: var(--text-secondary);
+}
+
+.console-logs-count {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.console-logs-tally {
+  padding: 0 4px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.console-logs-tally.console-level-error {
+  color: var(--accent-red);
+}
+
+.console-logs-tally.console-level-warning {
+  color: var(--accent-yellow, #d69e2e);
+}
+
+.console-logs-tally.console-level-info {
+  color: var(--accent-blue, #4299e1);
+}
+
+.console-logs-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.console-log-entry {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 1px 6px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  border-bottom: 1px solid color-mix(in srgb, var(--border-color) 40%, transparent);
+}
+
+.console-log-entry:last-child {
+  border-bottom: none;
+}
+
+.console-log-entry.console-level-debug {
+  opacity: 0.65;
+}
+
+.console-log-level {
+  flex-shrink: 0;
+  width: 46px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  font-weight: 600;
+  text-align: right;
+}
+
+.console-level-error .console-log-level {
+  color: var(--accent-red);
+}
+
+.console-level-warning .console-log-level {
+  color: var(--accent-yellow, #d69e2e);
+}
+
+.console-level-info .console-log-level {
+  color: var(--accent-blue, #4299e1);
+}
+
+.console-log-text {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-primary);
+}
+
+.console-logs-empty,
+.console-logs-pointer {
+  font-style: italic;
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 4px 0;
+}
+
+.console-logs-pointer {
+  font-style: normal;
+  color: var(--text-primary);
+}
+
+.console-logs-fallback {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0;
+  padding: 8px 12px;
+  background: var(--code-bg);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+/* ============================================================================
+ * Search results — `path:NN: content` lines grouped by file with clickable
+ * file paths (when onOpenFile is wired) and per-hit jump-to-line buttons.
+ * ============================================================================ */
+
+.search-results,
+.keyword-search-results {
+  padding: 8px 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--bg-primary);
+}
+
+.search-results-header {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.search-results-count {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.search-results-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 480px;
+  overflow-y: auto;
+}
+
+.search-results-file {
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--code-bg);
+  overflow: hidden;
+}
+
+.search-results-filepath {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 8px;
+  background: var(--bg-tertiary);
+  border: none;
+  border-bottom: 1px solid var(--border-color);
+  color: var(--accent-blue, #4299e1);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+button.search-results-filepath:hover {
+  background: var(--bg-hover, var(--bg-secondary));
+}
+
+.search-results-filepath-static {
+  cursor: default;
+  color: var(--text-primary);
+}
+
+.search-results-filehit-count {
+  font-weight: 400;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.search-results-hits {
+  display: flex;
+  flex-direction: column;
+}
+
+.search-result-line {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 2px 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-primary);
+  text-align: left;
+  width: 100%;
+}
+
+button.search-result-line {
+  background: none;
+  border: none;
+  border-radius: 0;
+}
+
+.search-result-line-clickable {
+  cursor: pointer;
+}
+
+.search-result-line-clickable:hover,
+.search-result-line-clickable:focus-visible {
+  background: color-mix(in srgb, var(--accent-blue, #4299e1) 8%, transparent);
+  outline: none;
+}
+
+.search-result-lineno {
+  flex-shrink: 0;
+  min-width: 3em;
+  text-align: right;
+  color: var(--text-muted);
+  font-size: 11px;
+  user-select: none;
+}
+
+.search-result-content {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  flex: 1;
+}
+
+.search-results-empty {
+  font-style: italic;
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 4px 0;
+}
+
+.search-results-fallback {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0;
+  padding: 4px 0;
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.search-results-notes {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.search-results-note {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* ── keyword_search: file + LLM-supplied relevance explanation ────────────── */
+
+.keyword-search-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 480px;
+  overflow-y: auto;
+}
+
+.keyword-search-hit {
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--code-bg);
+  padding: 6px 8px;
+}
+
+.keyword-search-filepath {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent-blue, #4299e1);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+  word-break: break-all;
+}
+
+button.keyword-search-filepath:hover {
+  text-decoration: underline;
+}
+
+.keyword-search-filepath-static {
+  cursor: default;
+  color: var(--text-primary);
+}
+
+.keyword-search-explanation {
+  margin-top: 3px;
+  font-family: var(--font-sans, inherit);
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.keyword-search-fallback-note {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.keyword-search-raw-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--code-bg);
+  border-radius: 3px;
+  max-height: 360px;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
