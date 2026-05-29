@@ -85,9 +85,24 @@ export function getStateDescription(state: ConversationState): string {
     case 'awaiting_llm':
       return 'preparing request...';
     case 'llm_requesting':
-      return state.attempt > 1 ? `thinking (retry ${state.attempt})...` : 'thinking...';
+      // Pre-first-byte: request is on the wire but we have no observable
+      // evidence of model activity (could be queued, prefilling, throttled,
+      // generating-but-buffering). `awaiting LLM response` describes the
+      // client's actual state — neutral about what the server is doing.
+      // The "LLM" qualifier disambiguates from `awaiting_user_response`
+      // (which means waiting on the human user, not the model).
+      // Post-first-byte the StateBar switches to `streaming` because
+      // tokens flowing IS observable evidence (REQ-WPV-007).
+      //
+      // No `(retry N)` suffix here — the StateBar appends a richer
+      // `(retry K/N after <reason>)` from `turnRetryContext` (REQ-LRV-001)
+      // and the pending bubble does the same; baking the bare attempt
+      // count into the description would double up.
+      return 'awaiting LLM response...';
     case 'seeded_llm_requesting':
-      return state.attempt > 1 ? `starting (retry ${state.attempt})...` : 'starting...';
+      // Same rationale as `llm_requesting`: defer to
+      // `turnRetryContext` for retry surfacing.
+      return 'starting...';
     case 'tool_executing': {
       // `current_tool.name` is authoritative on both wire paths; see
       // ToolCall's custom Serialize impl in state_machine/state.rs.
@@ -113,7 +128,11 @@ export function getStateDescription(state: ConversationState): string {
     case 'awaiting_task_approval':
       return 'awaiting approval';
     case 'awaiting_user_response':
-      return 'awaiting response';
+      // Disambiguated from `llm_requesting`'s "awaiting LLM response":
+      // this one is waiting on the *human user* to reply to an
+      // agent-posed question. Direct address ("your") makes the
+      // expected next action unmistakable.
+      return 'awaiting your reply';
     case 'error':
       return 'error';
     case 'awaiting_recovery':

@@ -20,6 +20,7 @@ use super::state::{
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use crate::db::{ErrorKind, ToolResult, UsageData};
+use crate::llm::LlmAttemptReason;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
@@ -180,7 +181,72 @@ fn resolve_task_file(
     })
 }
 
-const MAX_RETRY_ATTEMPTS: u32 = 3;
+/// The retry-budget ceiling for retryable LLM errors. Surfaced via
+/// `SseEvent::LlmAttempt.max_attempts` on every retry-scheduling event
+/// so the client can render `(retry K/N <reason>)` (specs/llm-retry-visibility/
+/// REQ-LRV-001). `pub` exposure is for the executor's
+/// `Effect::ScheduleRetry` handler, which sends the value on the wire.
+pub const MAX_RETRY_ATTEMPTS: u32 = 3;
+
+/// Stamp `retry_count = saturating_sub(1)` onto an assistant message's
+/// `display_data` (the JSON-blob form `Option<serde_json::Value>`) iff
+/// the final attempt count is > 1. No-op for first-try successes so
+/// the persisted JSON stays minimal and the UI's
+/// `retry_count > 0` check doubles as a presence check. Used by both
+/// the `persist_agent_message` helper (no-tool `LlmResponse` path) and
+/// the tool-round inline `assistant_message` build
+/// (`handle_core_llm_response`'s `ToolExecuting` branch). Specs:
+/// `specs/llm-retry-visibility/` REQ-LRV-006.
+fn stamp_retry_count(display_data: &mut Option<serde_json::Value>, final_attempt: u32) {
+    let retry_count = final_attempt.saturating_sub(1);
+    if retry_count == 0 {
+        return;
+    }
+    let display_obj =
+        display_data.get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(map) = display_obj.as_object_mut() {
+        map.insert(
+            "retry_count".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(retry_count)),
+        );
+    }
+}
+
+/// Project a runtime `ErrorKind` onto the three retryable
+/// `LlmAttemptReason` variants. `is_auto_retryable()` is the gate for
+/// `Effect::ScheduleRetry`; this helper is the wire-side projection of
+/// the same predicate. `TimedOut` collapses to `Network` because the
+/// upstream `LlmErrorKind` never distinguishes them (timeouts arrive
+/// as `LlmErrorKind::Network`); the runtime keeps the kinds separate
+/// for non-LLM paths but the `LlmAttempt` reader doesn't care.
+fn error_kind_to_attempt_reason(kind: &ErrorKind) -> LlmAttemptReason {
+    match kind {
+        ErrorKind::RateLimit => LlmAttemptReason::RateLimit,
+        ErrorKind::ServerError => LlmAttemptReason::ServerError,
+        ErrorKind::Network | ErrorKind::TimedOut => LlmAttemptReason::Network,
+        // Non-retryable kinds. `db::ErrorKind::is_auto_retryable` admits
+        // exactly the four kinds matched above, and every caller guards on it
+        // before reaching here, so a non-retryable kind landing in this arm is
+        // a runtime invariant violation. Log it (a wrong `reason` on the wire
+        // is a capability gap, not a crash — keep returning a well-formed
+        // value rather than panicking the conversation).
+        ErrorKind::Auth
+        | ErrorKind::UsageLimitReached
+        | ErrorKind::ServerOverloaded
+        | ErrorKind::InvalidRequest
+        | ErrorKind::Cancelled
+        | ErrorKind::SubAgentError
+        | ErrorKind::ContextExhausted
+        | ErrorKind::ContentFilter => {
+            tracing::error!(
+                ?kind,
+                "error_kind_to_attempt_reason reached with a non-retryable kind; \
+                 is_auto_retryable() guard should preclude this — defaulting wire reason to network"
+            );
+            LlmAttemptReason::Network
+        }
+    }
+}
 
 /// Discriminator for a `propose_task` tool call found in an LLM response: the
 /// payload either parsed into the typed input or failed serde (carrying the
@@ -701,9 +767,10 @@ fn handle_core_llm_response(
     else {
         unreachable!("handle_core_llm_response called with non-LlmResponse event");
     };
-    let CoreState::LlmRequesting { .. } = state else {
+    let CoreState::LlmRequesting { attempt } = state else {
         unreachable!("handle_core_llm_response called in non-LlmRequesting state");
     };
+    let final_attempt = *attempt;
 
     if tool_calls.is_empty() && content.is_empty() {
         tracing::debug!("LLM returned end_turn with empty content — no message to persist");
@@ -719,6 +786,7 @@ fn handle_core_llm_response(
                 Some(usage_data),
                 &context.working_dir,
                 request_id,
+                final_attempt,
             ))
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_agent_done()));
@@ -727,7 +795,13 @@ fn handle_core_llm_response(
     // Has tools -> ToolExecuting
     let first = tool_calls[0].clone();
     let rest = tool_calls[1..].to_vec();
-    let display_data = compute_bash_display_data(&content, &context.working_dir);
+    let mut display_data = compute_bash_display_data(&content, &context.working_dir);
+    // REQ-LRV-006: same retry_count stamp as the no-tool path
+    // (persist_agent_message above). The tool-round flow persists the
+    // assistant message via PersistCheckpoint, not persist_agent_message,
+    // so we have to inline the stamp here instead of going through the
+    // helper.
+    stamp_retry_count(&mut display_data, final_attempt);
     let assistant_message =
         AssistantMessage::new(request_id, content, Some(usage_data), display_data);
     // Broadcast (not persist) the assistant message now so the UI's main
@@ -1235,11 +1309,17 @@ fn handle_core_error_retry(
 ) -> Result<CoreTransitionResult, TransitionError> {
     match (state, event) {
         // Retryable LlmError below max -> retry (shared)
-        (CoreState::LlmRequesting { attempt }, CoreEvent::LlmError { error_kind, .. })
-            if error_kind.is_auto_retryable() && *attempt < MAX_RETRY_ATTEMPTS =>
-        {
+        (
+            CoreState::LlmRequesting { attempt },
+            CoreEvent::LlmError {
+                ref error_kind,
+                resets_at,
+                ..
+            },
+        ) if error_kind.is_auto_retryable() && *attempt < MAX_RETRY_ATTEMPTS => {
             let new_attempt = attempt + 1;
             let delay = retry_delay(new_attempt);
+            let reason = error_kind_to_attempt_reason(error_kind);
 
             Ok(CoreTransitionResult::new(CoreState::LlmRequesting {
                 attempt: new_attempt,
@@ -1248,6 +1328,8 @@ fn handle_core_error_retry(
             .with_effect(Effect::ScheduleRetry {
                 delay,
                 attempt: new_attempt,
+                reason,
+                resets_at,
             })
             .with_effect(Effect::notify_state_change()))
         }
@@ -1308,10 +1390,15 @@ fn handle_core_continuation(
                 rejected_tool_calls,
                 attempt,
             },
-            CoreEvent::LlmError { error_kind, .. },
+            CoreEvent::LlmError {
+                ref error_kind,
+                resets_at,
+                ..
+            },
         ) if error_kind.is_auto_retryable() && *attempt < MAX_RETRY_ATTEMPTS => {
             let new_attempt = attempt + 1;
             let delay = retry_delay(new_attempt);
+            let reason = error_kind_to_attempt_reason(error_kind);
 
             Ok(CoreTransitionResult::new(CoreState::AwaitingContinuation {
                 rejected_tool_calls: rejected_tool_calls.clone(),
@@ -1321,6 +1408,8 @@ fn handle_core_continuation(
             .with_effect(Effect::ScheduleRetry {
                 delay,
                 attempt: new_attempt,
+                reason,
+                resets_at,
             })
             .with_effect(Effect::notify_state_change()))
         }
@@ -1654,7 +1743,7 @@ pub fn transition_parent(
         // issues with guards on the same event payload.
         // ============================================================
         (
-            ParentState::Core(CoreState::LlmRequesting { .. }),
+            ParentState::Core(CoreState::LlmRequesting { attempt }),
             ParentEvent::Core(CoreEvent::LlmResponse {
                 content,
                 tool_calls,
@@ -1663,6 +1752,20 @@ pub fn transition_parent(
                 ..
             }),
         ) => {
+            let final_attempt = *attempt;
+            // REQ-LRV-006: stamp the retry count onto every parent-intercepted
+            // assistant message (propose_task / ask_user_question — typed,
+            // malformed, and validation-retry branches all persist a
+            // checkpointed AssistantMessage). Without this the retry audit
+            // trail is missing on exactly these tool replies, unlike the
+            // normal no-tool/tool paths. `content` is a parameter (not
+            // captured by ref) so each branch can still move its own `content`
+            // into `AssistantMessage::new` after calling this.
+            let make_display_data = |c: &[crate::llm::ContentBlock]| {
+                let mut dd = compute_bash_display_data(c, &context.working_dir);
+                stamp_retry_count(&mut dd, final_attempt);
+                dd
+            };
             // REQ-BED-028: propose_task interception (checked first).
             //
             // Find the propose_task call whether it parsed as typed input or
@@ -1693,7 +1796,7 @@ pub fn transition_parent(
 
                 if tool_calls.len() > 1 {
                     let msg = "propose_task must be the only tool in response".to_string();
-                    let display_data = compute_bash_display_data(&content, &context.working_dir);
+                    let display_data = make_display_data(&content);
                     let assistant_message = AssistantMessage::new(
                         request_id.clone(),
                         content,
@@ -1728,8 +1831,7 @@ pub fn transition_parent(
                             "propose_task input failed to parse: {err}. Re-emit the \
                              call with a valid payload (expected `{{\"task_file\": \"<path>\"}}`)."
                         );
-                        let display_data =
-                            compute_bash_display_data(&content, &context.working_dir);
+                        let display_data = make_display_data(&content);
                         let assistant_message = AssistantMessage::new(
                             request_id.clone(),
                             content,
@@ -1762,8 +1864,7 @@ pub fn transition_parent(
                         // Validation failed: surface the error as a tool_result and
                         // re-request the LLM so it can fix the file (or pick another)
                         // and retry.
-                        let display_data =
-                            compute_bash_display_data(&content, &context.working_dir);
+                        let display_data = make_display_data(&content);
                         let assistant_message = AssistantMessage::new(
                             request_id.clone(),
                             content,
@@ -1788,7 +1889,7 @@ pub fn transition_parent(
 
                 let tool_result =
                     ToolResult::success(tool.id.clone(), "Plan submitted for review".to_string());
-                let display_data = compute_bash_display_data(&content, &context.working_dir);
+                let display_data = make_display_data(&content);
                 let assistant_message = AssistantMessage::new(
                     request_id.clone(),
                     content,
@@ -1825,7 +1926,7 @@ pub fn transition_parent(
             }) {
                 if tool_calls.len() > 1 {
                     let msg = "ask_user_question must be the only tool in response".to_string();
-                    let display_data = compute_bash_display_data(&content, &context.working_dir);
+                    let display_data = make_display_data(&content);
                     let assistant_message = AssistantMessage::new(
                         request_id.clone(),
                         content,
@@ -1854,8 +1955,7 @@ pub fn transition_parent(
                             "ask_user_question input failed to parse: {err}. Re-emit the \
                              call with a valid `questions` array."
                         );
-                        let display_data =
-                            compute_bash_display_data(&content, &context.working_dir);
+                        let display_data = make_display_data(&content);
                         let assistant_message = AssistantMessage::new(
                             request_id.clone(),
                             content,
@@ -1882,7 +1982,7 @@ pub fn transition_parent(
                     tool.id.clone(),
                     "Awaiting user response. See following message for answers.".to_string(),
                 );
-                let display_data = compute_bash_display_data(&content, &context.working_dir);
+                let display_data = make_display_data(&content);
                 let assistant_message = AssistantMessage::new(
                     request_id.clone(),
                     content,
@@ -1905,8 +2005,14 @@ pub fn transition_parent(
 
             // REQ-BED-019: Context exhaustion check (after propose_task/ask_user_question)
             if should_trigger_continuation(&usage_data, context.context_window) {
-                let tr =
-                    handle_context_exhaustion(context, content, tool_calls, usage_data, request_id);
+                let tr = handle_context_exhaustion(
+                    context,
+                    content,
+                    tool_calls,
+                    usage_data,
+                    request_id,
+                    final_attempt,
+                );
                 return Ok(ParentTransitionResult {
                     new_state: ParentState::try_from(tr.new_state)
                         .expect("handle_context_exhaustion returns parent-valid state"),
@@ -2184,7 +2290,7 @@ pub fn transition_sub_agent(
         // borrow-after-move issues with guards)
         // ============================================================
         (
-            SubAgentState::Core(CoreState::LlmRequesting { .. }),
+            SubAgentState::Core(CoreState::LlmRequesting { attempt }),
             SubAgentEvent::Core(CoreEvent::LlmResponse {
                 content,
                 tool_calls,
@@ -2193,10 +2299,17 @@ pub fn transition_sub_agent(
                 ..
             }),
         ) => {
+            let final_attempt = *attempt;
             // Context exhaustion check first (sub-agent fails immediately)
             if should_trigger_continuation(&usage_data, context.context_window) {
-                let tr =
-                    handle_context_exhaustion(context, content, tool_calls, usage_data, request_id);
+                let tr = handle_context_exhaustion(
+                    context,
+                    content,
+                    tool_calls,
+                    usage_data,
+                    request_id,
+                    final_attempt,
+                );
                 return Ok(SubAgentTransitionResult {
                     new_state: SubAgentState::try_from(tr.new_state)
                         .expect("sub-agent context exhaustion returns Failed"),
@@ -2216,6 +2329,7 @@ pub fn transition_sub_agent(
                         Some(usage_data),
                         &context.working_dir,
                         request_id,
+                        final_attempt,
                     ));
                 }
                 return Ok(tr.with_effect(Effect::PersistState).with_effect(
@@ -2264,6 +2378,7 @@ pub fn transition_sub_agent(
                             Some(usage_data),
                             &context.working_dir,
                             request_id,
+                            final_attempt,
                         ))
                         .with_effect(Effect::PersistState)
                         .with_effect(Effect::NotifyParent {
@@ -2282,6 +2397,7 @@ pub fn transition_sub_agent(
                             Some(usage_data),
                             &context.working_dir,
                             request_id,
+                            final_attempt,
                         ))
                         .with_effect(Effect::PersistState)
                         .with_effect(Effect::NotifyParent {
@@ -2370,13 +2486,17 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
             usage,
             request_id,
         },
-        LlmOutcome::RateLimited { retry_after: _ } => {
+        LlmOutcome::RateLimited {
+            retry_after: _,
+            resets_at,
+        } => {
             let attempt = current_attempt(state);
             Event::LlmError {
                 message: "Rate limited".to_string(),
                 error_kind: ErrorKind::RateLimit,
                 attempt,
                 recovery_in_progress: false,
+                resets_at,
             }
         }
         LlmOutcome::UsageLimitReached {
@@ -2389,6 +2509,8 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::UsageLimitReached,
                 attempt,
                 recovery_in_progress: false,
+                // Non-retryable: never reaches Effect::ScheduleRetry.
+                resets_at: None,
             }
         }
         LlmOutcome::ServerError { status, body } => {
@@ -2398,6 +2520,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::ServerError,
                 attempt,
                 recovery_in_progress: false,
+                resets_at: None,
             }
         }
         LlmOutcome::ServerOverloaded { message } => {
@@ -2407,6 +2530,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::ServerOverloaded,
                 attempt,
                 recovery_in_progress: false,
+                resets_at: None,
             }
         }
         LlmOutcome::NetworkError { message } => {
@@ -2416,6 +2540,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::Network,
                 attempt,
                 recovery_in_progress: false,
+                resets_at: None,
             }
         }
         LlmOutcome::TokenBudgetExceeded => {
@@ -2425,6 +2550,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::ContextExhausted,
                 attempt,
                 recovery_in_progress: false,
+                resets_at: None,
             }
         }
         LlmOutcome::AuthError {
@@ -2437,6 +2563,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::Auth,
                 attempt,
                 recovery_in_progress,
+                resets_at: None,
             }
         }
         LlmOutcome::RequestRejected { message } => {
@@ -2446,6 +2573,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::InvalidRequest,
                 attempt,
                 recovery_in_progress: false,
+                resets_at: None,
             }
         }
         LlmOutcome::Cancelled => {
@@ -2455,6 +2583,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::Cancelled,
                 attempt,
                 recovery_in_progress: false,
+                resets_at: None,
             }
         }
     }
@@ -2526,6 +2655,7 @@ fn handle_context_exhaustion(
     tool_calls: Vec<ToolCall>,
     usage_data: UsageData,
     request_id: String,
+    final_attempt: u32,
 ) -> TransitionResult {
     use crate::state_machine::state::SubAgentOutcome;
 
@@ -2541,6 +2671,7 @@ fn handle_context_exhaustion(
                 Some(usage_data),
                 &ctx.working_dir,
                 request_id,
+                final_attempt,
             ))
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change())
@@ -2559,6 +2690,7 @@ fn handle_context_exhaustion(
                 Some(usage_data),
                 &ctx.working_dir,
                 request_id,
+                final_attempt,
             ))
             .with_effect(Effect::PersistState)
             .with_effect(Effect::NotifyParent {
@@ -2632,6 +2764,7 @@ mod tests {
                 error_kind: ErrorKind::ContextExhausted,
                 attempt: 1,
                 recovery_in_progress: false,
+                resets_at: None,
             },
         )
         .unwrap();
@@ -2665,6 +2798,7 @@ mod tests {
                 error_kind: ErrorKind::InvalidRequest,
                 attempt: 1,
                 recovery_in_progress: false,
+                resets_at: None,
             },
         )
         .unwrap();
@@ -2692,6 +2826,7 @@ mod tests {
                     error_kind: ErrorKind::ContextExhausted,
                     attempt,
                     recovery_in_progress: false,
+                    resets_at: None,
                 },
             )
             .unwrap();
@@ -2951,6 +3086,7 @@ mod tests {
                 cache_creation_tokens: 0,
             },
             "test-req-id".to_string(),
+            1,
         );
 
         // Sub-agent should go to Failed, not AwaitingContinuation
@@ -3008,6 +3144,7 @@ mod tests {
                 cache_creation_tokens: 0,
             },
             "test-req-id".to_string(),
+            1,
         );
 
         // Parent should go to AwaitingContinuation
@@ -3169,6 +3306,7 @@ mod tests {
                 error_kind: ErrorKind::Network, // retryable
                 attempt: 3,
                 recovery_in_progress: false,
+                resets_at: None,
             },
         )
         .unwrap();
@@ -3218,6 +3356,7 @@ mod tests {
                 error_kind: ErrorKind::Auth, // non-retryable
                 attempt: 1,
                 recovery_in_progress: false,
+                resets_at: None,
             },
         )
         .unwrap();
@@ -3251,6 +3390,7 @@ mod tests {
                 error_kind: ErrorKind::Network,
                 attempt: 3,
                 recovery_in_progress: false,
+                resets_at: None,
             },
         )
         .unwrap();

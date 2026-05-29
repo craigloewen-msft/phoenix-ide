@@ -12,6 +12,8 @@ import {
   SseMessageUpdatedDataSchema,
   SseStateChangeDataSchema,
   SseTokenDataSchema,
+  SseLlmFirstByteDataSchema,
+  SseLlmAttemptDataSchema,
   SseConversationUpdateDataSchema,
   SseAgentDoneDataSchema,
   SseConversationBecameTerminalDataSchema,
@@ -278,9 +280,26 @@ export function useConnection({
           const on = (type: string, handler: (e: Event) => void) => {
             es.addEventListener(type, (e) => {
               if (!isCurrentOwner()) return;
+              // REQ-WPV-004: bump the heartbeat-watchdog clock before
+              // delegating to per-event processing, on EVERY named
+              // event (native EventSource has no wildcard so this
+              // wrapper is the single place to do it). Specs:
+              // specs/working-phase-visibility/ design.md
+              // "EventSource listener wiring (required)".
+              stampedDispatch({ type: 'sse_event_observed' });
               handler(e);
             });
           };
+
+          // Typed `ping` keep-alive (REQ-WPV-004). The handler is empty:
+          // the lastSseEventAt bump happens in `on()` above, which is
+          // the entire purpose of this listener. Without an explicit
+          // registration, EventSource silently drops named events and
+          // the watchdog goes stale during a turn that only emits
+          // pings (server keep-alive without any data flowing).
+          on('ping', () => {
+            /* lastSseEventAt bump only; no payload to consume */
+          });
 
           on('init', (e) => {
             const res = parseEvent(SseInitDataSchema, e, 'init', stampedDispatch);
@@ -351,6 +370,8 @@ export function useConnection({
               type: 'sse_state_change',
               sequenceId: res.data.sequence_id,
               phase: nextPhase,
+              // RFC3339 → unix ms once at the SSE boundary (REQ-WPV-001).
+              stateUpdatedAt: Date.parse(res.data.state_updated_at),
             });
           });
 
@@ -417,6 +438,50 @@ export function useConnection({
               sequenceId: res.data.sequence_id,
               delta: res.data.text,
               requestId: res.data.request_id,
+            });
+          });
+
+          // REQ-WPV-007: first-byte marker. Emitted exactly once per LLM
+          // request immediately before the first `token` event for the
+          // same `request_id`. Drives the StateBar's `awaiting LLM response Ns` →
+          // `streaming` transition; the reducer stamps
+          // `firstByteRequestId` on the atom.
+          on('llm_first_byte', (e) => {
+            const res = parseEvent(
+              SseLlmFirstByteDataSchema,
+              e,
+              'llm_first_byte',
+              stampedDispatch,
+            );
+            if (!res.ok) return;
+            stampedDispatch({
+              type: 'sse_llm_first_byte',
+              sequenceId: res.data.sequence_id,
+              requestId: res.data.request_id,
+            });
+          });
+
+          // REQ-LRV-001 / REQ-WPV-003: retry-context marker. Emitted from
+          // the executor's Effect::ScheduleRetry handler immediately
+          // before the spawned backoff sleep. The reducer stamps the
+          // turnRetryContext so the StateBar can append a
+          // "(retry K/N <reason>)" suffix to the base reason.
+          on('llm_attempt', (e) => {
+            const res = parseEvent(
+              SseLlmAttemptDataSchema,
+              e,
+              'llm_attempt',
+              stampedDispatch,
+            );
+            if (!res.ok) return;
+            stampedDispatch({
+              type: 'sse_llm_attempt',
+              sequenceId: res.data.sequence_id,
+              attempt: res.data.attempt,
+              maxAttempts: res.data.max_attempts,
+              reason: res.data.reason,
+              backingOffMs: res.data.backing_off_ms,
+              resetsAt: res.data.resets_at ? Date.parse(res.data.resets_at) : null,
             });
           });
 

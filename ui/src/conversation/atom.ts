@@ -8,6 +8,8 @@ import {
   SseMessageDataSchema,
   SseMessageUpdatedDataSchema,
   SseAgentDoneDataSchema,
+  SseLlmFirstByteDataSchema,
+  SseLlmAttemptDataSchema,
   SseConversationUpdateDataSchema,
   SseBrowserSessionStateDataSchema,
   SseSteerMessageQueuedDataSchema,
@@ -51,6 +53,54 @@ export interface ConversationAtom {
    *  `null` when not in `tool_executing`. Used by StateBar to render a live
    *  elapsed-time counter. */
   toolExecutingStartedAt: number | null;
+  /** Server clock (unix ms) at which the conversation entered its current
+   *  `phase`. Sourced from `StateChange.state_updated_at` and from
+   *  `Init.conversation.state_updated_at`, both RFC3339 strings on the
+   *  wire that the SSE-handler converts to ms via `Date.parse(s)` once.
+   *  `null` until the first Init/StateChange lands. Used by StateBar to
+   *  render the working-phase elapsed counter; survives reconnect /
+   *  reload because the value is server-authoritative (REQ-WPV-001). */
+  phaseStateUpdatedAt: number | null;
+  /** Client-clock (unix ms) of the most recent SSE event observed on this
+   *  connection — any named event, including the typed `ping` keep-alive.
+   *  Initialised to `Date.now()` on creation; bumped by every wire-event
+   *  reducer action. Used by the heartbeat watchdog (REQ-WPV-004): when
+   *  `connectionState === 'live'` AND the phase is working AND
+   *  `now() - lastSseEventAt > HEARTBEAT_WATCHDOG_MS`, the StateBar
+   *  surfaces a "no signal from server for Ns" degraded indicator. */
+  lastSseEventAt: number;
+  /** Request id of the LLM request whose first byte has been observed on
+   *  this turn, or `null` if no first-byte marker has arrived since the
+   *  last phase entry. Set by the `sse_llm_first_byte` reducer; cleared
+   *  on every `state_change` event (the phase-entry edge — every new
+   *  llm_requesting attempt starts in pre-first-byte) and on the
+   *  turn-terminal `agent_done` event. Drives REQ-WPV-007's
+   *  `awaiting LLM response Ns` → `streaming` transition in the StateBar and the
+   *  pending bubble's spec-level `placeholder → streaming` edge
+   *  (REQ-WPV-006). */
+  firstByteRequestId: string | null;
+  /** Per-turn retry context: most recent `LlmAttempt` for the current
+   *  turn (specs/llm-retry-visibility/ REQ-LRV-001 / REQ-WPV-003). The
+   *  StateBar composes "(retry K/N <reason>)" from these fields and
+   *  appends as a suffix to the base reason. `null` when no retry has
+   *  fired this turn. Cleared on `agent_done` (success) and on terminal
+   *  `error` events; survives intra-turn phase transitions
+   *  (llm_requesting → tool_executing) per REQ-WPV-003's `executing bash
+   *  12s (retry 2/5)` example. */
+  turnRetryContext: {
+    attempt: number;
+    maxAttempts: number;
+    reason: 'rate_limit' | 'server_error' | 'network';
+    /** Human-rendered reason ("rate limit", "server error",
+     *  "network error"). Source of truth lives on the client because
+     *  the wire transport is the snake_case enum. */
+    reasonText: string;
+    backingOffMs: number;
+    /** unix ms; converted from the wire's RFC3339 string once. `null`
+     *  when the wire omitted the field (non-rate-limit retries; rate
+     *  limits whose 429 didn't include a reset timestamp). */
+    resetsAt: number | null;
+  } | null;
   /** Per-connection generation that produced the events this atom has accepted.
    *  `null` until `connection_opened` lands. Wire-originated actions tagged
    *  with a non-matching `epoch` are dropped at the reducer boundary — the
@@ -123,9 +173,50 @@ export type SSEAction =
       durationMs?: number;
       epoch?: number;
     }
-  | { type: 'sse_state_change'; sequenceId: number; phase: ConversationState; error?: ErrorPresentation; epoch?: number }
+  | {
+      type: 'sse_state_change';
+      sequenceId: number;
+      phase: ConversationState;
+      /** Server clock (unix ms) for the new phase's entry time. Converted
+       *  from the wire's RFC3339 `state_updated_at` once at the SSE
+       *  handler boundary; the reducer stores it on the atom as a number
+       *  (REQ-WPV-001). */
+      stateUpdatedAt: number;
+      /** Error presentation (#175): kind + auto-retry/user-resume policy,
+       *  present when the new phase carries an error. */
+      error?: ErrorPresentation;
+      epoch?: number;
+    }
   | { type: 'sse_agent_done'; sequenceId: number; epoch?: number }
   | { type: 'sse_token'; sequenceId: number; delta: string; requestId: string; epoch?: number }
+  | {
+      // REQ-WPV-007: first-byte marker for the LLM request identified by
+      // `requestId`. The reducer stamps this on the atom so the StateBar
+      // can switch from `awaiting LLM response Ns` to `streaming` (no counter); the
+      // pending bubble's spec-level `placeholder → streaming` edge is
+      // also gated by this signal (REQ-WPV-006). Emitted exactly once
+      // per request; never on requests that error before any tokens.
+      type: 'sse_llm_first_byte';
+      sequenceId: number;
+      requestId: string;
+      epoch?: number;
+    }
+  | {
+      // REQ-LRV-001 + REQ-WPV-003: per-turn retry context populator.
+      // Emitted from the executor's Effect::ScheduleRetry handler
+      // immediately before the spawned backoff sleep. The reducer
+      // stamps `turnRetryContext` on the atom; the StateBar appends
+      // "(retry K/N <reason>)" to the base reason.
+      type: 'sse_llm_attempt';
+      sequenceId: number;
+      attempt: number;
+      maxAttempts: number;
+      reason: 'rate_limit' | 'server_error' | 'network';
+      backingOffMs: number;
+      /** unix ms; null when the wire omitted the field. */
+      resetsAt: number | null;
+      epoch?: number;
+    }
   | { type: 'sse_conversation_update'; sequenceId: number; updates: Partial<Conversation>; epoch?: number }
   | { type: 'sse_browser_session_state'; sequenceId: number; active: boolean; epoch?: number }
   // `sequenceId` is present when the error originated on the wire (server's
@@ -146,6 +237,15 @@ export type SSEAction =
   // is accepted even when the atom retains a higher epoch from a prior
   // visit. Carries no epoch itself — see comment above on the action class.
   | { type: 'connection_reset' }
+  // Synthesized by `useConnection` on EVERY named SSE event (including
+  // the typed `ping` keep-alive) before delegating to per-event reducer
+  // handling. Bumps `lastSseEventAt` so the heartbeat watchdog can
+  // distinguish "no signal" from "slow LLM stream still emitting".
+  // No `epoch` — the watchdog is a client-side measurement of local
+  // silence, not a server-stream state, so a stale executor's late
+  // event-observed bump is benign (the worst it does is delay a
+  // genuine watchdog trip by one tick).
+  | { type: 'sse_event_observed' }
   // Coarse connection lifecycle indicator, dispatched from useConnection.
   | {
       type: 'connection_state';
@@ -195,9 +295,29 @@ export function createInitialAtom(): ConversationAtom {
     streamingBuffer: null,
     uiError: null,
     toolExecutingStartedAt: null,
+    phaseStateUpdatedAt: null,
+    lastSseEventAt: Date.now(),
+    firstByteRequestId: null,
+    turnRetryContext: null,
     connectionEpoch: null,
     connectionState: 'connecting',
   };
+}
+
+/** Human-rendered prose for an `LlmAttemptReason`. The wire transports
+ *  the snake_case enum; this function is the single source of truth for
+ *  the user-facing strings the StateBar appends in `(retry K/N <reason>)`.
+ *  Specs: `specs/llm-retry-visibility/` REQ-LRV-002 + the consumer's
+ *  `render_retry_modifier_for` helper. */
+function reasonText(reason: 'rate_limit' | 'server_error' | 'network'): string {
+  switch (reason) {
+    case 'rate_limit':
+      return 'rate limit';
+    case 'server_error':
+      return 'server error';
+    case 'network':
+      return 'network error';
+  }
 }
 
 export function breadcrumbFromPhase(
@@ -407,6 +527,7 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
         type: 'sse_state_change',
         sequenceId: res.output.sequence_id,
         phase: parseConversationState(res.output.state),
+        stateUpdatedAt: Date.parse(res.output.state_updated_at),
         ...(res.output.error ? { error: res.output.error } : {}),
       });
     }
@@ -453,6 +574,42 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
       return conversationReducer(atom, {
         type: 'sse_agent_done',
         sequenceId: res.output.sequence_id,
+      });
+    }
+    case 'llm_first_byte': {
+      const res = v.safeParse(SseLlmFirstByteDataSchema, entry);
+      if (!res.success) {
+        if (import.meta.env.DEV) {
+          console.warn('[sse] dropping malformed pending llm_first_byte entry', {
+            issues: res.issues,
+          });
+        }
+        return atom;
+      }
+      return conversationReducer(atom, {
+        type: 'sse_llm_first_byte',
+        sequenceId: res.output.sequence_id,
+        requestId: res.output.request_id,
+      });
+    }
+    case 'llm_attempt': {
+      const res = v.safeParse(SseLlmAttemptDataSchema, entry);
+      if (!res.success) {
+        if (import.meta.env.DEV) {
+          console.warn('[sse] dropping malformed pending llm_attempt entry', {
+            issues: res.issues,
+          });
+        }
+        return atom;
+      }
+      return conversationReducer(atom, {
+        type: 'sse_llm_attempt',
+        sequenceId: res.output.sequence_id,
+        attempt: res.output.attempt,
+        maxAttempts: res.output.max_attempts,
+        reason: res.output.reason,
+        backingOffMs: res.output.backing_off_ms,
+        resetsAt: res.output.resets_at ? Date.parse(res.output.resets_at) : null,
       });
     }
     case 'conversation_update': {
@@ -617,6 +774,31 @@ export function conversationReducer(
         streamingBuffer: phase1StreamingBuffer,
         uiError: null,
         toolExecutingStartedAt: p.phase.type === 'tool_executing' ? Date.now() : null,
+        // REQ-WPV-001: seed the server-authoritative phase-entry timestamp
+        // from `Init.conversation.state_updated_at` (RFC3339 on the wire,
+        // converted to ms here). Falls back to `null` if the server
+        // omitted it (old payload during rollout, or a brand-new
+        // conversation that hasn't yet had a state transition).
+        phaseStateUpdatedAt: p.conversation.state_updated_at
+          ? Date.parse(p.conversation.state_updated_at)
+          : null,
+        // (Watchdog clock `lastSseEventAt` is bumped by the unconditional
+        // `sse_event_observed` dispatch in useConnection's on() wrapper, the
+        // single source for it — see the `sse_event_observed` case.)
+        // REQ-WPV-007: an Init snapshot lands the authoritative phase;
+        // any first-byte signal from before this Init is by definition
+        // pre-reset state and must not bleed forward. If the replayed
+        // pending events contain a first-byte for the current request,
+        // the SseLlmFirstByteDataSchema path below re-stamps it.
+        firstByteRequestId: null,
+        // REQ-WPV-003 / REQ-LRV: same reasoning for the retry suffix. Clear
+        // any retry context carried over from before this Init — otherwise a
+        // reconnect-init after a finished retried turn (whose `agent_done`
+        // replay was missed, e.g. truncated ring) would preserve a stale
+        // `(retry N)` and surface it on the NEXT turn. If the turn is
+        // genuinely mid-backoff, the replayed `llm_attempt` in Phase 2
+        // re-stamps it.
+        turnRetryContext: null,
       };
 
       // Phase 2 — fold pending events through the reducer. Each entry is a
@@ -695,19 +877,51 @@ export function conversationReducer(
       return applyIfNewer(atom, 'sse_message_updated', action.sequenceId, (a) => {
         const idx = a.messages.findIndex((m) => m.message_id === action.messageId);
         if (idx < 0) return a;
-        // Merge `durationMs` into `display_data` so `ToolUseBlock` can read it
-        // from a single place regardless of whether the message arrived via
-        // reconnect (DB-persisted `display_data`) or live connection (typed wire
-        // field). Both paths converge here on the client.
-        const durPatch =
+        const existing = a.messages[idx]!;
+        const existingDisplay = (existing.display_data ?? {}) as Record<string, unknown>;
+        // REQ-WPV-002: shallow-merge `displayData` rather than replace
+        // wholesale. The runtime emits partial patches (e.g. just
+        // `{tool_starts: {...}}` from `dispatch_tool_execution`) and
+        // wholesale replacement would wipe existing keys (`bash`,
+        // `retry_count`, `duration_ms`, etc.) that earlier broadcasts
+        // or the persisted message set. Each emitter is responsible
+        // for sending only the keys it owns.
+        let mergedDisplay = existingDisplay;
+        if (action.displayData !== undefined) {
+          mergedDisplay = { ...existingDisplay, ...action.displayData };
+          // `tool_starts` is an accumulating map keyed by tool_use_id; each
+          // `dispatch_tool_execution` patch carries ONLY the newly-started
+          // tool. The shallow spread above would replace the whole map, so a
+          // second tool's start wipes the first tool's timestamp. Deep-merge
+          // the nested map so every in-flight tool keeps its start time
+          // (REQ-WPV-002).
+          const prevStarts = existingDisplay['tool_starts'];
+          const nextStarts = action.displayData['tool_starts'];
+          const isObj = (v: unknown): v is Record<string, unknown> =>
+            typeof v === 'object' && v !== null && !Array.isArray(v);
+          if (isObj(prevStarts) && isObj(nextStarts)) {
+            mergedDisplay = {
+              ...mergedDisplay,
+              tool_starts: { ...prevStarts, ...nextStarts },
+            };
+          }
+        }
+        // `durationMs` is a typed convenience field for tool-result
+        // updates — merge into the same display_data so consumers
+        // read from a single place regardless of source path.
+        const withDuration =
           action.durationMs !== undefined
-            ? { display_data: { ...(a.messages[idx]!.display_data ?? {}), duration_ms: action.durationMs } }
-            : {};
+            ? { ...mergedDisplay, duration_ms: action.durationMs }
+            : mergedDisplay;
         const merged = {
-          ...a.messages[idx]!,
-          ...(action.displayData !== undefined && { display_data: action.displayData }),
+          ...existing,
+          // Only overwrite display_data when at least one of the
+          // contributing fields was present; otherwise preserve the
+          // existing reference for cheap downstream equality checks.
+          ...((action.displayData !== undefined || action.durationMs !== undefined) && {
+            display_data: withDuration,
+          }),
           ...(action.content !== undefined && { content: action.content }),
-          ...durPatch,
         };
         const newMessages = [...a.messages];
         newMessages[idx] = merged;
@@ -734,7 +948,16 @@ export function conversationReducer(
           action.phase.type === 'tool_executing' ? Date.now() : null;
         return {
           ...a,
+          // main (#175): `phase` is the error-enriched phase computed above.
           phase,
+          // REQ-WPV-001: store the server-authoritative entry time.
+          phaseStateUpdatedAt: action.stateUpdatedAt,
+          // REQ-WPV-007: every phase transition resets the first-byte
+          // signal. The next llm_requesting attempt starts in pre-first-
+          // byte; non-llm phases (tool_executing, idle, …) don't have a
+          // first-byte concept and must clear it so a subsequent
+          // llm_requesting doesn't inherit a stale value.
+          firstByteRequestId: null,
           breadcrumbs,
           breadcrumbSequenceIds,
           toolExecutingStartedAt,
@@ -747,6 +970,36 @@ export function conversationReducer(
         ...a,
         phase: { type: 'idle' },
         streamingBuffer: null,
+        // REQ-WPV-007: turn boundary clears the first-byte signal. The
+        // sse_state_change handler also clears it on phase transitions,
+        // but agent_done can fire without a preceding state_change in
+        // some terminal paths, so we clear here defensively.
+        firstByteRequestId: null,
+        // REQ-WPV-003 + REQ-LRV-003: clear the retry context on turn end.
+        // Surfacing "(retry 2/5)" on a turn that has finished or aborted
+        // is confusing (the user reads it as "still retrying").
+        turnRetryContext: null,
+      }));
+    }
+
+    case 'sse_llm_first_byte': {
+      return applyIfNewer(atom, 'sse_llm_first_byte', action.sequenceId, (a) => ({
+        ...a,
+        firstByteRequestId: action.requestId,
+      }));
+    }
+
+    case 'sse_llm_attempt': {
+      return applyIfNewer(atom, 'sse_llm_attempt', action.sequenceId, (a) => ({
+        ...a,
+        turnRetryContext: {
+          attempt: action.attempt,
+          maxAttempts: action.maxAttempts,
+          reason: action.reason,
+          reasonText: reasonText(action.reason),
+          backingOffMs: action.backingOffMs,
+          resetsAt: action.resetsAt,
+        },
       }));
     }
 
@@ -822,13 +1075,18 @@ export function conversationReducer(
       // can't re-pop a toast the user already dismissed. Client-synthesized
       // errors (schema violations, malformed JSON) have no sequenceId and
       // apply unconditionally — they're not on the server's total order.
+      //
+      // REQ-LRV-003: a turn-terminal `error` clears the retry context.
+      // Surfacing "(retry 2/5)" on a finalised error reads as "still
+      // retrying" when the turn has actually given up.
       if (action.sequenceId !== undefined) {
         return applyIfNewer(atom, 'sse_error', action.sequenceId, (a) => ({
           ...a,
           uiError: action.error,
+          turnRetryContext: null,
         }));
       }
-      return { ...atom, uiError: action.error };
+      return { ...atom, uiError: action.error, turnRetryContext: null };
 
     case 'clear_error':
       return { ...atom, uiError: null };
@@ -861,10 +1119,27 @@ export function conversationReducer(
     case 'connection_state':
       return { ...atom, connectionState: action.state };
 
+    case 'sse_event_observed':
+      // REQ-WPV-004: cheap, no-payload action fired from useConnection's
+      // event wrapper on every named SSE event. Bumps the watchdog
+      // clock so a working phase with active token flow doesn't false-
+      // positive into "no signal from server."
+      //
+      // This is the SINGLE source for `lastSseEventAt`. Per-event reducers
+      // deliberately do NOT bump it: this dispatch is unconditional (fires
+      // before the event's own action and is not gated by `applyIfNewer`),
+      // so even a stale/duplicate event or a payload-less keep-alive `ping`
+      // correctly resets the heartbeat — "any observed traffic = alive."
+      return { ...atom, lastSseEventAt: Date.now() };
+
     case 'local_phase_change':
       if (action.expectedConversationId !== atom.conversationId) return atom;
       // Optimistic client-side phase update — does NOT bump lastSequenceId.
-      return { ...atom, phase: action.phase };
+      // Clear `phaseStateUpdatedAt` so the StateBar / pending bubble do not
+      // render an elapsed counter using the *previous* phase's server
+      // timestamp. The next server `state_change` will install the
+      // authoritative entry time for the new phase.
+      return { ...atom, phase: action.phase, phaseStateUpdatedAt: null };
 
     case 'local_conversation_update':
       if (action.expectedConversationId !== atom.conversationId) return atom;

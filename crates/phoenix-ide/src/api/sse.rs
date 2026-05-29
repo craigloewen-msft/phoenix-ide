@@ -66,10 +66,18 @@ pub fn sse_stream(
 
     let combined = init.chain(broadcasts);
 
+    // Typed `ping` event with non-empty data so the browser's EventSource
+    // observes it via an explicit listener and the heartbeat watchdog can
+    // bump `lastSseEventAt` (specs/working-phase-visibility/ REQ-WPV-004).
+    // The previous `.text("ping")` form emitted an SSE comment line which
+    // EventSource does NOT surface, leaving the watchdog blind to keep-
+    // alives. axum's `Event::data` drops empty-data events so the payload
+    // MUST be non-empty; the listener bumps lastSseEventAt and discards
+    // the body.
     let sse = Sse::new(combined).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
-            .text("ping"),
+            .event(Event::default().event("ping").data("ping")),
     );
 
     let mut headers = HeaderMap::new();
@@ -179,12 +187,14 @@ mod tests {
                 sequence_id,
                 state,
                 presentation_mode,
+                state_updated_at,
             } => {
                 let mut obj = json!({
                     "type": "state_change",
                     "sequence_id": sequence_id,
                     "state": serde_json::to_value(state).unwrap_or(Value::Null),
                     "presentation_mode": presentation_mode,
+                    "state_updated_at": state_updated_at,
                 });
                 if let Some(error_kind) = state.error_kind() {
                     obj["error"] = json!({
@@ -192,6 +202,37 @@ mod tests {
                         "can_auto_retry": error_kind.is_auto_retryable(),
                         "can_user_resume": error_kind.is_user_resumable(),
                     });
+                }
+                obj
+            }
+            SseEvent::LlmFirstByte {
+                sequence_id,
+                request_id,
+            } => json!({
+                "type": "llm_first_byte",
+                "sequence_id": sequence_id,
+                "request_id": request_id,
+            }),
+            SseEvent::LlmAttempt {
+                sequence_id,
+                attempt,
+                max_attempts,
+                reason,
+                backing_off_ms,
+                resets_at,
+            } => {
+                // `resets_at` is omitted from JSON when None (matches the
+                // typed wire's `skip_serializing_if = "Option::is_none"`).
+                let mut obj = json!({
+                    "type": "llm_attempt",
+                    "sequence_id": sequence_id,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "reason": reason,
+                    "backing_off_ms": backing_off_ms,
+                });
+                if let Some(ts) = resets_at {
+                    obj["resets_at"] = serde_json::to_value(ts).unwrap_or(Value::Null);
                 }
                 obj
             }
@@ -441,6 +482,7 @@ mod tests {
                 sequence_id: 44,
                 state: ConvState::LlmRequesting { attempt: 1 },
                 presentation_mode: "working".to_string(),
+                state_updated_at: ts(),
             },
             SseEvent::Message { message: eager },
         ];
@@ -610,6 +652,7 @@ mod tests {
             sequence_id: 13,
             state: ConvState::Idle,
             presentation_mode: "idle".to_string(),
+            state_updated_at: ts(),
         };
         assert_parity(&event);
     }
@@ -620,6 +663,7 @@ mod tests {
             sequence_id: 14,
             state: ConvState::LlmRequesting { attempt: 1 },
             presentation_mode: "working".to_string(),
+            state_updated_at: ts(),
         };
         assert_parity(&event);
     }
@@ -630,6 +674,44 @@ mod tests {
             sequence_id: 15,
             text: "Hel".to_string(),
             request_id: "req-42".to_string(),
+        };
+        assert_parity(&event);
+    }
+
+    #[test]
+    fn parity_llm_first_byte() {
+        let event = SseEvent::LlmFirstByte {
+            sequence_id: 21,
+            request_id: "req-42".to_string(),
+        };
+        assert_parity(&event);
+    }
+
+    #[test]
+    fn parity_llm_attempt_with_resets_at() {
+        let event = SseEvent::LlmAttempt {
+            sequence_id: 30,
+            attempt: 2,
+            max_attempts: 3,
+            reason: crate::llm::LlmAttemptReason::RateLimit,
+            backing_off_ms: 2000,
+            resets_at: Some(ts()),
+        };
+        assert_parity(&event);
+    }
+
+    #[test]
+    fn parity_llm_attempt_without_resets_at() {
+        // `resets_at: None` MUST be omitted from the JSON (not emitted
+        // as `null`) so the wire shape matches `#[serde(skip_serializing_if)]`
+        // and the client reads `undefined` rather than null.
+        let event = SseEvent::LlmAttempt {
+            sequence_id: 31,
+            attempt: 1,
+            max_attempts: 3,
+            reason: crate::llm::LlmAttemptReason::Network,
+            backing_off_ms: 1000,
+            resets_at: None,
         };
         assert_parity(&event);
     }
@@ -761,6 +843,7 @@ mod tests {
             sequence_id: seq,
             state: ConvState::LlmRequesting { attempt: 1 },
             presentation_mode: "working".to_string(),
+            state_updated_at: ts(),
         });
         let _ = broadcaster.send_seq(|seq| SseEvent::Token {
             sequence_id: seq,

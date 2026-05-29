@@ -33,6 +33,8 @@ import type {
   SseMessageUpdatedData as WireMessageUpdatedData,
   SseStateChangeData as WireStateChangeData,
   SseTokenData as WireTokenData,
+  SseLlmFirstByteData as WireLlmFirstByteData,
+  SseLlmAttemptData as WireLlmAttemptData,
   SseAgentDoneData as WireAgentDoneData,
   SseConversationBecameTerminalData as WireConversationBecameTerminalData,
   SseConversationUpdateData as WireConversationUpdateData,
@@ -262,6 +264,12 @@ export const SseStateChangeDataSchema = v.looseObject({
   sequence_id: v.number(),
   state: v.unknown(),
   presentation_mode: v.string(),
+  /** RFC3339 string on the wire — the same shape as the Init carrier
+   *  (`Conversation.state_updated_at` via `#[serde(flatten)]`). The
+   *  SSE-handler boundary converts to ms once via `Date.parse(s)`
+   *  before storing on the atom. Specs:
+   *  `specs/working-phase-visibility/` REQ-WPV-001. */
+  state_updated_at: v.string(),
   error: v.exactOptional(ErrorPresentationSchema),
 }) satisfies v.GenericSchema<unknown, WireStateChangeData>;
 
@@ -271,6 +279,30 @@ export const SseTokenDataSchema = v.looseObject({
   text: v.string(),
   request_id: v.string(),
 }) satisfies v.GenericSchema<unknown, WireTokenData>;
+
+/** `llm_first_byte`: marker emitted exactly once per LLM request,
+ *  immediately before the first `Token` event for the same `request_id`.
+ *  Drives the StateBar's `awaiting LLM response Ns` → `streaming` transition.
+ *  Spec: `specs/working-phase-visibility/` REQ-WPV-007. */
+export const SseLlmFirstByteDataSchema = v.looseObject({
+  sequence_id: v.number(),
+  request_id: v.string(),
+}) satisfies v.GenericSchema<unknown, WireLlmFirstByteData>;
+
+/** `llm_attempt`: retry-context marker emitted from the executor's
+ *  `Effect::ScheduleRetry` handler immediately before the spawned
+ *  backoff sleep. Drives the StateBar's `(retry K/N <reason>)`
+ *  suffix per specs/llm-retry-visibility/ REQ-LRV-001 / 003. */
+export const SseLlmAttemptDataSchema = v.looseObject({
+  sequence_id: v.number(),
+  attempt: v.number(),
+  max_attempts: v.number(),
+  reason: v.picklist(['rate_limit', 'server_error', 'network']),
+  backing_off_ms: v.number(),
+  /** RFC3339 string when known; omitted from JSON when None on the
+   *  Rust side (`skip_serializing_if = "Option::is_none"`). */
+  resets_at: v.exactOptional(v.string()),
+}) satisfies v.GenericSchema<unknown, WireLlmAttemptData>;
 
 /** `conversation_update`: partial conversation metadata update. The backend
  *  sends a strict subset of the Conversation fields (see Rust

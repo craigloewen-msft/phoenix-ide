@@ -4,7 +4,7 @@ import { FolderTree } from 'lucide-react';
 import { api, canChangeModelInState, type Conversation, type ConversationState, type ModelInfo, type PrStatusResponse } from '../api';
 import type { ConnectionState } from '../hooks';
 import { useIsMobile } from '../hooks';
-import { getStateDescription } from '../utils';
+import { getStateDescription, isAgentWorking } from '../utils';
 import { ContextIndicator } from './ContextIndicator';
 
 const CheckIcon = () => (
@@ -49,8 +49,42 @@ interface StateBarProps {
   onUpgradeModel?: (newModelId: string) => void;
   /** `Date.now()` timestamp when the current tool_executing phase began.
    *  Used to render a live elapsed-time counter ("running bash ... 4s").
-   *  `null` or `undefined` when not in tool_executing. */
+   *  `null` or `undefined` when not in tool_executing.
+   *  @deprecated Stage A: superseded by `phaseStateUpdatedAt` (server-
+   *  authoritative; covers every working phase). Retained while the
+   *  tool widget header continues to read it; the StateBar's elapsed
+   *  counter now derives from `phaseStateUpdatedAt`. */
   toolExecutingStartedAt?: number | null;
+  /** Server clock (unix ms) at which the conversation entered its
+   *  current phase. Sourced from `Conversation.state_updated_at` and
+   *  bumped on every `StateChange` SSE event. Used by the StateBar's
+   *  elapsed counter for every working phase (REQ-WPV-001). `null`
+   *  before the first Init/StateChange lands. */
+  phaseStateUpdatedAt?: number | null;
+  /** Client-clock (unix ms) of the most recent SSE event observed on
+   *  this connection (including the typed `ping` keep-alive). Fed
+   *  into the heartbeat watchdog: when the connection is `connected`
+   *  AND the conversation is in a working phase AND
+   *  `now() - lastSseEventAt > 35000`, the StateBar surfaces a
+   *  "no signal from server for Ns" degraded indicator (REQ-WPV-004). */
+  lastSseEventAt?: number;
+  /** Request id of the LLM request whose first byte has been observed
+   *  on this turn, or `null` before the first `LlmFirstByte` event.
+   *  When non-null AND the phase is `llm_requesting`, the StateBar
+   *  switches from `awaiting LLM response Ns` (with counter) to `streaming` (no
+   *  counter) per REQ-WPV-007 — the stream itself is the visible
+   *  progress signal so an additional counter is redundant. */
+  firstByteRequestId?: string | null;
+  /** Per-turn retry context populated by the `sse_llm_attempt` reducer.
+   *  When non-null AND the conversation is in a working phase, the
+   *  StateBar appends "(retry K/N <reason>)" after the base reason and
+   *  the elapsed counter — REQ-WPV-003 / REQ-LRV-001. Cleared on
+   *  `agent_done` and on terminal `error`. */
+  turnRetryContext?: {
+    attempt: number;
+    maxAttempts: number;
+    reasonText: string;
+  } | null;
   /** Mobile/tablet-only: opens the file browser overlay. When omitted (e.g. on
    *  desktop where `FileExplorerPanel` provides the same affordance), the
    *  button is not rendered. The explicit `| undefined` is required under
@@ -240,6 +274,13 @@ function formatElapsed(seconds: number): string {
   return s > 0 ? `${m}m ${s}s` : `${m}m`;
 }
 
+/** Heartbeat watchdog threshold (REQ-WPV-004). 35 s is ~2.3x the 15 s
+ *  server keep-alive interval, so a single missed keep-alive does not
+ *  trigger the watchdog. Defined here (rather than imported from a
+ *  shared config) because the StateBar is the sole consumer; if a
+ *  second consumer materialises this should move to `config.ts`. */
+const HEARTBEAT_WATCHDOG_SECONDS = 35;
+
 export function StateBar({
   conversation,
   convState,
@@ -252,11 +293,20 @@ export function StateBar({
   onRetryNow,
   continuation,
   onUpgradeModel,
-  toolExecutingStartedAt,
+  toolExecutingStartedAt: _deprecatedToolStartedAt,
+  phaseStateUpdatedAt,
+  lastSseEventAt,
+  firstByteRequestId,
+  turnRetryContext,
   onOpenFiles,
   onSendMessage,
   showError,
 }: StateBarProps) {
+  // `toolExecutingStartedAt` is kept on the prop type for the
+  // tool-widget header (which still reads it from the atom). The
+  // StateBar's own elapsed counter switched to `phaseStateUpdatedAt`
+  // in Stage A — the destructured value is intentionally unused here.
+  void _deprecatedToolStartedAt;
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerShowAll, setPickerShowAll] = useState(false);
   const [prStatus, setPrStatus] = useState<PrStatusResponse | null>(null);
@@ -275,21 +325,111 @@ export function StateBar({
   const pickerRef = useRef<HTMLSpanElement>(null);
   const prRef = useRef<HTMLSpanElement>(null);
 
-  // Live elapsed-time counter for tool_executing state.
-  // Ticks every second; cleared immediately when leaving tool_executing.
-  const [toolElapsedSeconds, setToolElapsedSeconds] = useState(0);
+  // Live elapsed-time counter, generalized for every working phase
+  // (REQ-WPV-001 / REQ-WPV-003). The source of truth is the server-
+  // authoritative `phaseStateUpdatedAt` (unix ms) carried on
+  // StateChange + Init, so the counter survives reconnect, page reload,
+  // and multi-tab observation. Ticks every second; reset to 0 the
+  // instant the phase leaves the working set.
+  // Working-phase set (elapsed counter, heartbeat watchdog gating,
+  // last-known-activity capture) is the single `isAgentWorking`
+  // predicate from utils — same set the rest of the UI gates on, with
+  // exhaustiveness enforced via `satisfies never`.
+  const phaseIsWorking = isAgentWorking(convState);
+  const [phaseElapsedSeconds, setPhaseElapsedSeconds] = useState(0);
   useEffect(() => {
-    if (convState.type !== 'tool_executing' || !toolExecutingStartedAt) {
-      setToolElapsedSeconds(0);
+    if (!phaseIsWorking || phaseStateUpdatedAt == null) {
+      setPhaseElapsedSeconds(0);
       return;
     }
-    // Compute immediately (avoids 1s lag on first render after transition)
-    setToolElapsedSeconds(Math.floor((Date.now() - toolExecutingStartedAt) / 1000));
+    // Compute immediately to avoid the 1s render lag after a phase
+    // transition; then tick once per second.
+    setPhaseElapsedSeconds(Math.max(0, Math.floor((Date.now() - phaseStateUpdatedAt) / 1000)));
     const interval = window.setInterval(() => {
-      setToolElapsedSeconds(Math.floor((Date.now() - toolExecutingStartedAt) / 1000));
+      setPhaseElapsedSeconds(
+        Math.max(0, Math.floor((Date.now() - phaseStateUpdatedAt) / 1000))
+      );
     }, 1000);
     return () => window.clearInterval(interval);
-  }, [convState.type, toolExecutingStartedAt]);
+  }, [phaseIsWorking, phaseStateUpdatedAt]);
+
+  // Heartbeat watchdog (REQ-WPV-004). When the connection is healthy
+  // AND the agent is working AND no SSE event of any kind (typed
+  // `ping` keep-alives included) has arrived for HEARTBEAT_WATCHDOG_MS,
+  // we surface a degraded-signal indicator. Ticks once per second to
+  // re-evaluate; cleared the instant any event lands or the connection
+  // leaves the healthy state. The 35 s threshold is ~2.3x the 15 s
+  // server keep-alive interval — one missed keep-alive does not
+  // trip the watchdog.
+  const [watchdogSeconds, setWatchdogSeconds] = useState(0);
+  const watchdogArmed =
+    (connectionState === 'connected' || connectionState === 'reconnected') &&
+    phaseIsWorking &&
+    typeof lastSseEventAt === 'number';
+  useEffect(() => {
+    if (!watchdogArmed) {
+      setWatchdogSeconds(0);
+      return;
+    }
+    const compute = () => {
+      const elapsed = Math.max(0, Math.floor((Date.now() - lastSseEventAt!) / 1000));
+      setWatchdogSeconds(elapsed);
+    };
+    compute();
+    const interval = window.setInterval(compute, 1000);
+    return () => window.clearInterval(interval);
+  }, [watchdogArmed, lastSseEventAt]);
+  const watchdogStale = watchdogArmed && watchdogSeconds >= HEARTBEAT_WATCHDOG_SECONDS;
+
+  // Last-known activity capture (REQ-WPV-005). When the connection
+  // leaves the healthy set during a working phase, freeze a snapshot
+  // of (phase, elapsed-at-disconnect) so the reconnecting/offline
+  // display shows "reconnecting (N) — last: awaiting LLM response 12s" instead of
+  // masking the agent's state entirely. Cleared on return to a
+  // healthy connection.
+  const lastKnownActivityRef = useRef<{
+    phase: ConversationState;
+    elapsedSecondsAtDisconnect: number;
+    // REQ-WPV-007: whether the live label was `streaming` (first byte had
+    // landed) at the moment we degraded. Without this the frozen "last: …"
+    // line regresses to "awaiting LLM response Ns" even though tokens were
+    // already flowing when the connection dropped.
+    wasStreaming: boolean;
+  } | null>(null);
+  const connectionHealthy =
+    connectionState === 'connected' || connectionState === 'reconnected';
+  useEffect(() => {
+    if (connectionHealthy) {
+      // Healthy connection — drop any frozen snapshot so the live
+      // path takes over again.
+      lastKnownActivityRef.current = null;
+      return;
+    }
+    // Degraded — capture iff we were working at the moment we
+    // degraded and we don't already have a snapshot for this
+    // degraded window.
+    if (
+      lastKnownActivityRef.current == null &&
+      phaseIsWorking &&
+      phaseStateUpdatedAt != null
+    ) {
+      const wasStreaming =
+        (convState.type === 'llm_requesting' ||
+          convState.type === 'seeded_llm_requesting' ||
+          convState.type === 'awaiting_llm') &&
+        firstByteRequestId != null;
+      lastKnownActivityRef.current = {
+        phase: convState,
+        elapsedSecondsAtDisconnect: Math.max(
+          0,
+          Math.floor((Date.now() - phaseStateUpdatedAt) / 1000)
+        ),
+        wasStreaming,
+      };
+    }
+    // No-op on subsequent renders during the same degraded window —
+    // the snapshot is by-construction frozen.
+  }, [connectionHealthy, phaseIsWorking, phaseStateUpdatedAt, convState, firstByteRequestId]);
 
   // Close model picker on outside click
   useEffect(() => {
@@ -336,11 +476,52 @@ export function StateBar({
   let dotClass = 'dot';
   let stateText = '';
 
+  // REQ-WPV-003 / REQ-LRV-001: when a retry has fired this turn, append
+  // "(retry K/N after <reason>)" to the base reason. Returns "" when no
+  // retry context exists. Leading space so the suffix concatenates
+  // cleanly onto either the live or the frozen-last-known reason.
+  const retrySuffix =
+    turnRetryContext != null
+      ? ` (retry ${turnRetryContext.attempt}/${turnRetryContext.maxAttempts} after ${turnRetryContext.reasonText})`
+      : '';
+
+  // Format the working-phase reason as "<base> Ns <retry?>" (e.g.
+  // "awaiting LLM response 4s (retry 2/3 after rate limit)",
+  // "running bash 12s") for use in both the live and the frozen-last-
+  // known-activity paths below.
+  const formatWorkingReason = (
+    phase: ConversationState,
+    elapsedSeconds: number,
+    streaming = false
+  ): string => {
+    // REQ-WPV-007: mirror the live path — if the first byte had landed,
+    // the label is `streaming` (no elapsed counter), with the retry suffix
+    // carried through. Used for the frozen last-known-activity display so a
+    // mid-stream disconnect doesn't regress to "awaiting LLM response Ns".
+    if (streaming) {
+      return `streaming${retrySuffix}`;
+    }
+    // Strip a trailing `...` from the base label: descriptions for
+    // working phases (`llm_requesting` → "awaiting LLM response...")
+    // already end in an ellipsis. Appending `... <elapsed>` directly
+    // would produce "awaiting LLM response... ... 7s".
+    const base = getStateDescription(phase).replace(/\.{3}$/, '');
+    const withElapsed =
+      elapsedSeconds > 0 ? `${base} ... ${formatElapsed(elapsedSeconds)}` : base;
+    return `${withElapsed}${retrySuffix}`;
+  };
+
   if (!conversation) {
     dotClass += ' hidden';
     stateText = '';
+  } else if (watchdogStale) {
+    // REQ-WPV-004: degraded-signal indicator overrides every working-
+    // state message. The user needs to know the channel is suspect
+    // before they trust further detail.
+    dotClass += ' degraded';
+    stateText = `no signal from server for ${formatElapsed(watchdogSeconds)}`;
   } else {
-    // Determine dot and text based on connection state first
+    // Determine dot and text based on connection state first.
     switch (connectionState) {
       case 'disconnected':
         dotClass += ' connecting';
@@ -352,15 +533,43 @@ export function StateBar({
         stateText = 'connecting...';
         break;
 
-      case 'reconnecting':
+      case 'reconnecting': {
+        // REQ-WPV-005: don't mask agent activity. If we were working
+        // when we degraded, show both the connection chip AND the
+        // last-known agent activity with its elapsed FROZEN at
+        // disconnect (honest about what we don't know — the agent
+        // may or may not still be doing the thing).
         dotClass += ' reconnecting';
-        stateText = `reconnecting (${connectionAttempt})...`;
+        const snap = lastKnownActivityRef.current;
+        if (snap) {
+          stateText = `reconnecting (${connectionAttempt}) — last: ${formatWorkingReason(
+            snap.phase,
+            snap.elapsedSecondsAtDisconnect,
+            snap.wasStreaming
+          )}`;
+        } else {
+          stateText = `reconnecting (${connectionAttempt})...`;
+        }
         break;
+      }
 
-      case 'offline':
+      case 'offline': {
+        // Same composition as reconnecting; the connection-chip text
+        // changes from "reconnecting (N)" to "offline" but the
+        // last-known activity is still surfaced when we have it.
         dotClass += ' offline';
-        stateText = 'offline';
+        const snap = lastKnownActivityRef.current;
+        if (snap) {
+          stateText = `offline — last: ${formatWorkingReason(
+            snap.phase,
+            snap.elapsedSecondsAtDisconnect,
+            snap.wasStreaming
+          )}`;
+        } else {
+          stateText = 'offline';
+        }
         break;
+      }
 
       case 'reconnected':
         dotClass += ' reconnected';
@@ -385,7 +594,11 @@ export function StateBar({
             break;
           case 'awaiting_user_response':
             dotClass += ' approval';
-            stateText = 'awaiting response';
+            // "your reply" disambiguates from `awaiting LLM response`
+            // (the llm_requesting label). Both surface in the same
+            // StateBar slot; the prose has to make clear who the user
+            // is waiting on.
+            stateText = 'awaiting your reply';
             break;
           case 'error':
             dotClass += ' error';
@@ -399,11 +612,33 @@ export function StateBar({
           case 'awaiting_sub_agents': case 'awaiting_continuation':
           case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
           case 'awaiting_recovery':
+            // REQ-WPV-001/003: elapsed counter is keyed off the
+            // server-authoritative `phaseStateUpdatedAt`, so every
+            // working phase gets a live "<reason> Ns" display (not
+            // just tool_executing). The previous tool-only counter
+            // is retained on the tool widget header itself via
+            // `toolExecutingStartedAt`.
             dotClass += ' working';
-            if (convState.type === 'tool_executing' && toolElapsedSeconds > 0) {
-              stateText = `${getStateDescription(convState)} ... ${formatElapsed(toolElapsedSeconds)}`;
+            // REQ-WPV-007: once the first byte for the current LLM
+            // request lands, switch the base reason from `awaiting LLM response Ns`
+            // to `streaming` (no counter — the stream itself is the
+            // progress signal). The transition applies only while
+            // the phase is one of the llm_requesting family; tool/
+            // sub-agent phases retain their elapsed counter.
+            if (
+              (convState.type === 'llm_requesting' ||
+                convState.type === 'seeded_llm_requesting' ||
+                convState.type === 'awaiting_llm') &&
+              firstByteRequestId != null
+            ) {
+              // REQ-WPV-003: retry suffix carries through every working
+              // phase, including streaming. A turn that retried once and
+              // is now streaming should still surface "(retry 2/3 …)"
+              // so the user has the full context for "why has this
+              // taken so long?".
+              stateText = `streaming${retrySuffix}`;
             } else {
-              stateText = getStateDescription(convState);
+              stateText = formatWorkingReason(convState, phaseElapsedSeconds);
             }
             break;
           default: convState satisfies never;

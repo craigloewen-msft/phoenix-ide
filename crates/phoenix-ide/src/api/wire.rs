@@ -289,9 +289,43 @@ pub enum SseWireEvent {
         #[ts(type = "unknown")]
         state: Value,
         presentation_mode: String,
+        /// Server clock at which the conversation entered this state — the
+        /// same `Conversation.state_updated_at: DateTime<Utc>` value the
+        /// runtime bumps on every state transition. RFC3339 on the wire,
+        /// matching the existing Init carrier (which carries the same
+        /// field via `#[serde(flatten)]` on `EnrichedConversation`); the
+        /// client converts to ms once at the SSE-handler boundary.
+        ///
+        /// Specs: `specs/working-phase-visibility/` REQ-WPV-001.
+        state_updated_at: DateTime<Utc>,
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         error: Option<ErrorPresentation>,
+    },
+    /// First-byte marker: emitted exactly once per LLM request,
+    /// immediately before the first `Token` event for the same
+    /// `request_id`. Drives the `StateBar`'s `awaiting LLM response Ns`
+    /// → `streaming` transition. Spec:
+    /// `specs/working-phase-visibility/` REQ-WPV-007.
+    LlmFirstByte {
+        sequence_id: i64,
+        request_id: String,
+    },
+    /// Retry-context marker: emitted from the executor's
+    /// `Effect::ScheduleRetry` handler immediately before the spawned
+    /// backoff sleep. Drives the `StateBar`'s `(retry K/N <reason>)`
+    /// suffix per specs/working-phase-visibility/ REQ-WPV-003 and
+    /// specs/llm-retry-visibility/. Replays via the ephemeral SSE ring
+    /// so mid-backoff reconnects reconstruct the suffix.
+    LlmAttempt {
+        sequence_id: i64,
+        attempt: u32,
+        max_attempts: u32,
+        reason: crate::llm::LlmAttemptReason,
+        backing_off_ms: u64,
+        #[ts(optional)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resets_at: Option<DateTime<Utc>>,
     },
     /// Ephemeral streaming token (LLM delta).
     Token {
@@ -362,6 +396,8 @@ impl SseWireEvent {
             SseWireEvent::Message { .. } => "message",
             SseWireEvent::MessageUpdated { .. } => "message_updated",
             SseWireEvent::StateChange { .. } => "state_change",
+            SseWireEvent::LlmFirstByte { .. } => "llm_first_byte",
+            SseWireEvent::LlmAttempt { .. } => "llm_attempt",
             SseWireEvent::Token { .. } => "token",
             SseWireEvent::AgentDone { .. } => "agent_done",
             SseWireEvent::ConversationBecameTerminal { .. } => "conversation_became_terminal",
@@ -436,15 +472,39 @@ impl From<SseEvent> for SseWireEvent {
                 sequence_id,
                 state,
                 presentation_mode,
+                state_updated_at,
             } => {
                 let error = state.error_kind().map(ErrorPresentation::from_kind);
                 SseWireEvent::StateChange {
                     sequence_id,
                     state: serde_json::to_value(&state).unwrap_or(Value::Null),
                     presentation_mode,
+                    state_updated_at,
                     error,
                 }
             }
+            SseEvent::LlmFirstByte {
+                sequence_id,
+                request_id,
+            } => SseWireEvent::LlmFirstByte {
+                sequence_id,
+                request_id,
+            },
+            SseEvent::LlmAttempt {
+                sequence_id,
+                attempt,
+                max_attempts,
+                reason,
+                backing_off_ms,
+                resets_at,
+            } => SseWireEvent::LlmAttempt {
+                sequence_id,
+                attempt,
+                max_attempts,
+                reason,
+                backing_off_ms,
+                resets_at,
+            },
             SseEvent::Token {
                 sequence_id,
                 text,

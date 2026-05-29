@@ -33,6 +33,7 @@ use crate::db::{ConvMode, Database};
 use crate::llm::ModelRegistry;
 use crate::state_machine::{ConvContext, ConvState, Event};
 use crate::system_prompt::ModeContext;
+use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -756,6 +757,11 @@ pub enum SseEvent {
         state: ConvState,
         /// Presentation mode for UI display (`idle`/`working`/`needs_action`/`error`/`done`)
         presentation_mode: String,
+        /// Server clock at which the conversation entered this state — the
+        /// same `Conversation.state_updated_at` value the runtime bumps on
+        /// every state transition. Specs: `specs/working-phase-visibility/`
+        /// REQ-WPV-001.
+        state_updated_at: DateTime<Utc>,
     },
     /// Ephemeral streaming token. Not persisted, but still carries a
     /// `sequence_id` from the same counter so reconnects don't strand tokens
@@ -765,6 +771,51 @@ pub enum SseEvent {
         sequence_id: i64,
         text: String,
         request_id: String,
+    },
+    /// Emitted exactly once per LLM request immediately before the first
+    /// `Token` event for that request, so the client can transition the
+    /// `StateBar`'s base reason from `awaiting LLM response Ns` (pre-first-byte)
+    /// to `streaming` (post-first-byte) per REQ-WPV-007. NOT emitted
+    /// when an LLM request completes with zero tokens (errors, early
+    /// termination). Spec: `specs/working-phase-visibility/`.
+    LlmFirstByte {
+        sequence_id: i64,
+        /// Matches the `request_id` carried on `Token` events for the same
+        /// LLM request, so the client can correlate the first-byte
+        /// transition with the right `StateBar` phase.
+        request_id: String,
+    },
+    /// Retry-context marker emitted from the executor's
+    /// `Effect::ScheduleRetry` handler immediately before the spawned
+    /// backoff sleep. Carries everything the `StateBar`'s retry suffix
+    /// needs — `(retry K/N <reason>)` per
+    /// specs/working-phase-visibility/ REQ-WPV-003 — so the user can
+    /// distinguish "rate-limit retry storm" from a wedged server during
+    /// the otherwise-silent backoff window. Replays via the ephemeral
+    /// SSE ring so mid-backoff reconnects reconstruct the suffix.
+    /// Specs: `specs/llm-retry-visibility/`, REQ-LRV-001 .. REQ-LRV-003.
+    LlmAttempt {
+        sequence_id: i64,
+        /// 1-indexed attempt this retry is scheduled FOR; matches the
+        /// `state.attempt` carried on the next `StateChange`.
+        attempt: u32,
+        /// Retry-budget ceiling (`MAX_RETRY_ATTEMPTS` from the state
+        /// machine — currently 3). Carried per-event so a future
+        /// per-provider policy is wire-compatible without a spec change.
+        max_attempts: u32,
+        /// Classified reason — one of `rate_limit`, `server_error`,
+        /// `network` (the retryable subset of `LlmErrorKind`).
+        reason: crate::llm::LlmAttemptReason,
+        /// `delay` from `Effect::ScheduleRetry`, in milliseconds.
+        /// Informational at v1 (the client doesn't count down); the
+        /// field exists so a future "backing off Ns" sub-display can be
+        /// added without a wire change.
+        backing_off_ms: u64,
+        /// Upstream quota window reset timestamp when the rate-limit
+        /// response included one (`None` for `server_error` / `network`
+        /// retries and for `rate_limit` retries whose 429 lacked a
+        /// `resets_at`). RFC3339 string on the wire.
+        resets_at: Option<chrono::DateTime<chrono::Utc>>,
     },
     AgentDone {
         sequence_id: i64,
@@ -1460,7 +1511,7 @@ impl RuntimeManager {
 
         // Determine initial state: check if conversation needs auto-continuation
         // REQ-BED-007 says resume from idle, but we need to handle interrupted turns
-        let (initial_state, needs_auto_continue) =
+        let (initial_state, initial_state_updated_at, needs_auto_continue) =
             self.determine_resume_state(conversation_id).await?;
 
         let runtime: ProductionRuntime = ConversationRuntime::new(
@@ -1478,6 +1529,7 @@ impl RuntimeManager {
             event_tx.clone(),
             broadcaster.clone(),
         )
+        .with_state_updated_at(initial_state_updated_at)
         .with_steering_queue(conv.steering_queue)
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
         .with_task_handoff_channel(self.handoff_tx.clone())
@@ -1736,10 +1788,19 @@ impl RuntimeManager {
     ///
     /// Delegates to `recovery::should_auto_continue` for the actual logic.
     /// See that module for comprehensive tests.
+    ///
+    /// Returns `(state, state_updated_at, needs_auto_continue)`. The
+    /// `state_updated_at` is the row's value when the resumed state matches
+    /// the persisted row, or `Utc::now()` when auto-continue synthesises a
+    /// different state (whose entry time is resume-time). The executor uses
+    /// it to seed `ConversationRuntime.state_updated_at` so the first
+    /// post-resume `SseEvent::StateChange` carries the real entry time, not
+    /// the runtime-construction time (specs/working-phase-visibility/
+    /// REQ-WPV-001).
     async fn determine_resume_state(
         &self,
         conversation_id: &str,
-    ) -> Result<(ConvState, bool), String> {
+    ) -> Result<(ConvState, DateTime<Utc>, bool), String> {
         // States that survive restart (preserved by reset_all_to_idle) must be
         // restored from the DB, not derived from message history. The recovery
         // heuristic only applies to transient states that were reset to Idle.
@@ -1748,6 +1809,8 @@ impl RuntimeManager {
             .get_conversation(conversation_id)
             .await
             .map_err(|e| e.to_string())?;
+
+        let row_state_updated_at = conv.state_updated_at;
 
         match &conv.state {
             ConvState::AwaitingTaskApproval { .. }
@@ -1761,7 +1824,7 @@ impl RuntimeManager {
                     state = ?std::mem::discriminant(&conv.state),
                     "Restoring persisted state (survives restart)"
                 );
-                return Ok((conv.state, false));
+                return Ok((conv.state, row_state_updated_at, false));
             }
             _ => {}
         }
@@ -1789,7 +1852,24 @@ impl RuntimeManager {
             );
         }
 
-        Ok((decision.state, decision.needs_auto_continue))
+        // When auto-continue synthesises a resume state that differs from the
+        // persisted (restart-reset) row state, its entry time is *now* — the
+        // synthesised phase is entered at resume, not whenever the row was
+        // last written. Seeding the row's stamp would make the client's
+        // elapsed counter (REQ-WPV-001) run from the prior state's time
+        // (potentially hours, for a long-interrupted conversation). When the
+        // decision leaves the state unchanged, the row stamp is the true
+        // entry time.
+        let resume_state_updated_at = if decision.state == conv.state {
+            row_state_updated_at
+        } else {
+            Utc::now()
+        };
+        Ok((
+            decision.state,
+            resume_state_updated_at,
+            decision.needs_auto_continue,
+        ))
     }
 
     /// Get the database handle

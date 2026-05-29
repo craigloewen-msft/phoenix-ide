@@ -1,0 +1,266 @@
+# Working-Phase Visibility
+
+## User Story
+
+As a user watching a Phoenix conversation, I need to always have an accurate,
+specific idea of what the agent is doing right now — distinguishing a
+long-running tool from a slow LLM call from a wedged server — so that I can
+decide whether to wait, cancel, or intervene. The current spinner-with-no-
+information UI fails this test: a 45-second silence could mean any of those
+things, and I have no way to tell.
+
+## Background
+
+The conversation runtime exposes "phases" via `SseWireEvent::StateChange`:
+`llm_requesting`, `tool_executing`, `awaiting_sub_agents`, and others. Today
+the UI's `StateBar` collapses every working phase into a generic spinner with
+a phase-name label. There is no elapsed-time indicator on most phases (only
+`tool_executing` has one, added ad-hoc in the `toolElapsedSeconds` pattern in `StateBar.tsx`), no
+indication when streaming has begun versus when we're still waiting for the
+first byte, no indication when the SSE stream has gone silent, and the
+StateBar masks the agent's last-known activity entirely whenever the
+connection state is anything other than `connected`.
+
+This spec covers the UI-side observability of working phases. The retry/
+backoff sub-system that generates additional context to display is specified
+separately in `specs/llm-retry-visibility/` and consumed here as a modifier
+on the displayed activity (REQ-WPV-003).
+
+## Requirements
+
+### REQ-WPV-001: Server-Authoritative Phase Entry Timestamp
+
+WHEN the conversation transitions to a new state
+THE SYSTEM SHALL include `state_updated_at` in the `StateChange` SSE
+event — sourced from the existing `Conversation.state_updated_at:
+DateTime<Utc>` field the runtime already bumps on every transition
+
+WHEN an SSE stream is opened (or reconnects)
+THE SYSTEM SHALL include `state_updated_at` in the `Init` snapshot,
+already carried at the top level of `init.conversation` via the
+`#[serde(flatten)]` on `EnrichedConversation`
+
+**Wire format:** Both carriers serialise the field as the default
+`DateTime<Utc>` shape (RFC3339 string, e.g.
+`"2026-05-25T20:24:36.123Z"`), NOT as a unix-ms integer. The client
+converts to ms-since-epoch once at the SSE-handler boundary (a single
+`Date.parse(s)` call) and stores the integer form in the conversation
+atom; every downstream consumer reads an integer. The wire is uniform
+across Init and StateChange because both fields come from the same
+serde-flattened `Conversation.state_updated_at` — there is no parallel
+integer-typed representation.
+
+**Rationale:** Elapsed-time displays must survive reconnect, page reload,
+and multi-tab observation. A client-derived timestamp at event-arrival
+time fails all three (timer resets on reconnect, drifts under network
+jitter, and diverges across tabs viewing the same conversation).
+Server-authoritative `state_updated_at` makes the elapsed time a pure
+function of `now() - state_updated_at`, deterministic and consistent.
+Reusing the existing `Conversation.state_updated_at` (rather than
+introducing a parallel `entered_at` field) avoids parallel representation
+of the same semantic value.
+
+---
+
+### REQ-WPV-002: Inline Elapsed-Time Indicator on In-Flight Artifacts
+
+WHEN a tool's execution is in flight (the tool-use block exists but no
+tool-result block has been persisted)
+THE SYSTEM SHALL render an elapsed-time indicator on the tool widget itself,
+ticking at one-second resolution
+
+WHEN the agent is in `llm_requesting` and no tokens have arrived yet
+THE SYSTEM SHALL render a placeholder assistant message bubble with the
+current elapsed time
+
+WHEN tokens begin arriving for that bubble
+THE SYSTEM SHALL replace the elapsed-time placeholder with the streaming text
+without unmounting/remounting the bubble (continuous visual identity)
+
+**Rationale:** The StateBar is a global summary that can scroll out of the
+user's field of view. The activity the user is watching for — "is this
+specific tool/turn making progress?" — should be visible at the point of
+expectation, not only in a header. Information at the point of expectation is
+the project's "information density, not minimalism" UI principle applied
+here.
+
+---
+
+### REQ-WPV-003: StateBar Activity Derivation Rule
+
+WHEN deriving the StateBar's working-phase text
+THE SYSTEM SHALL combine a **base reason** (derived from the conversation
+phase) with an optional **retry modifier** (derived from the most recent
+unresolved `LlmAttempt` event for this turn; see
+`specs/llm-retry-visibility/`)
+
+WHEN multiple potential live timers exist for a single phase
+THE SYSTEM SHALL display exactly one elapsed-time counter in the StateBar,
+selected by the precedence:
+1. The base reason's own timer (`now() - phase.state_updated_at`)
+2. NOT layered with any other timer (the inline-artifact timer in REQ-WPV-002
+   covers per-artifact granularity)
+
+**Rationale:** A reliable indicator is a *specific* indicator. Layering
+multiple counters compounds into noise; the user reads "one number,
+explained" faster than three numbers in different units. Retry is a modifier
+on the base state, not a replacement, because the question "what's it doing
+right now?" still has its primary answer in the phase (awaiting LLM response,
+waiting on a tool, etc.) and the question "why is it taking this long?" is the
+secondary answer that the modifier addresses.
+
+**Format examples (illustrative, not normative wire syntax):**
+- `awaiting LLM response 4s`
+- `awaiting LLM response 4s (retry 2/5 after rate limit)`
+- `executing bash 12s`
+- `executing bash 12s (retry 2/5)` *(when a tool itself didn't retry but the
+  surrounding turn did before reaching this tool — display the most recent
+  unresolved retry context)*
+- `backing off 4s (retry 2/5 after rate limit)`
+
+---
+
+### REQ-WPV-004: Heartbeat Watchdog
+
+GIVEN the SSE connection state is `connected` AND the conversation phase is
+any working phase
+WHEN no SSE event observable to the client `EventSource` has arrived for
+`HEARTBEAT_WATCHDOG_SECONDS` (default 35)
+THE SYSTEM SHALL surface a degraded-signal indicator in the StateBar:
+"no signal from server for Ns"
+
+WHEN any SSE event subsequently arrives
+THE SYSTEM SHALL clear the degraded-signal indicator immediately
+
+**Prerequisite:** The server keep-alive is currently emitted as an SSE
+comment line (`: ping\n\n`, see `api/sse.rs:71` / `handlers.rs`), and
+standard `EventSource` does NOT fire any handler for comments. For this
+requirement to be implementable as written, the keep-alive MUST be switched
+to a typed event with a **non-empty** `data` field
+(`event: ping\ndata: ping\n\n`) so the client `EventSource` observes it
+via an explicit `ping` listener. Empty-data events are dropped by the
+browser (per axum's `Event::data` docs); the listener bumps
+`lastSseEventAt` and discards the body. This switch is owned by
+design.md ("Server keep-alive observation") and is forward-compatible:
+clients that don't listen for `ping` simply ignore it.
+
+**Rationale:** TCP-level connection health is not the same as application-
+level liveness; a wedged server can hold the SSE socket open indefinitely.
+The keep-alive interval is 15s; `HEARTBEAT_WATCHDOG_SECONDS = 35` gives
+~2.3x headroom so a single missed keep-alive does not trigger a false
+positive. The threshold is for "no client-observable event of any kind"
+(typed `ping` events count) — a long LLM stream that is in fact sending
+tokens does not trigger it.
+
+---
+
+### REQ-WPV-005: Connection State Does Not Mask Agent State
+
+WHEN the SSE connection state is `reconnecting` or `offline` during a working
+phase
+THE SYSTEM SHALL display BOTH the connection state AND the last-known agent
+activity:
+- Connection chip: `reconnecting (N)`
+- Last-known agent activity, with elapsed time **frozen at disconnect**:
+  `last: awaiting LLM response 12s`
+
+WHEN the connection re-establishes
+THE SYSTEM SHALL resume live derivation from the (possibly new) phase carried
+in the next `Init` snapshot
+
+**Rationale:** A user whose connection blips mid-LLM-call needs to know that
+the long wait they're observing is a connection problem *and* what the agent
+was doing when it started. Freezing the elapsed counter (rather than
+continuing to count forward through the disconnect) is honest: we *do not
+know* whether the server is still working, so an active counter would be
+misleading. The "last:" prefix communicates that this is stale data.
+
+---
+
+### REQ-WPV-006: REMOVED
+
+Originally specified a synthetic placeholder assistant bubble during the
+pre-first-byte `llm_requesting` window. Removed after empirical review:
+the bubble's text content (`awaiting LLM response Ns` + retry suffix)
+exactly duplicated the StateBar's text (REQ-WPV-003), which is a
+fixed-position chrome element always visible regardless of scroll. The
+spec's original rationale claimed the StateBar "can scroll out of the
+user's field of view" — that premise was wrong. Without unique
+information value, the bubble's only contribution was a spatial anchor,
+which did not justify the cost of an extra render unit, a tail-unit
+component, and the React/Virtuoso reconciliation work to make
+pre-first-byte → streaming a continuous-identity transition (which the
+prior implementation did NOT achieve — see the PR thread that led to
+removal).
+
+The pre-first-byte phase is still surfaced to the user via the
+StateBar's `awaiting LLM response Ns` text (REQ-WPV-003 / REQ-WPV-007).
+
+---
+
+### REQ-WPV-007: First-Byte Sub-Phase Distinction
+
+WHEN the first token of an LLM response arrives over the SSE stream
+THE SYSTEM SHALL transition the displayed base reason from `awaiting LLM response Ns`
+(pre-first-byte) to `streaming` (post-first-byte), without resetting the
+phase elapsed timer
+
+WHEN displaying `streaming`
+THE SYSTEM SHALL NOT show an elapsed counter (the stream itself is visible
+progress; an additional counter is redundant)
+
+**Rationale:** "Thinking" and "streaming" feel identical to the user today
+because they share a phase (`llm_requesting`). The user-meaningful boundary
+is the first byte: pre-first-byte the user has no signal of life, post-
+first-byte the text itself is the signal. Splitting the display reduces the
+window in which "awaiting LLM response..." can hide a real problem.
+
+---
+
+### REQ-WPV-008: Display Continuity Across Reload
+
+GIVEN a user reloads the page mid-working-phase
+AND the `Init` payload carries `pending_truncated = false` (the SSE
+replay ring did not overflow since the last anchor — see
+`specs/sse_wire/sse_wire.allium`)
+THE SYSTEM SHALL reconstruct the inline and StateBar indicators from `Init`
+such that elapsed times match (within one second) what they would have
+shown on a continuously-connected client
+
+GIVEN a user reloads the page mid-working-phase
+AND the `Init` payload carries `pending_truncated = true`
+THE SYSTEM SHALL display the phase-level StateBar indicator (which
+reconstructs cleanly from the always-present `conversation.state` +
+`conversation.state_updated_at` fields) AND a degraded notice in place
+of the per-artifact inline indicators: "reload truncated — in-flight
+detail will reappear at the next checkpoint"
+
+**Rationale:** Acceptance-criterion expression of REQ-WPV-001 + REQ-WPV-005.
+The truncated-replay exception is necessary because pending_truncated=true
+means Phoenix intentionally sent an empty pending-event list and the DB
+snapshot lacks the eager assistant/tool-use blocks until the tool round
+checkpoint completes (see `specs/sse_wire/sse_wire.allium`'s
+`pending_truncated` semantics). Reconstructing the inline indicators
+within one second is not possible in that case; the spec is explicit
+about the degradation so implementers don't silently render stale data
+or empty timers. Listed separately because it is the integration-test
+target.
+
+---
+
+## Out of Scope
+
+- Persisting the elapsed time *after* a phase exits (we display live elapsed
+  while in-phase; on exit, the existing duration metadata on tool results
+  and the post-hoc retry badge from `llm-retry-visibility` cover the audit
+  trail).
+- A retry-attempt event log queryable from the UI ("show all retries for
+  this turn"). The `(retried 2x)` badge from `llm-retry-visibility` and the
+  server-side logs cover diagnostics needs at v1; richer surfacing is
+  deferred.
+- Multiple parallel tool executions in a single assistant message. The
+  existing model is sequential tool dispatch within a turn. If parallel
+  execution arrives, the inline per-tool timers (REQ-WPV-002) already key
+  off per-tool started_at and will continue to work.
+- Cross-conversation aggregate dashboards ("which conversations have stuck
+  agents").

@@ -83,13 +83,46 @@ value InitSnapshot {
 -- event was first emitted — that is, the entry's seq is the one the
 -- client's reducer rules will see if/when the entry replays via init.
 --
--- `event_type` matches the SseWireEvent's `type` discriminator
--- ("token", "state_change", "message", "message_updated",
--- "agent_done", "conversation_update", "conversation_became_terminal",
--- "error", "browser_session_state", "steer_message_queued"). Init
--- itself is never in the ring (init is per-subscriber, never
--- broadcast). ConversationHardDeleted is excluded by construction (a
--- deleted conversation cannot subsequently receive a subscribe).
+-- `event_type` matches the SseWireEvent's `type` discriminator. The
+-- full set defined by `crates/phoenix-ide/src/api/wire.rs::event_type`
+-- is:
+--   "init", "message", "message_updated", "state_change", "token",
+--   "agent_done", "conversation_became_terminal",
+--   "conversation_update", "error", "browser_session_state",
+--   "steer_message_queued", "rate_limit_snapshot",
+--   "conversation_hard_deleted", "llm_first_byte", "llm_attempt"
+--
+-- Ring eligibility (which events can appear as a PendingEventEntry):
+--   - "message" enters the ring via the eager-assistant path
+--     (EagerAssistantMessageAppendedToReplayRing below).
+--   - "token", "state_change", "message_updated", "agent_done",
+--     "conversation_update", "conversation_became_terminal",
+--     "error", "browser_session_state", "steer_message_queued",
+--     "rate_limit_snapshot", "llm_first_byte", "llm_attempt" enter
+--     via the ephemeral path (EphemeralEventAppendedToReplayRing
+--     below). All non-Message broadcasts go through
+--     `SseBroadcaster::send_seq`, which unconditionally appends to
+--     the ring (`runtime.rs::send_with_ring` with `RingOp::Append`).
+--   - Excluded entirely:
+--     - "init" (per-subscriber, never broadcast)
+--     - "conversation_hard_deleted" (terminal; no subsequent init
+--       can fire, so replay is moot)
+--
+-- Note on `rate_limit_snapshot` replay: the snapshot represents a
+-- point-in-time codex quota state, so a stale snapshot replayed on
+-- reconnect can paint the UI's quota chip with data that has since
+-- been superseded. The runtime currently accepts that staleness in
+-- exchange for the structural simplicity of "all broadcasts ride the
+-- ring." A future change could add a `send_seq_no_ring` broadcaster
+-- variant for genuinely-point-in-time events (snapshots, mid-stream
+-- diagnostics); flagged here so a future review can revisit it. Until
+-- then the whitelist and the broadcaster agree that
+-- "rate_limit_snapshot" replays.
+--
+-- Distinguish from "llm_attempt" on rationale (the per-retry
+-- context's reconnect preservation is load-bearing for the StateBar's
+-- retry suffix display per specs/llm-retry-visibility/ REQ-LRV-007;
+-- the snapshot replay is acceptable but not load-bearing).
 --
 -- `payload` is opaque at this level — it is whatever the wire-format
 -- carries for that event_type. The replay path serialises the entry
@@ -454,12 +487,77 @@ rule PersistedMessageClearsReplayRing {
         -- client's pending replay path).
 }
 
+-- ============================================================
+-- Cross-spec checklist — when adding a new SseWireEvent variant
+-- ============================================================
+-- The wire envelope is consumed by multiple specs and code paths.
+-- A new variant landed in only some of them silently degrades the
+-- guarantees the others depend on. When adding a variant, update
+-- ALL of the following in the same change:
+--
+-- 1. crates/phoenix-ide/src/api/wire.rs
+--    - Add the variant to enum SseWireEvent
+--    - Add its event-type discriminator to event_type()
+--    - Add a parity test entry under parity_*
+-- 2. crates/phoenix-ide/src/runtime.rs (SseEvent)
+--    - Add the matching runtime-side variant and From<SseEvent>
+--      conversion to SseWireEvent
+-- 3. ui/src/sseSchemas.ts
+--    - Add a valibot schema for the new variant
+--    - Wire it through the SSE-event reducer dispatch
+-- 4. ui/src/hooks/useConnection.ts (or wherever the EventSource
+--    listeners are registered)
+--    - Register an explicit listener for the new event name; the
+--      native EventSource has no wildcard for named events, so a
+--      missing listener silently drops the event on the client
+--      AND breaks the heartbeat-watchdog's lastSseEventAt bump
+--      (see specs/working-phase-visibility/, "EventSource listener
+--      wiring (required)" in design.md)
+-- 5. THIS spec (sse_wire.allium)
+--    - EphemeralEventAppendedToReplayRing.event_type whitelist below
+--    - PendingEventEntry's event_type comment block (~L87)
+--    - The replay-ordering invariants if the variant has ordering
+--      semantics that interact with token/Message
+-- 6. specs/conversation_atom/conversation_atom.allium
+--    - Add a reducer rule for the new event's effect on the atom,
+--      OR document it as ephemeral with no atom impact
+-- 7. specs/sse_wire/sse_wire.allium and any consumer spec that
+--    enumerates event types — search with: grep -rn "'token'" specs/
+--
+-- Audit pattern:
+--   grep -rn "'<new_event_name>'\\|\"<new_event_name>\"" specs/ crates/ ui/
+--
+-- Missing any step is a structural bug, not a polish item. A
+-- forgotten replay-ring whitelist entry (item 5) means the new event
+-- replays on reconnect for some clients but not others; a forgotten
+-- listener registration (item 4) means the watchdog goes stale during
+-- a turn that only emits the un-registered event type.
+-- ============================================================
+
 -- Every non-Message broadcast appends to the ring. Includes:
 -- token, state_change, message_updated, agent_done, conversation_update,
 -- conversation_became_terminal, error, browser_session_state,
--- steer_message_queued. Excludes Init (per-stream, never broadcast)
--- and ConversationHardDeleted (terminal action; no subsequent init
--- can fire for this conversation, so replay is moot).
+-- steer_message_queued, rate_limit_snapshot, llm_first_byte,
+-- llm_attempt. Excludes Init (per-stream, never broadcast) and
+-- ConversationHardDeleted (terminal action; no subsequent init can
+-- fire for this conversation, so replay is moot).
+--
+-- `llm_first_byte` (introduced by specs/working-phase-visibility/)
+-- MUST replay alongside the `token` events it precedes — if a client
+-- reloads after first-byte but before the assistant Message is
+-- persisted, replaying tokens without the preceding first-byte marker
+-- leaves the pending bubble stuck in `placeholder` while text streams,
+-- violating REQ-WPV-007/008. The boundary marker shares the ring's
+-- ordering guarantees so the bubble's first_byte_seq correlation
+-- holds across replay.
+--
+-- `llm_attempt` (introduced by specs/llm-retry-visibility/) MUST
+-- replay so a client reconnecting mid-backoff reconstructs the
+-- StateBar's "(retry K/N <reason>)" suffix from the same data a
+-- continuously-connected client sees. Without replay, the next
+-- Init carries the conversation state (`LlmRequesting{attempt: 2}`)
+-- but the retry reason and resets_at are lost, violating
+-- REQ-LRV-001's reconnect-correctness rationale.
 --
 -- Append happens atomically with broadcast: the entry's seq IS the
 -- envelope seq the live subscribers receive.
@@ -469,7 +567,8 @@ rule EphemeralEventAppendedToReplayRing {
     requires: entry.event_type in {
         "token", "state_change", "message_updated", "agent_done",
         "conversation_update", "conversation_became_terminal", "error",
-        "browser_session_state", "steer_message_queued"
+        "browser_session_state", "steer_message_queued",
+        "rate_limit_snapshot", "llm_first_byte", "llm_attempt"
     }
 
     let ring = ReplayRing{conversation_id: conv_id}

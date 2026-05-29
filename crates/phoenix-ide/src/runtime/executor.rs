@@ -29,6 +29,7 @@ use crate::state_machine::{
 };
 use crate::system_prompt::{build_system_prompt, ModeContext};
 use crate::tools::{BrowserSessionManager, ToolContext};
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -158,6 +159,17 @@ where
 {
     context: ConvContext,
     state: ConvState,
+    /// Server clock at which the conversation entered `state` — initialised
+    /// from the loaded `Conversation.state_updated_at` (or `Utc::now()` for
+    /// fresh runtimes) and bumped to `Utc::now()` whenever `state` is
+    /// reassigned by `apply_transition`. Carried on every `SseEvent::StateChange`
+    /// emission so the client's elapsed-time display can derive
+    /// `now() - state_updated_at` without any per-event timestamping
+    /// (specs/working-phase-visibility/ REQ-WPV-001). This same value is
+    /// threaded into the DB write via `StateStore::update_state`, so the
+    /// persisted `Conversation.state_updated_at` and the SSE-carried value
+    /// are identical — no clock drift between the two.
+    state_updated_at: DateTime<Utc>,
     storage: S,
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
@@ -256,6 +268,7 @@ where
         Self {
             context,
             state,
+            state_updated_at: Utc::now(),
             storage,
             llm_client: Arc::new(llm_client),
             tool_executor: Arc::new(tool_executor),
@@ -301,6 +314,16 @@ where
     #[cfg(test)]
     pub fn with_parent_tool_cycle_cap(mut self, cap: u32) -> Self {
         self.parent_tool_cycle_cap = cap;
+        self
+    }
+
+    /// Override the initial `state_updated_at` from the loaded DB row so
+    /// the very first `SseEvent::StateChange` after resume carries the
+    /// real entry timestamp rather than the runtime-construction time.
+    /// New (never-persisted) conversations don't call this — the
+    /// constructor default (`Utc::now()`) is correct for them.
+    pub fn with_state_updated_at(mut self, ts: DateTime<Utc>) -> Self {
+        self.state_updated_at = ts;
         self
     }
 
@@ -726,8 +749,23 @@ where
     ) -> Result<Vec<Event>, String> {
         let mut generated_events = Vec::new();
 
-        // Update state
+        // Update state. Bump the entry timestamp on phase change so every
+        // SseEvent::StateChange the executor subsequently emits carries a
+        // fresh, server-authoritative state_updated_at
+        // (specs/working-phase-visibility/ REQ-WPV-001). `persist_state_effect`
+        // threads this same value into the DB write, so the persisted row and
+        // the SSE value match exactly.
         let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
+        // Only stamp a fresh entry time when the phase actually changes.
+        // Several events absorb as no-ops (Terminal absorbs unknown events;
+        // an empty steering drain re-enters the same state) and reach here
+        // with new_state == old_state; bumping then would reset the client's
+        // elapsed counter (REQ-WPV-001) for a phase the agent never left.
+        // No-op transitions emit no PersistState effect, so the DB row keeps
+        // its prior value too — gating here keeps the in-memory stamp in sync.
+        if self.state != old_state {
+            self.state_updated_at = Utc::now();
+        }
 
         // Log notable state transitions at INFO. "Notable" means transitions that cross
         // a meaningful phase boundary (idle↔active, entering/leaving tool execution,
@@ -875,7 +913,17 @@ where
             Event::SteerDrainedUserMessages { entries },
         )
         .map_err(|e| format!("steering drain transition failed: {e:?}"))?;
-        self.state = drain_result.new_state;
+        let drain_old_state = std::mem::replace(&mut self.state, drain_result.new_state);
+        // Same gating as apply_transition_result: only stamp a fresh entry
+        // time when the drain actually changes phase. A mid-turn drain
+        // re-enters the same LlmRequesting state and emits only PersistState
+        // (no StateChange) — bumping then would advance the persisted
+        // state_updated_at with no matching SSE, so a later reconnect would
+        // read a DB timestamp newer than any StateChange the client saw and
+        // jump the elapsed counter (REQ-WPV-001).
+        if self.state != drain_old_state {
+            self.state_updated_at = Utc::now();
+        }
         for effect in drain_result.effects {
             if let Some(gen_event) = self.execute_effect(effect).await? {
                 generated_events.push(gen_event);
@@ -896,7 +944,11 @@ where
     /// 60004) since the drain emits its own authoritative state-change.
     async fn persist_state_effect(&mut self, broadcast: bool) -> Result<Option<Event>, String> {
         self.storage
-            .update_state(&self.context.conversation_id, &self.state)
+            .update_state(
+                &self.context.conversation_id,
+                &self.state,
+                self.state_updated_at,
+            )
             .await?;
 
         if broadcast {
@@ -904,6 +956,7 @@ where
                 sequence_id: seq,
                 state: self.state.clone(),
                 presentation_mode: self.state.presentation_mode().to_string(),
+                state_updated_at: self.state_updated_at,
             });
         }
         Ok(None)
@@ -1405,7 +1458,29 @@ where
 
             Effect::ExecuteTool { tool } => self.dispatch_tool_execution(tool).await,
 
-            Effect::ScheduleRetry { delay, attempt } => {
+            Effect::ScheduleRetry {
+                delay,
+                attempt,
+                reason,
+                resets_at,
+            } => {
+                // REQ-LRV-001: surface the retry context to clients before
+                // the backoff window opens. Two sequential `send_seq`
+                // calls below (LlmAttempt → eventual StateChange/Token
+                // path on the next attempt) keep the StateBar's retry
+                // suffix in lockstep with the state machine. Emitted
+                // BEFORE the tokio sleep so a client subscribing in the
+                // backoff window observes it via the replay ring.
+                let backing_off_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::LlmAttempt {
+                    sequence_id: seq,
+                    attempt,
+                    max_attempts: crate::state_machine::transition::MAX_RETRY_ATTEMPTS,
+                    reason,
+                    backing_off_ms,
+                    resets_at,
+                });
+
                 // Typed oneshot for retry timeout
                 let outcome_tx = self.outcome_tx.clone();
                 tokio::spawn(async move {
@@ -1429,6 +1504,7 @@ where
                     sequence_id: seq,
                     state: self.state.clone(),
                     presentation_mode: self.state.presentation_mode().to_string(),
+                    state_updated_at: self.state_updated_at,
                 });
                 Ok(None)
             }
@@ -1598,6 +1674,7 @@ where
                     sequence_id: seq,
                     state: ConvState::ContextExhausted { summary },
                     presentation_mode: "needs_action".to_string(),
+                    state_updated_at: self.state_updated_at,
                 });
                 Ok(None)
             }
@@ -1759,9 +1836,27 @@ where
         let request_id_for_fwd = request_id.clone();
         let forwarder_handle = tokio::spawn(async move {
             let mut rx = chunk_rx;
+            // REQ-WPV-007: emit `SseEvent::LlmFirstByte` exactly once
+            // per request, immediately before the first `Token` event
+            // for the same `request_id`. The two events get
+            // consecutive sequence_ids from the same broadcaster, so
+            // the client cannot observe a Token without first
+            // observing the marker. If this request completes with
+            // zero text chunks (the LLM errored or terminated before
+            // emitting any), `LlmFirstByte` is NOT emitted.
+            let mut first_text_seen = false;
             loop {
                 match rx.recv().await {
                     Ok(crate::llm::TokenChunk::Text(text)) => {
+                        if !first_text_seen {
+                            first_text_seen = true;
+                            let request_id_for_first = request_id_for_fwd.clone();
+                            let _ =
+                                broadcast_tx_for_tokens.send_seq(|seq| SseEvent::LlmFirstByte {
+                                    sequence_id: seq,
+                                    request_id: request_id_for_first,
+                                });
+                        }
                         let _ = broadcast_tx_for_tokens.send_seq(|seq| SseEvent::Token {
                             sequence_id: seq,
                             text,
@@ -1937,11 +2032,94 @@ where
     /// Dispatch tool execution: resolve the tool, build the execution context,
     /// spawn the background task, and wire up the outcome channel.
     #[allow(clippy::too_many_lines)]
+    /// REQ-WPV-002: broadcast `tool_starts[tool_use_id] = now_unix_ms` on
+    /// the parent assistant message via `MessageUpdated` so the client's
+    /// tool widget can render a live elapsed counter sourced from the
+    /// server clock. The state machine is guaranteed to be in
+    /// `ToolExecuting` when `dispatch_tool_execution` fires (only
+    /// `Effect::ExecuteTool { tool }` reaches that method, and that
+    /// effect is only emitted on entry to / between tools of
+    /// `ToolExecuting`), so the destructure below is structurally safe;
+    /// the defensive `else` arm covers a hypothetical future call path.
+    ///
+    /// Why broadcast-only (no DB write): the assistant message that
+    /// owns this `tool_use` is NOT persisted yet during the tool round —
+    /// it lives in the state machine via `BroadcastAssistantMessage`
+    /// (the eager broadcast, ring-replayable per `sse_wire.allium`'s
+    /// `EagerAssistantMessageAppendedToReplayRing`) and the DB write
+    /// happens later via `PersistCheckpoint` at the end of the round.
+    /// `update_message_display_data` against an unpersisted message
+    /// row no-ops with `MessageNotFound`. The client merges the
+    /// broadcast `MessageUpdated.display_data` shallowly onto the
+    /// in-memory message — that's the entire surface the live elapsed
+    /// counter consumes (REQ-WPV-002). Once the tool result lands and
+    /// the round checkpoint persists, the message's permanent
+    /// `display_data` doesn't need `tool_starts` because the
+    /// per-result `duration_ms` (`schema.rs:649`) takes over the
+    /// display.
+    fn broadcast_tool_start_timestamp(&self, tool_use_id: &str) {
+        let assistant_message_id = match &self.state {
+            ConvState::ToolExecuting {
+                assistant_message, ..
+            }
+            | ConvState::CancellingTool {
+                assistant_message, ..
+            } => assistant_message.message_id.clone(),
+            _ => {
+                tracing::warn!(
+                    conv_id = %self.context.conversation_id,
+                    tool_use_id = %tool_use_id,
+                    state = self.state.variant_name(),
+                    "tool_starts broadcast skipped — dispatch_tool_execution called outside ToolExecuting/CancellingTool"
+                );
+                return;
+            }
+        };
+
+        // Build the patch: { "tool_starts": { <id>: <unix_ms> } }.
+        // The client's MessageUpdated reducer merges this shallowly
+        // onto the existing message's display_data, so omitting the
+        // existing bash/etc. keys is safe.
+        let now_ms = Utc::now().timestamp_millis();
+        let mut tool_starts = serde_json::Map::new();
+        tool_starts.insert(
+            tool_use_id.to_string(),
+            serde_json::Value::Number(serde_json::Number::from(now_ms)),
+        );
+        let mut patch = serde_json::Map::new();
+        patch.insert(
+            "tool_starts".to_string(),
+            serde_json::Value::Object(tool_starts),
+        );
+        let display_for_broadcast = serde_json::Value::Object(patch);
+
+        let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
+            sequence_id: seq,
+            message_id: assistant_message_id.clone(),
+            display_data: Some(display_for_broadcast),
+            content: None,
+            duration_ms: None,
+        });
+    }
+
     async fn dispatch_tool_execution(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
         // Special handling for spawn_agents tool
         if tool.name() == "spawn_agents" {
             return self.handle_spawn_agents_tool(tool).await;
         }
+
+        // REQ-WPV-002: stamp the per-tool start time into the parent
+        // assistant message's `display_data.tool_starts[tool_use_id]` map
+        // (unix ms, server-authoritative) and broadcast `MessageUpdated`
+        // so the client's tool widget can render a live elapsed counter
+        // that survives reconnect / reload / multi-tab. The runtime
+        // discovers the parent message_id by destructuring the current
+        // ToolExecuting state — the state machine guarantees we're in
+        // ToolExecuting when this method is called (the only path here
+        // is `Effect::ExecuteTool { tool }` which fires on entry to
+        // ToolExecuting). If the destructure fails it's a bug and we
+        // silently skip the stamp rather than panic.
+        self.broadcast_tool_start_timestamp(&tool.id);
 
         // Typed oneshot channel: background task gets Sender<ToolExecOutcome>,
         // physically cannot send an LlmOutcome or other type.
@@ -2410,6 +2588,7 @@ where
                             error_kind: llm_error_to_db_error(e.kind),
                             attempt: 0,
                             recovery_in_progress: e.recovery_in_progress,
+                            resets_at: e.quota.as_ref().and_then(|q| q.resets_at),
                         })
                         .await;
                 }
@@ -2428,8 +2607,13 @@ where
         let conv_id = &self.context.conversation_id;
 
         // Update state. Mode is preserved (Branch stays Branch, Work stays Work).
+        // Stamp the entry time first and thread it into the DB write so the
+        // persisted row and the Terminal SseEvent::StateChange below carry the
+        // identical value (REQ-WPV-001). `self.state` itself is not mutated
+        // because the runtime is about to exit after this function returns.
+        self.state_updated_at = Utc::now();
         self.storage
-            .update_state(conv_id, &ConvState::Terminal)
+            .update_state(conv_id, &ConvState::Terminal, self.state_updated_at)
             .await?;
         // Legitimate cwd mutation (task 13012, teardown fallback): the
         // worktree is gone by this point, but API handlers (search_files,
@@ -2462,6 +2646,7 @@ where
             sequence_id: seq,
             state: ConvState::Terminal,
             presentation_mode: ConvState::Terminal.presentation_mode().to_string(),
+            state_updated_at: self.state_updated_at,
         });
         let _ = self
             .broadcast_tx
@@ -2652,6 +2837,7 @@ where
                     priority: priority_backup,
                     plan: plan_backup,
                 };
+                self.state_updated_at = Utc::now();
 
                 // Broadcast an error so the UI knows, but don't propagate — the
                 // conversation stays in AwaitingTaskApproval for retry.
@@ -2716,6 +2902,7 @@ where
                     priority: priority_backup,
                     plan: plan_backup,
                 };
+                self.state_updated_at = Utc::now();
                 let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
                     sequence_id: seq,
                     error: crate::runtime::user_facing_error::UserFacingError::retryable(
@@ -3570,7 +3757,14 @@ fn llm_error_to_db_error(kind: crate::llm::LlmErrorKind) -> crate::db::ErrorKind
 fn llm_error_to_outcome(error: crate::llm::LlmError) -> LlmOutcome {
     use crate::llm::LlmErrorKind;
     match error.kind {
-        LlmErrorKind::RateLimit => LlmOutcome::RateLimited { retry_after: None },
+        LlmErrorKind::RateLimit => LlmOutcome::RateLimited {
+            retry_after: None,
+            // Thread `resets_at` from the upstream `QuotaDetails` when the
+            // 429 response included one. Surfaces on `SseEvent::LlmAttempt`
+            // so the retry suffix can show "(retry K/N after rate limit,
+            // resets at HH:MM)" — specs/llm-retry-visibility/.
+            resets_at: error.quota.as_ref().and_then(|q| q.resets_at),
+        },
         LlmErrorKind::UsageLimitReached => {
             // The codex parser always attaches a QuotaDetails to UsageLimitReached
             // errors; fall back to an empty payload only as a defensive measure

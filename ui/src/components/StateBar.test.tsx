@@ -1,4 +1,4 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import type { ComponentProps } from 'react';
 import { MemoryRouter } from 'react-router-dom';
@@ -78,6 +78,12 @@ function renderStateBar({
   modelContextWindow = 200_000,
   continuation,
   onSendMessage,
+  connectionState = 'connected',
+  connectionAttempt = 0,
+  phaseStateUpdatedAt,
+  lastSseEventAt,
+  firstByteRequestId,
+  turnRetryContext,
 }: {
   conversation?: Conversation;
   convState?: ComponentProps<typeof StateBar>['convState'];
@@ -85,12 +91,18 @@ function renderStateBar({
   modelContextWindow?: number;
   continuation?: ComponentProps<typeof StateBar>['continuation'];
   onSendMessage?: ComponentProps<typeof StateBar>['onSendMessage'];
+  connectionState?: ComponentProps<typeof StateBar>['connectionState'];
+  connectionAttempt?: number;
+  phaseStateUpdatedAt?: number | null;
+  lastSseEventAt?: number;
+  firstByteRequestId?: string | null;
+  turnRetryContext?: ComponentProps<typeof StateBar>['turnRetryContext'];
 } = {}) {
   const props: ComponentProps<typeof StateBar> = {
     conversation,
     convState,
-    connectionState: 'connected',
-    connectionAttempt: 0,
+    connectionState,
+    connectionAttempt,
     nextRetryIn: null,
     contextWindowUsed,
     modelContextWindow,
@@ -100,6 +112,18 @@ function renderStateBar({
   }
   if (onSendMessage) {
     props.onSendMessage = onSendMessage;
+  }
+  if (phaseStateUpdatedAt !== undefined) {
+    props.phaseStateUpdatedAt = phaseStateUpdatedAt;
+  }
+  if (lastSseEventAt !== undefined) {
+    props.lastSseEventAt = lastSseEventAt;
+  }
+  if (firstByteRequestId !== undefined) {
+    props.firstByteRequestId = firstByteRequestId;
+  }
+  if (turnRetryContext !== undefined) {
+    props.turnRetryContext = turnRetryContext;
   }
   return render(
     <MemoryRouter>
@@ -282,5 +306,287 @@ describe('StateBar manual continuation action', () => {
     fireEvent.click(screen.getByText('100k'));
 
     expect(screen.queryByRole('button', { name: /end & summarize now/i })).not.toBeInTheDocument();
+  });
+});
+
+// Working-phase indicators (REQ-WPV-001 / 003 / 004 / 005). The reducer
+// math driving these is unit-tested above; these tests pin the StateBar's
+// composition function — which combinations of (connectionState, convState,
+// phaseStateUpdatedAt, lastSseEventAt) produce which text + dot class.
+describe('StateBar working-phase indicators', () => {
+  const T_NOW = 1_700_000_000_000; // any stable wall-clock anchor
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T_NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('renders the live elapsed counter for llm_requesting (REQ-WPV-001/003)', () => {
+    // 7 seconds into the llm_requesting phase.
+    renderStateBar({
+      convState: { type: 'llm_requesting', attempt: 1 },
+      phaseStateUpdatedAt: T_NOW - 7_000,
+      lastSseEventAt: T_NOW - 1_000,
+    });
+    expect(screen.getByText(/awaiting LLM response.*7s/i)).toBeInTheDocument();
+    const dot = document.querySelector('.dot');
+    expect(dot?.className).toMatch(/working/);
+  });
+
+  // Retry-suffix composition (REQ-WPV-003 / REQ-LRV-001). The
+  // `turnRetryContext` is populated by `sse_llm_attempt` and survives
+  // intra-turn phase transitions, so the suffix appears on every
+  // working-phase rendering until agent_done / error clears it.
+  it('appends "(retry K/N after <reason>)" during llm_requesting pre-first-byte', () => {
+    renderStateBar({
+      convState: { type: 'llm_requesting', attempt: 2 },
+      phaseStateUpdatedAt: T_NOW - 5_000,
+      lastSseEventAt: T_NOW - 1_000,
+      turnRetryContext: { attempt: 2, maxAttempts: 3, reasonText: 'rate limit' },
+    });
+    expect(
+      screen.getByText(/awaiting LLM response.*5s.*\(retry 2\/3 after rate limit\)/i)
+    ).toBeInTheDocument();
+  });
+
+  it('appends the retry suffix even when first byte has arrived ("streaming (retry…)")', () => {
+    renderStateBar({
+      convState: { type: 'llm_requesting', attempt: 3 },
+      phaseStateUpdatedAt: T_NOW - 2_000,
+      lastSseEventAt: T_NOW - 200,
+      firstByteRequestId: 'req-xyz',
+      turnRetryContext: { attempt: 3, maxAttempts: 3, reasonText: 'server error' },
+    });
+    expect(screen.getByText(/^streaming \(retry 3\/3 after server error\)$/i)).toBeInTheDocument();
+  });
+
+  it('appends the retry suffix on tool_executing too (carries across intra-turn transitions)', () => {
+    renderStateBar({
+      convState: {
+        type: 'tool_executing',
+        current_tool: { id: 'bash-1', name: 'bash', input: {} },
+        remaining_tools: [],
+      },
+      phaseStateUpdatedAt: T_NOW - 12_000,
+      lastSseEventAt: T_NOW - 1_000,
+      turnRetryContext: { attempt: 2, maxAttempts: 3, reasonText: 'network error' },
+    });
+    expect(
+      screen.getByText(/\b12s.*\(retry 2\/3 after network error\)/i)
+    ).toBeInTheDocument();
+  });
+
+  it('omits the retry suffix when turnRetryContext is null', () => {
+    renderStateBar({
+      convState: { type: 'llm_requesting', attempt: 1 },
+      phaseStateUpdatedAt: T_NOW - 4_000,
+      lastSseEventAt: T_NOW - 1_000,
+      turnRetryContext: null,
+    });
+    expect(screen.queryByText(/\(retry/i)).not.toBeInTheDocument();
+  });
+
+  it('renders the live counter for non-llm working phases too (REQ-WPV-001)', () => {
+    // tool_executing is the same generalized path now.
+    renderStateBar({
+      convState: {
+        type: 'tool_executing',
+        current_tool: { id: 'bash-1', name: 'bash', input: {} },
+        remaining_tools: [],
+      },
+      phaseStateUpdatedAt: T_NOW - 12_000,
+      lastSseEventAt: T_NOW - 1_000,
+    });
+    // The state-description helper produces "running bash" or similar;
+    // we just assert the elapsed suffix is present.
+    expect(screen.getByText(/\b12s\b/)).toBeInTheDocument();
+  });
+
+  it('overrides working text with "no signal from server" when watchdog stale (REQ-WPV-004)', () => {
+    // 40s since the last observed SSE event > 35s threshold.
+    renderStateBar({
+      convState: { type: 'llm_requesting', attempt: 1 },
+      phaseStateUpdatedAt: T_NOW - 50_000,
+      lastSseEventAt: T_NOW - 40_000,
+    });
+    expect(screen.getByText(/no signal from server for 40s/i)).toBeInTheDocument();
+    const dot = document.querySelector('.dot');
+    expect(dot?.className).toMatch(/degraded/);
+  });
+
+  it('does NOT trip the watchdog when not in a working phase', () => {
+    // Even after a long silence, idle conversations are not "stuck."
+    renderStateBar({
+      convState: { type: 'idle' },
+      phaseStateUpdatedAt: T_NOW - 60_000,
+      lastSseEventAt: T_NOW - 60_000,
+    });
+    expect(screen.queryByText(/no signal from server/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/ready/i)).toBeInTheDocument();
+  });
+
+  it('does NOT trip the watchdog when the connection has already degraded', () => {
+    // Reconnecting / offline carry their own messaging; the watchdog
+    // should disarm to avoid duplicate "no signal" + "reconnecting" text.
+    renderStateBar({
+      convState: { type: 'llm_requesting', attempt: 1 },
+      connectionState: 'reconnecting',
+      connectionAttempt: 2,
+      phaseStateUpdatedAt: T_NOW - 10_000,
+      lastSseEventAt: T_NOW - 60_000, // > 35s but connection isn't healthy
+    });
+    expect(screen.queryByText(/no signal from server/i)).not.toBeInTheDocument();
+  });
+
+  it('shows BOTH connection + last-known activity during reconnecting (REQ-WPV-005)', () => {
+    // The capture happens on the connected→reconnecting transition;
+    // a single render starting in reconnecting won't have the snapshot,
+    // so this test re-renders the component to simulate the edge.
+    const { rerender } = render(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'llm_requesting', attempt: 1 }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          phaseStateUpdatedAt={T_NOW - 12_000}
+          lastSseEventAt={T_NOW - 1_000}
+        />
+      </MemoryRouter>,
+    );
+    // First render — connected, working: shows "awaiting LLM response ... 12s".
+    expect(screen.getByText(/awaiting LLM response.*12s/i)).toBeInTheDocument();
+    // Connection drops mid-working — capture snapshot, freeze elapsed.
+    rerender(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'llm_requesting', attempt: 1 }}
+          connectionState="reconnecting"
+          connectionAttempt={2}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          phaseStateUpdatedAt={T_NOW - 12_000}
+          lastSseEventAt={T_NOW - 1_000}
+        />
+      </MemoryRouter>,
+    );
+    // Now we should see "reconnecting (2) — last: awaiting LLM response ... 12s".
+    expect(screen.getByText(/reconnecting \(2\).*last.*awaiting LLM response.*12s/i)).toBeInTheDocument();
+    const dot = document.querySelector('.dot');
+    expect(dot?.className).toMatch(/reconnecting/);
+  });
+
+  // Disambiguation: llm_requesting and awaiting_user_response both
+  // previously rendered the word "awaiting response", which conflated
+  // "waiting on the LLM" with "waiting on the human user". The fix
+  // qualifies the LLM case with "LLM response" and rewrites the user
+  // case as a direct second-person address.
+  it('renders "awaiting LLM response Ns" for llm_requesting (pre-first-byte)', () => {
+    renderStateBar({
+      convState: { type: 'llm_requesting', attempt: 1 },
+      phaseStateUpdatedAt: T_NOW - 4_000,
+      lastSseEventAt: T_NOW - 1_000,
+    });
+    expect(screen.getByText(/awaiting LLM response.*4s/i)).toBeInTheDocument();
+    // Negative-case the ambiguous prose to make sure the old label
+    // can't sneak back in.
+    expect(screen.queryByText(/^awaiting response\b/i)).not.toBeInTheDocument();
+  });
+
+  it('renders "awaiting your reply" for awaiting_user_response', () => {
+    renderStateBar({
+      convState: {
+        type: 'awaiting_user_response',
+        questions: [
+          {
+            question: 'Which option?',
+            header: 'Pick one',
+            options: [{ label: 'A' }, { label: 'B' }],
+            multiSelect: false,
+          },
+        ],
+      },
+      // awaiting_user_response is not a working phase — no counter,
+      // and the prose must not mention "LLM response".
+    });
+    expect(screen.getByText(/awaiting your reply/i)).toBeInTheDocument();
+    expect(screen.queryByText(/awaiting LLM response/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^awaiting response\b/i)).not.toBeInTheDocument();
+    const dot = document.querySelector('.dot');
+    expect(dot?.className).toMatch(/approval/);
+  });
+
+  it('switches to "streaming" (no counter) once first byte arrives (REQ-WPV-007)', () => {
+    renderStateBar({
+      convState: { type: 'llm_requesting', attempt: 1 },
+      phaseStateUpdatedAt: T_NOW - 4_000,
+      lastSseEventAt: T_NOW - 1_000,
+      firstByteRequestId: 'req-abc',
+    });
+    expect(screen.getByText(/^streaming$/i)).toBeInTheDocument();
+    // The pre-first-byte "awaiting LLM response Ns" form must NOT be present once
+    // the first byte has arrived.
+    expect(screen.queryByText(/awaiting LLM response.*4s/i)).not.toBeInTheDocument();
+    const dot = document.querySelector('.dot');
+    expect(dot?.className).toMatch(/working/);
+  });
+
+  it('keeps the elapsed counter for non-llm working phases even with firstByteRequestId set', () => {
+    // First byte applies only to llm_requesting-family states; a
+    // tool_executing phase keeps its elapsed counter even if a
+    // first-byte signal from a prior LLM request is still on the atom.
+    renderStateBar({
+      convState: { type: 'tool_executing', current_tool: { id: 'bash-1', name: 'bash', input: {} }, remaining_tools: [] },
+      phaseStateUpdatedAt: T_NOW - 9_000,
+      lastSseEventAt: T_NOW - 1_000,
+      firstByteRequestId: 'req-prior',
+    });
+    expect(screen.queryByText(/^streaming$/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/\b9s\b/)).toBeInTheDocument();
+  });
+
+  it('shows BOTH offline chip + last-known activity during offline (REQ-WPV-005)', () => {
+    const { rerender } = render(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'tool_executing', current_tool: { id: 'bash-1', name: 'bash', input: {} }, remaining_tools: [] }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          phaseStateUpdatedAt={T_NOW - 8_000}
+          lastSseEventAt={T_NOW - 1_000}
+        />
+      </MemoryRouter>,
+    );
+    rerender(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'tool_executing', current_tool: { id: 'bash-1', name: 'bash', input: {} }, remaining_tools: [] }}
+          connectionState="offline"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          phaseStateUpdatedAt={T_NOW - 8_000}
+          lastSseEventAt={T_NOW - 1_000}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText(/^offline.*last.*8s/i)).toBeInTheDocument();
+    const dot = document.querySelector('.dot');
+    expect(dot?.className).toMatch(/offline/);
   });
 });

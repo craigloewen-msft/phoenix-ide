@@ -142,7 +142,10 @@ function renderUnit(
   onRetry: (localId: string) => void,
   onCancelSteering: ((localId: string) => void) | undefined,
 ): JSX.Element | null {
-  if (unit.kind === 'sub_agent_status' || unit.kind === 'streaming_agent') {
+  if (
+    unit.kind === 'sub_agent_status' ||
+    unit.kind === 'streaming_agent'
+  ) {
     return renderTailUnit(unit, slug);
   }
   return renderHistoricalUnit(unit, onOpenFile, onRetry, onCancelSteering);
