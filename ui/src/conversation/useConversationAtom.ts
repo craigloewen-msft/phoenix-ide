@@ -39,6 +39,130 @@ export function useConversationAtom(slug: string): [ConversationAtom, Dispatch<S
   return [atom, dispatch];
 }
 
+/**
+ * The fields `<ConversationPage>` renders from. Excludes the two
+ * highest-frequency atom fields (`streamingBuffer`, `lastSseEventAt`) so
+ * their churn does not re-render the page. The render-isolation contract
+ * — why those are excluded and which leaf subscribers consume them — is
+ * specified in specs/conversation_atom/conversation_atom.allium
+ * (Render Subscription Isolation) and witnessed by
+ * useConversationView.perf-isolation.test.tsx.
+ */
+export type ConversationPageView = Pick<
+  ConversationAtom,
+  | 'conversationId'
+  | 'conversation'
+  | 'phase'
+  | 'messages'
+  | 'breadcrumbs'
+  | 'contextWindow'
+  | 'systemPrompt'
+  | 'uiError'
+  | 'toolExecutingStartedAt'
+  | 'phaseStateUpdatedAt'
+  | 'firstByteRequestId'
+  | 'turnRetryContext'
+>;
+
+const PAGE_VIEW_KEYS: readonly (keyof ConversationPageView)[] = [
+  'conversationId',
+  'conversation',
+  'phase',
+  'messages',
+  'breadcrumbs',
+  'contextWindow',
+  'systemPrompt',
+  'uiError',
+  'toolExecutingStartedAt',
+  'phaseStateUpdatedAt',
+  'firstByteRequestId',
+  'turnRetryContext',
+];
+
+function pageViewsEqual(a: ConversationPageView, b: ConversationPageView): boolean {
+  // Each field is reference-stable in the reducer when unchanged (every
+  // case spreads `...a` and replaces only the fields it mutates), so
+  // per-field `Object.is` is sufficient — no deep compare needed.
+  for (const k of PAGE_VIEW_KEYS) {
+    if (!Object.is(a[k], b[k])) return false;
+  }
+  return true;
+}
+
+/**
+ * Like {@link useConversationAtom}, but the subscriber only re-renders when
+ * a field the page actually renders from changes — NOT on `sse_token`
+ * (streaming buffer) or `sse_event_observed` (heartbeat clock).
+ *
+ * `getSnapshot` rebuilds the view object on each call but returns the
+ * previously-cached reference when every selected field is unchanged, so
+ * `useSyncExternalStore`'s `Object.is` check elides the render. Same
+ * caching contract as {@link useConversationsList}.
+ */
+export function useConversationView(
+  slug: string,
+): [ConversationPageView, Dispatch<SSEAction>] {
+  const store = useConversationStore();
+  const lastRef = useRef<ConversationPageView | null>(null);
+
+  const subscribe = useCallback(
+    (listener: () => void) => store.subscribe(slug, listener),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(() => {
+    const a = store.getSnapshot(slug);
+    const next: ConversationPageView = {
+      conversationId: a.conversationId,
+      conversation: a.conversation,
+      phase: a.phase,
+      messages: a.messages,
+      breadcrumbs: a.breadcrumbs,
+      contextWindow: a.contextWindow,
+      systemPrompt: a.systemPrompt,
+      uiError: a.uiError,
+      toolExecutingStartedAt: a.toolExecutingStartedAt,
+      phaseStateUpdatedAt: a.phaseStateUpdatedAt,
+      firstByteRequestId: a.firstByteRequestId,
+      turnRetryContext: a.turnRetryContext,
+    };
+    const prev = lastRef.current;
+    if (prev && pageViewsEqual(prev, next)) return prev;
+    lastRef.current = next;
+    return next;
+  }, [store, slug]);
+
+  const atom = useSyncExternalStore(subscribe, getSnapshot);
+
+  const dispatch = useCallback(
+    (action: SSEAction) => store.dispatch(slug, action),
+    [store, slug],
+  );
+
+  return [atom, dispatch];
+}
+
+/**
+ * Subscribes to just the heartbeat-watchdog clock (`lastSseEventAt`) for
+ * `slug`. Consumed below the page boundary (by `<ConnectedStateBar>`) so
+ * the per-event bump re-renders only the StateBar, not the whole page.
+ * The value is a primitive, so `Object.is` makes the snapshot trivially
+ * stable between equal observations.
+ */
+export function useLastSseEventAt(slug: string): number {
+  const store = useConversationStore();
+
+  const subscribe = useCallback(
+    (listener: () => void) => store.subscribe(slug, listener),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(
+    () => store.getSnapshot(slug).lastSseEventAt,
+    [store, slug],
+  );
+
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
 /** Derived selectors to avoid passing the raw atom to child components. */
 export function useConversationSelectors(slug: string) {
   const [atom, dispatch] = useConversationAtom(slug);
