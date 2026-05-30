@@ -58,6 +58,14 @@ const IDLE_TIMEOUT: Duration = Duration::from_mins(30);
 /// Cleanup check interval (60 seconds)
 const CLEANUP_INTERVAL: Duration = Duration::from_mins(1);
 
+// Per-phase ceiling on the individual cold-start CDP steps — browser launch,
+// first-page open, helper inject, and each listener setup. chromiumoxide's
+// awaits are otherwise unbounded, so a stalled subprocess or wedged CDP socket
+// hangs the caller forever. Applied per step (not around the whole of
+// BrowserSession::new) so the legitimate first-run chromium DOWNLOAD via
+// BrowserFetcher::fetch() is NOT bounded by it. Task 45001.
+const SESSION_INIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Default viewport dimensions
 const DEFAULT_VIEWPORT_WIDTH: u32 = 1024;
 const DEFAULT_VIEWPORT_HEIGHT: u32 = 768;
@@ -75,6 +83,9 @@ pub enum BrowserError {
 
     #[error("Chrome not available: {0}")]
     ChromeNotAvailable(String),
+
+    #[error("Browser session init timed out after {0:?}")]
+    InitTimeout(Duration),
 }
 
 impl From<chromiumoxide::error::CdpError> for BrowserError {
@@ -388,9 +399,14 @@ impl BrowserSession {
     ) -> Result<Self, BrowserError> {
         let config = Self::browser_config(scope_key, executable)?;
 
-        let (browser, mut handler) = Browser::launch(config)
-            .await
-            .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
+        // Browser::launch can hang on a wedged chromium subprocess. Bound it.
+        // If launch itself times out there is no browser handle to clean up.
+        let (mut browser, mut handler) =
+            match tokio::time::timeout(SESSION_INIT_TIMEOUT, Browser::launch(config)).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => return Err(BrowserError::LaunchFailed(e.to_string())),
+                Err(_) => return Err(BrowserError::InitTimeout(SESSION_INIT_TIMEOUT)),
+            };
 
         let handler_task = tokio::spawn(async move {
             while let Some(event) = handler.next().await {
@@ -400,21 +416,38 @@ impl BrowserSession {
             }
         });
 
-        let page = browser
-            .new_page("about:blank")
+        // new_page can hang on a wedged CDP socket after launch. Bound it, and
+        // on timeout/error kill the chromium we already launched so the failure
+        // path doesn't orphan a process behind the returned error.
+        let page = match tokio::time::timeout(SESSION_INIT_TIMEOUT, browser.new_page("about:blank"))
             .await
-            .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
+        {
+            Ok(Ok(page)) => page,
+            Ok(Err(e)) => {
+                handler_task.abort();
+                let _ = browser.kill().await;
+                return Err(BrowserError::LaunchFailed(e.to_string()));
+            }
+            Err(_) => {
+                handler_task.abort();
+                let _ = browser.kill().await;
+                return Err(BrowserError::InitTimeout(SESSION_INIT_TIMEOUT));
+            }
+        };
 
         // Auto-inject the __phoenix React helper into every future document.
         // Runs before page JS, so React registers its fiber roots into our hook
         // at startup. Harmless on non-React pages. See react.rs for full docs.
+        // Best-effort and bounded: a wedged socket here must not hang init, and
+        // the browser is already usable without the helper.
         let inject_params =
             chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams::new(
                 super::react::PHOENIX_REACT_HELPER_SCRIPT.to_string(),
             );
-        if let Err(e) = page.execute(inject_params).await {
-            tracing::warn!("Failed to auto-inject React helper: {e}");
-            // Non-fatal — browser still works, just no __phoenix on React pages
+        match tokio::time::timeout(SESSION_INIT_TIMEOUT, page.execute(inject_params)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!("Failed to auto-inject React helper: {e}"),
+            Err(_) => tracing::warn!("Auto-inject React helper timed out"),
         }
 
         Ok(Self {
@@ -882,17 +915,35 @@ impl BrowserSessionManager {
         }
 
         tracing::info!(work_scope = %work_scope, "Creating new browser session");
+        // BrowserSession::new bounds its own CDP launch (and may legitimately
+        // run a multi-minute first-run chromium download, which is NOT bounded).
         let session = BrowserSession::new(&key).await?;
         let session_arc = Arc::new(RwLock::new(session));
 
-        // Set up console log listener
-        if let Err(e) = BrowserSession::setup_console_listener(session_arc.clone()).await {
-            tracing::warn!(error = %e, "Failed to set up console listener");
+        // Listener setup is best-effort and bounded per call: a wedged CDP
+        // socket must not hang creation. On timeout we keep the (usable)
+        // session and skip the listener rather than tearing down a live browser.
+        match tokio::time::timeout(
+            SESSION_INIT_TIMEOUT,
+            BrowserSession::setup_console_listener(session_arc.clone()),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "Failed to set up console listener"),
+            Err(_) => tracing::warn!("console listener setup timed out"),
         }
 
         // Set up the profiling trace listener (REQ-BT-019.9 / .12).
-        if let Err(e) = BrowserSession::setup_profiling_listener(session_arc.clone()).await {
-            tracing::warn!(error = %e, "Failed to set up profiling listener");
+        match tokio::time::timeout(
+            SESSION_INIT_TIMEOUT,
+            BrowserSession::setup_profiling_listener(session_arc.clone()),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "Failed to set up profiling listener"),
+            Err(_) => tracing::warn!("profiling listener setup timed out"),
         }
 
         sessions.insert(
