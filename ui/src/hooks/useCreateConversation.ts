@@ -56,6 +56,41 @@ function workflowBranch(workflow: NewConversationWorkflow): string | null {
   }
 }
 
+// The selected workflow is a pure function of (user override, git status,
+// default branch) rather than a piece of state reconciled by effects. A null
+// override means "follow the default", so a git repo can never render with
+// 'direct' selected unless the user explicitly chose it. A null branch on an
+// override means "still follow the default branch" and is filled in once
+// branch metadata loads.
+//
+// branchUnavailable is the settled "the fetch finished and found no usable
+// branch" signal (unborn or branchless repo). Only then does the default fall
+// back to 'direct' — otherwise such a repo would be stuck on planFromBranch with
+// no branch and Send permanently disabled. While the fetch is still pending the
+// flag is false, so a normal repo never flashes 'direct'.
+export function effectiveWorkflow(
+  override: NewConversationWorkflow | null,
+  isGitDir: boolean | null,
+  fallbackBranch: string | null,
+  branchUnavailable: boolean,
+): NewConversationWorkflow {
+  if (isGitDir !== true) return { kind: 'direct' };
+  if (!override) {
+    if (!fallbackBranch && branchUnavailable) return { kind: 'direct' };
+    return { kind: 'planFromBranch', baseBranch: fallbackBranch };
+  }
+  switch (override.kind) {
+    case 'planFromBranch':
+      return { ...override, baseBranch: override.baseBranch ?? fallbackBranch };
+    case 'planFromTask':
+      return { ...override, baseBranch: override.baseBranch ?? fallbackBranch };
+    case 'continueBranch':
+      return { ...override, branch: override.branch ?? fallbackBranch };
+    case 'direct':
+      return override;
+  }
+}
+
 function deriveSubmission(workflow: NewConversationWorkflow): { mode: 'direct' | 'managed' | 'branch'; baseBranch: string | null } {
   switch (workflow.kind) {
     case 'direct':
@@ -97,12 +132,19 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [creating, setCreating] = useState(false);
 
   const [recentDirs, setRecentDirs] = useState<string[]>(() => getRecentDirs());
-  const [workflow, setWorkflow] = useState<NewConversationWorkflow>({ kind: 'direct' });
+  // Only the user's deliberate choice is stored; the active workflow is derived
+  // from this plus git status via effectiveWorkflow. null = follow the default.
+  const [workflowOverride, setWorkflowOverride] = useState<NewConversationWorkflow | null>(null);
   const [tasks, setTasks] = useState<TaskEntry[]>([]);
   const [branches, setBranches] = useState<GitBranchEntry[]>([]);
   const [currentBranch, setCurrentBranch] = useState<string | null>(null);
   const [defaultBranch, setDefaultBranch] = useState<string | null>(null);
   const [gitMetadataLoading, setGitMetadataLoading] = useState(false);
+  // Set once a branch fetch settles with no usable branch (unborn/branchless
+  // repo, or the fetch failed). Distinct from "fetch not started yet" so the
+  // default can degrade to 'direct' only after we actually know there is no
+  // branch — never during the initial load window.
+  const [branchUnavailable, setBranchUnavailable] = useState(false);
   const [branchSearch, setBranchSearch] = useState('');
   const [branchSearchLoading, setBranchSearchLoading] = useState(false);
 
@@ -110,7 +152,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [interimText, setInterimText] = useState('');
   const draftBeforeVoiceRef = useRef<string>('');
   const metadataRequestSeqRef = useRef(0);
-  const workflowTouchedCwdRef = useRef<string | null>(null);
+
+  const workflow = effectiveWorkflow(workflowOverride, isGitDir, defaultBranch ?? currentBranch, branchUnavailable);
 
   // Subscribe to the shared models poller so credential transitions
   // (Codex sign-in/sign-out, gateway flips) reach this page without a
@@ -144,17 +187,16 @@ export function useCreateConversation(navigate: (path: string) => void) {
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
   useEffect(() => { if (selectedModel) localStorage.setItem(LAST_MODEL_KEY, selectedModel); }, [selectedModel]);
 
-  useEffect(() => {
-    if (isGitDir === false && workflowNeedsGit(workflow)) setWorkflow({ kind: 'direct' });
-  }, [isGitDir, workflow]);
-
+  // A new directory drops any prior workflow choice; the active workflow then
+  // re-derives from the new git status (and the metadata fetched below).
   useEffect(() => {
     setBranches([]);
     setTasks([]);
     setCurrentBranch(null);
     setDefaultBranch(null);
     setGitMetadataLoading(false);
-    setWorkflow(prev => workflowNeedsGit(prev) ? { kind: 'direct' } : prev);
+    setBranchUnavailable(false);
+    setWorkflowOverride(null);
     setBranchSearch('');
   }, [cwd]);
 
@@ -165,6 +207,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
       setCurrentBranch(null);
       setDefaultBranch(null);
       setGitMetadataLoading(false);
+      setBranchUnavailable(false);
       setBranchSearch('');
       return;
     }
@@ -174,6 +217,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
     const requestSeq = ++metadataRequestSeqRef.current;
     let cancelled = false;
     setGitMetadataLoading(true);
+    setBranchUnavailable(false);
     Promise.allSettled([
       api.listGitBranches(trimmedCwd),
       api.listProjectTasks(trimmedCwd),
@@ -185,21 +229,17 @@ export function useCreateConversation(navigate: (path: string) => void) {
         setBranches(resp.branches);
         setCurrentBranch(resp.current);
         setDefaultBranch(resp.default_branch ?? null);
-        const initialBranch = resp.default_branch ?? resp.current;
-        setWorkflow(prev => {
-          if (!initialBranch) return prev;
-          if (prev.kind === 'direct') return workflowTouchedCwdRef.current === trimmedCwd ? prev : { kind: 'planFromBranch', baseBranch: initialBranch };
-          if (workflowBranch(prev)) return prev;
-          if (prev.kind === 'planFromBranch') return { ...prev, baseBranch: initialBranch };
-          if (prev.kind === 'planFromTask') return { ...prev, baseBranch: initialBranch };
-          if (prev.kind === 'continueBranch') return { ...prev, branch: initialBranch };
-          return prev;
-        });
+        // Unborn/branchless repo: HEAD points at no commit, so neither a
+        // default nor a current branch resolves. Record it so the default
+        // workflow degrades to 'direct' instead of a branchless planFromBranch
+        // the user can't send.
+        setBranchUnavailable(!(resp.default_branch || resp.current));
       } else {
         console.warn('Failed to fetch git branches:', branchesResult.reason);
         setBranches([]);
         setCurrentBranch(null);
         setDefaultBranch(null);
+        setBranchUnavailable(true);
       }
 
       if (tasksResult.status === 'fulfilled') {
@@ -361,21 +401,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
   };
 
   const setWorkflowFromUser = (next: NewConversationWorkflow) => {
-    workflowTouchedCwdRef.current = cwd.trim();
-    const initialBranch = defaultBranch ?? currentBranch;
-    if (!initialBranch || workflowBranch(next)) {
-      setWorkflow(next);
-      return;
-    }
-    if (next.kind === 'planFromBranch') {
-      setWorkflow({ ...next, baseBranch: initialBranch });
-    } else if (next.kind === 'planFromTask') {
-      setWorkflow({ ...next, baseBranch: initialBranch });
-    } else if (next.kind === 'continueBranch') {
-      setWorkflow({ ...next, branch: initialBranch });
-    } else {
-      setWorkflow(next);
-    }
+    setWorkflowOverride(next);
   };
 
   return {
