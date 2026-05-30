@@ -161,8 +161,10 @@ CREATE TABLE IF NOT EXISTS conversations (
     updated_at TEXT NOT NULL,
     archived BOOLEAN NOT NULL DEFAULT 0,
     model TEXT,
-    
-    FOREIGN KEY (parent_conversation_id) 
+    -- llm_language column added by migration 010; not in SCHEMA so that
+    -- migration 010's ALTER TABLE doesn't collide on a fresh DB.
+
+    FOREIGN KEY (parent_conversation_id)
         REFERENCES conversations(id) ON DELETE CASCADE
 );
 
@@ -201,6 +203,11 @@ CREATE INDEX IF NOT EXISTS idx_turn_usage_conversation ON turn_usage(conversatio
 CREATE INDEX IF NOT EXISTS idx_turn_usage_root ON turn_usage(root_conversation_id);
 
 CREATE TABLE IF NOT EXISTS notification_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
@@ -518,6 +525,11 @@ pub struct Conversation {
     /// `#[serde(default)]` handles old DB rows that predate this column.
     #[serde(default)]
     pub steering_queue: Vec<crate::state_machine::event::SteerEntry>,
+    /// LLM-facing prose language fixed at creation (e.g. `phoenix-native`,
+    /// `caveman`). Chain continuations and sub-agents inherit it.
+    /// `#[serde(default)]` handles old DB rows that predate this column.
+    #[serde(default)]
+    pub llm_language: crate::llm_language::LlmLanguage,
 }
 
 /// Derive a human-readable title from a kebab-case slug.
@@ -1467,6 +1479,7 @@ mod conversation_serde_tests {
             continued_in_conv_id,
             chain_name: None,
             steering_queue: vec![],
+            llm_language: crate::llm_language::LlmLanguage::default(),
         }
     }
 

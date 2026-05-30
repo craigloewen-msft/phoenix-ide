@@ -219,6 +219,13 @@ pub fn create_router(state: AppState) -> Router {
             "/api/settings/notifications",
             get(get_notification_settings).put(update_notification_settings),
         )
+        // Global default LLM language. Read at conversation-create time and
+        // pinned onto the new row; chain continuations inherit from the
+        // parent rather than re-reading this default.
+        .route(
+            "/api/settings/llm-language",
+            get(get_llm_language_setting).put(update_llm_language_setting),
+        )
         // Version
         .route("/version", get(get_version))
         .route("/api/version", get(get_version_json))
@@ -566,6 +573,65 @@ async fn update_notification_settings(
     Ok(Json(settings))
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct LlmLanguageSettingResponse {
+    /// Current global default language for new conversations.
+    language: String,
+    /// All values the client may choose between.
+    available: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LlmLanguageSettingRequest {
+    language: String,
+}
+
+fn llm_language_setting_response(
+    lang: crate::llm_language::LlmLanguage,
+) -> LlmLanguageSettingResponse {
+    LlmLanguageSettingResponse {
+        language: lang.as_str().to_string(),
+        available: crate::llm_language::LlmLanguage::ALL
+            .iter()
+            .map(|l| l.as_str().to_string())
+            .collect(),
+    }
+}
+
+async fn get_llm_language_setting(
+    State(state): State<AppState>,
+) -> Result<Json<LlmLanguageSettingResponse>, AppError> {
+    let lang = state
+        .db
+        .get_default_llm_language()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(llm_language_setting_response(lang)))
+}
+
+async fn update_llm_language_setting(
+    State(state): State<AppState>,
+    Json(req): Json<LlmLanguageSettingRequest>,
+) -> Result<Json<LlmLanguageSettingResponse>, AppError> {
+    let lang = crate::llm_language::LlmLanguage::parse(&req.language).ok_or_else(|| {
+        let allowed: Vec<&str> = crate::llm_language::LlmLanguage::ALL
+            .iter()
+            .map(|l| l.as_str())
+            .collect();
+        AppError::BadRequest(format!(
+            "invalid `language` field: {:?} (allowed: {})",
+            req.language,
+            allowed.join(", "),
+        ))
+    })?;
+    state
+        .db
+        .set_default_llm_language(lang)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(llm_language_setting_response(lang)))
+}
+
 // ============================================================
 // Projects (REQ-PROJ-014)
 // ============================================================
@@ -884,6 +950,26 @@ async fn create_conversation(
         },
         String::from,
     );
+    // New conversations are pinned to the current global default LLM language.
+    // Once set, this conversation (and all its chain continuations / sub-agents)
+    // stays in that language even if the global default later changes.
+    //
+    // A DB read failure here would silently flip every new conversation back
+    // to phoenix-native, hiding a partially-migrated or otherwise unhealthy
+    // settings table. Log at warn so operators see it, then fall back —
+    // refusing to create the conversation over a *preference* read is too
+    // strong a coupling.
+    let default_language = match state.runtime.db().get_default_llm_language().await {
+        Ok(lang) => lang,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to read default LLM language from app_settings; falling back to default. \
+                 Check that migration 010 ran and app_settings is readable."
+            );
+            crate::llm_language::LlmLanguage::default()
+        }
+    };
     let conversation = state
         .runtime
         .db()
@@ -899,6 +985,7 @@ async fn create_conversation(
             desired_base_branch,
             req.seed_parent_id.as_deref(),
             req.seed_label.as_deref(),
+            default_language,
         )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -1173,8 +1260,13 @@ async fn get_system_prompt(
     let tasks_dir_name = taskmd_core::discover::discover_or_default(&cwd)
         .to_string_lossy()
         .into_owned();
-    let system_prompt =
-        crate::system_prompt::build_system_prompt(&cwd, &tasks_dir_name, false, None);
+    let system_prompt = crate::system_prompt::build_system_prompt(
+        &cwd,
+        &tasks_dir_name,
+        false,
+        None,
+        conversation.llm_language,
+    );
 
     Ok(Json(SystemPromptResponse { system_prompt }))
 }
@@ -3947,6 +4039,7 @@ mod hard_delete_cascade_tests {
                 None,
                 None,
                 None,
+                crate::llm_language::LlmLanguage::default(),
             )
             .await
             .expect("create");
@@ -3988,6 +4081,7 @@ mod hard_delete_cascade_tests {
                 None,
                 None,
                 None,
+                crate::llm_language::LlmLanguage::default(),
             )
             .await
             .expect("create");
@@ -4575,6 +4669,7 @@ mod hard_delete_cascade_tests {
                     None,
                     None,
                     None,
+                    crate::llm_language::LlmLanguage::default(),
                 )
                 .await
                 .expect("create conv");

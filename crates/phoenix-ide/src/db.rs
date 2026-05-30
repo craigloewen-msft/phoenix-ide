@@ -297,6 +297,51 @@ impl Database {
         Ok(())
     }
 
+    // ==================== App Settings (generic key/value) ====================
+
+    /// Read a single global app setting by key, returning `None` if unset.
+    pub async fn get_app_setting(&self, key: &str) -> DbResult<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM app_settings WHERE key = ?1")
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(v,)| v))
+    }
+
+    /// Write a single global app setting (upsert).
+    pub async fn set_app_setting(&self, key: &str, value: &str) -> DbResult<()> {
+        sqlx::query(
+            "INSERT INTO app_settings (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Return the global default `LlmLanguage` for new conversations.
+    /// Falls back to `LlmLanguage::default()` when the row is missing or
+    /// holds a value this build doesn't recognize.
+    pub async fn get_default_llm_language(&self) -> DbResult<crate::llm_language::LlmLanguage> {
+        Ok(self
+            .get_app_setting("default_llm_language")
+            .await?
+            .as_deref()
+            .map(crate::llm_language::LlmLanguage::parse_or_default)
+            .unwrap_or_default())
+    }
+
+    pub async fn set_default_llm_language(
+        &self,
+        lang: crate::llm_language::LlmLanguage,
+    ) -> DbResult<()> {
+        self.set_app_setting("default_llm_language", lang.as_str())
+            .await
+    }
+
     // ==================== MCP Disabled Servers ====================
 
     /// Return the set of MCP server names that have been disabled.
@@ -494,6 +539,7 @@ impl Database {
             None,
             None,
             None,
+            crate::llm_language::LlmLanguage::default(),
         )
         .await
     }
@@ -513,6 +559,7 @@ impl Database {
         desired_base_branch: Option<&str>,
         seed_parent_id: Option<&str>,
         seed_label: Option<&str>,
+        llm_language: crate::llm_language::LlmLanguage,
     ) -> DbResult<Conversation> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
@@ -525,8 +572,8 @@ impl Database {
         loop {
             let title_str = schema::title_from_slug(&actual_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode, desired_base_branch, seed_parent_id, seed_label)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)",
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode, desired_base_branch, seed_parent_id, seed_label, llm_language)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             )
             .bind(id)
             .bind(&actual_slug)
@@ -542,6 +589,7 @@ impl Database {
             .bind(desired_base_branch)
             .bind(seed_parent_id)
             .bind(seed_label)
+            .bind(llm_language.as_str())
             .execute(&self.pool)
             .await;
 
@@ -586,6 +634,7 @@ impl Database {
             // REQ-CHN-007: fresh conversations have no user-set chain name.
             chain_name: None,
             steering_queue: vec![],
+            llm_language,
         })
     }
 
@@ -595,7 +644,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.id = ?1",
         )
@@ -615,7 +664,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.slug = ?1",
         )
@@ -635,7 +684,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0 AND c.user_initiated = 1
@@ -654,7 +703,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 1 AND c.user_initiated = 1
@@ -898,8 +947,8 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id)
-                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, ?7, ?8, ?9, ?10, NULL, NULL, NULL)",
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language)
+                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, ?7, ?8, ?9, ?10, NULL, NULL, NULL, ?11)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -911,6 +960,7 @@ impl Database {
             .bind(parent.project_id.as_deref())
             .bind(&work_mode_json)
             .bind(parent.desired_base_branch.as_deref())
+            .bind(parent.llm_language.as_str())
             .execute(&mut *tx)
             .await;
 
@@ -1012,6 +1062,7 @@ impl Database {
             continued_in_conv_id: None,
             chain_name: None,
             steering_queue: vec![],
+            llm_language: parent.llm_language,
         })
     }
 
@@ -1097,8 +1148,8 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id)
-                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12, NULL)",
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language)
+                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -1114,6 +1165,7 @@ impl Database {
             // decorative UI metadata for a different concept (REQ-SEED-003/004).
             .bind::<Option<&str>>(None)
             .bind::<Option<&str>>(None)
+            .bind(parent.llm_language.as_str())
             .execute(&mut *tx)
             .await;
 
@@ -1193,6 +1245,9 @@ impl Database {
             // root only (REQ-CHN-007).
             chain_name: None,
             steering_queue: vec![],
+            // Inherit language from the parent so the whole chain speaks the
+            // same way.
+            llm_language: parent.llm_language,
         };
         Ok(ContinueOutcome::Created(new_conversation))
     }
@@ -1416,7 +1471,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0
@@ -2042,6 +2097,13 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         .try_get::<Option<String>, _>("chain_name")
         .unwrap_or(None);
 
+    let llm_language = row
+        .try_get::<Option<String>, _>("llm_language")
+        .unwrap_or(None)
+        .as_deref()
+        .map(crate::llm_language::LlmLanguage::parse_or_default)
+        .unwrap_or_default();
+
     let steering_queue = row
         .try_get::<Option<String>, _>("steering_queue")
         .unwrap_or(None)
@@ -2073,6 +2135,7 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         continued_in_conv_id,
         chain_name,
         steering_queue,
+        llm_language,
     })
 }
 
@@ -2154,6 +2217,75 @@ fn parse_datetime(s: &str) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm_language::LlmLanguage;
+
+    #[tokio::test]
+    async fn app_setting_roundtrips_through_db() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        // Missing key reads back as None.
+        assert!(db.get_app_setting("never_set").await.unwrap().is_none());
+
+        // Insert.
+        db.set_app_setting("key", "value-1").await.unwrap();
+        assert_eq!(
+            db.get_app_setting("key").await.unwrap().as_deref(),
+            Some("value-1")
+        );
+
+        // Upsert overwrites.
+        db.set_app_setting("key", "value-2").await.unwrap();
+        assert_eq!(
+            db.get_app_setting("key").await.unwrap().as_deref(),
+            Some("value-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn default_llm_language_unset_returns_phoenix_native() {
+        let db = Database::open_in_memory().await.unwrap();
+        assert_eq!(
+            db.get_default_llm_language().await.unwrap(),
+            LlmLanguage::PhoenixNative
+        );
+    }
+
+    #[tokio::test]
+    async fn default_llm_language_set_persists_and_reads_back() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        db.set_default_llm_language(LlmLanguage::Caveman)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_default_llm_language().await.unwrap(),
+            LlmLanguage::Caveman
+        );
+
+        // Switch back.
+        db.set_default_llm_language(LlmLanguage::PhoenixNative)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_default_llm_language().await.unwrap(),
+            LlmLanguage::PhoenixNative
+        );
+    }
+
+    #[tokio::test]
+    async fn default_llm_language_falls_back_when_value_unknown() {
+        let db = Database::open_in_memory().await.unwrap();
+        // Forge a value this build doesn't recognize (forward-compat: an
+        // older binary reading a DB written by a newer one). Should fall
+        // back to the default rather than poison startup.
+        db.set_app_setting("default_llm_language", "klingon")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_default_llm_language().await.unwrap(),
+            LlmLanguage::default()
+        );
+    }
 
     #[tokio::test]
     async fn test_create_and_get_conversation() {
@@ -2777,6 +2909,7 @@ mod tests {
             None,
             None,
             None,
+            crate::llm_language::LlmLanguage::default(),
         )
         .await
         .unwrap();
@@ -3023,6 +3156,7 @@ mod tests {
             None,
             None,
             None,
+            crate::llm_language::LlmLanguage::default(),
         )
         .await
         .unwrap();
