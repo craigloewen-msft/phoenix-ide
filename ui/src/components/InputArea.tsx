@@ -15,7 +15,7 @@ import type { QueuedMessage } from '../hooks';
 import { useDraftActions, useDraftValue, useScopedState } from '../hooks';
 import type { ConversationState, ImageData, SkillEntry } from '../api';
 import { api, ExpansionError } from '../api';
-import { isAgentWorking, isCancellingState } from '../utils';
+import { canCancelConversationState, isAgentWorking, isCancellingState } from '../utils';
 import { ImageAttachments } from './ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from './VoiceInput';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
@@ -87,7 +87,12 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   onDismissError,
 }, ref) {
   const agentWorking = isAgentWorking(convState);
+  const canCancel = canCancelConversationState(convState);
   const isCancelling = isCancellingState(convState);
+  const blocksComposerSend =
+    isCancelling ||
+    convState.type === 'awaiting_llm' ||
+    convState.type === 'awaiting_continuation';
   const setDraft = onDraftChange;
   const clearDraft = useCallback(() => onDraftChange(''), [onDraftChange]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -342,69 +347,6 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   }, [draft, voiceBase, skillArgumentHint, setSkillArgumentHint]);
 
   // =========================================================================
-  // Keyboard handling (merged with autocomplete nav)
-  // =========================================================================
-
-  const [acSelectedIndex, setAcSelectedIndex] = useScopedState(conversationId, 0);
-
-  const filteredItems = useMemo(
-    () => fuzzyMatch(acItems, activeTrigger?.query ?? '', (item) => item.label),
-    [acItems, activeTrigger?.query],
-  );
-
-  useEffect(() => {
-    setAcSelectedIndex(0);
-  }, [activeTrigger?.query, setAcSelectedIndex]);
-
-  const handleKeyDown = useCallback(
-    (e: KeyboardEvent<HTMLTextAreaElement>) => {
-      // When autocomplete is open, intercept navigation and confirmation keys
-      if (activeTrigger && filteredItems.length > 0) {
-        if (e.key === 'ArrowDown') {
-          e.preventDefault();
-          setAcSelectedIndex((i) => Math.min(i + 1, filteredItems.length - 1));
-          return;
-        }
-        if (e.key === 'ArrowUp') {
-          e.preventDefault();
-          setAcSelectedIndex((i) => Math.max(i - 1, 0));
-          return;
-        }
-        if (e.key === 'Tab') {
-          const item = filteredItems[acSelectedIndex] ?? filteredItems[0];
-          if (item !== undefined) {
-            e.preventDefault();
-            handleAcSelect(item);
-            return;
-          }
-        }
-        if (e.key === 'Escape') {
-          e.preventDefault();
-          handleAcDismiss();
-          return;
-        }
-        // Enter with autocomplete open: if item selected, complete; otherwise fall through to send
-        if (e.key === 'Enter' && !e.shiftKey) {
-          const item = filteredItems[acSelectedIndex] ?? filteredItems[0];
-          if (item !== undefined) {
-            e.preventDefault();
-            handleAcSelect(item);
-            return;
-          }
-        }
-      }
-
-      // Default: Enter without shift sends message
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        handleSend();
-      }
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [activeTrigger, filteredItems, acSelectedIndex, handleAcSelect, handleAcDismiss],
-  );
-
-  // =========================================================================
   // Auto-resize
   // =========================================================================
 
@@ -476,6 +418,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     }
 
     if (!text && images.length === 0) return;
+    if (blocksComposerSend) return;
     // Allow send while agent is working — the server will queue it as a
     // steering message and deliver it when the conversation reaches Idle.
 
@@ -514,8 +457,92 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       // Non-expansion errors: draft is already cleared; the message queue
       // shows the failure with a retry button.
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [voiceBase, voiceInterim, draft, images, agentWorking, isOffline, onSend, clearDraft]);
+  }, [
+    voiceBase,
+    voiceInterim,
+    draft,
+    images,
+    blocksComposerSend,
+    onSend,
+    clearDraft,
+    setActiveTrigger,
+    setSkillArgumentHint,
+    setImages,
+    setVoiceBase,
+    setVoiceInterim,
+    setExpansionError,
+    setDraft,
+  ]);
+
+  // =========================================================================
+  // Keyboard handling (merged with autocomplete nav)
+  // =========================================================================
+
+  const [acSelectedIndex, setAcSelectedIndex] = useScopedState(conversationId, 0);
+
+  const filteredItems = useMemo(
+    () => fuzzyMatch(acItems, activeTrigger?.query ?? '', (item) => item.label),
+    [acItems, activeTrigger?.query],
+  );
+
+  useEffect(() => {
+    setAcSelectedIndex(0);
+  }, [activeTrigger?.query, setAcSelectedIndex]);
+
+  const handleKeyDown = useCallback(
+    (e: KeyboardEvent<HTMLTextAreaElement>) => {
+      // When autocomplete is open, intercept navigation and confirmation keys
+      if (activeTrigger && filteredItems.length > 0) {
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          setAcSelectedIndex((i) => Math.min(i + 1, filteredItems.length - 1));
+          return;
+        }
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          setAcSelectedIndex((i) => Math.max(i - 1, 0));
+          return;
+        }
+        if (e.key === 'Tab') {
+          const item = filteredItems[acSelectedIndex] ?? filteredItems[0];
+          if (item !== undefined) {
+            e.preventDefault();
+            handleAcSelect(item);
+            return;
+          }
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          handleAcDismiss();
+          return;
+        }
+        // Enter with autocomplete open: if item selected, complete; otherwise fall through to send
+        if (e.key === 'Enter' && !e.shiftKey) {
+          const item = filteredItems[acSelectedIndex] ?? filteredItems[0];
+          if (item !== undefined) {
+            e.preventDefault();
+            handleAcSelect(item);
+            return;
+          }
+        }
+      }
+
+      // Default: Enter without shift sends message
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        handleSend();
+      }
+    },
+    [
+      activeTrigger,
+      filteredItems,
+      acSelectedIndex,
+      handleAcSelect,
+      handleAcDismiss,
+      handleSend,
+      setAcSelectedIndex,
+    ],
+  );
 
   // =========================================================================
   // Voice input
@@ -580,7 +607,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   const displayedText = voiceBase !== null ? voiceBase : draft;
   const hasContent = displayedText.trim().length > 0 || voiceInterim.trim().length > 0 || images.length > 0;
-  const sendEnabled = hasContent && !expansionError;
+  const canSend = !blocksComposerSend;
+  const sendEnabled = canSend && hasContent && !expansionError;
 
   // Cycle placeholder hint each time the input clears (e.g., after send).
   // Advances only when draft goes empty, not on a timer.
@@ -605,9 +633,15 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     : 'Type a message...';
   const placeholder = isOffline
     ? 'Type a message (will send when back online)...'
-    : agentWorking
-      ? 'Agent working... send to queue a follow-up'
-      : hint ? `${baseText} (${hint})` : baseText;
+    : convState.type === 'awaiting_continuation'
+      ? 'Compacting conversation...'
+      : isCancelling
+        ? 'Stopping...'
+        : convState.type === 'awaiting_llm'
+          ? 'Preparing request...'
+          : agentWorking
+            ? 'Agent working... send to queue a follow-up'
+            : hint ? `${baseText} (${hint})` : baseText;
 
   // =========================================================================
   // Render
@@ -640,6 +674,19 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
               )}
             </div>
           ))}
+        </div>
+      )}
+
+      {convState.type === 'awaiting_continuation' && (
+        <div className="continuation-progress" role="status" aria-live="polite">
+          <div className="continuation-progress-header">
+            <span>Compacting conversation...</span>
+            <span className="continuation-progress-caption">Preparing a continuation</span>
+          </div>
+          <div className="continuation-progress-bar" aria-hidden="true">
+            <div className="continuation-progress-bar-fill" />
+          </div>
+          <p className="continuation-progress-text">Phoenix is generating a continuation summary to preserve context for a new conversation.</p>
         </div>
       )}
 
@@ -716,7 +763,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
               disabled={agentWorking}
             />
           )}
-          {agentWorking ? (
+          {canCancel || isCancelling ? (
             <button
               className="input-stop-btn"
               onClick={onCancel}
