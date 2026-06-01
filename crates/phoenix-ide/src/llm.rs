@@ -69,12 +69,15 @@ pub mod rate_limit;
 mod registry;
 mod service;
 pub(crate) mod sse;
-mod types;
 
 pub use codex_credential::{CodexCredential, CODEX_BACKEND_URL, CODEX_BRIDGE_CONTEXT_WINDOW};
 pub use credential_helper::{CredentialHelper, CredentialStatus};
 pub use discovery::{discover_models, probe_gateway, DiscoveryConfig};
-pub use error::{AutoRetryPolicy, LlmAttemptReason, LlmError, LlmErrorKind, UserResumePolicy};
+pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
+// AutoRetryPolicy / UserResumePolicy live in phoenix-core
+// (phoenix_core::domain::retry_policy) and are not re-exported here: nothing
+// imports them via a `crate::llm::` path. Their only consumer is the persisted
+// error-kind schema, which references the domain crate directly.
 // Re-exported types: QuotaDetails is consumed by `LlmOutcome::UsageLimitReached`
 // and the executor mapper. CreditsSnapshot / RateLimitWindow live behind it,
 // accessed via the `rate_limit` submodule.
@@ -87,7 +90,10 @@ pub use registry::{
     AuthStyle, CredentialSource, GatewayStatus, LlmAuth, LlmConfig, ModelRegistry, ResolvedAuth,
 };
 pub use service::LlmServiceImpl;
-pub use types::*;
+// `types` (ContentBlock, Usage, ImageSource, …) moved to phoenix-core. Alias
+// the module back as `types` and glob-re-export so both `crate::llm::types::X`
+// and `crate::llm::X` paths resolve unchanged.
+pub use phoenix_core::domain::llm_types::{self as types, *};
 
 use async_trait::async_trait;
 use std::sync::Arc;

@@ -2080,7 +2080,143 @@ def _classify_network_env() -> None:
         print("  i  outbound HTTPS: unavailable — skipping remote-network tests")
 
 
-def cmd_check():
+# ===========================================================================
+# Incremental check gating (Option A: path-based lane selection)
+# ===========================================================================
+# Lane key -> the input categories that, if touched, require the lane to run.
+# Keys match the thread names in cmd_check. Lanes absent from this table
+# (fast, pkglock) are always-on: they are sub-second and correctness-sensitive
+# (rustfmt, task validation, lockfile tripwire).
+_LANE_INPUTS = {
+    "rust": {"RUST"},
+    "tsc": {"UI"},
+    "ui-lint": {"UI"},
+    "vitest": {"UI"},
+    "ast-grep": {"UI", "ASTGREP"},
+    "allium": {"SPECS"},
+    # spec-anchors cross-validates REQ-* anchors in code against specs/, so a
+    # change to either side can orphan or satisfy an anchor.
+    "spec-anchors": {"SPECS", "RUST", "UI"},
+    "e2e": {"RUST", "E2E"},
+}
+_ALWAYS_ON_LANES = {"fast", "pkglock"}
+
+
+def _categorize_changed_paths(paths) -> set:
+    """Map repo-relative changed paths to coarse lane-input categories.
+
+    A path may contribute to several categories. `SELF` (dev.py itself)
+    is special-cased by the caller into "run everything".
+    """
+    cats: set[str] = set()
+    for p in paths:
+        if p == "dev.py":
+            cats.add("SELF")
+        if (
+            p.startswith("crates/")
+            or p in ("Cargo.toml", "Cargo.lock")
+            or p.startswith(".cargo/")
+            or p.startswith("rust-toolchain")
+        ):
+            cats.add("RUST")
+        # Generated TS is produced by the Rust ts-rs export tests; a committed
+        # change there must re-run the rust lane's codegen-stale guard.
+        if p.startswith("ui/src/generated/"):
+            cats.add("RUST")
+        if p.startswith("ui/") and not p.startswith("ui/dist/"):
+            cats.add("UI")
+        if p.startswith("tasks/"):
+            cats.add("TASKS")
+        if p.startswith("specs/"):
+            cats.add("SPECS")
+        if p.startswith("ast-grep-rules/"):
+            cats.add("ASTGREP")
+        if p.startswith("tests/e2e/") or p == "phoenix-client.py":
+            cats.add("E2E")
+    return cats
+
+
+def _changed_paths_vs_base():
+    """Return a set of repo-relative paths that differ from the integration
+    base, or None if the base cannot be determined (caller runs everything).
+
+    "Differ from base" = tracked changes between merge-base(HEAD, base) and the
+    working tree, unioned with untracked-but-not-ignored files. The base ref is
+    PHOENIX_CHECK_BASE if set, else the remote default branch (origin/HEAD),
+    else origin/main, else main.
+    """
+    def _git(args):
+        return subprocess.run(
+            ["git", *args], cwd=ROOT, capture_output=True, text=True,
+        )
+
+    base = os.environ.get("PHOENIX_CHECK_BASE")
+    candidates = [base] if base else []
+    # origin/HEAD points at the remote's default branch when the symbolic ref
+    # is configured; fall back to common names.
+    head_ref = _git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
+    if head_ref.returncode == 0 and head_ref.stdout.strip():
+        candidates.append(head_ref.stdout.strip().removeprefix("refs/remotes/"))
+    candidates += ["origin/main", "main", "origin/master", "master"]
+
+    merge_base = None
+    for cand in candidates:
+        if not cand:
+            continue
+        mb = _git(["merge-base", "HEAD", cand])
+        if mb.returncode == 0 and mb.stdout.strip():
+            merge_base = mb.stdout.strip()
+            break
+    if merge_base is None:
+        return None
+
+    tracked = _git(["diff", "--name-only", merge_base])
+    if tracked.returncode != 0:
+        return None
+    untracked = _git(["ls-files", "--others", "--exclude-standard"])
+    if untracked.returncode != 0:
+        return None
+
+    paths = set()
+    for chunk in (tracked.stdout, untracked.stdout):
+        paths.update(line.strip() for line in chunk.splitlines() if line.strip())
+    return paths
+
+
+def _gate_lanes():
+    """Decide which lanes to run for this check invocation.
+
+    Returns (active: set[str], skipped: dict[str, str]) where skipped maps a
+    lane key to a human reason. Always-on lanes are always in `active`.
+    Honors PHOENIX_CHECK_ALL=1 (run everything, no gating).
+    """
+    all_lanes = set(_LANE_INPUTS) | _ALWAYS_ON_LANES
+    if os.environ.get("PHOENIX_CHECK_ALL") == "1":
+        return all_lanes, {}
+
+    paths = _changed_paths_vs_base()
+    if paths is None:
+        # Base undeterminable — fail safe, run everything.
+        return all_lanes, {}
+
+    cats = _categorize_changed_paths(paths)
+    if "SELF" in cats:
+        # dev.py changed: the gating logic / lane definitions may differ.
+        return all_lanes, {}
+
+    active = set(_ALWAYS_ON_LANES)
+    skipped = {}
+    for lane, inputs in _LANE_INPUTS.items():
+        hit = inputs & cats
+        if hit:
+            active.add(lane)
+        else:
+            need = "/".join(sorted(inputs))
+            skipped[lane] = f"no {need} changes"
+    return active, skipped
+
+
+def cmd_check(gate: bool = True):
     """Run lint, format check, tests, and task validation in parallel."""
     results = []  # (name, returncode, elapsed, output)
     results_lock = threading.Lock()
@@ -2091,6 +2227,30 @@ def cmd_check():
     # local M-class hardware finishes in ~90s. Bump only if a single step
     # legitimately takes longer — never to mask flakes.
     CHECK_TIMEOUT = 600
+
+    # Decide which lanes to run (Option A path-gating) BEFORE any
+    # lane-specific setup runs. A skipped lane must not drag in its setup:
+    # a markdown/spec/task-only change must not require Corepack/pnpm or a
+    # working cargo toolchain to be present. --all / PHOENIX_CHECK_ALL=1
+    # (handled in _gate_lanes) forces every lane.
+    if gate:
+        active, skipped = _gate_lanes()
+    else:
+        active, skipped = set(_LANE_INPUTS) | _ALWAYS_ON_LANES, {}
+    if skipped:
+        ran = ", ".join(sorted(active))
+        print(f"  i  incremental gating: running [{ran}]")
+        for lane in sorted(skipped):
+            with results_lock:
+                results.append((lane, 0, 0.0, ""))
+            print(f"  -  {lane:<18s} (skipped — {skipped[lane]})")
+
+    # Lane groups whose shared, expensive setup is gated below. UI lanes need
+    # Corepack/pnpm (ensure_ui_deps); cargo lanes need the rustc/sccache env
+    # and the env-classification probes. Only `rust` consumes the nextest
+    # probe + thread sizing + codegen commands.
+    ui_active = bool(active & {"tsc", "ui-lint", "vitest"})
+    cargo_active = bool(active & {"rust", "e2e"})
 
     def run_step(name, cmd, cwd=ROOT):
         # Stream stdout+stderr line-by-line into a bounded buffer so that on
@@ -2486,159 +2646,165 @@ def cmd_check():
                 print(f"  ✓ {'spec anchors':<18s} ({elapsed:.1f}s)")
 
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.
-    ensure_ui_deps()
+    # Skipped when no UI lane runs, so a non-UI change never needs pnpm.
+    if ui_active:
+        ensure_ui_deps()
 
     # Enable sccache (if installed) as the rustc wrapper so deps' object files
     # are shared across worktrees / `cargo clean` cycles. Honored by every
     # cargo invocation below because the env is inherited by run_step's
     # subprocesses. Skip cleanly if sccache isn't on PATH or the user has
-    # explicitly set RUSTC_WRAPPER already.
-    if shutil.which("sccache") and "RUSTC_WRAPPER" not in os.environ:
+    # explicitly set RUSTC_WRAPPER already. Only relevant when a cargo lane runs.
+    if cargo_active and shutil.which("sccache") and "RUSTC_WRAPPER" not in os.environ:
         os.environ["RUSTC_WRAPPER"] = "sccache"
         # Default cache dir + 20G cap. Devs can override via SCCACHE_DIR /
         # SCCACHE_CACHE_SIZE before invoking dev.py.
         os.environ.setdefault("SCCACHE_CACHE_SIZE", "20G")
 
-    # Classify the environment up front so the Rust suite skips the
-    # classes of tests that would otherwise produce env-noise failures.
-    #
-    # Contract for `./dev.py check`:
-    #   - Red == broken code. Never "your network is broken" or
-    #     "you don't have Chrome installed".
-    #   - The internal signal env vars (PHOENIX_CHROME_EXECUTABLE,
-    #     PHOENIX_SKIP_BROWSER_TESTS, PHOENIX_SKIP_NETWORK_TESTS,
-    #     GIT_CONFIG_*) are MECHANISM — users never set them by hand.
-    #   - Probes print iff classification CHANGES test behavior:
-    #     auto-skipping a class, overriding a config, etc. Happy paths
-    #     (Chromium found, fetcher reachable, signing works, deps
-    #     present) stay silent so a normal-env run is clean.
-    _classify_browser_env()
-    _classify_network_env()
+    # Env classification + signing probe only matter when a cargo lane runs.
+    if cargo_active:
+        # Classify the environment up front so the Rust suite skips the
+        # classes of tests that would otherwise produce env-noise failures.
+        #
+        # Contract for `./dev.py check`:
+        #   - Red == broken code. Never "your network is broken" or
+        #     "you don't have Chrome installed".
+        #   - The internal signal env vars (PHOENIX_CHROME_EXECUTABLE,
+        #     PHOENIX_SKIP_BROWSER_TESTS, PHOENIX_SKIP_NETWORK_TESTS,
+        #     GIT_CONFIG_*) are MECHANISM — users never set them by hand.
+        #   - Probes print iff classification CHANGES test behavior:
+        #     auto-skipping a class, overriding a config, etc. Happy paths
+        #     (Chromium found, fetcher reachable, signing works, deps
+        #     present) stay silent so a normal-env run is clean.
+        _classify_browser_env()
+        _classify_network_env()
 
-    # Probe for working commit signing. Some envs configure a custom
-    # `gpg.ssh.program` (e.g. cloud sandboxes intercepting commits) that
-    # rejects unrecognised callers, breaking any test that runs `git commit`.
-    # If a probe commit fails, override `commit.gpgsign=false` for child
-    # processes via GIT_CONFIG_COUNT/KEY/VALUE — affects subprocesses only,
-    # not the developer's actual git config.
-    #
-    # Per the print-only-on-behavior-change rule above, the success
-    # branch is silent and only the override branch prints.
-    import tempfile as _tempfile
-    try:
-        with _tempfile.TemporaryDirectory() as _td:
-            subprocess.run(["git", "init", "--quiet"], cwd=_td, check=True,
-                           capture_output=True, timeout=5)
-            subprocess.run(
-                ["git", "-c", "user.email=probe@test", "-c", "user.name=probe",
-                 "commit", "--allow-empty", "-m", "probe"],
-                cwd=_td, check=True, capture_output=True, timeout=10,
-            )
-        _signing_ok = True
-    except Exception:
-        _signing_ok = False
-    if not _signing_ok:
-        os.environ["GIT_CONFIG_COUNT"] = "1"
-        os.environ["GIT_CONFIG_KEY_0"] = "commit.gpgsign"
-        os.environ["GIT_CONFIG_VALUE_0"] = "false"
-        print("  i  commit signing probe failed — disabling commit.gpgsign for tests")
+        # Probe for working commit signing. Some envs configure a custom
+        # `gpg.ssh.program` (e.g. cloud sandboxes intercepting commits) that
+        # rejects unrecognised callers, breaking any test that runs `git commit`.
+        # If a probe commit fails, override `commit.gpgsign=false` for child
+        # processes via GIT_CONFIG_COUNT/KEY/VALUE — affects subprocesses only,
+        # not the developer's actual git config.
+        #
+        # Per the print-only-on-behavior-change rule above, the success
+        # branch is silent and only the override branch prints.
+        import tempfile as _tempfile
+        try:
+            with _tempfile.TemporaryDirectory() as _td:
+                subprocess.run(["git", "init", "--quiet"], cwd=_td, check=True,
+                               capture_output=True, timeout=5)
+                subprocess.run(
+                    ["git", "-c", "user.email=probe@test", "-c", "user.name=probe",
+                     "commit", "--allow-empty", "-m", "probe"],
+                    cwd=_td, check=True, capture_output=True, timeout=10,
+                )
+            _signing_ok = True
+        except Exception:
+            _signing_ok = False
+        if not _signing_ok:
+            os.environ["GIT_CONFIG_COUNT"] = "1"
+            os.environ["GIT_CONFIG_KEY_0"] = "commit.gpgsign"
+            os.environ["GIT_CONFIG_VALUE_0"] = "false"
+            print("  i  commit signing probe failed — disabling commit.gpgsign for tests")
 
-    # Probe nextest and size the test-thread cap here in cmd_check scope (not
-    # in lane_rust) so both the serial codegen pre-step below and lane_rust's
-    # closed-over verification run share one decision. Neither probe touches
-    # the cargo target lock (`cargo nextest --version` only prints a version;
-    # the /proc/meminfo read is pure Python).
-    #
-    # This probe runs on the main path before any lane (and its
-    # LANE_JOIN_TIMEOUT) exists, so a rustup/network/cargo-home stall here
-    # would hang the whole check with no timeout or summary. Bound it and
-    # treat any stall/error as "no nextest" — the plain `cargo test` fallback
-    # is always correct, just slower.
-    try:
-        has_nextest = subprocess.run(
-            ["cargo", "nextest", "--version"],
-            capture_output=True, timeout=30,
-        ).returncode == 0
-    except (subprocess.TimeoutExpired, OSError):
-        has_nextest = False
-        print("  i  cargo nextest probe stalled/failed — using plain `cargo test`")
-    # nextest defaults to available_parallelism (= num_cpus). On low-RAM
-    # boxes, num_cpus parallel test threads can swap and stall sensitive
-    # tests (e.g. browser tests where Chrome's CDP WebSocket handshake
-    # times out if Chrome can't get CPU+RAM during launch). Cap the
-    # thread count by ~1.5 GiB headroom per thread so resource-starved
-    # machines back off, while leaving fast machines effectively unchanged.
-    cpus = os.cpu_count() or 4
-    try:
-        with open("/proc/meminfo") as f:
-            mem_gib = next(
-                int(l.split()[1]) for l in f if l.startswith("MemTotal:")
-            ) / (1024 * 1024)
-        mem_cap = max(1, int(mem_gib // 1.5))
-    except (OSError, StopIteration):
-        mem_cap = cpus
-    test_threads = max(2, min(cpus - 1, mem_cap))
-    if test_threads < cpus:
-        print(f"  i  cargo test: capping to {test_threads} threads "
-              f"(cpus={cpus}, mem_cap={mem_cap})")
+    # nextest probe, thread sizing, and codegen command shapes are rust-only.
+    if "rust" in active:
+        # Probe nextest and size the test-thread cap here in cmd_check scope (not
+        # in lane_rust) so both the serial codegen pre-step below and lane_rust's
+        # closed-over verification run share one decision. Neither probe touches
+        # the cargo target lock (`cargo nextest --version` only prints a version;
+        # the /proc/meminfo read is pure Python).
+        #
+        # This probe runs on the main path before any lane (and its
+        # LANE_JOIN_TIMEOUT) exists, so a rustup/network/cargo-home stall here
+        # would hang the whole check with no timeout or summary. Bound it and
+        # treat any stall/error as "no nextest" — the plain `cargo test` fallback
+        # is always correct, just slower.
+        try:
+            has_nextest = subprocess.run(
+                ["cargo", "nextest", "--version"],
+                capture_output=True, timeout=30,
+            ).returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            has_nextest = False
+            print("  i  cargo nextest probe stalled/failed — using plain `cargo test`")
+        # nextest defaults to available_parallelism (= num_cpus). On low-RAM
+        # boxes, num_cpus parallel test threads can swap and stall sensitive
+        # tests (e.g. browser tests where Chrome's CDP WebSocket handshake
+        # times out if Chrome can't get CPU+RAM during launch). Cap the
+        # thread count by ~1.5 GiB headroom per thread so resource-starved
+        # machines back off, while leaving fast machines effectively unchanged.
+        cpus = os.cpu_count() or 4
+        try:
+            with open("/proc/meminfo") as f:
+                mem_gib = next(
+                    int(l.split()[1]) for l in f if l.startswith("MemTotal:")
+                ) / (1024 * 1024)
+            mem_cap = max(1, int(mem_gib // 1.5))
+        except (OSError, StopIteration):
+            mem_cap = cpus
+        test_threads = max(2, min(cpus - 1, mem_cap))
+        if test_threads < cpus:
+            print(f"  i  cargo test: capping to {test_threads} threads "
+                  f"(cpus={cpus}, mem_cap={mem_cap})")
 
-    # ts-rs emits a `#[test] export_bindings_*` per `#[ts(export)]` type; those
-    # tests' side effect IS the codegen — they (re)write ui/src/generated/.
-    # Running them inside the parallel fan-out races every lane that reads that
-    # tree (tsc, vitest, eslint, ast-grep), since ts-rs truncates each file
-    # before refilling it (a reader can catch an empty/partial file). So codegen
-    # is pulled out of the fan-out into this serial pre-step: regenerate once,
-    # staleness-check, and only then fan out the readers against a tree that
-    # stays frozen for the rest of the run. lane_rust's verification run
-    # excludes export_bindings (regen already exercised them — no lost
-    # coverage) so it never writes the tree during the parallel phase.
-    #
-    # Discovery is preserved: every type still self-registers via its emitted
-    # test, so a new #[ts(export)] type is regenerated automatically with no
-    # hand-maintained root list to forget.
-    if has_nextest:
-        compile_cmd = ["cargo", "nextest", "run", "--no-run"]
-        test_cmd = ["cargo", "nextest", "run",
-                    "-E", "not test(/export_bindings/)",
-                    "--test-threads", str(test_threads)]
-        codegen_cmd = ["cargo", "nextest", "run", "-E", "test(/export_bindings/)"]
-    else:
-        compile_cmd = ["cargo", "test", "--no-run"]
-        test_cmd = ["cargo", "test", "--",
-                    "--test-threads", str(test_threads), "--skip", "export_bindings"]
-        codegen_cmd = ["cargo", "test", "export_bindings"]
+        # ts-rs emits a `#[test] export_bindings_*` per `#[ts(export)]` type; those
+        # tests' side effect IS the codegen — they (re)write ui/src/generated/.
+        # Running them inside the parallel fan-out races every lane that reads that
+        # tree (tsc, vitest, eslint, ast-grep), since ts-rs truncates each file
+        # before refilling it (a reader can catch an empty/partial file). So codegen
+        # is pulled out of the fan-out into this serial pre-step: regenerate once,
+        # staleness-check, and only then fan out the readers against a tree that
+        # stays frozen for the rest of the run. lane_rust's verification run
+        # excludes export_bindings (regen already exercised them — no lost
+        # coverage) so it never writes the tree during the parallel phase.
+        #
+        # Discovery is preserved: every type still self-registers via its emitted
+        # test, so a new #[ts(export)] type is regenerated automatically with no
+        # hand-maintained root list to forget.
+        if has_nextest:
+            compile_cmd = ["cargo", "nextest", "run", "--no-run"]
+            test_cmd = ["cargo", "nextest", "run",
+                        "-E", "not test(/export_bindings/)",
+                        "--test-threads", str(test_threads)]
+            codegen_cmd = ["cargo", "nextest", "run", "-E", "test(/export_bindings/)"]
+        else:
+            compile_cmd = ["cargo", "test", "--no-run"]
+            test_cmd = ["cargo", "test", "--",
+                        "--test-threads", str(test_threads), "--skip", "export_bindings"]
+            codegen_cmd = ["cargo", "test", "export_bindings"]
 
-    print("Regenerating codegen (serial, pre-fan-out)...\n")
-    # Cold-target safety: compile the test harnesses under their own
-    # CHECK_TIMEOUT before running the tiny codegen tests, mirroring
-    # lane_rust's compile/run split. On a cold target/CI the harness compile
-    # alone can approach the timeout; bundling it with the codegen run under
-    # one budget would reintroduce exactly the timeout case that split exists
-    # to avoid (and the later lane_rust `cargo test compile` cannot rescue a
-    # pre-step that has already timed out). lane_rust's own compile step then
-    # rides this warm cache.
-    run_step("codegen compile", compile_cmd)
-    run_step("codegen", codegen_cmd)
-    # Staleness guard: a non-empty porcelain status under ui/src/generated/ —
-    # modified or untracked — means the developer's Rust types and the
-    # committed TS don't line up. Recorded (not aborted) so the parallel phase
-    # still runs and the developer gets every failure in one pass; the readers
-    # below then validate against the freshly-regenerated (correct) tree.
-    run_step("codegen-stale", ["bash", "-c", (
-        'out=$(git status --porcelain -- ui/src/generated/); '
-        'if [ -n "$out" ]; then '
-        '  echo "ui/src/generated/ has uncommitted changes:"; '
-        '  echo "$out"; '
-        '  echo ""; '
-        '  echo "Run \'./dev.py codegen\' and commit the result."; '
-        '  exit 1; '
-        'fi'
-    )])
+        print("Regenerating codegen (serial, pre-fan-out)...\n")
+        # Cold-target safety: compile the test harnesses under their own
+        # CHECK_TIMEOUT before running the tiny codegen tests, mirroring
+        # lane_rust's compile/run split. On a cold target/CI the harness compile
+        # alone can approach the timeout; bundling it with the codegen run under
+        # one budget would reintroduce exactly the timeout case that split exists
+        # to avoid (and the later lane_rust `cargo test compile` cannot rescue a
+        # pre-step that has already timed out). lane_rust's own compile step then
+        # rides this warm cache.
+        run_step("codegen compile", compile_cmd)
+        run_step("codegen", codegen_cmd)
+        # Staleness guard: a non-empty porcelain status under ui/src/generated/ —
+        # modified or untracked — means the developer's Rust types and the
+        # committed TS don't line up. Recorded (not aborted) so the parallel phase
+        # still runs and the developer gets every failure in one pass; the readers
+        # below then validate against the freshly-regenerated (correct) tree.
+        run_step("codegen-stale", ["bash", "-c", (
+            'out=$(git status --porcelain -- ui/src/generated/); '
+            'if [ -n "$out" ]; then '
+            '  echo "ui/src/generated/ has uncommitted changes:"; '
+            '  echo "$out"; '
+            '  echo ""; '
+            '  echo "Run \'./dev.py codegen\' and commit the result."; '
+            '  exit 1; '
+            'fi'
+        )])
 
     print("\nRunning checks in parallel...\n")
 
     # Threads carry the lane name so a hung-thread report names the lane.
-    threads = [
+    _all_threads = [
         threading.Thread(target=lane_rust, name="rust"),
         # Use the `typecheck` script so contributors running `pnpm typecheck`
         # locally exercise the same `tsc -b --noEmit` invocation this lane
@@ -2654,6 +2820,7 @@ def cmd_check():
         threading.Thread(target=check_package_lock_clean, name="pkglock"),
         threading.Thread(target=lane_e2e, name="e2e"),
     ]
+    threads = [t for t in _all_threads if t.name in active]
     # daemon=True so a hung lane does not block interpreter shutdown after
     # we report it as failed and call sys.exit(1). Non-daemon threads cause
     # Python to wait at exit, defeating the hung-lane detection below.
@@ -4406,7 +4573,8 @@ def cmd_prod_build(version: str | None = None):
 def cmd_prod_deploy(version: str | None = None):
     """Build and deploy to production (auto-detects environment)."""
     print("Running pre-deploy checks...\n")
-    cmd_check()
+    # Deploys always run the full suite — never gate by changed paths.
+    cmd_check(gate=False)
     print()
 
     env = detect_prod_env()
@@ -4531,7 +4699,11 @@ def main():
     sub.add_parser("status", help="Check what's running")
 
     # check
-    sub.add_parser("check", help="Run lint, fmt check, and tests")
+    check_parser = sub.add_parser("check", help="Run lint, fmt check, and tests")
+    check_parser.add_argument(
+        "--all", dest="check_all", action="store_true", default=False,
+        help="Run every lane, disabling incremental path-gating (also: PHOENIX_CHECK_ALL=1)",
+    )
 
     # audit-specs (manual / verbose run; the orphan-anchor half also
     # runs as a `spec anchors` lane inside `./dev.py check`)
@@ -4614,7 +4786,7 @@ def main():
     elif args.command == "status":
         cmd_status()
     elif args.command == "check":
-        cmd_check()
+        cmd_check(gate=not args.check_all)
     elif args.command == "codegen":
         if not cmd_codegen():
             sys.exit(1)
