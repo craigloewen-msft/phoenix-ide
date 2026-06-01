@@ -339,7 +339,7 @@ pub(crate) async fn get_conversation_pr_status(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    let (branch_name, cwd) = match &conv.conv_mode {
+    let (branch_name, cwd, work_scope) = match &conv.conv_mode {
         ConvMode::Work {
             branch_name,
             worktree_path,
@@ -349,7 +349,14 @@ pub(crate) async fn get_conversation_pr_status(
             branch_name,
             worktree_path,
             ..
-        } => (branch_name.to_string(), worktree_path.to_string()),
+        } => (
+            branch_name.to_string(),
+            worktree_path.to_string(),
+            crate::work_scope::WorkScope::resolve(
+                &id,
+                Some(std::path::Path::new(worktree_path.as_str())),
+            ),
+        ),
         _ => {
             // Not applicable: no branch/worktree to query. Distinct from the
             // `gh`-can't-tell-us cases below, which return 200 + unavailable_reason.
@@ -361,17 +368,66 @@ pub(crate) async fn get_conversation_pr_status(
 
     let cwd = PathBuf::from(cwd);
     if !cwd.is_dir() {
-        return Ok(Json(PrStatusResponse::unavailable(
-            PrUnavailableReason::NotGitRepo,
-        )));
+        let attempted_at = chrono::Utc::now().to_rfc3339();
+        let response = match state
+            .runtime
+            .db()
+            .primary_work_scope_pr_association(&work_scope)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?
+        {
+            Some(pr) => crate::api::pr_monitoring::stale_response(
+                pr,
+                PrUnavailableReason::NotGitRepo,
+                attempted_at,
+            ),
+            None => PrStatusResponse::unavailable(PrUnavailableReason::NotGitRepo),
+        };
+        return Ok(Json(response));
     }
 
-    tokio::task::spawn_blocking(move || {
+    let db = state.runtime.db().clone();
+    let refresh = tokio::task::spawn_blocking(move || {
         crate::api::pr_monitoring::get_pr_status_for_branch(&cwd, &branch_name)
     })
     .await
-    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))
-    .map(Json)
+    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+
+    if !refresh.observations.is_empty() {
+        db.upsert_work_scope_pr_observations(&work_scope, &refresh.observations)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+    }
+
+    if let Some(primary) = db
+        .primary_work_scope_pr_association(&work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        if refresh.response.refresh.state != crate::api::types::PrRefreshState::Fresh {
+            return Ok(Json(
+                crate::api::pr_monitoring::stale_primary_response_with_refresh_state(
+                    &primary,
+                    refresh.response.refresh.state,
+                    refresh.response.refresh.reason.clone(),
+                    refresh.response.refresh.last_attempted_at,
+                ),
+            ));
+        }
+
+        if refresh.response.number != Some(primary.pr_number) {
+            return Ok(Json(
+                crate::api::pr_monitoring::stale_primary_response_with_refresh_state(
+                    &primary,
+                    refresh.response.refresh.state,
+                    refresh.response.refresh.reason.clone(),
+                    refresh.response.refresh.last_attempted_at,
+                ),
+            ));
+        }
+    }
+
+    Ok(Json(refresh.response))
 }
 
 pub(crate) async fn create_pr_auto_fix_context(
@@ -385,7 +441,7 @@ pub(crate) async fn create_pr_auto_fix_context(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    let (branch_name, worktree_path) = match &conv.conv_mode {
+    let (branch_name, worktree_path, work_scope) = match &conv.conv_mode {
         ConvMode::Work {
             branch_name,
             worktree_path,
@@ -395,7 +451,14 @@ pub(crate) async fn create_pr_auto_fix_context(
             branch_name,
             worktree_path,
             ..
-        } => (branch_name.to_string(), worktree_path.to_string()),
+        } => (
+            branch_name.to_string(),
+            worktree_path.to_string(),
+            crate::work_scope::WorkScope::resolve(
+                &id,
+                Some(std::path::Path::new(worktree_path.as_str())),
+            ),
+        ),
         _ => {
             return Err(AppError::BadRequest(
                 "Conversation is not in Work or Branch mode (no associated PR)".to_string(),
@@ -403,22 +466,47 @@ pub(crate) async fn create_pr_auto_fix_context(
         }
     };
 
-    tokio::task::spawn_blocking(move || {
+    let db = state.runtime.db().clone();
+    let associated_pr = db
+        .primary_work_scope_pr_association(&work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let result = tokio::task::spawn_blocking(move || {
         let worktree = PathBuf::from(worktree_path);
-        crate::api::pr_monitoring::capture_pr_auto_fix_context(&worktree, &branch_name).map_err(
-            |e| match e {
-                crate::api::pr_monitoring::PrMonitorError::BadRequest(message) => {
-                    AppError::BadRequest(message)
-                }
-                crate::api::pr_monitoring::PrMonitorError::Internal(message) => {
-                    AppError::Internal(message)
-                }
-            },
-        )
+        if let Some(pr) = associated_pr {
+            crate::api::pr_monitoring::capture_pr_auto_fix_context_for_pr(&worktree, pr.pr_number)
+        } else {
+            crate::api::pr_monitoring::capture_pr_auto_fix_context_for_branch(
+                &worktree,
+                &branch_name,
+            )
+        }
     })
     .await
-    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?
-    .map(Json)
+    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+
+    let (response, observations) = match result {
+        Ok(capture) => (Ok(capture.response), capture.observations),
+        Err(crate::api::pr_monitoring::PrMonitorError::BadRequestWithObservations {
+            message,
+            observations,
+        }) => (Err(AppError::BadRequest(message)), observations),
+        Err(crate::api::pr_monitoring::PrMonitorError::BadRequest(message)) => {
+            return Err(AppError::BadRequest(message));
+        }
+        Err(crate::api::pr_monitoring::PrMonitorError::Internal(message)) => {
+            return Err(AppError::Internal(message));
+        }
+    };
+
+    if !observations.is_empty() {
+        db.upsert_work_scope_pr_observations(&work_scope, &observations)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+    }
+
+    Ok(Json(response?))
 }
 
 /// `GET /api/conversations/:id/diff` — committed and uncommitted changes

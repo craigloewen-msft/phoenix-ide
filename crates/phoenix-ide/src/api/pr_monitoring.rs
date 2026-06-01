@@ -1,15 +1,16 @@
 use super::types::{
     PrAutoFixContextResponse, PrCheckDetail, PrCheckLogSnippet, PrCheckLogSource, PrCheckState,
     PrCheckSummary, PrDisplayState, PrFeedbackCoverage, PrFeedbackCoverageStatus,
-    PrFeedbackCoverageSurface, PrFeedbackItem, PrFeedbackSource, PrFeedbackSummary,
-    PrStatusResponse, PrUnavailableReason,
+    PrFeedbackCoverageSurface, PrFeedbackItem, PrFeedbackSource, PrFeedbackSummary, PrIdentity,
+    PrRefreshMetadata, PrRefreshState, PrStatusResponse, PrUnavailableReason,
 };
+use crate::db::{WorkScopePrAssociation, WorkScopePrObservation};
 use crate::git_ops::run_git;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const ARTIFACT_VERSION: u32 = 1;
 const LOG_SNIPPET_LIMIT: usize = 16 * 1024;
@@ -17,13 +18,19 @@ const LOG_SNIPPET_LIMIT: usize = 16 * 1024;
 #[derive(Debug)]
 pub(crate) enum PrMonitorError {
     BadRequest(String),
+    BadRequestWithObservations {
+        message: String,
+        observations: Vec<WorkScopePrObservation>,
+    },
     Internal(String),
 }
 
 impl std::fmt::Display for PrMonitorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BadRequest(message) | Self::Internal(message) => write!(f, "{message}"),
+            Self::BadRequest(message)
+            | Self::BadRequestWithObservations { message, .. }
+            | Self::Internal(message) => write!(f, "{message}"),
         }
     }
 }
@@ -62,6 +69,7 @@ struct GhFailure {
 
 trait GhClient {
     fn pr_list_for_head(&self, branch: &str) -> Result<Vec<GhPrListItem>, GhFailure>;
+    fn pr_view(&self, number: u64) -> Result<GhPrListItem, GhFailure>;
     fn pr_checks(&self, number: u64) -> Result<Vec<GhPrCheck>, GhFailure>;
     fn repo_view(&self) -> Result<GhRepoView, GhFailure>;
     fn issue_comments(
@@ -90,11 +98,22 @@ trait GhClient {
 
 struct ShellGhClient<'a> {
     cwd: &'a Path,
+    deadline: Option<Instant>,
 }
 
 impl<'a> ShellGhClient<'a> {
     fn new(cwd: &'a Path) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            deadline: None,
+        }
+    }
+
+    fn with_deadline(cwd: &'a Path, deadline: Instant) -> Self {
+        Self {
+            cwd,
+            deadline: Some(deadline),
+        }
     }
 
     fn run_json<T: for<'de> Deserialize<'de>>(
@@ -102,7 +121,7 @@ impl<'a> ShellGhClient<'a> {
         args: &[&str],
         label: &str,
     ) -> Result<T, GhFailure> {
-        let raw = run_gh(self.cwd, args)?;
+        let raw = run_gh_with_deadline(self.cwd, args, self.deadline)?;
         serde_json::from_str(&raw).map_err(|e| GhFailure {
             kind: GhFailureKind::CommandFailed,
             message: format!("failed to parse {label}: {e}"),
@@ -129,9 +148,23 @@ impl GhClient for ShellGhClient<'_> {
         )
     }
 
+    fn pr_view(&self, number: u64) -> Result<GhPrListItem, GhFailure> {
+        let number = number.to_string();
+        self.run_json(
+            &[
+                "pr",
+                "view",
+                &number,
+                "--json",
+                "number,title,url,state,isDraft,baseRefName,headRefName,updatedAt",
+            ],
+            "PR view",
+        )
+    }
+
     fn pr_checks(&self, number: u64) -> Result<Vec<GhPrCheck>, GhFailure> {
         let number = number.to_string();
-        let out = run_gh_raw(
+        let out = run_gh_raw_with_deadline(
             self.cwd,
             &[
                 "pr",
@@ -141,6 +174,7 @@ impl GhClient for ShellGhClient<'_> {
                 "name,state,bucket,link,description,workflow,startedAt,completedAt",
                 "--watch=false",
             ],
+            self.deadline,
         )?;
         if out.stdout.trim().is_empty() {
             return Err(GhFailure {
@@ -266,24 +300,53 @@ impl GhClient for ShellGhClient<'_> {
     }
 }
 
-pub(crate) fn get_pr_status_for_branch(cwd: &Path, branch_name: &str) -> PrStatusResponse {
+pub(crate) struct PrStatusRefresh {
+    pub response: PrStatusResponse,
+    pub observations: Vec<WorkScopePrObservation>,
+}
+
+pub(crate) fn get_pr_status_for_branch(cwd: &Path, branch_name: &str) -> PrStatusRefresh {
     if run_git(cwd, &["rev-parse", "--is-inside-work-tree"]).is_err() {
-        return PrStatusResponse::unavailable(PrUnavailableReason::NotGitRepo);
+        return PrStatusRefresh {
+            response: PrStatusResponse::unavailable(PrUnavailableReason::NotGitRepo),
+            observations: Vec::new(),
+        };
     }
     get_pr_status_with_client(&ShellGhClient::new(cwd), branch_name)
 }
 
-fn get_pr_status_with_client(client: &dyn GhClient, branch_name: &str) -> PrStatusResponse {
+pub(crate) fn get_pr_status_for_branch_with_deadline(
+    cwd: &Path,
+    branch_name: &str,
+    deadline: Instant,
+) -> PrStatusRefresh {
+    if run_git(cwd, &["rev-parse", "--is-inside-work-tree"]).is_err() {
+        return PrStatusRefresh {
+            response: PrStatusResponse::unavailable(PrUnavailableReason::NotGitRepo),
+            observations: Vec::new(),
+        };
+    }
+    get_pr_status_with_client(&ShellGhClient::with_deadline(cwd, deadline), branch_name)
+}
+
+fn get_pr_status_with_client(client: &dyn GhClient, branch_name: &str) -> PrStatusRefresh {
+    let attempted_at = Utc::now().to_rfc3339();
     let prs = match client.pr_list_for_head(branch_name) {
         Ok(prs) => prs,
         Err(e) => {
             tracing::debug!(branch = %branch_name, error = %e.message, "gh pr list failed");
-            return PrStatusResponse::unavailable(e.kind.unavailable_reason());
+            return PrStatusRefresh {
+                response: unavailable_at(e.kind.unavailable_reason(), attempted_at),
+                observations: Vec::new(),
+            };
         }
     };
 
-    let Some(pr) = choose_pr(prs) else {
-        return PrStatusResponse::not_found();
+    let Some(pr) = choose_pr(prs.clone()) else {
+        return PrStatusRefresh {
+            response: not_found_at(attempted_at),
+            observations: Vec::new(),
+        };
     };
     let display_state = normalize_pr_display_state(&pr.state, pr.is_draft);
     let checks = if matches!(display_state, PrDisplayState::Open) {
@@ -298,41 +361,94 @@ fn get_pr_status_with_client(client: &dyn GhClient, branch_name: &str) -> PrStat
         unknown_checks()
     };
 
-    PrStatusResponse {
-        found: true,
-        unavailable_reason: None,
-        number: Some(pr.number),
-        title: Some(pr.title),
-        url: Some(pr.url),
-        state: Some(pr.state),
-        draft: Some(pr.is_draft),
-        base: Some(pr.base_ref_name),
-        head: Some(pr.head_ref_name),
-        check_state: matches!(display_state, PrDisplayState::Open).then_some(checks.state),
-        check_summary: matches!(display_state, PrDisplayState::Open).then_some(checks.summary),
-        feedback_summary: None,
-        updated_at: Some(Utc::now().to_rfc3339()),
-        display_state: Some(display_state),
+    let observations: Vec<_> = match client.repo_view() {
+        Ok(repo) => prs
+            .iter()
+            .cloned()
+            .map(|pr| gh_pr_to_observation(&repo, pr))
+            .collect(),
+        Err(e) => {
+            tracing::debug!(branch = %branch_name, error = %e.message, "gh repo view failed; PR status will not persist observations");
+            Vec::new()
+        }
+    };
+    let pr_identity = gh_pr_to_identity(&pr);
+    PrStatusRefresh {
+        response: fresh_response(pr_identity, checks, attempted_at),
+        observations,
     }
 }
 
-pub(crate) fn capture_pr_auto_fix_context(
+#[derive(Debug)]
+pub(crate) struct PrAutoFixCapture {
+    pub response: PrAutoFixContextResponse,
+    pub observations: Vec<WorkScopePrObservation>,
+}
+
+pub(crate) fn capture_pr_auto_fix_context_for_pr(
     worktree: &Path,
-    branch_name: &str,
-) -> Result<PrAutoFixContextResponse, PrMonitorError> {
+    pr_number: u64,
+) -> Result<PrAutoFixCapture, PrMonitorError> {
     if !worktree.is_dir() || run_git(worktree, &["rev-parse", "--is-inside-work-tree"]).is_err() {
         return Err(PrMonitorError::BadRequest(
             "Conversation worktree is not a git repository".to_string(),
         ));
     }
-    capture_pr_auto_fix_context_with_client(worktree, branch_name, &ShellGhClient::new(worktree))
+    let client = ShellGhClient::new(worktree);
+    let pr = client.pr_view(pr_number).map_err(|e| {
+        let reason = e.kind.unavailable_reason();
+        PrMonitorError::BadRequest(format!(
+            "PR context unavailable: {}",
+            unavailable_reason_message(&reason)
+        ))
+    })?;
+    let observation = match client.repo_view() {
+        Ok(repo) => Some(gh_pr_to_observation(&repo, pr.clone())),
+        Err(e) => {
+            tracing::debug!(pr = pr_number, error = %e.message, "gh repo view failed; associated PR auto-fix will not persist observation");
+            None
+        }
+    };
+    let response = match capture_pr_auto_fix_context_for_pr_item(worktree, pr, &client) {
+        Ok(response) => response,
+        Err(PrMonitorError::BadRequest(message)) => {
+            if let Some(observation) = observation {
+                return Err(PrMonitorError::BadRequestWithObservations {
+                    message,
+                    observations: vec![observation],
+                });
+            }
+            return Err(PrMonitorError::BadRequest(message));
+        }
+        Err(err) => return Err(err),
+    };
+    Ok(PrAutoFixCapture {
+        response,
+        observations: observation.into_iter().collect(),
+    })
 }
 
-fn capture_pr_auto_fix_context_with_client(
+pub(crate) fn capture_pr_auto_fix_context_for_branch(
+    worktree: &Path,
+    branch_name: &str,
+) -> Result<PrAutoFixCapture, PrMonitorError> {
+    if !worktree.is_dir() || run_git(worktree, &["rev-parse", "--is-inside-work-tree"]).is_err() {
+        return Err(PrMonitorError::BadRequest(
+            "Conversation worktree is not a git repository".to_string(),
+        ));
+    }
+    capture_pr_auto_fix_context_for_branch_with_client(
+        worktree,
+        branch_name,
+        &ShellGhClient::new(worktree),
+    )
+}
+
+fn capture_pr_auto_fix_context_for_branch_with_client(
     worktree: &Path,
     branch_name: &str,
     client: &dyn GhClient,
-) -> Result<PrAutoFixContextResponse, PrMonitorError> {
+) -> Result<PrAutoFixCapture, PrMonitorError> {
     let prs = client.pr_list_for_head(branch_name).map_err(|e| {
         let reason = e.kind.unavailable_reason();
         tracing::debug!(branch = %branch_name, reason = ?reason, error = %e.message, "failed to capture PR context");
@@ -341,9 +457,49 @@ fn capture_pr_auto_fix_context_with_client(
             unavailable_reason_message(&reason)
         ))
     })?;
+    let repo = match client.repo_view() {
+        Ok(repo) => Some(repo),
+        Err(e) => {
+            tracing::debug!(branch = %branch_name, error = %e.message, "gh repo view failed; PR auto-fix will not persist observations");
+            None
+        }
+    };
+    let observations: Vec<WorkScopePrObservation> = repo
+        .as_ref()
+        .map(|repo| {
+            prs.iter()
+                .cloned()
+                .map(|pr| gh_pr_to_observation(repo, pr))
+                .collect()
+        })
+        .unwrap_or_default();
     let pr = choose_pr(prs).ok_or_else(|| {
         PrMonitorError::BadRequest("No pull request found for this branch".to_string())
     })?;
+    let response =
+        capture_pr_auto_fix_context_for_pr_item(worktree, pr, client).map_err(|err| {
+            if let PrMonitorError::BadRequest(message) = err {
+                if !observations.is_empty() {
+                    return PrMonitorError::BadRequestWithObservations {
+                        message,
+                        observations: observations.clone(),
+                    };
+                }
+                return PrMonitorError::BadRequest(message);
+            }
+            err
+        })?;
+    Ok(PrAutoFixCapture {
+        response,
+        observations,
+    })
+}
+
+fn capture_pr_auto_fix_context_for_pr_item(
+    worktree: &Path,
+    pr: GhPrListItem,
+    client: &dyn GhClient,
+) -> Result<PrAutoFixContextResponse, PrMonitorError> {
     let display_state = normalize_pr_display_state(&pr.state, pr.is_draft);
     if display_state != PrDisplayState::Open {
         return Err(PrMonitorError::BadRequest(
@@ -407,6 +563,206 @@ fn capture_pr_auto_fix_context_with_client(
         pr_number: artifact.pr.number,
         message,
     })
+}
+
+fn fresh_response(
+    pr: PrIdentity,
+    checks: CapturedPrChecks,
+    attempted_at: String,
+) -> PrStatusResponse {
+    let refreshed_at = Utc::now().to_rfc3339();
+    PrStatusResponse {
+        found: true,
+        unavailable_reason: None,
+        number: Some(pr.number),
+        title: Some(pr.title.clone()),
+        url: Some(pr.url.clone()),
+        state: Some(pr.state.clone()),
+        draft: Some(pr.draft),
+        base: Some(pr.base.clone()),
+        head: Some(pr.head.clone()),
+        check_state: matches!(pr.display_state, PrDisplayState::Open).then_some(checks.state),
+        check_summary: matches!(pr.display_state, PrDisplayState::Open).then_some(checks.summary),
+        feedback_summary: None,
+        updated_at: pr.updated_at.clone().or_else(|| Some(refreshed_at.clone())),
+        display_state: Some(pr.display_state.clone()),
+        pr: Some(pr),
+        refresh: PrRefreshMetadata {
+            state: PrRefreshState::Fresh,
+            reason: None,
+            last_attempted_at: attempted_at,
+            last_refreshed_at: Some(refreshed_at),
+            stale: false,
+        },
+    }
+}
+
+fn not_found_at(attempted_at: String) -> PrStatusResponse {
+    PrStatusResponse {
+        refresh: PrRefreshMetadata {
+            state: PrRefreshState::NotFound,
+            reason: None,
+            last_attempted_at: attempted_at.clone(),
+            last_refreshed_at: Some(attempted_at),
+            stale: false,
+        },
+        ..PrStatusResponse::not_found()
+    }
+}
+
+fn unavailable_at(reason: PrUnavailableReason, attempted_at: String) -> PrStatusResponse {
+    PrStatusResponse {
+        refresh: PrRefreshMetadata {
+            state: PrRefreshState::Unavailable,
+            reason: Some(reason.clone()),
+            last_attempted_at: attempted_at,
+            last_refreshed_at: None,
+            stale: false,
+        },
+        unavailable_reason: Some(reason),
+        ..PrStatusResponse::not_found()
+    }
+}
+
+pub(crate) fn stale_response(
+    pr: WorkScopePrAssociation,
+    reason: PrUnavailableReason,
+    attempted_at: String,
+) -> PrStatusResponse {
+    stale_response_with_refresh_state(
+        pr,
+        PrRefreshState::Unavailable,
+        Some(reason.clone()),
+        attempted_at,
+        Some(reason),
+    )
+}
+
+pub(crate) fn stale_response_with_refresh_state(
+    pr: WorkScopePrAssociation,
+    refresh_state: PrRefreshState,
+    refresh_reason: Option<PrUnavailableReason>,
+    attempted_at: String,
+    legacy_unavailable_reason: Option<PrUnavailableReason>,
+) -> PrStatusResponse {
+    let identity = association_to_identity(&pr);
+    PrStatusResponse {
+        found: true,
+        unavailable_reason: legacy_unavailable_reason,
+        number: Some(identity.number),
+        title: Some(identity.title.clone()),
+        url: Some(identity.url.clone()),
+        state: Some(identity.state.clone()),
+        draft: Some(identity.draft),
+        base: Some(identity.base.clone()),
+        head: Some(identity.head.clone()),
+        check_state: None,
+        check_summary: None,
+        feedback_summary: None,
+        updated_at: identity.updated_at.clone(),
+        display_state: Some(identity.display_state.clone()),
+        pr: Some(identity),
+        refresh: PrRefreshMetadata {
+            state: refresh_state,
+            reason: refresh_reason,
+            last_attempted_at: attempted_at,
+            last_refreshed_at: Some(pr.last_seen_at),
+            stale: true,
+        },
+    }
+}
+
+pub(crate) fn stale_primary_response_with_refresh_state(
+    pr: &WorkScopePrAssociation,
+    refresh_state: PrRefreshState,
+    refresh_reason: Option<PrUnavailableReason>,
+    attempted_at: String,
+) -> PrStatusResponse {
+    persisted_primary_response(
+        pr,
+        PrRefreshMetadata {
+            state: refresh_state,
+            reason: refresh_reason,
+            last_attempted_at: attempted_at,
+            last_refreshed_at: Some(pr.last_seen_at.clone()),
+            stale: true,
+        },
+        true,
+    )
+}
+
+pub(crate) fn persisted_primary_response(
+    pr: &WorkScopePrAssociation,
+    mut refresh: PrRefreshMetadata,
+    stale: bool,
+) -> PrStatusResponse {
+    let identity = association_to_identity(pr);
+    refresh.stale = stale;
+    if refresh.last_refreshed_at.is_none() && !stale {
+        refresh.last_refreshed_at = Some(pr.last_seen_at.clone());
+    }
+    PrStatusResponse {
+        found: true,
+        unavailable_reason: refresh.reason.clone(),
+        number: Some(identity.number),
+        title: Some(identity.title.clone()),
+        url: Some(identity.url.clone()),
+        state: Some(identity.state.clone()),
+        draft: Some(identity.draft),
+        base: Some(identity.base.clone()),
+        head: Some(identity.head.clone()),
+        check_state: None,
+        check_summary: None,
+        feedback_summary: None,
+        updated_at: identity.updated_at.clone(),
+        display_state: Some(identity.display_state.clone()),
+        pr: Some(identity),
+        refresh,
+    }
+}
+
+fn gh_pr_to_identity(pr: &GhPrListItem) -> PrIdentity {
+    PrIdentity {
+        number: pr.number,
+        title: pr.title.clone(),
+        url: pr.url.clone(),
+        state: pr.state.clone(),
+        draft: pr.is_draft,
+        display_state: normalize_pr_display_state(&pr.state, pr.is_draft),
+        base: pr.base_ref_name.clone(),
+        head: pr.head_ref_name.clone(),
+        updated_at: pr.updated_at.clone(),
+    }
+}
+
+fn association_to_identity(pr: &WorkScopePrAssociation) -> PrIdentity {
+    PrIdentity {
+        number: pr.pr_number,
+        title: pr.title.clone(),
+        url: pr.url.clone(),
+        state: pr.state.clone(),
+        draft: pr.draft,
+        display_state: pr.display_state.clone(),
+        base: pr.base.clone(),
+        head: pr.head.clone(),
+        updated_at: pr.github_updated_at.clone(),
+    }
+}
+
+fn gh_pr_to_observation(repo: &GhRepoView, pr: GhPrListItem) -> WorkScopePrObservation {
+    WorkScopePrObservation {
+        repo_owner: repo.owner.login.clone(),
+        repo_name: repo.name.clone(),
+        pr_number: pr.number,
+        title: pr.title,
+        url: pr.url,
+        state: pr.state.clone(),
+        draft: pr.is_draft,
+        display_state: normalize_pr_display_state(&pr.state, pr.is_draft),
+        base: pr.base_ref_name,
+        head: pr.head_ref_name,
+        github_updated_at: pr.updated_at,
+    }
 }
 
 fn unavailable_reason_message(reason: &PrUnavailableReason) -> &'static str {
@@ -771,10 +1127,13 @@ struct GhOutput {
     stderr: String,
 }
 
-fn run_gh_raw(cwd: &Path, args: &[&str]) -> Result<GhOutput, GhFailure> {
+fn run_gh_raw_with_deadline(
+    cwd: &Path,
+    args: &[&str],
+    deadline: Option<Instant>,
+) -> Result<GhOutput, GhFailure> {
     use std::io::Read;
     use std::process::{Command, Stdio};
-    use std::time::Instant;
 
     let mut child = Command::new("gh")
         .args(args)
@@ -810,14 +1169,20 @@ fn run_gh_raw(cwd: &Path, args: &[&str]) -> Result<GhOutput, GhFailure> {
         })? {
             break status;
         }
-        if started.elapsed() > Duration::from_secs(8) {
+        let command_timed_out = started.elapsed() > Duration::from_secs(8);
+        let deadline_expired = deadline.is_some_and(|deadline| Instant::now() >= deadline);
+        if command_timed_out || deadline_expired {
             let _ = child.kill();
             let _ = child.wait();
             let _ = stdout_h.join();
             let _ = stderr_h.join();
             return Err(GhFailure {
                 kind: GhFailureKind::CommandFailed,
-                message: format!("gh {} timed out", args.join(" ")),
+                message: if deadline_expired {
+                    format!("gh {} aborted at refresh deadline", args.join(" "))
+                } else {
+                    format!("gh {} timed out", args.join(" "))
+                },
             });
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -833,8 +1198,12 @@ fn run_gh_raw(cwd: &Path, args: &[&str]) -> Result<GhOutput, GhFailure> {
     })
 }
 
-fn run_gh(cwd: &Path, args: &[&str]) -> Result<String, GhFailure> {
-    let out = run_gh_raw(cwd, args)?;
+fn run_gh_with_deadline(
+    cwd: &Path,
+    args: &[&str],
+    deadline: Option<Instant>,
+) -> Result<String, GhFailure> {
+    let out = run_gh_raw_with_deadline(cwd, args, deadline)?;
     if out.status.success() {
         return Ok(out.stdout);
     }
@@ -1069,6 +1438,16 @@ mod tests {
         fn pr_list_for_head(&self, _: &str) -> Result<Vec<GhPrListItem>, GhFailure> {
             self.prs.clone()
         }
+        fn pr_view(&self, number: u64) -> Result<GhPrListItem, GhFailure> {
+            self.prs
+                .clone()?
+                .into_iter()
+                .find(|pr| pr.number == number)
+                .ok_or_else(|| GhFailure {
+                    kind: GhFailureKind::CommandFailed,
+                    message: "not found".to_string(),
+                })
+        }
         fn pr_checks(&self, _: u64) -> Result<Vec<GhPrCheck>, GhFailure> {
             self.checks.clone()
         }
@@ -1183,6 +1562,44 @@ mod tests {
     }
 
     #[test]
+    fn stale_primary_response_marks_mismatch_stale_with_primary_timestamp() {
+        let primary = WorkScopePrAssociation {
+            work_scope_id: 1,
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number: 42,
+            title: "cached primary".to_string(),
+            url: "https://example.test/42".to_string(),
+            state: "OPEN".to_string(),
+            draft: false,
+            display_state: PrDisplayState::Open,
+            base: "main".to_string(),
+            head: "old-branch".to_string(),
+            github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            first_seen_at: "2026-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2026-01-02T00:00:00Z".to_string(),
+        };
+
+        let response = stale_primary_response_with_refresh_state(
+            &primary,
+            PrRefreshState::Fresh,
+            None,
+            "2026-01-03T00:00:00Z".to_string(),
+        );
+
+        assert!(response.found);
+        assert_eq!(response.number, Some(42));
+        assert_eq!(response.refresh.state, PrRefreshState::Fresh);
+        assert!(response.refresh.stale);
+        assert_eq!(response.refresh.last_attempted_at, "2026-01-03T00:00:00Z");
+        assert_eq!(
+            response.refresh.last_refreshed_at,
+            Some("2026-01-02T00:00:00Z".to_string())
+        );
+        assert_eq!(response.unavailable_reason, None);
+    }
+
+    #[test]
     fn status_poll_does_not_fetch_feedback() {
         let gh = FakeGh {
             prs: Ok(vec![pr(7, "OPEN", false, "2026-01-01")]),
@@ -1191,9 +1608,9 @@ mod tests {
             ..FakeGh::default()
         };
         let status = get_pr_status_with_client(&gh, "branch");
-        assert!(status.found);
-        assert_eq!(status.check_state, Some(PrCheckState::Passing));
-        assert!(status.feedback_summary.is_none());
+        assert!(status.response.found);
+        assert_eq!(status.response.check_state, Some(PrCheckState::Passing));
+        assert!(status.response.feedback_summary.is_none());
     }
 
     #[test]
@@ -1244,7 +1661,10 @@ mod tests {
             review_summaries: Ok(vec![]),
             review_threads: Ok(vec![]),
         };
-        let response = capture_pr_auto_fix_context_with_client(temp.path(), "branch", &gh).unwrap();
+        let response =
+            capture_pr_auto_fix_context_for_branch_with_client(temp.path(), "branch", &gh)
+                .unwrap()
+                .response;
         assert!(response
             .message
             .contains("Do not push unless the user explicitly asks"));
@@ -1284,13 +1704,39 @@ mod tests {
     }
 
     #[test]
+    fn non_open_auto_fix_error_carries_observations() {
+        let temp = TempDir::new().unwrap();
+        let gh = FakeGh {
+            prs: Ok(vec![pr(7, "MERGED", false, "2026-01-01")]),
+            repo: Ok(repo()),
+            ..FakeGh::default()
+        };
+        let err = capture_pr_auto_fix_context_for_branch_with_client(temp.path(), "branch", &gh)
+            .unwrap_err();
+        match err {
+            PrMonitorError::BadRequestWithObservations {
+                message,
+                observations,
+            } => {
+                assert!(message.contains("Auto-fix is only available"));
+                assert_eq!(observations.len(), 1);
+                assert_eq!(observations[0].pr_number, 7);
+                assert_eq!(observations[0].state, "MERGED");
+            }
+            other => panic!("expected observations on non-open error, got {other:?}"),
+        }
+        assert!(!temp.path().join(".phoenix/pr-context").exists());
+    }
+
+    #[test]
     fn context_failure_writes_no_artifact() {
         let temp = TempDir::new().unwrap();
         let gh = FakeGh {
             prs: Ok(vec![]),
             ..FakeGh::default()
         };
-        let err = capture_pr_auto_fix_context_with_client(temp.path(), "branch", &gh).unwrap_err();
+        let err = capture_pr_auto_fix_context_for_branch_with_client(temp.path(), "branch", &gh)
+            .unwrap_err();
         assert!(matches!(err, PrMonitorError::BadRequest(_)));
         assert!(!temp.path().join(".phoenix/pr-context").exists());
     }

@@ -35,7 +35,8 @@ function deriveWorkLifecycleControls({
   const prMerged = !!prStatus?.found && prStatus.display_state === 'merged';
   const prClosedUnmerged = !!prStatus?.found && prStatus.display_state === 'closed';
   const prUnavailable = !!prStatus?.unavailable_reason;
-  const prBlocksCleanup = !!prStatus?.found && !prMerged;
+  const prUnavailableStale = prUnavailable && prStatus?.refresh.state === 'unavailable' && !!prStatus.refresh.stale;
+  const prBlocksCleanup = !!prStatus?.found && !prMerged && (!prUnavailableStale || prClosedUnmerged);
   const completeDisabled = isLoading || hasContinuation || prChecking || (!!prBlocksCleanup && !manualFallbackEnabled);
   const completeLabel = prChecking
     ? 'Checking PR…'
@@ -102,16 +103,21 @@ function WorkViewerActions() {
   </>;
 }
 
+function prRefreshUnavailableText(prStatus: PrStatusResponse): string {
+  return `Resolve PR refresh issue before auto-fix: refresh unavailable (${prStatus.refresh.reason ?? 'unknown'})`;
+}
+
 function PrRemediationActions({ conversationId, prStatus, onSendMessage, showError }: { conversationId: string; prStatus: PrStatusResponse | null; onSendMessage?: ((text: string) => void) | undefined; showError?: ((message: string) => void) | undefined }) {
   const [loading, setLoading] = useState(false);
-  const canAddress = !!prStatus?.found && prStatus.display_state === 'open' && !!onSendMessage;
+  const refreshUnavailable = prStatus?.refresh.state === 'unavailable';
+  const canAddress = !!prStatus?.found && prStatus.display_state === 'open' && !refreshUnavailable && !!onSendMessage;
   if (!prStatus?.found || prStatus.display_state !== 'open') return null;
   return (
     <button
       type="button"
       className="work-actions-btn work-actions-pr-remediate"
       disabled={!canAddress || loading}
-      title={!canAddress ? 'Conversation input is unavailable' : undefined}
+      title={!canAddress ? (refreshUnavailable ? prRefreshUnavailableText(prStatus) : 'Conversation input is unavailable') : undefined}
       onClick={async () => {
         if (!canAddress) return;
         setLoading(true);

@@ -42,9 +42,19 @@ vi.mock('../api', () => ({
   },
 }));
 
-function prStatusHandle(prStatus: PrStatusResponse = { found: false }, manualFallbackEnabled = false) {
+function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }, manualFallbackEnabled = false) {
+  const status: PrStatusResponse = {
+    found: false,
+    refresh: {
+      state: 'not_found',
+      last_attempted_at: '2026-01-01T00:00:00Z',
+      last_refreshed_at: '2026-01-01T00:00:00Z',
+      stale: false,
+    },
+    ...prStatus,
+  };
   return {
-    state: { status: 'ready' as const, prStatus },
+    state: { status: 'ready' as const, prStatus: status },
     manualFallbackEnabled,
     enableManualFallback: vi.fn(),
   };
@@ -125,6 +135,67 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
     expect(mark.textContent).toMatch(/manual fallback/i);
     fireEvent.click(mark);
     expect(api.markMerged).not.toHaveBeenCalled();
+  });
+
+  it('keeps manual cleanup fallback reachable for stale PR data when gh is unavailable', async () => {
+    const handle = prStatusHandle({
+      found: true,
+      number: 134,
+      display_state: 'open',
+      unavailable_reason: 'not_authenticated',
+      refresh: {
+        state: 'unavailable',
+        reason: 'not_authenticated',
+        last_attempted_at: '2026-01-01T00:00:00Z',
+        last_refreshed_at: '2025-12-31T00:00:00Z',
+        stale: true,
+      },
+    });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-stale-unavailable"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={handle}
+      />,
+    );
+
+    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
+    expect(mark.disabled).toBe(false);
+    expect(mark.textContent).toMatch(/manual fallback/i);
+    fireEvent.click(mark);
+    expect(api.markMerged).not.toHaveBeenCalled();
+    expect(handle.enableManualFallback).toHaveBeenCalled();
+  });
+
+  it('keeps stale unavailable closed PRs directed to Abandon', async () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-stale-closed"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({
+          found: true,
+          number: 135,
+          display_state: 'closed',
+          unavailable_reason: 'not_authenticated',
+          refresh: {
+            state: 'unavailable',
+            reason: 'not_authenticated',
+            last_attempted_at: '2026-01-01T00:00:00Z',
+            last_refreshed_at: '2025-12-31T00:00:00Z',
+            stale: true,
+          },
+        })}
+      />,
+    );
+
+    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
+    expect(mark.disabled).toBe(true);
+    expect(mark.textContent).toMatch(/closed without merge/i);
+    expect(mark.title).toMatch(/Use Abandon/i);
   });
 
   it('marks merged after explicit manual fallback is enabled', async () => {
