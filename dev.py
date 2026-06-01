@@ -2176,7 +2176,7 @@ def cmd_check():
             print(f"  {ok} {name:<18s} ({elapsed:.1f}s)")
 
     def lane_rust():
-        """Rust lane: clippy → [musl smoke check] → test compile → test run → codegen staleness check.
+        """Rust lane: clippy → [musl smoke check] → test compile → test run.
 
         The musl smoke check is **macOS-only and conditional** on the
         `x86_64-linux-musl-gcc` cross toolchain being on PATH; it never
@@ -2198,11 +2198,16 @@ def cmd_check():
         approach 300s on their own, and when bundled with ~50s of test runtime
         the combined step exceeds the timeout even though nothing is wrong.
 
-        The final `codegen-stale` step guards against Rust-type edits landing
-        without a regenerated `ui/src/generated/` directory (task 02677).
-        `cargo test` runs ts-rs' per-type `export_bindings_*` tests which
-        overwrite the generated .ts files; if those differ from what's
-        committed to git, the developer forgot to regenerate.
+        Codegen does NOT run in this lane. The ts-rs `export_bindings_*`
+        tests (re)write `ui/src/generated/` as a side effect; running them
+        here would race the tsc, vitest, eslint, and ast-grep lanes that read
+        that tree in parallel. A serial pre-step in cmd_check regenerates and
+        staleness-checks the tree before the fan-out, and `test_cmd` (built in
+        cmd_check) excludes `export_bindings` from this lane's verification
+        run so the generated tree stays frozen for the whole parallel phase.
+        The pre-step already exercised those tests, so the exclusion drops no
+        coverage. `compile_cmd`/`test_cmd`/the thread cap are computed once in
+        cmd_check and closed over here.
         """
         run_step("cargo clippy", ["cargo", "clippy", "--", "-D", "warnings"])
         if sys.platform == "darwin":
@@ -2219,57 +2224,8 @@ def cmd_check():
         # strictly redundant with `cargo clippy` above (clippy implies check).
         # Drop it — musl validation belongs on the CI/macOS path that has the
         # cross toolchain installed.
-        has_nextest = subprocess.run(
-            ["cargo", "nextest", "--version"],
-            capture_output=True,
-        ).returncode == 0
-        # nextest defaults to available_parallelism (= num_cpus). On low-RAM
-        # boxes, num_cpus parallel test threads can swap and stall sensitive
-        # tests (e.g. browser tests where Chrome's CDP WebSocket handshake
-        # times out if Chrome can't get CPU+RAM during launch). Cap the
-        # thread count by ~1.5 GiB headroom per thread so resource-starved
-        # machines back off, while leaving fast machines effectively
-        # unchanged.
-        cpus = os.cpu_count() or 4
-        try:
-            with open("/proc/meminfo") as f:
-                mem_gib = next(
-                    int(l.split()[1]) for l in f if l.startswith("MemTotal:")
-                ) / (1024 * 1024)
-            mem_cap = max(1, int(mem_gib // 1.5))
-        except (OSError, StopIteration):
-            mem_cap = cpus
-        test_threads = max(2, min(cpus - 1, mem_cap))
-        if test_threads < cpus:
-            print(f"  i  cargo test: capping to {test_threads} threads "
-                  f"(cpus={cpus}, mem_cap={mem_cap})")
-        if has_nextest:
-            compile_cmd = ["cargo", "nextest", "run", "--no-run"]
-            test_cmd = ["cargo", "nextest", "run",
-                        "--test-threads", str(test_threads)]
-        else:
-            compile_cmd = ["cargo", "test", "--no-run"]
-            test_cmd = ["cargo", "test", "--",
-                        "--test-threads", str(test_threads)]
         run_step("cargo test compile", compile_cmd)
         run_step("cargo test", test_cmd)
-        # Codegen staleness guard. `cargo test` above re-runs the ts-rs
-        # `export_bindings_*` tests, which overwrite files in
-        # `ui/src/generated/`. A non-empty porcelain status under that path
-        # — modified or untracked — means the developer's Rust types and
-        # the committed TS don't line up.
-        run_step("codegen-stale", ["bash", "-c", (
-            # Fail if `git status --porcelain -- ui/src/generated/` has
-            # any output at all (covers modified *and* untracked).
-            'out=$(git status --porcelain -- ui/src/generated/); '
-            'if [ -n "$out" ]; then '
-            '  echo "ui/src/generated/ has uncommitted changes:"; '
-            '  echo "$out"; '
-            '  echo ""; '
-            '  echo "Run \'./dev.py codegen\' and commit the result."; '
-            '  exit 1; '
-            'fi'
-        )])
 
     def lane_ui_lint():
         """UI lint lane: eslint (TS/TSX) → stylelint (CSS).
@@ -2303,10 +2259,25 @@ def cmd_check():
         and an isolated temp DB, then runs a battery of scripted conversations
         through the same HTTP/SSE surface phoenix-client.py uses.
 
-        The cargo bin build inside this lane shares the workspace target dir
-        with `lane_rust`'s cargo invocations — cargo's target lock serializes
-        them, so the bin link is cheap once clippy/test compile have populated
-        target/. Designed to fit in lane_rust's wall-clock shadow.
+        Target-lock sharing with lane_rust. run.py's `cargo build --bin
+        phoenix_ide` and lane_rust's cargo invocations share the one workspace
+        target dir, whose exclusive lock serializes all builds. The `--bin`
+        artifact is NOT a cheap link riding on lane_rust's output: clippy emits
+        only check-mode .rmeta, and `cargo test --no-run` emits cfg(test)
+        harness binaries under deps/ — neither produces target/debug/phoenix_ide,
+        so this build does a full non-test crate codegen + link. Only the
+        external dependency crates are reused.
+
+        The overlap that keeps this lane inside lane_rust's wall-clock shadow
+        comes from nextest, not artifact reuse: `cargo nextest run` splits
+        build from run and releases the target lock for the run phase, so this
+        bin build proceeds in parallel with the test run. On the plain
+        `cargo test` fallback (no nextest installed) the run phase holds the
+        lock end-to-end, so this build serializes after it and adds a full
+        bin codegen to the tail of the critical path — the fallback is slower
+        by design, not broken. lane_rust hoists its lock-free probe/sizing
+        ahead of clippy so this build cannot wedge between clippy and
+        test-compile.
         """
         run_step("e2e", ["uv", "run", "tests/e2e/run.py"])
 
@@ -2572,7 +2543,99 @@ def cmd_check():
         os.environ["GIT_CONFIG_VALUE_0"] = "false"
         print("  i  commit signing probe failed — disabling commit.gpgsign for tests")
 
-    print("Running checks in parallel...\n")
+    # Probe nextest and size the test-thread cap here in cmd_check scope (not
+    # in lane_rust) so both the serial codegen pre-step below and lane_rust's
+    # closed-over verification run share one decision. Neither probe touches
+    # the cargo target lock (`cargo nextest --version` only prints a version;
+    # the /proc/meminfo read is pure Python).
+    #
+    # This probe runs on the main path before any lane (and its
+    # LANE_JOIN_TIMEOUT) exists, so a rustup/network/cargo-home stall here
+    # would hang the whole check with no timeout or summary. Bound it and
+    # treat any stall/error as "no nextest" — the plain `cargo test` fallback
+    # is always correct, just slower.
+    try:
+        has_nextest = subprocess.run(
+            ["cargo", "nextest", "--version"],
+            capture_output=True, timeout=30,
+        ).returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        has_nextest = False
+        print("  i  cargo nextest probe stalled/failed — using plain `cargo test`")
+    # nextest defaults to available_parallelism (= num_cpus). On low-RAM
+    # boxes, num_cpus parallel test threads can swap and stall sensitive
+    # tests (e.g. browser tests where Chrome's CDP WebSocket handshake
+    # times out if Chrome can't get CPU+RAM during launch). Cap the
+    # thread count by ~1.5 GiB headroom per thread so resource-starved
+    # machines back off, while leaving fast machines effectively unchanged.
+    cpus = os.cpu_count() or 4
+    try:
+        with open("/proc/meminfo") as f:
+            mem_gib = next(
+                int(l.split()[1]) for l in f if l.startswith("MemTotal:")
+            ) / (1024 * 1024)
+        mem_cap = max(1, int(mem_gib // 1.5))
+    except (OSError, StopIteration):
+        mem_cap = cpus
+    test_threads = max(2, min(cpus - 1, mem_cap))
+    if test_threads < cpus:
+        print(f"  i  cargo test: capping to {test_threads} threads "
+              f"(cpus={cpus}, mem_cap={mem_cap})")
+
+    # ts-rs emits a `#[test] export_bindings_*` per `#[ts(export)]` type; those
+    # tests' side effect IS the codegen — they (re)write ui/src/generated/.
+    # Running them inside the parallel fan-out races every lane that reads that
+    # tree (tsc, vitest, eslint, ast-grep), since ts-rs truncates each file
+    # before refilling it (a reader can catch an empty/partial file). So codegen
+    # is pulled out of the fan-out into this serial pre-step: regenerate once,
+    # staleness-check, and only then fan out the readers against a tree that
+    # stays frozen for the rest of the run. lane_rust's verification run
+    # excludes export_bindings (regen already exercised them — no lost
+    # coverage) so it never writes the tree during the parallel phase.
+    #
+    # Discovery is preserved: every type still self-registers via its emitted
+    # test, so a new #[ts(export)] type is regenerated automatically with no
+    # hand-maintained root list to forget.
+    if has_nextest:
+        compile_cmd = ["cargo", "nextest", "run", "--no-run"]
+        test_cmd = ["cargo", "nextest", "run",
+                    "-E", "not test(/export_bindings/)",
+                    "--test-threads", str(test_threads)]
+        codegen_cmd = ["cargo", "nextest", "run", "-E", "test(/export_bindings/)"]
+    else:
+        compile_cmd = ["cargo", "test", "--no-run"]
+        test_cmd = ["cargo", "test", "--",
+                    "--test-threads", str(test_threads), "--skip", "export_bindings"]
+        codegen_cmd = ["cargo", "test", "export_bindings"]
+
+    print("Regenerating codegen (serial, pre-fan-out)...\n")
+    # Cold-target safety: compile the test harnesses under their own
+    # CHECK_TIMEOUT before running the tiny codegen tests, mirroring
+    # lane_rust's compile/run split. On a cold target/CI the harness compile
+    # alone can approach the timeout; bundling it with the codegen run under
+    # one budget would reintroduce exactly the timeout case that split exists
+    # to avoid (and the later lane_rust `cargo test compile` cannot rescue a
+    # pre-step that has already timed out). lane_rust's own compile step then
+    # rides this warm cache.
+    run_step("codegen compile", compile_cmd)
+    run_step("codegen", codegen_cmd)
+    # Staleness guard: a non-empty porcelain status under ui/src/generated/ —
+    # modified or untracked — means the developer's Rust types and the
+    # committed TS don't line up. Recorded (not aborted) so the parallel phase
+    # still runs and the developer gets every failure in one pass; the readers
+    # below then validate against the freshly-regenerated (correct) tree.
+    run_step("codegen-stale", ["bash", "-c", (
+        'out=$(git status --porcelain -- ui/src/generated/); '
+        'if [ -n "$out" ]; then '
+        '  echo "ui/src/generated/ has uncommitted changes:"; '
+        '  echo "$out"; '
+        '  echo ""; '
+        '  echo "Run \'./dev.py codegen\' and commit the result."; '
+        '  exit 1; '
+        'fi'
+    )])
+
+    print("\nRunning checks in parallel...\n")
 
     # Threads carry the lane name so a hung-thread report names the lane.
     threads = [
