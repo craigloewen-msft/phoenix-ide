@@ -3,7 +3,7 @@ import { AlertCircle, Loader2 } from 'lucide-react';
 import { ViewerShell } from './viewer/ViewerShell';
 import { MetaViewer } from './viewer/MetaViewer';
 import { classifyViewerFile } from './viewer/viewerFileTypes';
-import type { MetaViewerPayload, PatchContext } from './viewer/metaViewerTypes';
+import type { MetaViewerPayload, PatchContext, TextRenderMode } from './viewer/metaViewerTypes';
 
 /**
  * FileViewer — the file loader/adapter.
@@ -127,6 +127,23 @@ export function FileViewer({
   );
 }
 
+// content.length is UTF-16 code units, not bytes — the threshold is a
+// character count, named accordingly.
+const LARGE_TEXT_CHARS = 250_000;
+const LARGE_TEXT_LINES = 2_000;
+
+function textRenderMode(content: string): TextRenderMode {
+  if (content.length > LARGE_TEXT_CHARS) return 'plainLargeText';
+  let lines = 1;
+  for (let i = 0; i < content.length; i += 1) {
+    if (content.charCodeAt(i) === 10) {
+      lines += 1;
+      if (lines > LARGE_TEXT_LINES) return 'plainLargeText';
+    }
+  }
+  return 'rich';
+}
+
 interface PayloadContext {
   filePath: string;
   rootDir: string;
@@ -152,11 +169,16 @@ function buildPayload(data: ReadFileResult, ctx: PayloadContext): MetaViewerPayl
   }
 
   const { renderKind, language } = classifyViewerFile(ctx.filePath, data.file_type);
+  // Code renders through Pierre's virtualized CodeView, which stays responsive
+  // on large files, so it never needs the plain-text fallback. Text/markdown
+  // still build line-per-node DOM, so they keep the large-file guard.
+  const renderMode = renderKind === 'code' ? 'rich' : textRenderMode(data.content);
   const textCommon = {
     ...common,
     filePath: ctx.filePath,
     rootDir: ctx.rootDir,
     content: data.content,
+    ...(renderMode !== 'rich' ? { renderMode } : {}),
     ...(ctx.patchContext !== undefined ? { patchContext: ctx.patchContext } : {}),
   };
 
