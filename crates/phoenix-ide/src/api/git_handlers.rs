@@ -14,7 +14,7 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 
 pub(crate) async fn list_git_branches(
     State(state): State<AppState>,
@@ -367,6 +367,7 @@ pub(crate) async fn get_conversation_pr_status(
     };
 
     let cwd = PathBuf::from(cwd);
+    let cwd_for_status = cwd.clone();
     if !cwd.is_dir() {
         let attempted_at = chrono::Utc::now().to_rfc3339();
         let response = match state
@@ -388,7 +389,7 @@ pub(crate) async fn get_conversation_pr_status(
 
     let db = state.runtime.db().clone();
     let refresh = tokio::task::spawn_blocking(move || {
-        crate::api::pr_monitoring::get_pr_status_for_branch(&cwd, &branch_name)
+        crate::api::pr_monitoring::get_pr_status_for_branch(&cwd_for_status, &branch_name)
     })
     .await
     .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
@@ -427,7 +428,61 @@ pub(crate) async fn get_conversation_pr_status(
         }
     }
 
-    Ok(Json(refresh.response))
+    let response = attach_pr_feedback_freshness(refresh.response, &db, &work_scope, &cwd).await?;
+
+    Ok(Json(response))
+}
+
+async fn attach_pr_feedback_freshness(
+    mut response: PrStatusResponse,
+    db: &crate::db::Database,
+    work_scope: &crate::work_scope::WorkScope,
+    cwd: &FsPath,
+) -> Result<PrStatusResponse, AppError> {
+    let response_pr_number = response.number;
+    let response_updated_at = response.updated_at.clone();
+
+    let (true, Some(pr_number), Some(updated_at)) = (
+        response.found,
+        response_pr_number,
+        response_updated_at.as_deref(),
+    ) else {
+        return Ok(response);
+    };
+
+    let Some(baseline) = db
+        .work_scope_pr_feedback_baseline(work_scope, pr_number)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    else {
+        return Ok(response);
+    };
+
+    if crate::api::pr_monitoring::pr_updated_after_baseline(&baseline, updated_at) {
+        let cwd_for_feedback = cwd.to_path_buf();
+        let feedback = tokio::task::spawn_blocking(move || {
+            crate::api::pr_monitoring::fetch_pr_feedback_for_pr(&cwd_for_feedback, pr_number)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+        response.feedback_freshness = match feedback {
+            Ok(feedback) => crate::api::pr_monitoring::feedback_freshness_from_baseline(
+                &baseline,
+                Some(updated_at),
+                Some(&feedback),
+            ),
+            Err(err) => {
+                tracing::debug!(pr = pr_number, error = %err, "failed to classify PR feedback freshness");
+                crate::api::pr_monitoring::feedback_freshness_from_baseline(
+                    &baseline,
+                    Some(updated_at),
+                    None,
+                )
+            }
+        };
+    }
+
+    Ok(response)
 }
 
 pub(crate) async fn create_pr_auto_fix_context(
@@ -486,12 +541,16 @@ pub(crate) async fn create_pr_auto_fix_context(
     .await
     .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
 
-    let (response, observations) = match result {
-        Ok(capture) => (Ok(capture.response), capture.observations),
+    let (response, observations, _result_baseline) = match result {
+        Ok(capture) => (
+            Ok(capture.response),
+            capture.observations,
+            Some(capture.baseline),
+        ),
         Err(crate::api::pr_monitoring::PrMonitorError::BadRequestWithObservations {
             message,
             observations,
-        }) => (Err(AppError::BadRequest(message)), observations),
+        }) => (Err(AppError::BadRequest(message)), observations, None),
         Err(crate::api::pr_monitoring::PrMonitorError::BadRequest(message)) => {
             return Err(AppError::BadRequest(message));
         }
@@ -507,6 +566,42 @@ pub(crate) async fn create_pr_auto_fix_context(
     }
 
     Ok(Json(response?))
+}
+
+pub(crate) async fn record_pr_auto_fix_context_baseline(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    text: &str,
+) -> Result<(), AppError> {
+    let Some(raw) = text.strip_prefix("Address the PR feedback captured in `") else {
+        return Ok(());
+    };
+    let Some((artifact_path, _)) = raw.split_once('`') else {
+        return Ok(());
+    };
+
+    let conv = db
+        .get_conversation(conversation_id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    let work_scope = match &conv.conv_mode {
+        ConvMode::Work { worktree_path, .. } | ConvMode::Branch { worktree_path, .. } => {
+            crate::work_scope::WorkScope::resolve(
+                conversation_id,
+                Some(std::path::Path::new(worktree_path.as_str())),
+            )
+        }
+        _ => return Ok(()),
+    };
+    let worktree = std::path::Path::new(&conv.cwd);
+    let artifact =
+        crate::api::pr_monitoring::read_pr_auto_fix_context_artifact(&worktree.join(artifact_path))
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+    let baseline = artifact.baseline();
+    db.upsert_work_scope_pr_feedback_baseline(&work_scope, &baseline)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(())
 }
 
 /// `GET /api/conversations/:id/diff` — committed and uncommitted changes
