@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, type PrStatusResponse } from '../api';
 
 export type ConversationPrStatusState =
@@ -10,6 +10,7 @@ export interface ConversationPrStatusHandle {
   state: ConversationPrStatusState;
   manualFallbackEnabled: boolean;
   enableManualFallback: () => void;
+  refresh: () => Promise<void>;
 }
 
 export function useConversationPrStatus({
@@ -23,10 +24,44 @@ export function useConversationPrStatus({
 }): ConversationPrStatusHandle {
   const [state, setState] = useState<ConversationPrStatusState>({ status: 'disabled', prStatus: null });
   const [manualFallbackEnabled, setManualFallbackEnabled] = useState(false);
+  const latestSeqRef = useRef(0);
+  const activeScopeRef = useRef<string | null>(null);
+  const scopeKey = conversationId && branchName && (convModeLabel === 'Work' || convModeLabel === 'Branch')
+    ? `${conversationId}\0${branchName}\0${convModeLabel}`
+    : null;
+
+  const refresh = useCallback(async () => {
+    if (!scopeKey || !conversationId) return;
+    if (activeScopeRef.current !== scopeKey) return;
+    const seq = ++latestSeqRef.current;
+    try {
+      const prStatus = await api.getPrStatus(conversationId);
+      if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return;
+      setState({ status: 'ready', prStatus });
+      if (!prStatus.unavailable_reason) setManualFallbackEnabled(false);
+    } catch {
+      if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return;
+      setState({
+        status: 'ready',
+        prStatus: {
+          found: false,
+          unavailable_reason: 'command_failed',
+          refresh: {
+            state: 'unavailable',
+            reason: 'command_failed',
+            last_attempted_at: new Date().toISOString(),
+            stale: false,
+          },
+        },
+      });
+    }
+  }, [conversationId, scopeKey]);
 
   useEffect(() => {
     setManualFallbackEnabled(false);
-    if (!conversationId || !branchName || (convModeLabel !== 'Work' && convModeLabel !== 'Branch')) {
+    latestSeqRef.current += 1;
+    activeScopeRef.current = scopeKey;
+    if (!scopeKey) {
       setState({ status: 'disabled', prStatus: null });
       return;
     }
@@ -34,31 +69,10 @@ export function useConversationPrStatus({
     setState({ status: 'loading', prStatus: null });
     let cancelled = false;
     let timeout: number | null = null;
-    let latestSeq = 0;
 
     const fetchStatus = async () => {
-      const seq = ++latestSeq;
-      const fresh = () => !cancelled && seq === latestSeq;
-      try {
-        const prStatus = await api.getPrStatus(conversationId);
-        if (!fresh()) return;
-        setState({ status: 'ready', prStatus });
-        if (!prStatus.unavailable_reason) setManualFallbackEnabled(false);
-      } catch {
-        if (fresh()) setState({
-          status: 'ready',
-          prStatus: {
-            found: false,
-            unavailable_reason: 'command_failed',
-            refresh: {
-              state: 'unavailable',
-              reason: 'command_failed',
-              last_attempted_at: new Date().toISOString(),
-              stale: false,
-            },
-          },
-        });
-      }
+      if (cancelled) return;
+      await refresh();
     };
 
     const schedule = () => {
@@ -76,14 +90,17 @@ export function useConversationPrStatus({
     document.addEventListener('visibilitychange', onVisible);
     return () => {
       cancelled = true;
+      latestSeqRef.current += 1;
+      if (activeScopeRef.current === scopeKey) activeScopeRef.current = null;
       if (timeout != null) window.clearTimeout(timeout);
       document.removeEventListener('visibilitychange', onVisible);
     };
-  }, [conversationId, convModeLabel, branchName]);
+  }, [scopeKey, refresh]);
 
   return {
     state,
     manualFallbackEnabled,
     enableManualFallback: () => setManualFallbackEnabled(true),
+    refresh,
   };
 }

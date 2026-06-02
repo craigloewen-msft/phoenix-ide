@@ -568,6 +568,54 @@ pub(crate) async fn create_pr_auto_fix_context(
     Ok(Json(response?))
 }
 
+fn validate_pr_auto_fix_artifact_path(artifact_path: &str) -> Result<(), AppError> {
+    let path = std::path::Path::new(artifact_path);
+    if path.is_absolute() {
+        return Err(AppError::BadRequest(
+            "Invalid PR context artifact path".to_string(),
+        ));
+    }
+
+    let components = path.components().collect::<Vec<_>>();
+    let valid_prefix = matches!(components.first(), Some(std::path::Component::Normal(part)) if *part == ".phoenix")
+        && matches!(components.get(1), Some(std::path::Component::Normal(part)) if *part == "pr-context")
+        && components.len() > 2;
+    let only_normal_components = components
+        .iter()
+        .all(|component| matches!(component, std::path::Component::Normal(_)));
+    if valid_prefix && only_normal_components {
+        return Ok(());
+    }
+
+    Err(AppError::BadRequest(
+        "Invalid PR context artifact path".to_string(),
+    ))
+}
+
+fn pr_auto_fix_artifact_path(
+    conv: &crate::db::Conversation,
+    artifact_path: &str,
+) -> Result<PathBuf, AppError> {
+    validate_pr_auto_fix_artifact_path(artifact_path)?;
+    Ok(match &conv.conv_mode {
+        ConvMode::Work { worktree_path, .. } | ConvMode::Branch { worktree_path, .. } => {
+            let worktree_artifact =
+                std::path::Path::new(worktree_path.as_str()).join(artifact_path);
+            if worktree_artifact.exists() {
+                worktree_artifact
+            } else {
+                let cwd_artifact = std::path::Path::new(&conv.cwd).join(artifact_path);
+                if cwd_artifact.exists() {
+                    cwd_artifact
+                } else {
+                    worktree_artifact
+                }
+            }
+        }
+        _ => std::path::Path::new(&conv.cwd).join(artifact_path),
+    })
+}
+
 pub(crate) async fn record_pr_auto_fix_context_baseline(
     db: &crate::db::Database,
     conversation_id: &str,
@@ -593,10 +641,10 @@ pub(crate) async fn record_pr_auto_fix_context_baseline(
         }
         _ => return Ok(()),
     };
-    let worktree = std::path::Path::new(&conv.cwd);
-    let artifact =
-        crate::api::pr_monitoring::read_pr_auto_fix_context_artifact(&worktree.join(artifact_path))
-            .map_err(|e| AppError::Internal(e.to_string()))?;
+    let artifact = crate::api::pr_monitoring::read_pr_auto_fix_context_artifact(
+        &pr_auto_fix_artifact_path(&conv, artifact_path)?,
+    )
+    .map_err(|e| AppError::Internal(e.to_string()))?;
     let baseline = artifact.baseline();
     db.upsert_work_scope_pr_feedback_baseline(&work_scope, &baseline)
         .await
@@ -695,9 +743,116 @@ fn truncated_kib(stdout: &str, total_bytes: u64, saturated: bool) -> Option<u32>
 mod tests {
     use super::*;
 
+    fn conversation_with_mode(
+        cwd: &std::path::Path,
+        conv_mode: ConvMode,
+    ) -> crate::db::Conversation {
+        let now = chrono::Utc::now();
+        crate::db::Conversation {
+            id: "conv-test".to_string(),
+            slug: None,
+            title: None,
+            cwd: cwd.to_string_lossy().to_string(),
+            parent_conversation_id: None,
+            user_initiated: true,
+            state: crate::db::ConvState::Idle,
+            state_updated_at: now,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            model: None,
+            project_id: None,
+            conv_mode,
+            desired_base_branch: None,
+            message_count: 0,
+            seed_parent_id: None,
+            seed_label: None,
+            continued_in_conv_id: None,
+            chain_name: None,
+            steering_queue: Vec::new(),
+            llm_language: Default::default(),
+        }
+    }
+
+    #[test]
+    fn pr_auto_fix_artifact_path_prefers_worktree_root_over_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("worktree");
+        let cwd = worktree.join("nested");
+        std::fs::create_dir_all(worktree.join(".phoenix/pr-context")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let artifact_path = ".phoenix/pr-context/pr-12.json";
+        let artifact = worktree.join(artifact_path);
+        std::fs::write(&artifact, "{}").unwrap();
+        let conv = conversation_with_mode(
+            &cwd,
+            ConvMode::Branch {
+                branch_name: crate::db::NonEmptyString::new("feature").unwrap(),
+                worktree_path: crate::db::NonEmptyString::new(
+                    worktree.to_string_lossy().to_string(),
+                )
+                .unwrap(),
+                base_branch: crate::db::NonEmptyString::new("main").unwrap(),
+            },
+        );
+
+        assert_eq!(
+            pr_auto_fix_artifact_path(&conv, artifact_path).unwrap(),
+            artifact
+        );
+    }
+
+    #[test]
+    fn pr_auto_fix_artifact_path_preserves_cwd_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("worktree");
+        let cwd = temp.path().join("cwd");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(cwd.join(".phoenix/pr-context")).unwrap();
+        let artifact_path = ".phoenix/pr-context/pr-12.json";
+        let artifact = cwd.join(artifact_path);
+        std::fs::write(&artifact, "{}").unwrap();
+        let conv = conversation_with_mode(
+            &cwd,
+            ConvMode::Work {
+                branch_name: crate::db::NonEmptyString::new("task-test").unwrap(),
+                worktree_path: crate::db::NonEmptyString::new(
+                    worktree.to_string_lossy().to_string(),
+                )
+                .unwrap(),
+                base_branch: crate::db::NonEmptyString::new("main").unwrap(),
+                task_id: crate::db::NonEmptyString::new("11002").unwrap(),
+                task_title: crate::db::NonEmptyString::new("Fix freshness").unwrap(),
+            },
+        );
+
+        assert_eq!(
+            pr_auto_fix_artifact_path(&conv, artifact_path).unwrap(),
+            artifact
+        );
+    }
+
+    #[test]
+    fn pr_auto_fix_artifact_path_rejects_paths_outside_pr_context_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let conv = conversation_with_mode(temp.path(), ConvMode::Direct);
+
+        for artifact_path in [
+            "/tmp/pr-12.json",
+            "../.phoenix/pr-context/pr-12.json",
+            ".phoenix/../pr-context/pr-12.json",
+            ".phoenix/not-pr-context/pr-12.json",
+            ".phoenix/pr-context/../secrets.json",
+        ] {
+            assert!(
+                pr_auto_fix_artifact_path(&conv, artifact_path).is_err(),
+                "expected {artifact_path} to be rejected",
+            );
+        }
+    }
+
     #[test]
     fn truncated_kib_passthrough_when_under_cap() {
-        // 5-byte stdout, 5 total bytes, not saturated → None.
         assert_eq!(truncated_kib("short", 5, false), None);
     }
 
@@ -709,15 +864,12 @@ mod tests {
 
     #[test]
     fn truncated_kib_over_cap_reports_kib() {
-        // 1 KiB visible, 3 KiB total, not saturated → Some(3).
         let body = "x".repeat(1024);
         assert_eq!(truncated_kib(&body, 3072, false), Some(3));
     }
 
     #[test]
     fn truncated_kib_saturated_returns_lower_bound() {
-        // Saturated always reports the (lower-bound) total even if it
-        // happens to equal stdout.len() — caller must show "≥X KiB" UI.
         assert_eq!(truncated_kib("x", 8 * 1024, true), Some(8));
     }
 }
