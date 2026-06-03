@@ -124,8 +124,11 @@ describe('FileExplorer adapter — URL-driven open file', () => {
 
     act(() => {
       latest!.openFile('/repo/x.ts', '/repo', {
-        modifiedLines: new Set([3, 5]),
-        firstModifiedLine: 3,
+        kind: 'patch',
+        patchContext: {
+          modifiedLines: new Set([3, 5]),
+          firstModifiedLine: 3,
+        },
       });
     });
     expect(latest!.openFileState?.path).toBe('/repo/x.ts');
@@ -238,6 +241,36 @@ describe('FileExplorer adapter — REQ-VS-014 last-viewer persistence', () => {
 
     expect(search).not.toContain('file=');
     expect(search).not.toContain('root=');
+  });
+
+  it('restores on in-app navigation when URL only has a stray line param', () => {
+    setLastViewer('conv-A', 'file=%2Frepo%2FREADME.md&root=%2Frepo');
+
+    let search = '';
+    const onSearch = (s: string) => { search = s; };
+
+    function NavHarness() {
+      const navigate = useNavigate();
+      return <button data-testid="enter" onClick={() => navigate('/c/conv-A?line=42')}>enter</button>;
+    }
+
+    const { getByTestId } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="/" element={<NavHarness />} />
+          <Route
+            path="/c/:slug"
+            element={<Providers scopeKey="conv-A"><LocationCapture onSearch={onSearch} /></Providers>}
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    act(() => { fireEvent.click(getByTestId('enter')); });
+
+    expect(search).toContain('file=%2Frepo%2FREADME.md');
+    expect(search).toContain('root=%2Frepo');
+    expect(search).not.toContain('line=42');
   });
 
   it('does NOT restore when the URL already carries viewer params', () => {
