@@ -5,10 +5,14 @@
 pub mod bash_types;
 pub mod db_schema;
 pub mod kill_signal;
+pub mod llm_error_kind;
 pub mod llm_types;
 pub mod mode_context;
 pub mod patch_types;
+pub mod pr_display_state;
+pub mod quota_details;
 pub mod retry_policy;
 pub mod skill_invocation;
 pub mod sm_event;
 pub mod sm_state;
+pub mod tool_wire;

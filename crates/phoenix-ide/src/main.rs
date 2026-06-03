@@ -6,24 +6,50 @@
 mod api;
 mod chain_qa;
 mod chain_runtime;
-mod db;
 pub(crate) mod git_ops;
 mod llm;
 mod message_expander;
 mod runtime;
-pub mod skills;
-mod state_machine;
 mod system_prompt;
-mod terminal;
 mod title_generator;
 mod tls;
-mod tools;
 
 // Domain-vocabulary leaves now live in the acyclic `phoenix-core` base crate.
 // Re-export them at their historical crate-root paths so existing
 // `crate::llm_language::…` / `crate::task_source::…` call sites resolve
 // unchanged (move-down, re-export-up).
 use phoenix_core::{llm_language, platform, task_source, work_scope};
+
+// Terminal-core (PTY spawn, relay, command tracking, session registry) now
+// lives in the `phoenix-terminal` crate. Re-export it at its historical
+// `crate::terminal::…` path so existing call sites resolve unchanged
+// (move-down, re-export-up). The axum/WebSocket glue stayed behind in
+// `api::terminal_ws`.
+use phoenix_terminal as terminal;
+
+// The pure conversation reducer now lives in the `phoenix-state-machine`
+// crate. Re-export it at its historical `crate::state_machine::…` path so
+// existing call sites resolve unchanged (move-down, re-export-up).
+use phoenix_state_machine as state_machine;
+
+// Skill discovery, metadata, and invocation now live in the `phoenix-skills`
+// crate (so the `phoenix-tools` crate can call it without depending on
+// phoenix-ide). Re-export at the historical `crate::skills::…` path so existing
+// call sites resolve unchanged (move-down, re-export-up).
+pub use phoenix_skills as skills;
+
+// Tool implementations (bash, patch, browser, tmux, search, …) now live in the
+// `phoenix-tools` crate. Re-export at the historical `crate::tools::…` path so
+// existing call sites (runtime executor, api handlers, browser_view, the
+// shutdown kill-tree pass) resolve unchanged (move-down, re-export-up). The
+// axum/HTTP glue that drives tools stayed behind in `api`.
+use phoenix_tools as tools;
+
+// SQLite persistence (conversations, messages, steering queues, migrations)
+// now lives in the `phoenix-db` crate, a leaf depending only on phoenix-core.
+// Re-export at the historical `crate::db::…` path so existing call sites
+// resolve unchanged (move-down, re-export-up).
+use phoenix_db as db;
 
 use api::{create_router, AppState};
 use db::Database;

@@ -8,6 +8,11 @@ rust-version = "1.94"
 # Shared domain vocabulary (acyclic base crate)
 phoenix-core = { path = "../phoenix-core" }
 
+# PTY-backed terminal sessions (spawn, relay, command tracking, session
+# registry). The axum/WebSocket glue lives here in `api::terminal_ws`, not in
+# the library crate, to keep phoenix-terminal acyclic.
+phoenix-terminal = { path = "../phoenix-terminal" }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
@@ -25,6 +30,23 @@ tower-http = { version = "0.6", features = ["cors", "fs", "compression-br", "com
 # Local TLS CA + leaf-cert issuance (separate workspace member to keep
 # `phoenix-tls`'s cold-compile cost off `phoenix-tls` itself).
 phoenix-tls = { path = "../phoenix-tls" }
+
+# Skill discovery, metadata, and invocation. Extracted so the
+# `phoenix-tools` crate can call it without depending on phoenix-ide.
+phoenix-skills = { path = "../phoenix-skills" }
+
+# Tool implementations (bash, patch, browser, tmux, search, …). The Tool
+# trait, ToolContext, and ToolRegistry live here. The axum/HTTP glue that
+# drives tools (api::handlers, api::browser_view) stays in phoenix-ide.
+phoenix-tools = { path = "../phoenix-tools" }
+
+# SQLite persistence (conversations, messages, steering queues, migrations).
+# Extracted so the persistence layer is a leaf depending only on phoenix-core.
+phoenix-db = { path = "../phoenix-db" }
+
+# Pure conversation reducer (Elm-architecture state machine). Extracted so the
+# runtime/executor depend *down* onto the reducer + shared domain vocabulary.
+phoenix-state-machine = { path = "../phoenix-state-machine" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -108,6 +130,13 @@ ts-rs = { version = "12", features = ["serde-compat", "chrono-impl"] }
 # constructors (ContentBlock::tool_use, …) are visible to this crate's tests.
 # Dev-only: production `cargo build` never enables the feature.
 phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
+# Re-declared with test-support so phoenix-terminal's #[cfg(test)] ANSI/OSC
+# stream builders (full_command, TerminalStream) are visible to the api-layer
+# WebSocket relay tests. Dev-only.
+phoenix-terminal = { path = "../phoenix-terminal", features = ["test-support"] }
+# Re-declared with test-support so phoenix-db's #[cfg(test)] `create_conversation`
+# explore-mode test wrapper is visible to this crate's tests. Dev-only.
+phoenix-db = { path = "../phoenix-db", features = ["test-support"] }
 tempfile = "3"
 proptest = "1"
 # `test-util` enables `tokio::time::pause`/`advance`, used by the

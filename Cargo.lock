@@ -2513,9 +2513,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-bash-display"
+version = "0.1.0"
+dependencies = [
+ "brush-parser",
+]
+
+[[package]]
 name = "phoenix-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "libc",
  "serde",
@@ -2524,6 +2532,23 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "ts-rs",
+ "uuid",
+]
+
+[[package]]
+name = "phoenix-db"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "libsqlite3-sys",
+ "phoenix-core",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -2541,11 +2566,83 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-skills"
+version = "0.1.0"
+dependencies = [
+ "phoenix-core",
+ "rust-embed",
+ "tempfile",
+]
+
+[[package]]
+name = "phoenix-state-machine"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "phoenix-bash-display",
+ "phoenix-core",
+ "proptest",
+ "rand 0.10.1",
+ "serde_json",
+ "taskmd-core",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "phoenix-terminal"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "libc",
+ "nix 0.31.3",
+ "phoenix-core",
+ "proptest",
+ "tokio",
+ "tracing",
+ "vte",
+]
+
+[[package]]
 name = "phoenix-tls"
 version = "0.1.0"
 dependencies = [
  "rcgen",
  "time",
+]
+
+[[package]]
+name = "phoenix-tools"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "brush-parser",
+ "chromiumoxide",
+ "futures",
+ "globset",
+ "ignore",
+ "libc",
+ "phoenix-bash-display",
+ "phoenix-core",
+ "phoenix-skills",
+ "phoenix-terminal",
+ "proptest",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "similar 3.1.1",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "unicode-security",
+ "uuid",
+ "which",
 ]
 
 [[package]]
@@ -2571,7 +2668,12 @@ dependencies = [
  "nix 0.31.3",
  "nucleo-matcher",
  "phoenix-core",
+ "phoenix-db",
+ "phoenix-skills",
+ "phoenix-state-machine",
+ "phoenix-terminal",
  "phoenix-tls",
+ "phoenix-tools",
  "proptest",
  "pulldown-cmark",
  "rand 0.10.1",
