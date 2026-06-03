@@ -11,7 +11,37 @@ import { useCreateConversationWithStore } from '../conversation';
 const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
 const RECENT_DIRS_KEY = 'phoenix-recent-dirs';
+const NEW_CONVERSATION_DRAFT_KEY = 'phoenix-new-conversation-draft';
 const MAX_RECENT = 5;
+
+function readNewConversationDraft(): string {
+  try {
+    return localStorage.getItem(NEW_CONVERSATION_DRAFT_KEY) ?? '';
+  } catch (error) {
+    console.warn('Error reading new conversation draft from localStorage:', error);
+    return '';
+  }
+}
+
+function writeNewConversationDraft(value: string): void {
+  try {
+    if (value) {
+      localStorage.setItem(NEW_CONVERSATION_DRAFT_KEY, value);
+    } else {
+      localStorage.removeItem(NEW_CONVERSATION_DRAFT_KEY);
+    }
+  } catch (error) {
+    console.warn('Error saving new conversation draft to localStorage:', error);
+  }
+}
+
+function clearNewConversationDraft(): void {
+  try {
+    localStorage.removeItem(NEW_CONVERSATION_DRAFT_KEY);
+  } catch (error) {
+    console.warn('Error clearing new conversation draft from localStorage:', error);
+  }
+}
 
 function relativeTaskPath(cwd: string, taskPath: string): string {
   const root = cwd.endsWith('/') ? cwd : `${cwd}/`;
@@ -126,7 +156,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [models, setModels] = useState<ModelsResponse | null>(null);
   const [selectedModel, setSelectedModel] = useState<string | null>(() => localStorage.getItem(LAST_MODEL_KEY));
   const [showAllModels, setShowAllModels] = useState(false);
-  const [draft, setDraft] = useState('');
+  const [draft, setDraft] = useState(readNewConversationDraft);
   const [images, setImages] = useState<ImageData[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -186,6 +216,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
   // Save preferences
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
   useEffect(() => { if (selectedModel) localStorage.setItem(LAST_MODEL_KEY, selectedModel); }, [selectedModel]);
+  useEffect(() => { writeNewConversationDraft(draft); }, [draft]);
 
   // A new directory drops any prior workflow choice; the active workflow then
   // re-derives from the new git status (and the metadata fetched below).
@@ -393,6 +424,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
       );
       addRecentDir(trimmedCwd);
       setRecentDirs(getRecentDirs());
+      setDraft('');
+      clearNewConversationDraft();
       navigate(`/c/${conv.slug}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create conversation');
