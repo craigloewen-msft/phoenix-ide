@@ -13,11 +13,11 @@ import {
   type SseInitData,
 } from '../sseSchemas';
 import type { Breadcrumb } from '../types';
-import { parseConversationState } from '../utils';
+import { parseConversationState, isAgentWorking } from '../utils';
 import { conversationReducer, createInitialAtom, type ConversationAtom, type InitPayload } from '../conversation/atom';
 import * as v from 'valibot';
 
-type InlineStreamState =
+export type InlineStreamState =
   | { type: 'idle'; atom: ConversationAtom; error: null }
   | { type: 'connecting'; atom: ConversationAtom; error: null }
   | { type: 'ready'; atom: ConversationAtom; error: null }
@@ -87,21 +87,12 @@ function parseEventData(event: Event): unknown | null {
   }
 }
 
-let liveStreamOwner: string | null = null;
-
-function acquireLiveStream(conversationId: string): boolean {
-  if (liveStreamOwner === null || liveStreamOwner === conversationId) {
-    liveStreamOwner = conversationId;
-    return true;
-  }
-  return false;
-}
-
-function releaseLiveStream(conversationId: string): void {
-  if (liveStreamOwner === conversationId) {
-    liveStreamOwner = null;
-  }
-}
+// Bounded retry for a 404 on the initial snapshot. A freshly-spawned sub-agent
+// can 404 transiently (the parent card renders before RuntimeManager inserts
+// the child row); retry briefly to cover that race, then give up so a deleted
+// sub-agent doesn't loop forever. ~10 × 500ms ≈ 5s.
+const MAX_NOT_FOUND_RETRIES = 10;
+const NOT_FOUND_RETRY_MS = 500;
 
 function maxMessageSequence(messages: Message[]): number {
   let max = 0;
@@ -137,6 +128,11 @@ function isNotFound(error: unknown): boolean {
  * Uses the same conversation reducer as the full page, including init pending
  * event replay, so sequence floors/token buffering/message updates follow one
  * protocol contract instead of a parallel sub-agent-specific implementation.
+ *
+ * `live` true opens the SSE stream (and self-closes once the sub-agent reaches
+ * a terminal state); `false` is snapshot-only. `true` streams regardless of the
+ * loaded phase so a just-spawned sub-agent that's still momentarily `Idle`
+ * (created before its initial event) is followed once it starts working.
  */
 export function useConversationInlineStream(conversationId: string, enabled: boolean, live: boolean): InlineStreamState {
   const [state, dispatch] = useReducer(reducer, undefined, initialState);
@@ -151,6 +147,7 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
     if (!enabled) return;
     let cancelled = false;
     let source: EventSource | null = null;
+    let notFoundRetries = 0;
     let retryTimer: number | null = null;
 
     const closeSource = () => {
@@ -158,15 +155,10 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
         source.close();
         source = null;
       }
-      releaseLiveStream(conversationId);
     };
 
     const openLiveStream = () => {
       if (cancelled) return;
-      if (!acquireLiveStream(conversationId)) {
-        dispatch({ type: 'error', error: 'Another live sub-agent stream is already open. Collapse it before opening this one live.' });
-        return;
-      }
       source = new EventSource(`/api/conversations/${encodeURIComponent(conversationId)}/stream`);
 
       source.addEventListener('init', (event) => {
@@ -216,12 +208,13 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
         if (raw === null) return;
         const res = v.safeParse(SseStateChangeDataSchema, raw);
         if (!res.success) return;
+        const phase = parseConversationState(res.output.state);
         dispatch({
           type: 'atom',
           atomAction: {
             type: 'sse_state_change',
             sequenceId: res.output.sequence_id,
-            phase: parseConversationState(res.output.state),
+            phase,
             // REQ-WPV-001: thread the server-authoritative entry time
             // (RFC3339 → ms) onto the atom. NOTE: this inline sub-agent
             // stream does NOT register the llm_first_byte / llm_attempt /
@@ -234,6 +227,13 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
             stateUpdatedAt: Date.parse(res.output.state_updated_at),
           },
         });
+        // Sub-agent reached a terminal/idle state — stop streaming so we
+        // don't hold the single live-stream slot (or an idle connection)
+        // open after the agent has finished. The final phase is already on
+        // the atom, so consumers see the completed state.
+        if (!isAgentWorking(phase)) {
+          closeSource();
+        }
       });
 
       source.addEventListener('token', (event) => {
@@ -294,8 +294,16 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
         })
         .catch((err) => {
           if (cancelled) return;
-          if (live && isNotFound(err)) {
-            retryTimer = window.setTimeout(loadSnapshot, 500);
+          // Spawn race: the parent card can render a sub-agent before
+          // RuntimeManager has inserted the freshly-spawned child row (the
+          // spawn request is enqueued on an async channel before the parent
+          // enters AwaitingSubAgents), so a 404 right after open is often
+          // transient. Retry briefly when streaming live, but bound it so a
+          // genuinely-missing / deleted sub-agent surfaces an error instead of
+          // looping forever.
+          if (live && isNotFound(err) && notFoundRetries < MAX_NOT_FOUND_RETRIES) {
+            notFoundRetries += 1;
+            retryTimer = window.setTimeout(loadSnapshot, NOT_FOUND_RETRY_MS);
             return;
           }
           dispatch({ type: 'error', error: err instanceof Error ? err.message : 'Failed to load sub-agent' });

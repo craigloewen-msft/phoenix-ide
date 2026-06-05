@@ -1,5 +1,5 @@
 import { useLocation } from 'react-router-dom';
-import { useEffect } from 'react';
+import { lazy, Suspense, useEffect } from 'react';
 import {
   useConversationsList,
   useConversationsRefresh,
@@ -9,6 +9,13 @@ import { useResizablePane, useIsDesktop } from '../hooks';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
+import { SubAgentViewerProvider, useSubAgentViewer } from '../contexts/SubAgentViewerContext';
+// Code-split: the panel pulls MessageComponents (markdown + syntax highlighting),
+// which must not land in the non-lazy app-shell bundle for routes that never
+// open a sub-agent. Loaded on first open.
+const SubAgentViewerPanel = lazy(() =>
+  import('./SubAgentViewerPanel').then((m) => ({ default: m.SubAgentViewerPanel })),
+);
 import { CommandPalette } from './CommandPalette';
 import { Toast } from './Toast';
 import { PaneDivider } from './PaneDivider';
@@ -23,6 +30,42 @@ import {
 
 interface DesktopLayoutProps {
   children: React.ReactNode;
+}
+
+/**
+ * Right-docked sub-agent viewer. Owns its own resizable width and renders
+ * nothing until a sub-agent is opened. A descendant of SubAgentViewerProvider,
+ * mounted only on desktop so the panel never appears where there's no room.
+ */
+function SubAgentViewerDock() {
+  const viewer = useSubAgentViewer();
+  const pane = useResizablePane({
+    key: 'subagent-viewer-width',
+    min: 320,
+    max: () => Math.max(360, Math.round(window.innerWidth * 0.6)),
+    defaultSize: 460,
+  });
+  if (!viewer?.opened) return null;
+  return (
+    <>
+      <PaneDivider
+        orientation="vertical"
+        title="Drag to resize • Double-click to close"
+        onPointerDown={(e) => pane.startDrag(e, 'x', true)}
+        onDoubleClick={viewer.close}
+      />
+      <Suspense fallback={null}>
+        {/* Key by agentId so switching sub-agents remounts with a fresh stream
+            instead of showing the prior agent's transcript under the new title. */}
+        <SubAgentViewerPanel
+          key={viewer.opened.agentId}
+          opened={viewer.opened}
+          onClose={viewer.close}
+          width={pane.size}
+        />
+      </Suspense>
+    </>
+  );
 }
 
 export function DesktopLayout({ children }: DesktopLayoutProps) {
@@ -102,6 +145,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   // See task 08664: previously the early-return on !isDesktop produced a
   // different React tree, unmounting ConversationPage and resetting its state.
   return (
+    <SubAgentViewerProvider>
     <ViewerSlotProvider
       scopeKey={activeSlug ?? undefined}
       browserSessionActive={activeConversation?.browser_session_active ?? false}
@@ -152,10 +196,12 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
         <div className={isDesktop ? 'desktop-main' : undefined}>
           {children}
         </div>
+        {isDesktop && <SubAgentViewerDock />}
         {isDesktop && <CommandPalette conversations={conversations} activeConversation={activeConversation} />}
         <Toast messages={toasts} onDismiss={dismissToast} />
       </div>
      </FileExplorerProvider>
     </ViewerSlotProvider>
+    </SubAgentViewerProvider>
   );
 }
