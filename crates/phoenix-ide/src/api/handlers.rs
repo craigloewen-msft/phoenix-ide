@@ -72,6 +72,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/new", get(serve_spa))
         // Codex/ChatGPT login page (SPA-rendered)
         .route("/codex/login", get(serve_spa))
+        // About this deployment page (SPA-rendered)
+        .route("/about", get(serve_spa))
         // Service worker
         .route("/service-worker.js", get(serve_service_worker))
         // Favicon (referenced from index.html)
@@ -248,6 +250,8 @@ pub fn create_router(state: AppState) -> Router {
         // Version
         .route("/version", get(get_version))
         .route("/api/version", get(get_version_json))
+        // About this deployment (read-only diagnostics)
+        .route("/api/deployment", get(super::deployment::deployment_info))
         // Auth endpoints (REQ-AUTH-002, REQ-AUTH-003)
         .route("/api/auth/status", get(super::auth::auth_status))
         .route("/api/auth/login", post(super::auth::auth_login))
@@ -4662,6 +4666,7 @@ mod hard_delete_cascade_tests {
             terminals,
             chain_qa,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
+            deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
         }
     }
 
@@ -5841,6 +5846,7 @@ mod upgrade_model_state_guard_tests {
             terminals,
             chain_qa,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
+            deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
         }
     }
 
