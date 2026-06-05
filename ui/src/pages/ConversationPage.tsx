@@ -1206,7 +1206,8 @@ function ConversationPageContent() {
         <ConnectedInputArea
           ref={inputRef}
           slug={slug!}
-          conversationId={conversationId}
+          cwd={conversation.cwd}
+          scopeKey={conversationId}
           convState={convStateForChildren}
           images={images}
           setImages={setImages}
@@ -1270,7 +1271,8 @@ function ConversationPageContent() {
         <ConnectedInputArea
           ref={inputRef}
           slug={slug!}
-          conversationId={conversationId}
+          cwd={conversation.cwd}
+          scopeKey={conversationId}
           convState={convStateForChildren}
           images={images}
           setImages={setImages}

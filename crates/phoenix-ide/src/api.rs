@@ -9,7 +9,7 @@ mod chains;
 pub mod codex_login;
 mod deployment;
 mod git_handlers;
-mod handlers;
+pub(crate) mod handlers;
 mod lifecycle_handlers;
 mod pr_monitoring;
 mod sse;
