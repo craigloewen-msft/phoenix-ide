@@ -3266,6 +3266,7 @@ mod tests {
             mode: ModeKind::Managed,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+            persona: None,
         };
 
         let result = handle_context_exhaustion(
@@ -3387,6 +3388,7 @@ mod tests {
             mode: ModeKind::Managed,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+            persona: None,
         };
 
         let result = transition(
@@ -3492,6 +3494,7 @@ mod tests {
             mode: ModeKind::Managed,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+            persona: None,
         };
 
         // attempt == MAX_RETRY_ATTEMPTS (3), retryable error → retries exhausted
@@ -3543,6 +3546,7 @@ mod tests {
             mode: ModeKind::Managed,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+            persona: None,
         };
 
         // Non-retryable error at attempt 1 → immediate failure
