@@ -19,11 +19,12 @@ mod terminal_command_history;
 mod terminal_last_command;
 mod think;
 pub mod tmux;
+pub mod work_scope_inventory;
 
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::{
-    BashHandleError, BashHandleRegistry, BashOp, BashTool, BashToolInput,
-    ConversationHandles as BashConversationHandles,
+    BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecycleSink, BashOp, BashTool,
+    BashToolInput, WorkScopeHandles as BashWorkScopeHandles,
 };
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
@@ -42,7 +43,10 @@ pub use subagent::{SpawnAgentsTool, SubmitErrorTool, SubmitResultTool};
 pub use terminal_command_history::TerminalCommandHistoryTool;
 pub use terminal_last_command::TerminalLastCommandTool;
 pub use think::ThinkTool;
-pub use tmux::{TmuxError, TmuxRegistry, TmuxRunTool, TmuxServer, TmuxTool};
+pub use tmux::{
+    TmuxError, TmuxLifecycleEvent, TmuxLifecycleSink, TmuxRegistry, TmuxRunTool, TmuxServer,
+    TmuxTool,
+};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -218,7 +222,7 @@ pub struct ToolContext {
     browser_sessions: Arc<BrowserSessionManager>,
 
     /// Per-process bash handle registry (access via `bash_handles()` method).
-    /// Owns the per-conversation handle tables, ring buffers, tombstones,
+    /// Owns the per-`WorkScope` handle tables, ring buffers, tombstones,
     /// and live-handle cap enforcement (REQ-BASH-005, REQ-BASH-006,
     /// REQ-BASH-014). Reached by tools through `bash_handles()` /
     /// `bash_handle_registry()`.
@@ -298,29 +302,29 @@ impl ToolContext {
         self.browser_sessions.get_session(&self.work_scope).await
     }
 
-    /// Get the per-conversation bash handle table.
+    /// Get the per-`WorkScope` bash handle table.
     ///
-    /// Lazily creates the conversation entry on first call; subsequent
-    /// calls in the same conversation return the same `Arc<RwLock<...>>`.
-    /// Returns a `Result` for shape-parity with [`Self::browser`] —
-    /// `get_or_create` is currently infallible, but the surface accepts
-    /// future failure modes (e.g. registry resource exhaustion) without
-    /// reshaping every callsite.
+    /// Lazily creates the scope entry on first call; subsequent calls that
+    /// resolve to the same `WorkScope` — including from a continuation that
+    /// inherits the same worktree — return the same `Arc<RwLock<...>>`, so a
+    /// continuation chain on one worktree shares one handle table
+    /// (REQ-BASH-WS-001). Returns a `Result` for shape-parity with
+    /// [`Self::browser`] — `get_or_create` is currently infallible, but the
+    /// surface accepts future failure modes (e.g. registry resource
+    /// exhaustion) without reshaping every callsite.
     ///
-    /// REQ-BASH-014: Stateless Tool with Per-Conversation Handle Registry.
+    /// REQ-BASH-014: Stateless Tool with Per-`WorkScope` Handle Registry.
     ///
     /// # Errors
     /// Returns [`BashHandleError`] to keep shape-parity with [`Self::browser`].
     /// `get_or_create` is currently infallible, so this presently always
     /// returns `Ok`.
-    pub async fn bash_handles(
-        &self,
-    ) -> Result<Arc<RwLock<BashConversationHandles>>, BashHandleError> {
-        Ok(self.bash_handles.get_or_create(&self.conversation_id).await)
+    pub async fn bash_handles(&self) -> Result<Arc<RwLock<BashWorkScopeHandles>>, BashHandleError> {
+        Ok(self.bash_handles.get_or_create(&self.work_scope).await)
     }
 
     /// Direct access to the registry (used by the hard-delete cascade
-    /// integration in task 02696, and by the shutdown kill-tree pass).
+    /// integration and by the shutdown kill-tree pass).
     #[must_use]
     pub fn bash_handle_registry(&self) -> &Arc<BashHandleRegistry> {
         &self.bash_handles

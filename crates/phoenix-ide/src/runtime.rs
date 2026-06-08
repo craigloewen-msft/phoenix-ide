@@ -24,7 +24,11 @@ pub use traits::*;
 use crate::platform::PlatformCapability;
 use crate::state_machine::state::{ModeKind, SubAgentMode, SubAgentOutcome, SubAgentSpec};
 use crate::tools::browser::session::BrowserSessionLifecycleEvent;
-use crate::tools::{BashHandleRegistry, BrowserSessionManager, TmuxRegistry, ToolRegistry};
+use crate::tools::{
+    BashHandleRegistry, BashLifecycleEvent, BrowserSessionManager, TmuxLifecycleEvent,
+    TmuxRegistry, ToolRegistry,
+};
+use phoenix_core::work_scope::WorkScope;
 
 /// Type alias for production runtime with concrete implementations
 pub type ProductionRuntime =
@@ -89,8 +93,9 @@ pub struct RuntimeManager {
     platform: PlatformCapability,
     browser_sessions: Arc<BrowserSessionManager>,
     /// Per-process bash handle registry. Shared by every conversation's
-    /// `ToolContext`; each conversation gets its own `ConversationHandles`
-    /// table inside (REQ-BASH-014).
+    /// `ToolContext`; each `WorkScope` gets its own `WorkScopeHandles`
+    /// table inside, so a continuation chain on one worktree shares one
+    /// table (REQ-BASH-014, REQ-BASH-WS-001).
     bash_handles: Arc<BashHandleRegistry>,
     /// Per-process tmux server registry. Shared by every conversation's
     /// `ToolContext`; each conversation gets its own `Arc<RwLock<TmuxServer>>`
@@ -139,6 +144,27 @@ pub struct RuntimeManager {
     /// task that resolves `conversation_id` to its `SseBroadcaster` and
     /// broadcasts [`SseEvent::BrowserSessionState`].
     browser_lifecycle_rx: RwLock<Option<mpsc::UnboundedReceiver<BrowserSessionLifecycleEvent>>>,
+    /// Receiver for bash state-transition signals (spawn / terminal / kill).
+    /// Taken once by [`RuntimeManager::start_work_scope_bridge`], which
+    /// assembles the affected scope's inventory and broadcasts
+    /// [`SseEvent::WorkScopeUpdate`] (REQ-WSUI-007).
+    bash_lifecycle_rx: RwLock<Option<mpsc::UnboundedReceiver<BashLifecycleEvent>>>,
+    /// Receiver for tmux state-transition signals (entry created / status
+    /// change / cascade removal). Taken once by
+    /// [`RuntimeManager::start_work_scope_bridge`], which assembles the
+    /// affected scope's inventory and broadcasts [`SseEvent::WorkScopeUpdate`].
+    /// Opening a conversation's terminal panel materializes a tmux entry via
+    /// `ensure_live`; this is the edge that pushes it to the work-scope panel
+    /// (REQ-WSUI-007).
+    tmux_lifecycle_rx: RwLock<Option<mpsc::UnboundedReceiver<TmuxLifecycleEvent>>>,
+    /// Sender the browser lifecycle bridge forwards a `WorkScope` into after
+    /// it broadcasts a `BrowserSessionState` edge, so the work-scope bridge
+    /// also emits a `WorkScopeUpdate` for that scope (REQ-WSUI-007: a browser
+    /// liveness edge is a work-scope change). Reuses the browser bridge's
+    /// scope resolution rather than introducing a second mechanism.
+    work_scope_browser_tx: mpsc::UnboundedSender<WorkScope>,
+    /// Matching receiver, taken once by `start_work_scope_bridge`.
+    work_scope_browser_rx: RwLock<Option<mpsc::UnboundedReceiver<WorkScope>>>,
 }
 
 /// Handle to interact with a running conversation
@@ -650,6 +676,12 @@ pub struct EnrichedConversation {
     /// the full pane on follow-up. False when the PTY runs a direct
     /// `$SHELL`.
     pub terminal_uses_tmux: bool,
+    /// `WorkScope::stable_key()` for this conversation's resolved `WorkScope`.
+    /// The frontend uses it to build the work-scope inventory URL
+    /// (`GET /api/work-scope/:scope_key/inventory`). Resolved from the
+    /// conversation id + worktree path, the same inputs the
+    /// `browser_session_active` lookup uses.
+    pub work_scope_key: String,
 }
 
 /// Breadcrumb entry for showing LLM thought-process trail in the UI.
@@ -876,6 +908,16 @@ pub enum SseEvent {
         sequence_id: i64,
         snapshot: crate::llm::QuotaDetails,
     },
+    /// A work-affine resource in this conversation's `WorkScope` changed
+    /// state (bash handle spawned / went terminal / was killed, or a browser
+    /// session crossed a liveness edge). Carries the full refreshed
+    /// `WorkScopeInventory` snapshot — not a delta (REQ-WSUI-007) — assembled
+    /// from the live registries by the work-scope bridge. The UI panel
+    /// updates from this without re-polling the pull endpoint.
+    WorkScopeUpdate {
+        sequence_id: i64,
+        inventory: phoenix_core::domain::work_scope_inventory::WorkScopeInventory,
+    },
 }
 
 /// Pick the tool registry for a sub-agent runtime on (re-)creation from
@@ -913,6 +955,20 @@ impl RuntimeManager {
         // drop edges and desync the UI's "session live" indicator. The
         // matching `Receiver` is consumed by `start_browser_lifecycle_bridge`.
         let (browser_lifecycle_tx, browser_lifecycle_rx) = mpsc::unbounded_channel();
+        // Bash state-transition channel (spawn / terminal / kill). Unbounded
+        // for the same reason as the browser channel: dropping an edge would
+        // desync the work-scope panel's view of the scope's resources.
+        let (bash_lifecycle_tx, bash_lifecycle_rx) = mpsc::unbounded_channel();
+        // Tmux state-transition channel (entry created / status change /
+        // cascade removal). Unbounded for the same reason as the bash
+        // channel: dropping an edge would leave the work-scope panel showing
+        // a stale tmux row (notably: a terminal-only conversation whose
+        // tmux entry never reaches the panel).
+        let (tmux_lifecycle_tx, tmux_lifecycle_rx) = mpsc::unbounded_channel();
+        // Browser-edge → work-scope forward channel. The browser lifecycle
+        // bridge sends the affected scope here after broadcasting its own
+        // edge, so the work-scope bridge re-broadcasts a `WorkScopeUpdate`.
+        let (work_scope_browser_tx, work_scope_browser_rx) = mpsc::unbounded_channel();
         Self {
             db,
             llm_registry,
@@ -920,8 +976,10 @@ impl RuntimeManager {
             browser_sessions: BrowserSessionManager::with_lifecycle_sink(Some(
                 browser_lifecycle_tx,
             )),
-            bash_handles: Arc::new(BashHandleRegistry::new()),
-            tmux_registry: Arc::new(TmuxRegistry::new()),
+            bash_handles: Arc::new(BashHandleRegistry::with_lifecycle_sink(Some(
+                bash_lifecycle_tx,
+            ))),
+            tmux_registry: Arc::new(TmuxRegistry::with_lifecycle_sink(Some(tmux_lifecycle_tx))),
             mcp_manager,
             terminals: crate::terminal::ActiveTerminals::new(),
             runtimes: RwLock::new(HashMap::new()),
@@ -935,6 +993,10 @@ impl RuntimeManager {
             handoff_rx: RwLock::new(Some(handoff_rx)),
             credential_helper,
             browser_lifecycle_rx: RwLock::new(Some(browser_lifecycle_rx)),
+            bash_lifecycle_rx: RwLock::new(Some(bash_lifecycle_rx)),
+            tmux_lifecycle_rx: RwLock::new(Some(tmux_lifecycle_rx)),
+            work_scope_browser_tx,
+            work_scope_browser_rx: RwLock::new(Some(work_scope_browser_rx)),
         }
     }
 
@@ -977,6 +1039,36 @@ impl RuntimeManager {
     /// `RuntimeManager::new`. If the receiver was already taken (double
     /// call) this is a no-op.
     pub async fn start_browser_lifecycle_bridge(self: &Arc<Self>) {
+        // Gate browser idle reaping on scope liveness: the cleanup task must
+        // not force-close Chrome while the scope still owns a non-terminal
+        // conversation. A `Weak` keeps the closure from holding the runtime
+        // alive; if the runtime is gone the scope is by definition not live.
+        let weak = Arc::downgrade(self);
+        self.browser_sessions()
+            .set_scope_liveness_hook(Arc::new(move |scope: WorkScope| {
+                let weak = weak.clone();
+                Box::pin(async move {
+                    match weak.upgrade() {
+                        Some(manager) => match manager.scope_has_live_conversation(&scope).await {
+                            Ok(live) => live,
+                            // The idle reaper fails closed: an unreadable DB
+                            // (transient lock contention during cleanup) must
+                            // not reap a still-live session, so treat the scope
+                            // as live and try again on the next idle sweep.
+                            Err(e) => {
+                                tracing::warn!(
+                                    work_scope = %scope,
+                                    error = %e,
+                                    "scope liveness query failed; preserving scope to avoid reaping a live browser session"
+                                );
+                                true
+                            }
+                        },
+                        None => false,
+                    }
+                }) as futures::future::BoxFuture<'static, bool>
+            }));
+
         let rx = self.browser_lifecycle_rx.write().await.take();
         let Some(mut rx) = rx else {
             tracing::debug!("browser lifecycle bridge already started; skipping");
@@ -1043,9 +1135,226 @@ impl RuntimeManager {
                         "dropping browser session lifecycle event — no live runtime handle on scope"
                     );
                 }
+
+                // A browser liveness edge is also a work-scope change
+                // (REQ-WSUI-007). Forward the scope to the work-scope bridge
+                // so it re-broadcasts a `WorkScopeUpdate` carrying the full
+                // refreshed inventory. Reuses this bridge's scope resolution
+                // rather than re-deriving it. Best-effort: a closed channel
+                // (bridge not started) is logged at debug.
+                if let Err(e) = manager.work_scope_browser_tx.send(work_scope.clone()) {
+                    tracing::debug!(
+                        work_scope = %work_scope,
+                        error = %e,
+                        "dropping work-scope forward of browser edge — channel closed"
+                    );
+                }
             }
             tracing::info!("Browser lifecycle bridge stopped");
         });
+    }
+
+    /// Start the bridge that turns bash state-transition signals, tmux
+    /// state-transition signals, and forwarded browser liveness edges into
+    /// per-conversation `WorkScopeUpdate` broadcasts (REQ-WSUI-007 /
+    /// REQ-WSUI-008). Must be called once after `RuntimeManager::new`; a
+    /// double call is a no-op.
+    ///
+    /// On each signal for `WorkScope` W it assembles W's full inventory from
+    /// the three live registries (the same `assemble_inventory` the pull
+    /// endpoint uses) and broadcasts it to W's conversation(s) using the
+    /// identical scope-resolution the browser lifecycle bridge applies:
+    /// enumerate live runtime handles, resolve each conversation's scope via
+    /// `WorkScope::resolve`, match against W. REQ-PROJ-025 guarantees at most
+    /// one non-terminal conversation per scope, so this lands on the one live
+    /// member.
+    pub async fn start_work_scope_bridge(self: &Arc<Self>) {
+        let bash_rx = self.bash_lifecycle_rx.write().await.take();
+        let tmux_rx = self.tmux_lifecycle_rx.write().await.take();
+        let browser_rx = self.work_scope_browser_rx.write().await.take();
+        let (Some(mut bash_rx), Some(mut tmux_rx), Some(mut browser_rx)) =
+            (bash_rx, tmux_rx, browser_rx)
+        else {
+            tracing::debug!("work-scope bridge already started; skipping");
+            return;
+        };
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                let work_scope = tokio::select! {
+                    Some(event) = bash_rx.recv() => event.work_scope,
+                    Some(event) = tmux_rx.recv() => event.work_scope,
+                    Some(scope) = browser_rx.recv() => scope,
+                    else => break,
+                };
+                manager.broadcast_work_scope_update(&work_scope).await;
+            }
+            tracing::info!("Work-scope bridge stopped");
+        });
+    }
+
+    /// Assemble `work_scope`'s inventory and broadcast a `WorkScopeUpdate` to
+    /// every live runtime handle whose conversation resolves to it. Factored
+    /// out of [`Self::start_work_scope_bridge`] so the bash and browser signal
+    /// arms share one routing path.
+    pub(crate) async fn broadcast_work_scope_update(self: &Arc<Self>, work_scope: &WorkScope) {
+        let inventory = phoenix_tools::work_scope_inventory::assemble_inventory(
+            work_scope,
+            self.bash_handles(),
+            self.tmux_registry(),
+            self.browser_sessions(),
+        )
+        .await;
+
+        // Same resolution as the browser lifecycle bridge: enumerate live
+        // runtime handles, resolve each conversation's scope, match.
+        let conv_ids: Vec<String> = {
+            let runtimes = self.runtimes.read().await;
+            runtimes.keys().cloned().collect()
+        };
+
+        let mut delivered = 0usize;
+        for conv_id in conv_ids {
+            let Ok(conv) = self.db().get_conversation(&conv_id).await else {
+                continue;
+            };
+            let conv_scope = crate::work_scope::WorkScope::resolve(
+                &conv.id,
+                conv.conv_mode.worktree_path().map(std::path::Path::new),
+            );
+            if &conv_scope != work_scope {
+                continue;
+            }
+            let broadcaster = {
+                let runtimes = self.runtimes.read().await;
+                runtimes.get(&conv_id).map(|h| h.broadcast_tx.clone())
+            };
+            let Some(broadcaster) = broadcaster else {
+                continue;
+            };
+            if broadcaster
+                .send_seq(|seq| SseEvent::WorkScopeUpdate {
+                    sequence_id: seq,
+                    inventory: inventory.clone(),
+                })
+                .is_ok()
+            {
+                delivered += 1;
+            }
+        }
+
+        if delivered == 0 {
+            tracing::debug!(
+                work_scope = %work_scope,
+                "dropping work-scope update — no live runtime handle on scope"
+            );
+        }
+    }
+
+    /// Whether `work_scope` still owns a non-terminal conversation — the
+    /// "is this scope live?" question the browser idle-cleanup hook asks.
+    ///
+    /// Authority is the DATABASE, not the live-runtime-handle set: a
+    /// conversation can be non-terminal in the DB yet carry no runtime handle
+    /// (after a server restart, or runtime eviction). For a
+    /// `WorkScope::Worktree(path)` we query the conversations whose
+    /// `conv_mode.worktree_path` is that path; for a `WorkScope::Conversation`
+    /// only that conversation resolves to the scope. Each candidate's scope is
+    /// resolved via `WorkScope::resolve` and matched against `work_scope`. A
+    /// match counts as live only when its conversation is neither terminal
+    /// (`ConvState::is_terminal`) nor archived. REQ-PROJ-025 guarantees at
+    /// most one non-terminal conversation per scope, so the first match is
+    /// decisive.
+    ///
+    /// A genuinely absent conversation row (`DbError::ConversationNotFound`)
+    /// is `Ok(false)` — that is a definitive "not live", not a failure. Any
+    /// other DB error propagates as `Err`: liveness is unknowable, and each
+    /// caller picks its own policy (the idle reaper maps `Err` to "live" to
+    /// avoid premature teardown; the cleanup cascade fails the operation
+    /// rather than archive while skipping resource teardown).
+    pub(crate) async fn scope_has_live_conversation(
+        &self,
+        work_scope: &WorkScope,
+    ) -> Result<bool, crate::db::DbError> {
+        self.scope_has_live_conversation_inner(work_scope, None)
+            .await
+    }
+
+    /// Like [`scope_has_live_conversation`] but skips `excluded_conv_id` when
+    /// enumerating. Used by the resource-cleanup cascade to ask "does a
+    /// non-terminal, non-archived conversation OTHER THAN the one being
+    /// deleted still resolve to this scope?"
+    ///
+    /// Exclusion is load-bearing: the cascade runs BEFORE the terminal-state
+    /// write, so the conversation being deleted/archived still reads
+    /// non-terminal in the DB. Without excluding it, the scope would always
+    /// look live and never tear down.
+    pub(crate) async fn scope_has_live_conversation_excluding(
+        &self,
+        work_scope: &WorkScope,
+        excluded_conv_id: &str,
+    ) -> Result<bool, crate::db::DbError> {
+        self.scope_has_live_conversation_inner(work_scope, Some(excluded_conv_id))
+            .await
+    }
+
+    async fn scope_has_live_conversation_inner(
+        &self,
+        work_scope: &WorkScope,
+        excluded_conv_id: Option<&str>,
+    ) -> Result<bool, crate::db::DbError> {
+        // Candidate conversations come from the DB so a non-terminal owner
+        // without a runtime handle (post-restart / post-eviction) still
+        // counts. A `WorkScope::Conversation(id)` is single-owner: only `id`
+        // resolves to it, so we look up just that conversation. A
+        // `WorkScope::Worktree(path)` can be shared (a Work sub-agent and its
+        // parent), so we query every conversation on that worktree path.
+        let candidates: Vec<crate::db::Conversation> = match work_scope {
+            WorkScope::Conversation(id) => {
+                if excluded_conv_id == Some(id.as_str()) {
+                    return Ok(false);
+                }
+                match self.db().get_conversation(id).await {
+                    Ok(conv) => vec![conv],
+                    // A genuinely absent row is a definitive "not live", not a
+                    // failure. Any other DB error is unknowable liveness and
+                    // propagates so each caller picks its own policy.
+                    Err(crate::db::DbError::ConversationNotFound(_)) => return Ok(false),
+                    Err(e) => return Err(e),
+                }
+            }
+            WorkScope::Worktree(path) => self.db().list_conversations_for_worktree(path).await?,
+            // The `Global` singleton scope (the `/new` page global terminal)
+            // is not owned by any conversation — `WorkScope::resolve` only ever
+            // yields `Worktree` or `Conversation` — so no conversation can
+            // preserve it.
+            WorkScope::Global => return Ok(false),
+        };
+
+        for conv in candidates {
+            if excluded_conv_id == Some(conv.id.as_str()) {
+                continue;
+            }
+            if conv.state.is_terminal() {
+                continue;
+            }
+            // An archived conversation is not a live owner even when its
+            // row still reads non-terminal: archiving a Work/Branch chain
+            // archives earlier members before the leaf's cleanup runs.
+            // Counting it as live would preserve the shared scope and leak
+            // its bash/tmux/browser/terminal resources.
+            if conv.archived {
+                continue;
+            }
+            let conv_scope = crate::work_scope::WorkScope::resolve(
+                &conv.id,
+                conv.conv_mode.worktree_path().map(std::path::Path::new),
+            );
+            if &conv_scope == work_scope {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Start the background task that handles sub-agent spawn/cancel requests
@@ -1238,6 +1547,12 @@ impl RuntimeManager {
             ConvMode::Explore { .. } | ConvMode::Work { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
+        // Scope keying derives from the persisted conv_mode's worktree path,
+        // the same authority every DB-facing path uses. An Explore sub-agent
+        // has `worktree_path: None`, so it scopes to its own
+        // `WorkScope::Conversation(id)` — isolated from the parent, matching
+        // the inventory / cleanup / SSE derivations.
+        conv_context.work_scope_worktree = sub_conv_mode.worktree_path().map(PathBuf::from);
         // Sub-agent inherits parent's worktree cwd; discover the project's
         // tasks directory the same way the parent did.
         conv_context.tasks_dir_name =
@@ -1456,6 +1771,11 @@ impl RuntimeManager {
             ConvMode::Explore { .. } | ConvMode::Work { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
+        // Scope keying derives from the persisted conv_mode's worktree path,
+        // the single authority every DB-facing path uses for
+        // `WorkScope::resolve`. Keeps `ToolContext.work_scope` in lock-step
+        // with the inventory / cleanup / SSE scope derivations.
+        context.work_scope_worktree = conv.conv_mode.worktree_path().map(PathBuf::from);
         // Discover the project's tasks directory once at conversation
         // startup; cached for the lifetime of this runtime so state machine,
         // executor, patch tool registration, and system prompt all agree on
@@ -2065,6 +2385,120 @@ mod sub_agent_registry_resume_tests {
 }
 
 #[cfg(test)]
+mod work_scope_derivation_tests {
+    //! The scope keying used to address a conversation's bash / browser /
+    //! tmux handles (`ToolContext.work_scope`) MUST agree with the scope the
+    //! DB-facing paths derive (inventory assembler, hard-delete cleanup
+    //! cascade, work-scope SSE routing, browser-liveness reap). Both sides
+    //! resolve from a single authority: the persisted
+    //! `ConvMode::worktree_path()`.
+    //!
+    //! Regression: an Explore sub-agent persists as
+    //! `ConvMode::Explore { worktree_path: None }`, so its DB-facing scope is
+    //! `WorkScope::Conversation(id)` (REQ-BASH-WS-001: "Direct-mode
+    //! conversations and sub-agents resolve to `WorkScope::Conversation(id)`").
+    //! A prior tool-side derivation keyed off `mode != Direct → working_dir`,
+    //! which gave a managed sub-agent `WorkScope::Worktree(cwd)` instead —
+    //! diverging from every DB-facing path, so its handles never appeared in
+    //! its own inventory and deleting the parent's worktree scope could kill
+    //! the live sub-agent's handles.
+    use crate::db::{ConvMode, NonEmptyString};
+    use crate::work_scope::WorkScope;
+    use std::path::Path;
+
+    /// The DB-facing derivation, mirrored from `WorkScope::resolve(conv.id,
+    /// conv.conv_mode.worktree_path())` as used by the inventory / cleanup /
+    /// SSE paths in this module.
+    fn db_facing_scope(conv_id: &str, conv_mode: &ConvMode) -> WorkScope {
+        WorkScope::resolve(conv_id, conv_mode.worktree_path().map(Path::new))
+    }
+
+    /// The tool-side derivation. `ConvContext.work_scope_worktree` is set from
+    /// `conv_mode.worktree_path()` at both runtime construction sites (spawn +
+    /// resume), and the executor passes it to `ToolContext::new`, which calls
+    /// `WorkScope::resolve(conv_id, work_scope_worktree)`. We replicate that
+    /// chain here without standing up a full runtime.
+    fn tool_side_scope(conv_id: &str, conv_mode: &ConvMode) -> WorkScope {
+        let work_scope_worktree = conv_mode.worktree_path().map(std::path::PathBuf::from);
+        WorkScope::resolve(conv_id, work_scope_worktree.as_deref())
+    }
+
+    fn assert_scopes_agree(conv_id: &str, conv_mode: &ConvMode, expected: WorkScope) {
+        let db = db_facing_scope(conv_id, conv_mode);
+        let tool = tool_side_scope(conv_id, conv_mode);
+        assert_eq!(db, tool, "tool-side and DB-facing scope must agree");
+        assert_eq!(tool, expected);
+    }
+
+    #[test]
+    fn explore_subagent_resolves_to_its_own_conversation_scope() {
+        // The bug's epicentre: no worktree of its own → isolated conv scope.
+        let mode = ConvMode::Explore {
+            worktree_path: None,
+        };
+        assert_scopes_agree(
+            "explore-subagent-1",
+            &mode,
+            WorkScope::Conversation("explore-subagent-1".to_string()),
+        );
+    }
+
+    #[test]
+    fn top_level_explore_resolves_to_its_worktree_scope() {
+        // A top-level Explore conversation owns a worktree pre-approval.
+        let mode = ConvMode::Explore {
+            worktree_path: Some(NonEmptyString::new("/tmp/wt-explore").unwrap()),
+        };
+        assert_scopes_agree(
+            "explore-toplevel-1",
+            &mode,
+            WorkScope::Worktree("/tmp/wt-explore".to_string()),
+        );
+    }
+
+    #[test]
+    fn work_subagent_shares_parent_worktree_scope() {
+        // A Work sub-agent inherits the parent's conv_mode (worktree included)
+        // and so co-owns the parent's worktree scope (REQ-BASH-WS-002).
+        let mode = ConvMode::Work {
+            branch_name: NonEmptyString::new("task-0001-x").unwrap(),
+            worktree_path: NonEmptyString::new("/tmp/wt-work").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+            task_id: NonEmptyString::new("0001").unwrap(),
+            task_title: NonEmptyString::new("x").unwrap(),
+        };
+        assert_scopes_agree(
+            "work-subagent-1",
+            &mode,
+            WorkScope::Worktree("/tmp/wt-work".to_string()),
+        );
+    }
+
+    #[test]
+    fn branch_resolves_to_its_worktree_scope() {
+        let mode = ConvMode::Branch {
+            branch_name: NonEmptyString::new("feature-x").unwrap(),
+            worktree_path: NonEmptyString::new("/tmp/wt-branch").unwrap(),
+            base_branch: NonEmptyString::new("feature-x").unwrap(),
+        };
+        assert_scopes_agree(
+            "branch-1",
+            &mode,
+            WorkScope::Worktree("/tmp/wt-branch".to_string()),
+        );
+    }
+
+    #[test]
+    fn direct_resolves_to_its_conversation_scope() {
+        assert_scopes_agree(
+            "direct-1",
+            &ConvMode::Direct,
+            WorkScope::Conversation("direct-1".to_string()),
+        );
+    }
+}
+
+#[cfg(test)]
 mod broadcaster_tests {
     use super::*;
 
@@ -2500,6 +2934,253 @@ mod broadcaster_tests {
             highest,
             anchor + events.len() as i64,
             "with seq 11..17 in the ring, highest is 17"
+        );
+    }
+}
+
+#[cfg(test)]
+mod scope_liveness_tests {
+    //! `scope_has_live_conversation[_excluding]` derives liveness from the
+    //! DATABASE, not the live-runtime-handle set. Two properties matter:
+    //!
+    //! - A non-terminal, non-archived sibling that resolves to the scope
+    //!   preserves it even when it has NO runtime handle (post-restart /
+    //!   post-eviction). Counting only handles would let the cascade tear
+    //!   down a worktree/branch and bash/tmux/browser still owned by a live
+    //!   conversation — data loss.
+    //! - An archived conversation is not a live owner even when its DB row
+    //!   still reads non-terminal: archiving a Work/Branch chain archives
+    //!   earlier members before the leaf's cleanup cascade runs; counting an
+    //!   archived member as live would preserve the shared `WorkScope` and
+    //!   leak its bash/tmux/browser/terminal resources.
+    use super::*;
+    use crate::llm::ModelRegistry;
+    use crate::platform::PlatformCapability;
+    use crate::tools::mcp::McpClientManager;
+    use phoenix_core::domain::db_schema::{ConvMode, NonEmptyString};
+    use phoenix_core::domain::sm_state::ConvState;
+
+    fn work_mode(worktree_path: &str) -> ConvMode {
+        ConvMode::Work {
+            branch_name: NonEmptyString::new("task-branch").unwrap(),
+            worktree_path: NonEmptyString::new(worktree_path).unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+            task_id: NonEmptyString::new("T1").unwrap(),
+            task_title: NonEmptyString::new("title").unwrap(),
+        }
+    }
+
+    /// Create a non-user-initiated conversation in Work mode on `worktree_path`
+    /// and give it NO runtime handle — exactly the post-restart / post-eviction
+    /// shape the regression guards against.
+    async fn create_handleless_work_conv(mgr: &RuntimeManager, id: &str, worktree_path: &str) {
+        mgr.db()
+            .create_conversation_with_project(
+                id,
+                id,
+                worktree_path,
+                false,
+                None,
+                None,
+                None,
+                &work_mode(worktree_path),
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("create work conv");
+    }
+
+    async fn test_manager() -> RuntimeManager {
+        let db = crate::db::Database::open_in_memory().await.expect("db");
+        RuntimeManager::new(
+            db,
+            Arc::new(ModelRegistry::new_empty()),
+            PlatformCapability::None,
+            Arc::new(McpClientManager::new()),
+            None,
+        )
+    }
+
+    /// Register a lingering runtime handle for `conv_id` without spawning a
+    /// real conversation runtime — mirrors the handle the executor inserts.
+    async fn register_lingering_handle(mgr: &RuntimeManager, conv_id: &str) {
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        mgr.runtimes.write().await.insert(
+            conv_id.to_string(),
+            ConversationHandle {
+                event_tx,
+                broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
+                identity: Arc::new(()),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn non_terminal_unarchived_conversation_counts_as_live() {
+        let mgr = test_manager().await;
+        mgr.db()
+            .create_conversation("conv-live", "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        register_lingering_handle(&mgr, "conv-live").await;
+
+        let scope = crate::work_scope::WorkScope::Conversation("conv-live".to_string());
+        assert!(
+            mgr.scope_has_live_conversation(&scope).await.unwrap(),
+            "a non-terminal, unarchived owner with a live handle is live"
+        );
+    }
+
+    #[tokio::test]
+    async fn archived_conversation_does_not_count_as_live() {
+        let mgr = test_manager().await;
+        mgr.db()
+            .create_conversation("conv-arch", "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        register_lingering_handle(&mgr, "conv-arch").await;
+
+        // Sanity: live before archiving.
+        let scope = crate::work_scope::WorkScope::Conversation("conv-arch".to_string());
+        assert!(mgr.scope_has_live_conversation(&scope).await.unwrap());
+
+        // Archive the (still non-terminal) conversation; the lingering
+        // runtime handle stays registered, as it does in the real cascade.
+        mgr.db()
+            .archive_conversation("conv-arch")
+            .await
+            .expect("archive");
+        let conv = mgr.db().get_conversation("conv-arch").await.expect("get");
+        assert!(conv.archived, "precondition: archived flag set");
+        assert!(
+            !conv.state.is_terminal(),
+            "precondition: row still reads non-terminal"
+        );
+
+        assert!(
+            !mgr.scope_has_live_conversation(&scope).await.unwrap(),
+            "an archived conversation must not preserve its scope"
+        );
+    }
+
+    /// Regression: a non-terminal, non-archived sibling with NO runtime handle
+    /// still preserves its shared worktree scope. Deleting the leaf
+    /// (`excluded_conv_id`) must NOT let the cascade tear down the worktree /
+    /// branch / bash because the parent — handle-less after a restart — still
+    /// resolves to the same `WorkScope`.
+    #[tokio::test]
+    async fn handleless_non_terminal_sibling_preserves_worktree_scope() {
+        let mgr = test_manager().await;
+        let worktree = "/repo/.phoenix/worktrees/shared";
+
+        // Parent (surviving owner) — non-terminal, non-archived, NO handle.
+        create_handleless_work_conv(&mgr, "parent", worktree).await;
+        // Leaf sub-agent being deleted — also on the shared worktree.
+        create_handleless_work_conv(&mgr, "leaf", worktree).await;
+
+        let scope = crate::work_scope::WorkScope::Worktree(worktree.to_string());
+
+        assert!(
+            mgr.scope_has_live_conversation_excluding(&scope, "leaf")
+                .await
+                .unwrap(),
+            "handle-less non-terminal parent still owns the shared worktree scope"
+        );
+    }
+
+    /// Counterpart: when the deleted leaf is genuinely the last live owner
+    /// (the sibling has gone terminal), the scope is NOT preserved and the
+    /// cascade tears down.
+    #[tokio::test]
+    async fn truly_last_owner_does_not_preserve_worktree_scope() {
+        let mgr = test_manager().await;
+        let worktree = "/repo/.phoenix/worktrees/shared";
+
+        create_handleless_work_conv(&mgr, "parent", worktree).await;
+        create_handleless_work_conv(&mgr, "leaf", worktree).await;
+
+        // Parent reaches a terminal state — only the leaf remains live.
+        mgr.db()
+            .update_conversation_state(
+                "parent",
+                &ConvState::Completed {
+                    result: "done".to_string(),
+                },
+            )
+            .await
+            .expect("terminate parent");
+
+        let scope = crate::work_scope::WorkScope::Worktree(worktree.to_string());
+
+        assert!(
+            !mgr.scope_has_live_conversation_excluding(&scope, "leaf")
+                .await
+                .unwrap(),
+            "with the only other owner terminal, deleting the leaf leaves no live owner"
+        );
+    }
+
+    /// A non-terminal sibling on a DIFFERENT worktree must not preserve this
+    /// scope — the DB query is keyed on `worktree_path`, so unrelated live
+    /// conversations are not false positives.
+    #[tokio::test]
+    async fn sibling_on_other_worktree_does_not_preserve_scope() {
+        let mgr = test_manager().await;
+        let worktree = "/repo/.phoenix/worktrees/shared";
+
+        create_handleless_work_conv(&mgr, "leaf", worktree).await;
+        create_handleless_work_conv(&mgr, "unrelated", "/repo/.phoenix/worktrees/other").await;
+
+        let scope = crate::work_scope::WorkScope::Worktree(worktree.to_string());
+
+        assert!(
+            !mgr.scope_has_live_conversation_excluding(&scope, "leaf")
+                .await
+                .unwrap(),
+            "a live conversation on a different worktree does not own this scope"
+        );
+    }
+
+    /// A `WorkScope::Conversation(id)` whose row is genuinely absent
+    /// (`DbError::ConversationNotFound`) is `Ok(false)` — a definitive
+    /// "not live", not an error. A non-NotFound DB error propagates as
+    /// `Err` instead, leaving each caller to pick its policy (idle reaper
+    /// preserves, cleanup cascade fails the operation). That error path
+    /// needs DB fault injection the in-memory test DB does not expose, so it
+    /// is exercised at the caller layer (`handlers.rs` cascade tests) and by
+    /// inspection of the match arm rather than a unit test here.
+    #[tokio::test]
+    async fn missing_conversation_scope_is_not_live() {
+        let mgr = test_manager().await;
+        let scope = crate::work_scope::WorkScope::Conversation("does-not-exist".to_string());
+        assert!(
+            !mgr.scope_has_live_conversation(&scope).await.unwrap(),
+            "an absent conversation row resolves to not-live"
+        );
+    }
+
+    /// An unreadable DB makes liveness unknowable: a non-NotFound error
+    /// propagates as `Err` rather than being swallowed to a bool. This is the
+    /// input the idle-reaper hook maps to "preserve" (its `Err => true` arm)
+    /// and the cleanup cascade maps to "fail the operation". Fault injection:
+    /// closing the pool makes the worktree query fail with a non-NotFound
+    /// `DbError`.
+    #[tokio::test]
+    async fn unreadable_db_propagates_error_for_caller_policy() {
+        let mgr = test_manager().await;
+        let worktree = "/repo/.phoenix/worktrees/shared";
+        create_handleless_work_conv(&mgr, "owner", worktree).await;
+
+        mgr.db().pool().close().await;
+
+        let scope = crate::work_scope::WorkScope::Worktree(worktree.to_string());
+        assert!(
+            mgr.scope_has_live_conversation(&scope).await.is_err(),
+            "an unreadable DB must surface as Err, not a swallowed bool — the \
+             idle reaper preserves on Err, the cascade fails on Err"
         );
     }
 }

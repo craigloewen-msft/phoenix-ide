@@ -10,8 +10,10 @@ import { SkillsPanel } from '../SkillsPanel';
 import { SkillViewer } from '../SkillViewer';
 import { TasksPanel } from '../TasksPanel';
 import { TaskViewer } from '../TaskViewer';
+import { WorkScopeSection } from '../WorkScopePanel';
+import { useSeededLiveCount } from '../useWorkScopeSeed';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
-import type { SkillEntry, TaskEntry } from '../../api';
+import type { SkillEntry, TaskEntry, WorkScopeInventory } from '../../api';
 
 interface Props {
   collapsed: boolean;
@@ -31,6 +33,14 @@ interface Props {
   activeSlug: string;
   /** Width in px when expanded — driven by useResizablePane */
   width?: number | undefined;
+  /** The conversation's work-scope key. When present, the Work scope section
+   *  (and its collapsed-rail badge) render; resources are WorkScope-keyed so
+   *  this single key addresses every backgrounded bash handle, the tmux
+   *  server, and the browser session (REQ-WSUI-010). */
+  workScopeKey?: string | null | undefined;
+  /** Live work-scope inventory from the conversation atom (SSE-fed). Drives
+   *  the collapsed-rail live count and overrides the section's initial fetch. */
+  liveWorkScope?: WorkScopeInventory | null | undefined;
 }
 
 /** Extract task ID from a Work branch name like "task-08617-some-slug" */
@@ -40,15 +50,25 @@ function extractTaskId(branchName: string | null | undefined): string | undefine
   return match ? match[1] : undefined;
 }
 
-export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, showError, branchName, activeSlug, width }: Props) {
+export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, showError, branchName, activeSlug, width, workScopeKey, liveWorkScope }: Props) {
   const { openFile, activeFile } = useFileExplorer();
   const [refreshKey, setRefreshKey] = useState(0);
   const handleRefresh = useCallback(() => setRefreshKey(k => k + 1), []);
   const [selectedSkill, setSelectedSkill] = useState<SkillEntry | null>(null);
   const [selectedTask, setSelectedTask] = useState<TaskEntry | null>(null);
   const [skillsPanelExpanded, setSkillsPanelExpanded] = useState(false);
+  // Default-expanded: this is an at-a-glance resource view, so the section is
+  // open on first paint rather than requiring a click like Skills/Tasks.
+  const [workScopeExpanded, setWorkScopeExpanded] = useState(true);
 
   const currentTaskId = extractTaskId(branchName);
+
+  // Seed the work-scope live count from the inventory endpoint even while
+  // collapsed: the collapsed rail does not mount `WorkScopeSection`, so without
+  // this the badge is driven solely by the SSE-fed `liveWorkScope` and reads 0
+  // forever when the spawn `work_scope_update` fell outside the replay window.
+  // One fetch per scope (no poll); SSE stays authoritative once it arrives.
+  const workScopeCount = useSeededLiveCount(workScopeKey, liveWorkScope);
 
   const handleFileSelect = (filePath: string, rootDir: string) => {
     openFile(filePath, rootDir);
@@ -73,6 +93,15 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
           <button className="fe-collapsed-badge" onClick={onToggle} title="Tasks">
             T
           </button>
+          {workScopeKey && (
+            <button
+              className={`fe-collapsed-badge${workScopeCount > 0 ? ' fe-collapsed-badge--active' : ''}`}
+              onClick={onToggle}
+              title={`Work scope · ${workScopeCount} running`}
+            >
+              {workScopeCount}
+            </button>
+          )}
         </div>
       </aside>
     );
@@ -123,6 +152,14 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
             currentTaskId={currentTaskId}
             onTaskClick={setSelectedTask}
           />
+          {workScopeKey && (
+            <WorkScopeSection
+              scopeKey={workScopeKey}
+              liveInventory={liveWorkScope}
+              expanded={workScopeExpanded}
+              onToggleExpanded={setWorkScopeExpanded}
+            />
+          )}
         </>
       )}
     </aside>

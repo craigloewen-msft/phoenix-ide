@@ -525,12 +525,26 @@ than a `HashMap<String, …>` keyed by conversation id. Continuation
 conversations that resolve to the same `WorkScope` MUST share the
 existing terminal rather than spawn a new one.
 
-The cleanup cascade MUST decide preservation by `WorkScope` equality
-between the conversation being torn down and its continuation's resolved
-scope: skip the teardown iff `inheritor_scope == Some(work_scope)`. This
-mirrors REQ-TMUX-WS-001 / REQ-TMUX-WS-002 and REQ-BROWSER-WS-001 /
-REQ-BROWSER-WS-003 — the three work-affine resources (tmux server,
-Chrome session, terminal PTY) share a single ownership pattern.
+The cleanup cascade MUST decide preservation by whether the scope is
+still owned by a live conversation other than the one being torn down:
+skip the teardown iff `inheritor_scope == Some(work_scope)`, where
+`inheritor_scope` is `Some(work_scope)` iff a live conversation
+other than the deleted one resolves to that scope — a continuation that
+inherits it, or a live sibling such as a Work-mode sub-agent that shares
+its parent's scope. A live conversation is one that is BOTH non-terminal
+in state AND not `archived`, determined from the persisted conversation
+rows in the DATABASE — NOT from the set of live runtime handles. A
+non-terminal conversation with no runtime handle (after a server restart
+or runtime eviction) is still a live owner; enumerating handles would tear
+down a scope whose surviving owner is handle-less. An archived conversation
+does not count as a live owner even while non-terminal, because archiving a
+chain archives earlier members before the leaf's cascade runs. The deleted conversation is excluded from that
+enumeration: the cascade runs before its terminal-state write, so it
+still reads non-terminal, and excluding it is what lets the terminal
+tear down when it is the last live owner. This mirrors REQ-TMUX-WS-001 /
+REQ-TMUX-WS-002 and REQ-BROWSER-WS-001 / REQ-BROWSER-WS-003 — the three
+work-affine resources (tmux server, Chrome session, terminal PTY) share
+a single ownership pattern.
 
 **Rationale:** Pre-existing keying by `conversation_id` created two
 parallel representations of "who owns this resource" — `ActiveTerminals`

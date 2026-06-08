@@ -23,10 +23,12 @@ or kill the process. The tool itself remains pipe-backed and non-interactive —
 PTY needs and "I want this to survive Phoenix restart" needs are served by the
 separate `tmux` tool (see `specs/tmux-integration/`).
 
-**Persistence boundary:** handles are in-memory only. They survive arbitrarily
-long within a single Phoenix process, but a Phoenix restart drops them — the
-agent will see `handle_not_found` on a previously-known handle. Persistence
-across Phoenix restart is what `tmux` is for.
+**Persistence boundary:** handles are in-memory only, owned by the `WorkScope`
+that spawned them (REQ-BASH-WS-001). They survive arbitrarily long within a
+single Phoenix process — including across a continuation boundary, because a
+continuation inherits its predecessor's `WorkScope` — but a Phoenix restart
+drops them: the agent will see `handle_not_found` on a previously-known handle.
+Persistence across Phoenix restart is what `tmux` is for.
 
 ## Requirements
 
@@ -201,9 +203,38 @@ THE SYSTEM SHALL append the bytes to a per-handle ring buffer bounded by
 AND split incoming bytes on newline boundaries to assign each complete line a
 monotonically increasing offset (line 0, 1, 2, ... since spawn)
 
-WHEN the ring buffer reaches `RING_BUFFER_BYTES` and new content arrives
+WHEN the ring buffer's retained complete-line bytes reach `RING_BUFFER_BYTES`
+and new content arrives
 THE SYSTEM SHALL evict the oldest lines until the new content fits
 AND advance `start_offset` to the offset of the oldest still-retained line
+
+THE SYSTEM SHALL track a monotonic count of total bytes the process has
+written — incremented on every append, inclusive of bytes currently held as
+an un-newlined trailing partial, and never decremented by eviction. This
+count is the reported output size (`output_bytes`), distinct from the
+retained-byte count that drives eviction. It is defined in every state
+(0 at spawn), surfaced on the observability inventory and process-inspection
+wire as `output_bytes`, and persisted into the tombstone so a terminal handle
+reports the same total a final live read would have.
+
+WHEN incoming bytes have no trailing newline
+THE SYSTEM SHALL hold them as a partial line bounded by `MAX_PARTIAL_BYTES`
+(default 64 KiB): when an append would grow the partial past that bound, the
+partial is flushed immediately as a complete line (receiving the next
+monotonic offset) so a process that never emits a newline cannot grow the
+partial without bound
+
+WHEN a handle's reader idles with a non-empty partial line for
+`PARTIAL_IDLE_FLUSH_SECONDS` (default 10)
+THE SYSTEM SHALL flush the partial as a complete line so output a process
+emitted without a trailing newline and then stopped producing becomes
+visible to `since`/`lines` reads (which return complete lines only) rather
+than staying invisible until EOF
+
+THE read window returned on a live peek/wait/run response SHALL carry the
+current trailing partial line (lossy UTF-8) as a `partial` field, structurally
+distinct from the complete `lines`. A tombstone read carries no `partial`
+(the partial was flushed to a complete line on EOF before demotion).
 
 WHEN agent supplies `peek=<handle>` with `lines=N`
 THE SYSTEM SHALL return the last N lines of the ring buffer (or all lines if
@@ -234,23 +265,44 @@ race each other. `truncated_before` makes information loss explicit rather than
 silent: the agent can detect when content fell out of the window and decide how
 to respond.
 
+The reported output size is a monotonic total of bytes written, not the
+retained-line byte count. These are two different values doing two different
+jobs: the retained count bounds memory (it falls as lines evict), while the
+output total answers "how much has this process produced" (it only rises). A
+single field cannot honestly serve both — a no-newline emitter would report
+0 forever under a retained-line count, and a heavily-evicted ring would
+under-report. The total is partial-inclusive so output a process is mid-way
+through emitting still counts, and it is persisted into the tombstone so the
+count survives the live-to-terminal transition rather than vanishing.
+
+The partial line is bounded structurally (`MAX_PARTIAL_BYTES`) rather than by
+convention: the eviction cap governs complete lines only, so without a partial
+bound a process that never emits `\n` is an unbounded memory leak. The idle
+flush (`PARTIAL_IDLE_FLUSH_SECONDS`) exists because `since`/`lines` reads
+return complete lines only — a prompt or progress fragment emitted without a
+newline would otherwise be invisible to the agent until the process exits. The
+read window exposes the partial as a field distinct from `lines` so a consumer
+that wants the in-progress line (the process inspector) can render it while the
+LLM peek, which reasons over complete lines, can ignore it; folding it into
+`lines` would give it a fake offset and blur "complete" against "in progress."
+
 ---
 
 ### REQ-BASH-005: Live Handle Cap
 
-WHEN agent calls `bash(cmd=<command>, ...)` AND the conversation has
+WHEN agent calls `bash(cmd=<command>, ...)` AND the work scope has
 `LIVE_HANDLE_CAP` (default 8) live handles (status `running`)
 THE SYSTEM SHALL reject the call with:
 - `error: "handle_cap_reached"`
 - `cap`: the configured value
 - `live_handles`: list of `{ handle, cmd, age_seconds, status }` for each live
-  handle in the conversation
+  handle in the work scope
 - `hint`: text directing the agent to kill or wait on a handle, or use the
   `tmux` tool for long-runners
 
 WHEN a handle transitions out of `running` (exit, kill, signal)
 THE SYSTEM SHALL decrement the live count
-AND a subsequent run from the same conversation MAY succeed if it brings the
+AND a subsequent run in the same work scope MAY succeed if it brings the
 live count under the cap
 
 **Rationale:** A hard refusal is the pit-of-success failure mode. LRU eviction
@@ -291,10 +343,16 @@ THE SYSTEM SHALL respond with the same `status: "tombstoned"` shape as
 peek/wait — no `already_terminal` flag is needed because the
 `tombstoned` status conveys it
 
-WHEN a conversation is hard-deleted
-THE SYSTEM SHALL kill any of that conversation's processes whose handles are
+WHEN a conversation is hard-deleted AND no surviving conversation inherits its
+`WorkScope`
+THE SYSTEM SHALL kill any of that `WorkScope`'s processes whose handles are
 still `running`
-AND remove all tombstone records for that conversation
+AND remove all tombstone records for that `WorkScope`
+
+WHEN a conversation is hard-deleted AND a continuation inherits the same
+`WorkScope`
+THE SYSTEM SHALL leave that `WorkScope`'s handles and tombstones intact for the
+inheritor (REQ-BASH-WS-002)
 
 WHEN Phoenix shuts down (gracefully or via crash)
 THE SYSTEM SHALL kill all live processes via the reaper machinery
@@ -618,33 +676,122 @@ AND the absence of Landlock SHALL NOT prevent Work mode from functioning
 
 ---
 
-### REQ-BASH-014: Stateless Tool with Per-Conversation Handle Registry
+### REQ-BASH-014: Stateless Tool with Per-WorkScope Handle Registry
 
 WHEN bash tool is invoked
 THE SYSTEM SHALL receive all execution context via a `ToolContext` parameter
 AND derive working directory from `ToolContext.working_dir`
 AND use `ToolContext.cancel` for cancellation handling
 AND access the bash handle registry via `ctx.bash_handles()`, which SHALL
-return `Result<Arc<RwLock<ConversationHandles>>, BashHandleError>` matching
+resolve the table for `ToolContext.work_scope` and return
+`Result<Arc<RwLock<WorkScopeHandles>>, BashHandleError>` matching
 the existing `ctx.browser()` accessor's `async + Result + Arc<RwLock<...>>`
 shape
 
 WHEN bash tool is constructed
-THE SYSTEM SHALL NOT store per-conversation state on the tool itself
-AND tool instance SHALL be reusable across conversations
+THE SYSTEM SHALL NOT store per-WorkScope state on the tool itself
+AND tool instance SHALL be reusable across conversations and work scopes
 
-THE handle registry SHALL be per-conversation; calls in one conversation cannot
-peek, wait, or kill handles owned by another conversation. A `handle_not_found`
-is the response if a handle ID from one conversation is presented in another.
+THE handle registry SHALL be keyed by `WorkScope`; calls in one work scope
+cannot peek, wait, or kill handles owned by another work scope. Conversations
+that resolve to the same `WorkScope` — a continuation chain on one worktree —
+share a single handle table. A `handle_not_found` is the response if a handle
+ID from one work scope is presented in another.
 
 **Rationale:** The bash tool itself remains stateless — instance reusable,
 context flows through `ToolContext`. The handle table is a shared service
 (like the browser session manager), reached through the context, scoped to the
-conversation. The accessor signature was aligned in revision 2 with the
-existing `browser()` shape so all per-conversation tool registries share one
-pattern (`async fn foo(&self) -> Result<Arc<RwLock<T>>, FooError>`); the
-earlier draft proposed an idiosyncratic lifetime-bound `BashHandleScope<'_>`
-that does not compose with `ToolContext: Clone`.
+`WorkScope`. The accessor signature matches the `browser()` shape so all
+`WorkScope`-keyed tool registries (browser, tmux, terminal, bash) share one
+pattern (`async fn foo(&self) -> Result<Arc<RwLock<T>>, FooError>`); a
+lifetime-bound `BashHandleScope<'_>` alternative does not compose with
+`ToolContext: Clone`.
+
+---
+
+### REQ-BASH-WS-001: Handle Registry Keyed by WorkScope
+
+THE handle registry SHALL key its per-scope handle tables by `WorkScope`, not
+by conversation id — matching the terminal, browser, and tmux registries
+(REQ-TERM-WS-001, REQ-BROWSER-WS-001).
+
+WHEN two conversations resolve to the same `WorkScope` (a continuation chain on
+one worktree)
+THE SYSTEM SHALL give them the same handle table, so a handle spawned before a
+continuation boundary remains addressable for peek/wait/kill after it
+AND count both conversations' live handles against the one per-`WorkScope`
+`LIVE_HANDLE_CAP` (REQ-BASH-005)
+
+WHEN a handle id owned by one `WorkScope` is presented in a call running under a
+different `WorkScope`
+THE SYSTEM SHALL return `error: "handle_not_found"` (no cross-scope leakage of
+handle existence)
+
+**Rationale:** A backgrounded process is a `WorkScope`-level resource, like the
+tmux server and browser session that share its worktree. Conversation-keying
+orphans a live process at every continuation boundary: the process keeps
+running but becomes unaddressable from the continuation, so the agent sees the
+runtime silently forget half its in-flight work. Keying by `WorkScope` makes
+bash symmetric with the other three runtime resources and makes "the work scope
+owns its processes" structural rather than conventional. The scope is derived
+from the persisted `ConvMode::worktree_path()`, the single authority every
+DB-facing path (inventory, hard-delete cascade, work-scope SSE routing) also
+resolves from — so the handle-table keying and the inventory/cleanup keying
+cannot diverge. Direct-mode conversations and Explore sub-agents (which persist
+`worktree_path: None`) resolve to `WorkScope::Conversation(id)`, for which this
+is exactly one conversation's handles; worktree-backed chains and Work-mode
+sub-agents (which inherit the parent's worktree-bearing `conv_mode`) resolve to
+`WorkScope::Worktree(path)` and so share one table — the former across a
+continuation boundary, the latter with the live parent, both toward survival.
+
+---
+
+### REQ-BASH-WS-002: Hard-Delete Cascade Preserves a Scope Still Owned by a Live Conversation
+
+WHEN a conversation is hard-deleted AND a non-terminal conversation OTHER THAN
+the one being deleted resolves to the same `WorkScope` — whether a continuation
+that inherits it, or a sibling such as a Work-mode sub-agent that shares its
+parent's scope
+THE SYSTEM SHALL NOT kill that `WorkScope`'s running processes or drop its
+tombstones — the surviving owner keeps them
+
+WHEN a conversation is hard-deleted AND no non-terminal conversation other than
+the one being deleted resolves to its `WorkScope`
+THE SYSTEM SHALL kill every running process in that `WorkScope`'s handle table
+AND drop the `WorkScope`'s handles and tombstones
+
+THE cascade SHALL receive the deleted conversation's `WorkScope` and a
+preservation signal that is true iff the scope is still owned, and SHALL skip
+teardown when the signal is true, mirroring `cascade_terminal_on_delete` /
+`cascade_browser_on_delete` (REQ-TERM-WS-002, REQ-BROWSER-WS-002).
+
+THE preservation signal SHALL exclude the conversation being deleted when
+enumerating live owners. The cascade runs before the deleted conversation's
+terminal-state write, so it still reads non-terminal; excluding it is what lets
+the scope tear down when it is the last live owner.
+
+A live owner is a conversation, RECORDED IN THE DATABASE, that is BOTH
+non-terminal in state AND not `archived`. Liveness SHALL be determined from
+the persisted conversation rows, NOT from the set of live runtime handles: a
+conversation can be non-terminal in the DB yet hold no runtime handle (after a
+server restart or runtime eviction), and such a conversation is still a live
+owner. Enumerating only handles would let the cascade tear down a scope whose
+surviving owner is a handle-less, non-terminal conversation — destroying its
+shared worktree, branch, and processes. An archived conversation SHALL NOT
+count as a live owner even while its state row still reads non-terminal:
+archiving a chain archives its earlier members before the leaf's cleanup
+cascade runs, so counting one as live would preserve the shared `WorkScope`
+and leak its processes and tombstones.
+
+**Rationale:** A continuation is not the only way a scope outlives one
+conversation. A Work-mode sub-agent inherits its parent's `conv_mode` and so
+resolves to the parent's `WorkScope`, but has no continuation. Preserving only
+on a continuation SIGKILLs the still-open parent's processes (and tears down its
+tmux server, terminal, and browser session, which share the call site) the
+instant the sub-agent is deleted — an asymmetry the agent experiences as the
+runtime randomly forgetting work. The correct signal is "is the scope still
+owned by a live conversation other than this one," which a continuation
+satisfies as one case among several.
 
 ---
 
@@ -690,8 +837,10 @@ operations so the UI has a sensible display for non-run calls.
 | Name | Default | Description |
 |---|---|---|
 | `MAX_WAIT_SECONDS` | 900 | Upper bound on `wait_seconds` per call |
-| `RING_BUFFER_BYTES` | 4 MB | Per-handle live ring buffer size |
-| `LIVE_HANDLE_CAP` | 8 | Per-conversation cap on `running` handles |
+| `RING_BUFFER_BYTES` | 4 MB | Per-handle live ring buffer size (bounds retained complete-line bytes, not the reported `output_bytes` total) |
+| `MAX_PARTIAL_BYTES` | 64 KiB | Bound on the trailing un-newlined partial line; an append that would exceed it flushes the partial as a complete line |
+| `PARTIAL_IDLE_FLUSH_SECONDS` | 10 | Reader idle interval after which a non-empty partial line is flushed as a complete line |
+| `LIVE_HANDLE_CAP` | 8 | Per-WorkScope cap on `running` handles |
 | `KILL_RESPONSE_TIMEOUT_SECONDS` | 30 | After signal sent, wait this long for exit before returning `kill_pending_kernel` |
 | `SHUTDOWN_KILL_GRACE_SECONDS` | 2 | Time Phoenix waits at shutdown for SIGKILL'd groups to exit |
 | `TOMBSTONE_TAIL_LINES` | 2000 | Lines retained in `final_tail` after exit demotion |

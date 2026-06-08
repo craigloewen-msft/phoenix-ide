@@ -46,6 +46,16 @@ export type { ChainPosition } from './generated/ChainPosition';
 export type { ChainQaRow } from './generated/ChainQaRow';
 export type { ChainQaStatus } from './generated/ChainQaStatus';
 export type { SubmitChainQaResponse } from './generated/SubmitChainQaResponse';
+export type {
+  WorkScopeInventory,
+  BashHandleInventory,
+  BashHandleState,
+  TmuxInventory,
+  TmuxServerStatus,
+  BrowserInventory,
+  BrowserSessionLiveness,
+} from './generated/sse';
+import type { WorkScopeInventory as WorkScopeInventoryType } from './generated/sse';
 
 export interface Conversation {
   id: string;
@@ -124,6 +134,12 @@ export interface Conversation {
    *  so the 5s poll's snapshot upsert never clobbers a true value back to
    *  false (regression history: PR #92). */
   terminal_uses_tmux: boolean;
+  /** `WorkScope::stable_key()` for this conversation's resolved work scope
+   *  (e.g. `worktree:/path`, `conversation:<id>`, `global:`). Used to build
+   *  the work-scope inventory URL `GET /api/work-scope/:scope_key/inventory`.
+   *  Server-resolved from the conversation id + worktree path; always
+   *  populated. */
+  work_scope_key: string;
 }
 
 export type PrUnavailableReason = 'gh_missing' | 'not_authenticated' | 'not_git_repo' | 'command_failed';
@@ -868,6 +884,14 @@ export const api = {
     if (resp.status === 404) return null;
     if (!resp.ok) throw new Error('Failed to resolve conversation slug');
     return (await resp.json()).slug as string;
+  },
+
+  /** Initial pull of a scope's work-affine resource inventory (REQ-WSUI-006).
+   *  The live `work_scope_update` SSE event keeps it fresh afterwards. */
+  async getWorkScopeInventory(scopeKey: string): Promise<WorkScopeInventoryType> {
+    const resp = await fetch(`/api/work-scope/${encodeURIComponent(scopeKey)}/inventory`);
+    if (!resp.ok) throw new Error('Failed to get work-scope inventory');
+    return resp.json();
   },
 
   async sendMessage(

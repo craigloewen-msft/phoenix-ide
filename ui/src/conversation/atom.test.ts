@@ -21,6 +21,7 @@ const testConversation: Conversation = {
   message_count: 0,
   browser_session_active: false,
   terminal_uses_tmux: false,
+  work_scope_key: 'conversation:conv-1',
 };
 
 function makeMessage(sequenceId: number, messageType: 'user' | 'agent' = 'agent'): Message {
@@ -1113,6 +1114,75 @@ describe('conversationReducer', () => {
 
       expect(next).toBe(atom);
       expect(next.conversation?.browser_session_active).toBe(false);
+    });
+  });
+
+  describe('sse_work_scope_update', () => {
+    // REQ-WSUI-007 / REQ-WSUI-010: full-snapshot inventory push. The reducer
+    // replaces `workScope` wholesale (no delta merge) and respects the same
+    // applyIfNewer total order as every other wire event.
+    const inventory = (scopeKey: string, bashIds: string[]) => ({
+      scope_key: scopeKey,
+      bash: bashIds.map((id) => ({
+        handle_id: id,
+        cmd: `cmd ${id}`,
+        state: 'running' as const,
+        started_at: '2024-01-01T00:00:00Z',
+        output_bytes: 0,
+      })),
+      tmux: null,
+      browser: null,
+    });
+
+    it('seeds workScope from null on first push', () => {
+      const atom = createInitialAtom();
+      expect(atom.workScope).toBeNull();
+
+      const next = dispatch(atom, {
+        type: 'sse_work_scope_update',
+        sequenceId: 7,
+        inventory: inventory('conversation:conv-1', ['b-1']),
+      });
+
+      expect(next.workScope?.bash.map((h) => h.handle_id)).toEqual(['b-1']);
+      expect(next.lastSequenceId).toBe(7);
+    });
+
+    it('replaces (not merges) the previous inventory wholesale', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastSequenceId: 7,
+        workScope: inventory('conversation:conv-1', ['b-1', 'b-2']),
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_work_scope_update',
+        sequenceId: 8,
+        // The new snapshot drops b-1/b-2 and carries only b-3: a merge would
+        // resurrect the stale handles; a replace must not.
+        inventory: inventory('conversation:conv-1', ['b-3']),
+      });
+
+      expect(next.workScope?.bash.map((h) => h.handle_id)).toEqual(['b-3']);
+      expect(next.lastSequenceId).toBe(8);
+    });
+
+    it('rejects a stale sequenceId (applyIfNewer)', () => {
+      const held = inventory('conversation:conv-1', ['b-1']);
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastSequenceId: 30,
+        workScope: held,
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_work_scope_update',
+        sequenceId: 29,
+        inventory: inventory('conversation:conv-1', ['b-9']),
+      });
+
+      expect(next).toBe(atom);
+      expect(next.workScope).toBe(held);
     });
   });
 

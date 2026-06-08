@@ -29,6 +29,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use phoenix_core::work_scope::WorkScope;
 use tokio::sync::watch;
 use tokio::sync::{Mutex, RwLock};
 
@@ -37,10 +38,10 @@ use super::ring::{RingBuffer, RingLine};
 /// Default tombstone tail size (REQ-BASH-006: `TOMBSTONE_TAIL_LINES`).
 pub const TOMBSTONE_TAIL_LINES: usize = 2000;
 
-/// Stable handle identifier within a conversation.
+/// Stable handle identifier within a `WorkScope`.
 ///
 /// Format is implementation detail (sequential `b-1`, `b-2`, ...).
-/// The Allium contract is only that the pair `(conversation, handle_id)`
+/// The Allium contract is only that the pair `(work_scope, handle_id)`
 /// is unique.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HandleId(pub String);
@@ -123,6 +124,11 @@ pub struct Tombstone {
     /// `next_offset` at the moment of demotion. Lets `truncated_before`
     /// be computed for tombstone reads.
     pub next_offset_at_exit: u64,
+    /// Total bytes the process ever wrote (monotonic, partial-inclusive),
+    /// snapshotted from the live ring at demotion. The reported output size
+    /// survives the tombstone transition — a terminal handle reports the
+    /// same truthful count a final live peek would have.
+    pub output_bytes: u64,
     /// If a kill was attempted before this terminal state was reached,
     /// these record the last attempt that landed.
     pub kill_signal_sent: Option<KillSignal>,
@@ -167,17 +173,17 @@ pub enum ExitState {
 
 /// A bash handle: identity + lifecycle state + watch-channel for exit notification.
 ///
-/// The handle is owned by exactly one `ConversationHandles` registry entry.
+/// The handle is owned by exactly one `WorkScopeHandles` registry entry.
 /// `state` is `RwLock<Arc<HandleState>>` (per design.md) — peek and wait
 /// readers clone the `Arc` without holding the outer lock while they
 /// shape responses. Writers hold the outer lock for write to swap the
 /// `Arc`.
-// `handle_id` and `conversation_id` mirror the Allium `Handle` entity's
+// `handle_id` and `work_scope` mirror the Allium `Handle` entity's
 // field names; renaming them to satisfy clippy's struct-name-prefix lint
 // would diverge from the spec.
 #[allow(clippy::struct_field_names)]
 pub struct Handle {
-    pub conversation_id: String,
+    pub work_scope: WorkScope,
     pub handle_id: HandleId,
     pub cmd: String,
     /// Optional human-readable annotation supplied at run-time. Echoed on
@@ -204,7 +210,7 @@ pub struct Handle {
 impl std::fmt::Debug for Handle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Handle")
-            .field("conversation_id", &self.conversation_id)
+            .field("work_scope", &self.work_scope)
             .field("handle_id", &self.handle_id)
             .field("cmd", &self.cmd)
             .field("label", &self.label)
@@ -224,7 +230,7 @@ impl Handle {
     #[allow(clippy::similar_names)]
     #[must_use]
     pub fn new_live(
-        conversation_id: String,
+        work_scope: WorkScope,
         handle_id: HandleId,
         cmd: String,
         label: Option<String>,
@@ -239,7 +245,7 @@ impl Handle {
         };
         let (tx, rx) = watch::channel::<Option<ExitState>>(None);
         Arc::new(Self {
-            conversation_id,
+            work_scope,
             handle_id,
             cmd,
             label,
@@ -346,6 +352,7 @@ impl Handle {
                 let ring = live.ring.lock().await;
                 let final_tail = ring.snapshot_tail(tombstone_tail_lines);
                 let next_offset_at_exit = ring.next_offset();
+                let output_bytes = ring.output_bytes();
                 drop(ring);
 
                 // Pull the most recent kill attempt (if any) — Copy type,
@@ -369,6 +376,7 @@ impl Handle {
                     finished_at: SystemTime::now(),
                     final_tail,
                     next_offset_at_exit,
+                    output_bytes,
                     kill_signal_sent,
                     kill_attempted_at,
                 };
@@ -471,7 +479,7 @@ mod tests {
 
     fn live_handle() -> Arc<Handle> {
         Handle::new_live(
-            "conv-1".into(),
+            WorkScope::Conversation("conv-1".into()),
             HandleId::new("b-1"),
             "echo hi".into(),
             None,
@@ -498,6 +506,36 @@ mod tests {
                 assert_eq!(t.exit_code, Some(0));
                 assert_eq!(t.duration_ms, 42);
                 assert!(matches!(t.final_cause, FinalCause::Exited { .. }));
+            }
+            HandleState::Live(_) => panic!("expected tombstone"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tombstone_carries_final_output_bytes() {
+        let h = live_handle();
+        // Write some output (a complete line + an un-newlined partial) before exit.
+        {
+            let state = h.state().await;
+            let HandleState::Live(live) = state.as_ref() else {
+                panic!("expected live");
+            };
+            let mut ring = live.ring.lock().await;
+            ring.append(b"hello\nworld"); // 6 + 5 = 11 bytes, no trailing nl
+        }
+        assert!(
+            h.transition_to_terminal(
+                FinalCause::Exited { exit_code: Some(0) },
+                Duration::from_millis(3),
+                TOMBSTONE_TAIL_LINES,
+            )
+            .await
+        );
+        let state = h.state().await;
+        match state.as_ref() {
+            HandleState::Tombstoned(t) => {
+                // Partial-inclusive: the unterminated "world" bytes count.
+                assert_eq!(t.output_bytes, 11);
             }
             HandleState::Live(_) => panic!("expected tombstone"),
         }

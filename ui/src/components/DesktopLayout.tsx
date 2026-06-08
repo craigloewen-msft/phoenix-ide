@@ -4,6 +4,7 @@ import {
   useConversationsList,
   useConversationsRefresh,
   useConversationSnapshot,
+  useWorkScope,
 } from '../conversation';
 import { useResizablePane, useIsDesktop } from '../hooks';
 import { Sidebar } from './Sidebar';
@@ -130,6 +131,11 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const activeSlug = slugMatch?.[1] ?? null;
   const activeConversation = useConversationSnapshot(activeSlug);
   const activeConversationId = activeConversation?.id;
+  // Live work-scope inventory (SSE-fed) for the active conversation, threaded
+  // into FileExplorerPanel's Work scope section + collapsed-rail badge
+  // (REQ-WSUI-010). Single-writer atom contract: only the SSE reducer writes
+  // `workScope`; the section's initial fetch seeds local state, not the atom.
+  const liveWorkScope = useWorkScope(activeSlug);
 
   useEffect(() => {
     if (activeConversationId) {
@@ -182,6 +188,8 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             branchName={activeConversation?.branch_name}
             activeSlug={activeSlug}
             width={fileExplorerPane.collapsed ? undefined : fileExplorerPane.size}
+            workScopeKey={activeConversation?.work_scope_key}
+            liveWorkScope={liveWorkScope}
           />
         )}
         {isDesktop && activeSlug && (
