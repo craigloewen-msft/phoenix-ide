@@ -21,6 +21,7 @@ use super::state::{
 use super::{ConvContext, ConvState, Effect, Event};
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
 use phoenix_core::domain::llm_error_kind::LlmAttemptReason;
+use phoenix_core::domain::mode_context::ModeContext;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
@@ -56,7 +57,13 @@ struct TaskFileSnapshot {
     task_file: String,
     title: String,
     priority: phoenix_core::task_source::Priority,
+    /// Display copy of the brief: the file body trimmed of surrounding
+    /// whitespace, for the approval reader.
     plan: String,
+    /// The authoritative file bytes, exactly as read from disk (untrimmed).
+    /// A fork commits this verbatim, so it must equal the reviewed file
+    /// byte-for-byte (REQ-PROJ-033).
+    body_raw: String,
 }
 
 /// Read and validate a task file referenced by `propose_task`.
@@ -186,7 +193,20 @@ fn resolve_task_file(
         title,
         priority,
         plan,
+        body_raw: body,
     })
+}
+
+/// Whether `dir` (or any ancestor) is inside a git repository.
+///
+/// A `.git` entry is matched whether it is a directory (ordinary repo), a file
+/// (linked worktree / submodule, where `.git` is a `gitdir:` pointer), so a
+/// Direct origin started inside any git checkout is recognised. Like
+/// [`resolve_task_file`], this is a deterministic, bounded, local FS read the
+/// state machine treats as a data-load, not an external side effect: it gates
+/// the fork path (REQ-PROJ-036 — a Direct origin must be git-backed to fork).
+fn is_git_repository(dir: &Path) -> bool {
+    dir.ancestors().any(|a| a.join(".git").exists())
 }
 
 /// The retry-budget ceiling for retryable LLM errors. Surfaced via
@@ -1875,20 +1895,6 @@ pub fn transition_parent(
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. } => None,
             }) {
-                // propose_task is only valid in Managed mode (Explore/Work lifecycle).
-                // Direct and Branch mode should never produce this tool call.
-                if context.mode == ModeKind::Direct || context.mode == ModeKind::Branch {
-                    return Ok(
-                        ParentTransitionResult::new(ParentState::Core(CoreState::Error {
-                            message: "propose_task is not available in Direct or Branch mode"
-                                .to_string(),
-                            error_kind: ErrorKind::InvalidRequest,
-                        }))
-                        .with_effect(Effect::PersistState)
-                        .with_effect(Effect::notify_state_change()),
-                    );
-                }
-
                 if tool_calls.len() > 1 {
                     let msg = "propose_task must be the only tool in response".to_string();
                     let display_data = make_display_data(&content);
@@ -1982,8 +1988,111 @@ pub fn transition_parent(
                     }
                 };
 
-                let tool_result =
-                    ToolResult::success(tool.id.clone(), "Plan submitted for review".to_string());
+                // Mode-aware resolution (REQ-PROJ-033/036). Explore parks (the
+                // in-place Explore->Work gateway); the writing modes record a
+                // non-blocking fork and keep running. `ModeKind::Managed` covers
+                // both Explore and Work, so the precise mode comes from
+                // `mode_context`.
+                let is_explore = matches!(context.mode_context, Some(ModeContext::Explore));
+                let fork_eligible = matches!(context.mode, ModeKind::Branch)
+                    || matches!(
+                        context.mode_context,
+                        Some(ModeContext::Work { .. } | ModeContext::Branch { .. })
+                    )
+                    || (matches!(context.mode, ModeKind::Direct)
+                        && is_git_repository(&context.working_dir));
+
+                if is_explore {
+                    let tool_result = ToolResult::success(
+                        tool.id.clone(),
+                        "Plan submitted for review".to_string(),
+                    );
+                    let display_data = make_display_data(&content);
+                    let assistant_message = AssistantMessage::new(
+                        request_id.clone(),
+                        content,
+                        Some(usage_data),
+                        display_data,
+                    );
+                    let checkpoint =
+                        CheckpointData::tool_round(assistant_message, vec![tool_result])
+                            .expect("propose_task produces exactly one tool_use and one result");
+
+                    return Ok(
+                        ParentTransitionResult::new(ParentState::AwaitingTaskApproval {
+                            task_file: snapshot.task_file.clone(),
+                            title: snapshot.title.clone(),
+                            priority: snapshot.priority,
+                            plan: snapshot.plan.clone(),
+                        })
+                        .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                        .with_effect(Effect::PersistState)
+                        .with_effect(Effect::notify_state_change()),
+                    );
+                }
+
+                if !fork_eligible {
+                    // Direct origin outside a git repository: the tool registry
+                    // does not offer propose_task here (no default branch to fork
+                    // from — REQ-PROJ-036), so this is unreachable in practice.
+                    // Surface a tool error rather than panic; record nothing.
+                    let err_msg = "propose_task is unavailable: a fork cuts from the \
+                         repository's default branch, but this working directory is \
+                         not inside a git repository."
+                        .to_string();
+                    let display_data = make_display_data(&content);
+                    let assistant_message = AssistantMessage::new(
+                        request_id.clone(),
+                        content,
+                        Some(usage_data),
+                        display_data,
+                    );
+                    let tool_result = ToolResult::error(tool.id.clone(), err_msg);
+                    let checkpoint =
+                        CheckpointData::tool_round(assistant_message, vec![tool_result])
+                            .expect("propose_task produces exactly one tool_use and one result");
+                    return Ok(ParentTransitionResult::new(ParentState::Core(
+                        CoreState::LlmRequesting { attempt: 1 },
+                    ))
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change())
+                    .with_effect(Effect::RequestLlm));
+                }
+
+                // Fork proposal (REQ-PROJ-033). At the continuation threshold the
+                // fork does NOT fire: ContextThresholdReachedParent (the check
+                // below) parks into awaiting_continuation instead, replaying the
+                // propose_task call after continuation. Without this guard a fork
+                // would be recorded while the origin is over-budget.
+                if should_trigger_continuation(&usage_data, context.context_window) {
+                    let tr = handle_context_exhaustion(
+                        context,
+                        content,
+                        tool_calls,
+                        usage_data,
+                        request_id,
+                        final_attempt,
+                    );
+                    return Ok(ParentTransitionResult {
+                        new_state: ParentState::try_from(tr.new_state)
+                            .expect("handle_context_exhaustion returns parent-valid state"),
+                        effects: tr.effects,
+                    });
+                }
+
+                let proposal_id = uuid::Uuid::new_v4().to_string();
+                // The success ack carries ONLY the proposal_id as a discoverable
+                // handle (in display_data, UI-only — never replayed into the LLM
+                // transcript, which sees only the output text). The snapshot body
+                // is deliberately absent so the shed work cannot leak back into
+                // the origin's context on later turns (REQ-PROJ-035). The UI keys
+                // the Review affordance off `display_data.fork_proposal_id`.
+                let tool_result = ToolResult::success_with_display(
+                    tool.id.clone(),
+                    "Fork proposal recorded — pending your review; continue your work".to_string(),
+                    Some(serde_json::json!({ "fork_proposal_id": proposal_id })),
+                );
                 let display_data = make_display_data(&content);
                 let assistant_message = AssistantMessage::new(
                     request_id.clone(),
@@ -1994,17 +2103,23 @@ pub fn transition_parent(
                 let checkpoint = CheckpointData::tool_round(assistant_message, vec![tool_result])
                     .expect("propose_task produces exactly one tool_use and one result");
 
-                return Ok(
-                    ParentTransitionResult::new(ParentState::AwaitingTaskApproval {
-                        task_file: snapshot.task_file.clone(),
-                        title: snapshot.title.clone(),
-                        priority: snapshot.priority,
-                        plan: snapshot.plan.clone(),
-                    })
-                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                    .with_effect(Effect::PersistState)
-                    .with_effect(Effect::notify_state_change()),
-                );
+                // The conversation continues: LlmRequesting, parent_status
+                // untouched. One atomic persist (checkpoint + proposal row) via
+                // PersistForkProposal — no separate PersistCheckpoint on this arm.
+                return Ok(ParentTransitionResult::new(ParentState::Core(
+                    CoreState::LlmRequesting { attempt: 1 },
+                ))
+                .with_effect(Effect::PersistForkProposal {
+                    proposal_id,
+                    task_file: snapshot.task_file.clone(),
+                    title: snapshot.title.clone(),
+                    priority: snapshot.priority,
+                    body: snapshot.body_raw.clone(),
+                    checkpoint,
+                })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::RequestLlm));
             }
 
             // REQ-AUQ-001: ask_user_question interception. Same shape as
@@ -2527,6 +2642,38 @@ pub fn transition_sub_agent(
                         unreachable!("is_terminal_tool returned true for non-terminal tool")
                     }
                 };
+            }
+
+            // REQ-PROJ-008 / REQ-PROJ-036 (SubAgentProposeTaskRejected): a
+            // sub-agent never gets `propose_task` in its registry, so a sole
+            // `propose_task` call here is a stale/replayed payload. Reject it in
+            // the state machine — task management belongs to the parent — rather
+            // than routing it through the executor's unreachable `run()`
+            // fallback. The context-exhaustion check above wins at the
+            // threshold, so an over-budget sub-agent fails instead of looping on
+            // rejected propose_task errors.
+            if tool_calls.len() == 1 && matches!(tool_calls[0].input, ToolInput::ProposeTask(_)) {
+                let err_msg =
+                    "propose_task is not available to sub-agents — task management is the \
+                     parent conversation's job."
+                        .to_string();
+                let display_data = compute_bash_display_data(&content, &context.working_dir);
+                let assistant_message = AssistantMessage::new(
+                    request_id.clone(),
+                    content,
+                    Some(usage_data),
+                    display_data,
+                );
+                let tool_result = ToolResult::error(tool_calls[0].id.clone(), err_msg);
+                let checkpoint = CheckpointData::tool_round(assistant_message, vec![tool_result])
+                    .expect("propose_task produces exactly one tool_use and one result");
+                return Ok(SubAgentTransitionResult::new(SubAgentState::Core(
+                    CoreState::LlmRequesting { attempt: 1 },
+                ))
+                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::RequestLlm));
             }
 
             // Normal tool execution -> delegate to core
@@ -3581,6 +3728,105 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::NotifyParent { .. })),
             "Sub-agent should notify parent on non-retryable LLM error"
+        );
+    }
+
+    /// REQ-PROJ-008 / REQ-PROJ-036 (SubAgentProposeTaskRejected): a sub-agent
+    /// never has `propose_task` in its registry, but a stale/replayed sole
+    /// `propose_task` call must be rejected in the state machine — surfaced as a
+    /// tool error and the LLM re-requested — not stalled or routed to the
+    /// executor's unreachable `run()` fallback.
+    #[test]
+    fn test_subagent_sole_propose_task_rejected_not_stalled() {
+        use crate::state::{ContextExhaustionBehavior, ProposeTaskInput, ToolInput};
+        use phoenix_core::domain::db_schema::ToolOutcome;
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        let subagent_ctx = ConvContext {
+            mode_context: None,
+            conversation_id: "subagent-1".to_string(),
+            root_conversation_id: "test-root".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            model_id: "test-model".to_string(),
+            is_sub_agent: true,
+            context_window: 200_000,
+            context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
+            max_turns: 0,
+            desired_base_branch: None,
+            mode: ModeKind::Managed,
+            tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
+            llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+            persona: None,
+            work_scope_worktree: None,
+        };
+
+        let propose_tool = ToolCall::new(
+            "tool-propose-1",
+            ToolInput::ProposeTask(ProposeTaskInput {
+                task_file: "tasks/12345-p1-ready--fix-the-bug.md".to_string(),
+            }),
+        );
+
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &subagent_ctx,
+            Event::LlmResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "tool-propose-1".to_string(),
+                    name: "propose_task".to_string(),
+                    input: serde_json::json!({
+                        "task_file": "tasks/12345-p1-ready--fix-the-bug.md"
+                    }),
+                }],
+                tool_calls: vec![propose_tool],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "test-req-id".to_string(),
+            },
+        )
+        .expect("sub-agent sole propose_task must produce Ok transition");
+
+        // Re-request the LLM, not stall and not complete/fail.
+        assert!(
+            matches!(result.new_state, ConvState::LlmRequesting { .. }),
+            "sub-agent sole propose_task must re-request the LLM, got {:?}",
+            result.new_state
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "should have RequestLlm to feed the rejection back"
+        );
+
+        // The checkpoint's tool result is an error explaining the parent owns
+        // task management — not the executor's "this is a bug" fallback.
+        let checkpoint = result
+            .effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::PersistCheckpoint { data } => Some(data),
+                _ => None,
+            })
+            .expect("should persist a tool-round checkpoint with the rejection");
+        let CheckpointData::ToolRound { tool_results, .. } = checkpoint;
+        assert_eq!(tool_results.len(), 1);
+        match &tool_results[0].outcome {
+            ToolOutcome::Error { output, .. } => {
+                assert!(
+                    output.contains("parent"),
+                    "rejection must explain task management is the parent's job, got: {output}"
+                );
+            }
+            other => panic!("expected an error tool result, got {other:?}"),
+        }
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::ExecuteTool { .. })),
+            "must not dispatch the propose_task tool to the executor"
         );
     }
 
@@ -4651,6 +4897,394 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ========================================================================
+    // Fork proposal interception (REQ-PROJ-033/036).
+    //
+    // Explore parks (in-place Explore->Work gateway, unchanged); Work/Branch/
+    // Direct-in-a-git-repo record a non-blocking fork and keep running.
+    // ========================================================================
+    mod fork_proposal {
+        use super::*;
+        use crate::state::{ProposeTaskInput, ToolInput};
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+        use tempfile::TempDir;
+
+        /// A temp worktree with `tasks/<file>` written, returned together with
+        /// the relative path. The dir handle keeps the files alive for the test.
+        fn worktree_with_task() -> (TempDir, String) {
+            let tmp = TempDir::new().unwrap();
+            std::fs::create_dir(tmp.path().join("tasks")).unwrap();
+            let rel = "tasks/12345-p1-ready--fix-the-bug.md".to_string();
+            std::fs::write(
+                tmp.path().join(&rel),
+                "# Fix the bug\n\nplan body for the fork\n",
+            )
+            .unwrap();
+            (tmp, rel)
+        }
+
+        fn ctx_for(
+            tmp: &TempDir,
+            mode: ModeKind,
+            mode_context: Option<ModeContext>,
+        ) -> ConvContext {
+            let mut ctx = ConvContext::new(
+                "origin-conv",
+                tmp.path().to_path_buf(),
+                "test-model",
+                200_000,
+            );
+            ctx.mode = mode;
+            ctx.mode_context = mode_context;
+            ctx
+        }
+
+        fn propose_event(task_file: &str) -> Event {
+            let propose_tool = ToolCall::new(
+                "tool-propose-1",
+                ToolInput::ProposeTask(ProposeTaskInput {
+                    task_file: task_file.to_string(),
+                }),
+            );
+            Event::LlmResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "tool-propose-1".to_string(),
+                    name: "propose_task".to_string(),
+                    input: serde_json::json!({ "task_file": task_file }),
+                }],
+                tool_calls: vec![propose_tool],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "test-req-id".to_string(),
+            }
+        }
+
+        fn fork_proposal_effect(
+            effects: &[Effect],
+        ) -> Option<(
+            &String,
+            &String,
+            &String,
+            phoenix_core::task_source::Priority,
+            &String,
+        )> {
+            effects.iter().find_map(|e| match e {
+                Effect::PersistForkProposal {
+                    proposal_id,
+                    task_file,
+                    title,
+                    priority,
+                    body,
+                    ..
+                } => Some((proposal_id, task_file, title, *priority, body)),
+                _ => None,
+            })
+        }
+
+        #[test]
+        fn explore_valid_file_parks_into_awaiting_task_approval() {
+            let (tmp, rel) = worktree_with_task();
+            let ctx = ctx_for(&tmp, ModeKind::Managed, Some(ModeContext::Explore));
+
+            let result = transition(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &ctx,
+                propose_event(&rel),
+            )
+            .expect("transition must succeed");
+
+            assert!(
+                matches!(result.new_state, ConvState::AwaitingTaskApproval { .. }),
+                "Explore must park, got {:?}",
+                result.new_state
+            );
+            assert!(
+                result
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::PersistCheckpoint { .. })),
+                "Explore parks via PersistCheckpoint"
+            );
+            assert!(
+                fork_proposal_effect(&result.effects).is_none(),
+                "Explore must NOT record a fork proposal"
+            );
+        }
+
+        #[test]
+        fn work_valid_file_forks_without_parking() {
+            let (tmp, rel) = worktree_with_task();
+            let ctx = ctx_for(
+                &tmp,
+                ModeKind::Managed,
+                Some(ModeContext::Work {
+                    branch_name: "task-12345".to_string(),
+                    base_branch: "main".to_string(),
+                    worktree_path: tmp.path().display().to_string(),
+                }),
+            );
+
+            let result = transition(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &ctx,
+                propose_event(&rel),
+            )
+            .expect("transition must succeed");
+
+            assert!(
+                matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }),
+                "Work fork continues running, got {:?}",
+                result.new_state
+            );
+            assert!(
+                !matches!(result.new_state, ConvState::AwaitingTaskApproval { .. }),
+                "Work fork must NOT park"
+            );
+            assert!(
+                !result
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::PersistCheckpoint { .. })),
+                "fork path emits PersistForkProposal, not a separate PersistCheckpoint"
+            );
+            let (proposal_id, task_file, title, priority, body) =
+                fork_proposal_effect(&result.effects).expect("must emit PersistForkProposal");
+            assert!(!proposal_id.is_empty(), "a proposal_id must be present");
+            assert_eq!(task_file, &rel);
+            assert_eq!(title, "Fix the bug");
+            assert_eq!(priority, phoenix_core::task_source::Priority::P1);
+            assert!(body.contains("plan body for the fork"));
+            assert!(
+                result
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::RequestLlm)),
+                "fork continues with a fresh LLM request"
+            );
+        }
+
+        #[test]
+        fn branch_valid_file_takes_the_fork_path() {
+            let (tmp, rel) = worktree_with_task();
+            let ctx = ctx_for(
+                &tmp,
+                ModeKind::Branch,
+                Some(ModeContext::Branch {
+                    branch_name: "feature".to_string(),
+                    base_branch: "main".to_string(),
+                    worktree_path: tmp.path().display().to_string(),
+                }),
+            );
+
+            let result = transition(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &ctx,
+                propose_event(&rel),
+            )
+            .expect("transition must succeed");
+
+            assert!(
+                matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }),
+                "Branch fork continues running, got {:?}",
+                result.new_state
+            );
+            assert!(
+                fork_proposal_effect(&result.effects).is_some(),
+                "Branch records a fork proposal"
+            );
+            assert!(
+                result
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::RequestLlm)),
+                "Branch fork re-requests the LLM"
+            );
+        }
+
+        #[test]
+        fn direct_in_git_repo_takes_the_fork_path() {
+            let (tmp, rel) = worktree_with_task();
+            // Make the worktree a git repo so is_git_repository() is satisfied.
+            std::fs::create_dir(tmp.path().join(".git")).unwrap();
+            let ctx = ctx_for(&tmp, ModeKind::Direct, Some(ModeContext::Direct));
+
+            let result = transition(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &ctx,
+                propose_event(&rel),
+            )
+            .expect("transition must succeed");
+
+            assert!(
+                matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }),
+                "Direct-in-git fork continues running, got {:?}",
+                result.new_state
+            );
+            assert!(
+                fork_proposal_effect(&result.effects).is_some(),
+                "Direct-in-git records a fork proposal"
+            );
+        }
+
+        /// REQ-PROJ-033: the fork snapshot is the authoritative file BYTES. A
+        /// brief with significant leading/trailing whitespace and a trailing
+        /// newline must reach `Effect::PersistForkProposal { body }` unaltered —
+        /// it is the verbatim source for the fork's committed file, NOT the
+        /// trimmed display plan.
+        #[test]
+        fn fork_body_preserves_raw_file_bytes() {
+            let tmp = TempDir::new().unwrap();
+            std::fs::create_dir(tmp.path().join("tasks")).unwrap();
+            let rel = "tasks/12345-p1-ready--fix-the-bug.md".to_string();
+            let raw = "\n\n  # Fix the bug\n\nplan body for the fork\n\n  \n";
+            std::fs::write(tmp.path().join(&rel), raw).unwrap();
+
+            let ctx = ctx_for(
+                &tmp,
+                ModeKind::Managed,
+                Some(ModeContext::Work {
+                    branch_name: "task-12345".to_string(),
+                    base_branch: "main".to_string(),
+                    worktree_path: tmp.path().display().to_string(),
+                }),
+            );
+
+            let result = transition(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &ctx,
+                propose_event(&rel),
+            )
+            .expect("transition must succeed");
+
+            let (_, _, _, _, body) =
+                fork_proposal_effect(&result.effects).expect("must emit PersistForkProposal");
+            assert_eq!(
+                body, raw,
+                "fork body must be the raw file bytes, not the trimmed plan"
+            );
+            assert_ne!(
+                body,
+                &raw.trim().to_string(),
+                "fork body must NOT be the trimmed display plan"
+            );
+        }
+
+        #[test]
+        fn invalid_file_in_fork_mode_records_nothing() {
+            let tmp = TempDir::new().unwrap();
+            std::fs::create_dir(tmp.path().join("tasks")).unwrap();
+            // Closed `done` status — rejected by the shared validation.
+            let rel = "tasks/12345-p1-done--closed.md";
+            std::fs::write(tmp.path().join(rel), "# closed\n").unwrap();
+            let ctx = ctx_for(
+                &tmp,
+                ModeKind::Managed,
+                Some(ModeContext::Work {
+                    branch_name: "task-12345".to_string(),
+                    base_branch: "main".to_string(),
+                    worktree_path: tmp.path().display().to_string(),
+                }),
+            );
+
+            let result = transition(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &ctx,
+                propose_event(rel),
+            )
+            .expect("transition must succeed");
+
+            assert!(
+                matches!(result.new_state, ConvState::LlmRequesting { .. }),
+                "invalid file re-requests the LLM, got {:?}",
+                result.new_state
+            );
+            assert!(
+                fork_proposal_effect(&result.effects).is_none(),
+                "an invalid file must NOT record a fork proposal"
+            );
+            assert!(
+                result
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::PersistCheckpoint { .. })),
+                "the tool error is persisted as a normal checkpoint"
+            );
+            assert!(
+                result
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::RequestLlm)),
+                "the LLM is re-requested to fix the file"
+            );
+        }
+
+        #[test]
+        fn propose_task_with_second_tool_still_errors_in_fork_mode() {
+            let (tmp, rel) = worktree_with_task();
+            let ctx = ctx_for(
+                &tmp,
+                ModeKind::Managed,
+                Some(ModeContext::Work {
+                    branch_name: "task-12345".to_string(),
+                    base_branch: "main".to_string(),
+                    worktree_path: tmp.path().display().to_string(),
+                }),
+            );
+            let propose_tool = ToolCall::new(
+                "tool-propose-1",
+                ToolInput::ProposeTask(ProposeTaskInput {
+                    task_file: rel.clone(),
+                }),
+            );
+            let bash_tool = ToolCall::new(
+                "tool-bash-1",
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                    "echo hi",
+                )),
+            );
+            let event = Event::LlmResponse {
+                content: vec![
+                    ContentBlock::ToolUse {
+                        id: "tool-propose-1".to_string(),
+                        name: "propose_task".to_string(),
+                        input: serde_json::json!({ "task_file": rel }),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "tool-bash-1".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({ "op": "run", "cmd": "echo hi" }),
+                    },
+                ],
+                tool_calls: vec![propose_tool, bash_tool],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "test-req-id".to_string(),
+            };
+
+            let result = transition(&ConvState::LlmRequesting { attempt: 1 }, &ctx, event)
+                .expect("transition must succeed");
+
+            assert!(
+                fork_proposal_effect(&result.effects).is_none(),
+                "the 'must be the only tool' error pre-empts the fork path"
+            );
+            assert!(
+                result
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::PersistCheckpoint { .. })),
+                "the must-be-sole error is persisted as a checkpoint"
+            );
+            assert!(
+                result
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::RequestLlm)),
+                "the error is fed back to the LLM"
+            );
+        }
     }
 }
 
