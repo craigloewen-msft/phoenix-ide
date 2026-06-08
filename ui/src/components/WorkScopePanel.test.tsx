@@ -7,8 +7,10 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, fireEvent, act } from '@testing-library/react';
+import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import type { WorkScopeInventory, BashHandleInventory } from '../api';
 import { api } from '../api';
+import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { hasRunningBash, hasLiveResource } from './workScopeHelpers';
 
 vi.mock('../api', async (importOriginal) => {
@@ -19,7 +21,7 @@ vi.mock('../api', async (importOriginal) => {
   };
 });
 
-import { WorkScopeSection } from './WorkScopePanel';
+import { WorkScopeSection, WorkScopePanel } from './WorkScopePanel';
 import { useSeededLiveCount } from './useWorkScopeSeed';
 
 const getInv = vi.mocked(api.getWorkScopeInventory);
@@ -51,14 +53,7 @@ function inv(
 async function renderExpanded(liveInventory?: WorkScopeInventory | null) {
   let utils!: ReturnType<typeof render>;
   await act(async () => {
-    utils = render(
-      <WorkScopeSection
-        scopeKey="ws-1"
-        liveInventory={liveInventory}
-        expanded={true}
-        onToggleExpanded={() => {}}
-      />,
-    );
+    utils = render(sectionTree({ scopeKey: 'ws-1', liveInventory: liveInventory ?? null }));
   });
   return utils;
 }
@@ -66,6 +61,32 @@ async function renderExpanded(liveInventory?: WorkScopeInventory | null) {
 /** Open the bash row's detail disclosure so `output` becomes visible. */
 function openBashDetail() {
   fireEvent.click(screen.getByTitle('Toggle details'));
+}
+
+/** The provider tree the section needs at runtime: a Router (ViewerSlot uses
+ *  useLocation) wrapping the viewer-slot context (BashRow's inspect affordance
+ *  calls useViewerSlot). Tests render/rerender through this so the section
+ *  mounts in the same context the app gives it. */
+function sectionTree(props: { scopeKey: string; liveInventory?: WorkScopeInventory | null }) {
+  return (
+    <MemoryRouter initialEntries={['/c/conv-A']}>
+      <Routes>
+        <Route
+          path="/c/:slug"
+          element={
+            <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={false}>
+              <WorkScopeSection
+                scopeKey={props.scopeKey}
+                liveInventory={props.liveInventory ?? null}
+                expanded={true}
+                onToggleExpanded={() => {}}
+              />
+            </ViewerSlotProvider>
+          }
+        />
+      </Routes>
+    </MemoryRouter>
+  );
 }
 
 beforeEach(() => {
@@ -270,26 +291,12 @@ describe('WorkScopeSection stale-scope guard', () => {
 
     let utils!: ReturnType<typeof render>;
     await act(async () => {
-      utils = render(
-        <WorkScopeSection
-          scopeKey="ws-old"
-          liveInventory={null}
-          expanded={true}
-          onToggleExpanded={() => {}}
-        />,
-      );
+      utils = render(sectionTree({ scopeKey: 'ws-old', liveInventory: null }));
     });
 
     // Switch to the new scope; its fetch resolves immediately.
     await act(async () => {
-      utils.rerender(
-        <WorkScopeSection
-          scopeKey="ws-new"
-          liveInventory={null}
-          expanded={true}
-          onToggleExpanded={() => {}}
-        />,
-      );
+      utils.rerender(sectionTree({ scopeKey: 'ws-new', liveInventory: null }));
       await Promise.resolve();
     });
     expect(screen.getByText('NEW-SCOPE-CMD')).toBeTruthy();
@@ -321,27 +328,13 @@ describe('WorkScopeSection SSE-generation guard (same-scope time ordering)', () 
     // Render with no SSE yet; the initial fetch is in flight (unresolved).
     let utils!: ReturnType<typeof render>;
     await act(async () => {
-      utils = render(
-        <WorkScopeSection
-          scopeKey="ws-1"
-          liveInventory={null}
-          expanded={true}
-          onToggleExpanded={() => {}}
-        />,
-      );
+      utils = render(sectionTree({ scopeKey: 'ws-1', liveInventory: null }));
     });
 
     // SSE push lands first: a live handle. Bumps the generation.
     const pushed = inv([bash({ cmd: 'SSE-LIVE-CMD', state: 'running' })]);
     await act(async () => {
-      utils.rerender(
-        <WorkScopeSection
-          scopeKey="ws-1"
-          liveInventory={pushed}
-          expanded={true}
-          onToggleExpanded={() => {}}
-        />,
-      );
+      utils.rerender(sectionTree({ scopeKey: 'ws-1', liveInventory: pushed }));
       await Promise.resolve();
     });
     expect(screen.getByText('SSE-LIVE-CMD')).toBeTruthy();
@@ -447,6 +440,38 @@ describe('WorkScopeSection in-flight gate (slow poll, no overlap or starvation)'
     });
     expect(getInv).toHaveBeenCalledTimes(callsAfterSeed + 2);
     expect(screen.getByText('16.0 KB')).toBeTruthy();
+  });
+});
+
+describe('inspect affordance + provider dependency', () => {
+  it('a non-inspectable BashRow renders WITHOUT a ViewerSlotProvider (no hook, no throw)', async () => {
+    // The standalone chain-page dock renders with inspectable={false} and is NOT
+    // wrapped in a ViewerSlotProvider. A non-inspectable row must not call
+    // useViewerSlot() (which throws outside a provider), so this renders cleanly.
+    getInv.mockResolvedValue(inv([bash({ state: 'running' })]));
+
+    await act(async () => {
+      render(
+        <WorkScopePanel scopeKey="ws-1" liveInventory={null} collapsed={false} onToggle={() => {}} />,
+      );
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // The row rendered; opening its detail must not surface an inspect affordance.
+    openBashDetail();
+    expect(document.querySelector('.ws-row--bash')).toBeTruthy();
+    expect(screen.queryByTitle('Open the process inspector for this handle')).toBeNull();
+  });
+
+  it('an inspectable BashRow inside a ViewerSlotProvider renders the inspect affordance', async () => {
+    getInv.mockResolvedValue(inv([bash({ state: 'running' })]));
+
+    await renderExpanded(); // sectionTree → WorkScopeSection (inspectable) inside the provider
+    openBashDetail();
+    expect(screen.getByTitle('Open the process inspector for this handle')).toBeTruthy();
+    expect(screen.getByText('inspect →')).toBeTruthy();
   });
 });
 

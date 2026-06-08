@@ -56,6 +56,11 @@ export type {
   BrowserSessionLiveness,
 } from './generated/sse';
 import type { WorkScopeInventory as WorkScopeInventoryType } from './generated/sse';
+export type { BashHandleInspection } from './generated/BashHandleInspection';
+export type { ResourceSample } from './generated/ResourceSample';
+export type { BashRingWindow } from './generated/BashRingWindow';
+export type { BashRingLine } from './generated/BashRingLine';
+import type { BashHandleInspection as BashHandleInspectionType } from './generated/BashHandleInspection';
 
 export interface Conversation {
   id: string;
@@ -509,6 +514,16 @@ export class ConflictError extends Error {
   }
 }
 
+/** Thrown by API methods when the addressed resource is gone (404). A typed
+ *  error so callers can distinguish a definitive "no longer exists" outcome
+ *  from a transient/ambiguous failure rather than string-matching a message. */
+export class NotFoundError extends Error {
+  constructor(message = 'Not found') {
+    super(message);
+    this.name = 'NotFoundError';
+  }
+}
+
 export interface McpServerStatus {
   name: string;
   tool_count: number;
@@ -891,6 +906,28 @@ export const api = {
   async getWorkScopeInventory(scopeKey: string): Promise<WorkScopeInventoryType> {
     const resp = await fetch(`/api/work-scope/${encodeURIComponent(scopeKey)}/inventory`);
     if (!resp.ok) throw new Error('Failed to get work-scope inventory');
+    return resp.json();
+  },
+
+  /** One handle's combined inspection snapshot — identity + state, an output
+   *  delta (the ring read), and a live resource sample (REQ-PINSP-005). The
+   *  optional `since` is the prior response's `end_offset`; omitting it returns
+   *  a recent tail (REQ-PINSP-003). The process inspector polls this while open
+   *  on a live handle (REQ-PINSP-006). */
+  async getBashHandleInspection(
+    scopeKey: string,
+    handleId: string,
+    since?: number,
+  ): Promise<BashHandleInspectionType> {
+    const query = since !== undefined ? `?since=${encodeURIComponent(since)}` : '';
+    const resp = await fetch(
+      `/api/work-scope/${encodeURIComponent(scopeKey)}/bash/${encodeURIComponent(handleId)}/inspect${query}`,
+    );
+    // 404 = the handle table no longer knows this id (e.g. lost after a
+    // restart). A typed error lets the inspector stop polling and show a
+    // definitive "handle no longer exists" state instead of a transient stall.
+    if (resp.status === 404) throw new NotFoundError('Bash handle no longer exists');
+    if (!resp.ok) throw new Error('Failed to get bash handle inspection');
     return resp.json();
   },
 
