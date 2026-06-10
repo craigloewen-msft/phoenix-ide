@@ -24,7 +24,7 @@ pub use handlers::create_router;
 pub use types::*;
 
 use crate::chain_qa::ChainQa;
-use crate::db::Database;
+use crate::db::{Database, Fts5Retriever, MessageRetriever};
 use crate::llm::ModelRegistry;
 use crate::platform::PlatformCapability;
 use crate::runtime::RuntimeManager;
@@ -50,6 +50,12 @@ pub struct AppState {
     /// [`crate::chain_runtime::ChainRuntimeRegistry`] that the chains API
     /// handlers subscribe to and publish onto.
     pub chain_qa: ChainQa,
+    /// Conversation-retrieval backend (`specs/conversation-retrieval/`): the
+    /// scope-filtered message-search seam (REQ-RET-005) the chain Q&A agent
+    /// and a future application-wide Q&A drive. Reconciled against `messages`
+    /// once at startup.
+    #[allow(dead_code)] // Consumed by the chain Q&A agent loop (REQ-CHN-009, Phase 2)
+    pub message_retriever: Arc<dyn MessageRetriever>,
     /// In-flight Codex/ChatGPT login flows. See [`codex_login`].
     pub codex_login: Arc<codex_login::CodexLoginManager>,
     /// Static deployment facts (binding, TLS, on-disk layout) resolved once at
@@ -80,12 +86,35 @@ impl AppState {
         runtime.start_work_scope_bridge().await;
         handlers::start_attachment_cleanup_task(db.clone());
         let terminals = runtime.terminals.clone();
-        // Chain Q&A is constructed last so it can share the same `Database`
-        // and `ModelRegistry` handles. Its internal `ChainRuntimeRegistry`
-        // is owned by this `ChainQa` value — chain SSE handlers reach into
-        // it via `state.chain_qa.runtime_registry()` so subscribers and
-        // publishers go through one registry.
-        let chain_qa = ChainQa::new(db.clone(), llm_registry.clone());
+        // Conversation-retrieval index: bring it in line with `messages` once
+        // at startup (REQ-RET-003) off the request path — retrieval works on
+        // whatever is already indexed while the sweep runs, and reports
+        // `index_reconciled()` when complete.
+        let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
+        {
+            let retriever = retriever.clone();
+            tokio::spawn(async move {
+                match retriever.reconcile().await {
+                    Ok(stats) => tracing::info!(
+                        indexed = stats.indexed,
+                        reindexed = stats.reindexed,
+                        pruned = stats.pruned,
+                        "conversation retrieval index reconciled"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "conversation retrieval index reconcile failed; recall may be incomplete until next startup"
+                    ),
+                }
+            });
+        }
+        let message_retriever: Arc<dyn MessageRetriever> = retriever;
+        // Chain Q&A shares the same `Database`, `ModelRegistry`, and retrieval
+        // seam. Its internal `ChainRuntimeRegistry` is owned by this `ChainQa`
+        // value — chain SSE handlers reach into it via
+        // `state.chain_qa.runtime_registry()` so subscribers and publishers go
+        // through one registry.
+        let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let codex_login = codex_login::CodexLoginManager::new();
         Self {
             runtime,
@@ -97,6 +126,7 @@ impl AppState {
             password,
             terminals,
             chain_qa,
+            message_retriever,
             codex_login,
             deployment,
         }

@@ -1,0 +1,321 @@
+//! Plain-text extraction from a typed [`Message`] for the conversation
+//! retrieval index (`specs/conversation-retrieval/` REQ-RET-004).
+//!
+//! The index stores extracted prose, never the raw `content` JSON, so a
+//! search matches words a human wrote rather than serialization structure.
+//! Tool results are machine output but still content-bearing — the answer
+//! to a recall question is often a path or an error that lives only in a
+//! build log — so they are kept as a size-capped **head + tail** excerpt
+//! rather than dropped to a bare marker (a failing test name or error is
+//! usually near the *end* of a long log, so head-only truncation would miss
+//! it). The full body is always reachable through the read path; this is the
+//! ranking-signal projection.
+
+use super::db_schema::{Message, MessageContent};
+use super::llm_types::ContentBlock;
+
+/// Leading slice (in characters) of an over-long tool result kept in the
+/// index excerpt.
+pub const TOOL_EXCERPT_HEAD_CHARS: usize = 1024;
+/// Trailing slice (in characters) of an over-long tool result kept in the
+/// index excerpt.
+pub const TOOL_EXCERPT_TAIL_CHARS: usize = 1024;
+
+/// Extract the searchable text of a single message for the retrieval index.
+///
+/// Returns the message body only — no role label or framing — because the
+/// role is carried in the index's `message_type` column, not the indexed
+/// text. Agent tool calls and server-side/MCP tool results are rendered via
+/// the shared [`ContentBlock::render_text`] so recall can find terms that live
+/// only in a tool block; the rendering is excerpted (head + tail) like other
+/// tool output.
+///
+/// Messages the UI deliberately hides (`display_data.hidden == true`, e.g.
+/// dismissed-error / dismissed-question recovery markers persisted as
+/// `System`) yield empty text, so internal artifacts never surface in recall.
+#[must_use]
+pub fn index_text(message: &Message) -> String {
+    if is_hidden(message) {
+        return String::new();
+    }
+    match &message.content {
+        // `llm_text()` is the expanded form the model actually saw (e.g.
+        // `@file` content), not the display shorthand. Attached non-image files
+        // contribute their context tag (name/path/metadata) just as the runtime
+        // appends to LLM history — index that so recall can find them too.
+        MessageContent::User(c) => {
+            let mut text = c.llm_text().to_string();
+            for f in &c.files {
+                text.push('\n');
+                text.push_str(&f.llm_context_tag());
+            }
+            text
+        }
+        // Index every content-bearing block (text, tool calls, and server-side
+        // / MCP tool results) via the shared renderer, so recall can locate a
+        // member by terms in a tool block. Prose `Text` stays fully searchable;
+        // only bulky tool-result payloads are excerpted head+tail, so a long
+        // plain answer isn't truncated to its first/last KB.
+        MessageContent::Agent(blocks) => blocks
+            .iter()
+            .map(|b| {
+                let rendered = b.render_text();
+                if matches!(b, ContentBlock::Text { .. }) {
+                    rendered
+                } else {
+                    tool_excerpt(&rendered, TOOL_EXCERPT_HEAD_CHARS, TOOL_EXCERPT_TAIL_CHARS)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        MessageContent::Tool(c) => {
+            tool_excerpt(&c.content, TOOL_EXCERPT_HEAD_CHARS, TOOL_EXCERPT_TAIL_CHARS)
+        }
+        MessageContent::System(c) => c.text.clone(),
+        MessageContent::Error(c) => c.message.clone(),
+        MessageContent::Continuation(c) => c.summary.clone(),
+        // Index the expanded skill body (and any attached file tags), not just
+        // the name/trigger — recall must be able to locate a conversation by
+        // text that lives only in the injected skill instructions.
+        MessageContent::Skill(c) => {
+            let mut text = format!("/{} {}\n{}", c.name, c.trigger, c.body);
+            for f in &c.files {
+                text.push('\n');
+                text.push_str(&f.llm_context_tag());
+            }
+            text
+        }
+    }
+}
+
+/// Whether the UI deliberately hides this message (`display_data.hidden ==
+/// true`), e.g. dismissed-error / dismissed-question recovery markers. Hidden
+/// messages are kept out of the retrieval index so internal artifacts don't
+/// pollute recall.
+fn is_hidden(message: &Message) -> bool {
+    message
+        .display_data
+        .as_ref()
+        .and_then(|d| d.get("hidden"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Size-capped head + tail excerpt of a tool-result body. Short results pass
+/// through whole; long ones keep the leading `head` and trailing `tail`
+/// characters with the elided middle marked. Counts characters (not bytes)
+/// so the slice never splits a UTF-8 scalar.
+fn tool_excerpt(content: &str, head: usize, tail: usize) -> String {
+    let total = content.chars().count();
+    if total <= head + tail {
+        return content.to_string();
+    }
+    let head_str: String = content.chars().take(head).collect();
+    let tail_str: String = {
+        // take the last `tail` chars, preserving order
+        let mut t: Vec<char> = content.chars().rev().take(tail).collect();
+        t.reverse();
+        t.into_iter().collect()
+    };
+    let elided = total - head - tail;
+    format!("{head_str}\n[… {elided} chars elided …]\n{tail_str}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::db_schema::{
+        ContinuationContent, ErrorContent, Message, MessageContent, MessageType, SkillContent,
+        SystemContent, ToolContent, UserContent,
+    };
+    use crate::domain::llm_types::ContentBlock;
+    use chrono::Utc;
+
+    fn msg(content: MessageContent) -> Message {
+        Message {
+            message_id: "m1".into(),
+            conversation_id: "c1".into(),
+            sequence_id: 1,
+            message_type: MessageType::User,
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn user_text_is_extracted_verbatim() {
+        let m = msg(MessageContent::User(UserContent {
+            text: "fix the auth schema".into(),
+            images: vec![],
+            files: vec![],
+            llm_text: None,
+            is_meta: false,
+        }));
+        assert_eq!(index_text(&m), "fix the auth schema");
+    }
+
+    #[test]
+    fn user_expanded_llm_text_is_indexed() {
+        // When input expansion occurred (e.g. `@file`), the searchable text is
+        // the expanded form the model saw, not the display shorthand — so
+        // recall covers terms that exist only in the expansion.
+        let m = msg(MessageContent::User(UserContent {
+            text: "review @config".into(),
+            images: vec![],
+            files: vec![],
+            llm_text: Some("review <file path=\"config\">timeout_seconds = 42</file>".into()),
+            is_meta: false,
+        }));
+        let indexed = index_text(&m);
+        assert!(indexed.contains("timeout_seconds = 42"), "got: {indexed}");
+    }
+
+    #[test]
+    fn agent_long_text_is_not_truncated() {
+        // A long plain assistant reply (no tool output) must stay fully
+        // searchable — only bulky tool-result payloads are excerpted.
+        let long = format!("needle {} endneedle", "filler ".repeat(1000));
+        let m = msg(MessageContent::Agent(vec![ContentBlock::Text {
+            text: long.clone(),
+        }]));
+        assert_eq!(
+            index_text(&m),
+            long,
+            "prose must not be head/tail excerpted"
+        );
+    }
+
+    #[test]
+    fn agent_indexes_text_and_tool_blocks() {
+        // Tool calls and server-side tool results are indexed (not dropped) so
+        // recall can locate a member by terms that live only in a tool block.
+        let m = msg(MessageContent::Agent(vec![
+            ContentBlock::Text {
+                text: "first".into(),
+            },
+            ContentBlock::ToolUse {
+                id: "t".into(),
+                name: "bash".into(),
+                input: serde_json::json!({ "command": "grep token_bucket" }),
+            },
+            ContentBlock::WebSearchToolResult {
+                tool_use_id: "w".into(),
+                content: serde_json::json!({ "found": "rate limiter design" }),
+            },
+            ContentBlock::Text {
+                text: "second".into(),
+            },
+        ]));
+        let indexed = index_text(&m);
+        assert!(indexed.contains("first") && indexed.contains("second"));
+        assert!(
+            indexed.contains("grep token_bucket"),
+            "tool input: {indexed}"
+        );
+        assert!(
+            indexed.contains("rate limiter design"),
+            "tool result: {indexed}",
+        );
+    }
+
+    #[test]
+    fn short_tool_result_passes_through_whole() {
+        let m = msg(MessageContent::Tool(ToolContent {
+            tool_use_id: "t".into(),
+            content: "error: missing semicolon at foo.rs:42".into(),
+            is_error: true,
+            images: vec![],
+        }));
+        assert_eq!(index_text(&m), "error: missing semicolon at foo.rs:42");
+    }
+
+    #[test]
+    fn long_tool_result_keeps_head_and_tail() {
+        // head marker ... (filler) ... tail marker
+        let filler = "x".repeat(5000);
+        let body = format!("HEAD_START compiling crate\n{filler}\nFAILED at zzz.rs:7 TAIL_END");
+        let m = msg(MessageContent::Tool(ToolContent {
+            tool_use_id: "t".into(),
+            content: body,
+            is_error: true,
+            images: vec![],
+        }));
+        let out = index_text(&m);
+        assert!(out.contains("HEAD_START"), "head signal must survive");
+        assert!(out.contains("TAIL_END"), "tail signal must survive");
+        assert!(out.contains("chars elided"), "elision must be marked");
+        assert!(
+            out.len() < 5000,
+            "excerpt must be bounded, got {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn tool_excerpt_respects_char_boundaries() {
+        // multibyte content; ensure no panic and bounded output
+        let body = "é".repeat(4000);
+        let out = tool_excerpt(&body, 1024, 1024);
+        assert!(out.contains("elided"));
+        // round-trips as valid UTF-8 (String guarantees it; assert non-empty head/tail)
+        assert!(out.starts_with('é'));
+        assert!(out.ends_with('é'));
+    }
+
+    #[test]
+    fn other_variants_extract_their_prose() {
+        assert_eq!(
+            index_text(&msg(MessageContent::System(SystemContent {
+                text: "sys".into()
+            }))),
+            "sys"
+        );
+        assert_eq!(
+            index_text(&msg(MessageContent::Error(ErrorContent {
+                message: "boom".into()
+            }))),
+            "boom"
+        );
+        assert_eq!(
+            index_text(&msg(MessageContent::Continuation(ContinuationContent {
+                summary: "did things".into()
+            }))),
+            "did things"
+        );
+        // The expanded body is indexed (not just name/trigger) so recall can
+        // locate a conversation by skill-injected instructions.
+        let skill = index_text(&msg(MessageContent::Skill(SkillContent {
+            name: "review".into(),
+            body: "inspect the auth middleware for token leaks".into(),
+            trigger: "/review".into(),
+            files: vec![],
+        })));
+        assert!(skill.contains("/review /review"), "got: {skill}");
+        assert!(
+            skill.contains("inspect the auth middleware for token leaks"),
+            "skill body must be indexed: {skill}",
+        );
+    }
+
+    #[test]
+    fn hidden_messages_are_not_indexed() {
+        let mut m = msg(MessageContent::System(SystemContent {
+            text: "user dismissed the error".into(),
+        }));
+        m.display_data = Some(serde_json::json!({ "hidden": true }));
+        assert_eq!(
+            index_text(&m),
+            "",
+            "hidden recovery markers must not enter the index",
+        );
+
+        // A non-hidden system message still indexes normally.
+        let mut visible = msg(MessageContent::System(SystemContent {
+            text: "context restored".into(),
+        }));
+        visible.display_data = Some(serde_json::json!({ "hidden": false }));
+        assert_eq!(index_text(&visible), "context restored");
+    }
+}

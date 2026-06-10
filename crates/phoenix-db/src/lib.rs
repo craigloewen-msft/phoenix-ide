@@ -3,6 +3,7 @@
 //! Provides persistence for conversations and messages.
 
 mod migrations;
+pub mod retrieval;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,
 // …) moved to the phoenix-core domain crate to break the db↔state_machine
 // cycle. Alias the module back as `schema` so the persistence logic in this
@@ -10,6 +11,9 @@ mod migrations;
 use phoenix_core::domain::db_schema as schema;
 
 pub use migrations::run_pending_migrations;
+pub use retrieval::{
+    Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalScope, RetrievedChunk,
+};
 pub use schema::*;
 
 use chrono::{DateTime, Utc};
@@ -1608,11 +1612,12 @@ impl Database {
         .fetch_one(&mut *tx)
         .await?;
 
+        let handoff_summary_msg_id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)",
         )
-        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&handoff_summary_msg_id)
         .bind(parent_id)
         .bind(parent_next_sequence_id)
         .bind(handoff_summary.message_type().to_string())
@@ -1640,6 +1645,35 @@ impl Database {
             }
             return Err(DbError::ConversationNotFound(parent_id.to_string()));
         }
+
+        // Index the two messages this handoff inserts (the seed message and the
+        // parent's continuation summary) in the same transaction — they go in
+        // via raw INSERTs that bypass the `add_message` index hook, so without
+        // this they'd be missing from retrieval until the next startup
+        // reconcile (specs/conversation-retrieval/ REQ-RET-003).
+        let seed_msg = Message {
+            message_id: seed_message_id.clone(),
+            conversation_id: new_id.clone(),
+            sequence_id: 1,
+            message_type: seed_content.message_type(),
+            content: seed_content.clone(),
+            display_data: None,
+            usage_data: None,
+            created_at: now,
+        };
+        let handoff_msg = Message {
+            message_id: handoff_summary_msg_id,
+            conversation_id: parent_id.to_string(),
+            sequence_id: parent_next_sequence_id,
+            message_type: handoff_summary.message_type(),
+            content: handoff_summary.clone(),
+            display_data: None,
+            usage_data: None,
+            created_at: now,
+        };
+        retrieval::fts_upsert_conn(&mut tx, &seed_msg).await?;
+        retrieval::fts_upsert_conn(&mut tx, &handoff_msg).await?;
+
         tx.commit().await?;
 
         Ok(Conversation {
@@ -2010,7 +2044,13 @@ impl Database {
         Ok(())
     }
 
-    /// Mark a Q&A row complete with the final answer (REQ-CHN-005).
+    /// Mark a Q&A row complete with the final answer and the chain snapshot as
+    /// of completion (REQ-CHN-005).
+    ///
+    /// The snapshot counters are rewritten (not just set once at insert)
+    /// because the Q&A agent resolves chain members live, so a continuation
+    /// added mid-run can inform the answer; the freshness comparison must be
+    /// against the shape the answer actually saw.
     ///
     /// # Errors
     ///
@@ -2020,16 +2060,21 @@ impl Database {
         &self,
         id: &str,
         answer: &str,
+        snapshot_member_count: i64,
+        snapshot_total_messages: i64,
         completed_at: DateTime<Utc>,
     ) -> DbResult<()> {
         let result = sqlx::query(
             "UPDATE chain_qa
-             SET answer = ?1, status = ?2, completed_at = ?3
-             WHERE id = ?4",
+             SET answer = ?1, status = ?2, completed_at = ?3,
+                 snapshot_member_count = ?4, snapshot_total_messages = ?5
+             WHERE id = ?6",
         )
         .bind(answer)
         .bind(ChainQaStatus::Completed.as_str())
         .bind(completed_at.to_rfc3339())
+        .bind(snapshot_member_count)
+        .bind(snapshot_total_messages)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -2477,15 +2522,22 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn delete_conversation(&self, id: &str) -> DbResult<()> {
-        // Messages are deleted by CASCADE
+        // Conversation + messages (FK CASCADE) and the standalone FTS prune
+        // run in one transaction. The FTS table has no FK cascade, so without
+        // the shared transaction a crash between the source delete and the
+        // prune would leave orphaned index rows and hard-deleted content could
+        // resurface in recall until the next reconcile (REQ-RET-003).
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query("DELETE FROM conversations WHERE id = ?1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-
         if result.rows_affected() == 0 {
+            // tx dropped without commit → rollback.
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
+        retrieval::fts_delete_conversation_conn(&mut tx, id).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2764,7 +2816,7 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
-        Ok(Message {
+        let message = Message {
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id,
@@ -2773,7 +2825,17 @@ impl Database {
             display_data: display_data.cloned(),
             usage_data: usage_data.cloned(),
             created_at: now,
-        })
+        };
+        // Index for retrieval (specs/conversation-retrieval/ REQ-RET-003).
+        // The startup reconcile is the backstop if this ever fails after the
+        // message row commits.
+        if let Err(e) = retrieval::fts_upsert(&self.pool, &message).await {
+            tracing::warn!(
+                message_id = %message.message_id, error = %e,
+                "failed to index message for retrieval; startup reconcile will repair",
+            );
+        }
+        Ok(message)
     }
 
     /// Like `add_message_with_seq`, but persists a caller-supplied
@@ -2831,7 +2893,7 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
-        Ok(Message {
+        let message = Message {
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id,
@@ -2840,7 +2902,15 @@ impl Database {
             display_data: display_data.cloned(),
             usage_data: usage_data.cloned(),
             created_at,
-        })
+        };
+        // Index for retrieval (specs/conversation-retrieval/ REQ-RET-003).
+        if let Err(e) = retrieval::fts_upsert(&self.pool, &message).await {
+            tracing::warn!(
+                message_id = %message.message_id, error = %e,
+                "failed to index message for retrieval; startup reconcile will repair",
+            );
+        }
+        Ok(message)
     }
 
     /// Get messages for a conversation
@@ -2982,6 +3052,24 @@ impl Database {
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::MessageNotFound(message_id.to_string()));
+        }
+        // Re-index the mutated message so the retrieval index reflects the new
+        // content (specs/conversation-retrieval/ REQ-RET-003).
+        let updated: Option<Message> = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages WHERE message_id = ?1",
+        )
+        .bind(message_id)
+        .try_map(parse_message_row)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(message) = updated {
+            if let Err(e) = retrieval::fts_upsert(&self.pool, &message).await {
+                tracing::warn!(
+                    message_id = %message.message_id, error = %e,
+                    "failed to index message for retrieval; startup reconcile will repair",
+                );
+            }
         }
         Ok(())
     }
@@ -3349,6 +3437,12 @@ async fn insert_message_tx(
     .bind(msg.created_at.to_rfc3339())
     .execute(&mut **tx)
     .await?;
+    // Index for retrieval atomically with the message insert, so tx-based
+    // persists (fork-resolution seed messages, checkpoint replays) get the
+    // same FTS coverage as `add_message_with_seq` — no message reaches a chain
+    // unindexed before the startup reconcile (specs/conversation-retrieval/
+    // REQ-RET-003).
+    retrieval::fts_upsert_conn(tx, msg).await?;
     Ok(())
 }
 
@@ -4861,7 +4955,8 @@ mod tests {
         assert!(row.completed_at.is_none());
     }
 
-    /// REQ-CHN-005: `complete_chain_qa` sets answer + `completed_at` + status.
+    /// REQ-CHN-005: `complete_chain_qa` sets answer + `completed_at` + status,
+    /// and rewrites the snapshot counters to the completion-time chain shape.
     #[tokio::test]
     async fn test_complete_chain_qa_transitions_row() {
         let db = Database::open_in_memory().await.unwrap();
@@ -4870,8 +4965,10 @@ mod tests {
             .await
             .unwrap();
 
+        // Complete with a snapshot larger than the inserted one (a continuation
+        // landed mid-run): the completion-time counters must overwrite.
         let now = Utc::now();
-        db.complete_chain_qa("qac-1", "the final answer", now)
+        db.complete_chain_qa("qac-1", "the final answer", 4, 21, now)
             .await
             .unwrap();
 
@@ -4879,6 +4976,8 @@ mod tests {
         assert_eq!(row.status, ChainQaStatus::Completed);
         assert_eq!(row.answer.as_deref(), Some("the final answer"));
         assert!(row.completed_at.is_some());
+        assert_eq!(row.snapshot_member_count, 4);
+        assert_eq!(row.snapshot_total_messages, 21);
     }
 
     /// REQ-CHN-005: `fail_chain_qa` preserves the question and an optional partial.
@@ -4947,7 +5046,7 @@ mod tests {
         db.insert_chain_qa(fresh_new_chain_qa("qas-c", "qas-a"))
             .await
             .unwrap();
-        db.complete_chain_qa("qas-c", "done", Utc::now())
+        db.complete_chain_qa("qas-c", "done", 2, 8, Utc::now())
             .await
             .unwrap();
 

@@ -1,139 +1,72 @@
 #![allow(clippy::wildcard_enum_match_arm)]
-//! Chain Q&A backend (REQ-CHN-001, REQ-CHN-004, REQ-CHN-005, REQ-CHN-006).
+//! Chain Q&A backend (REQ-CHN-001, REQ-CHN-004, REQ-CHN-005, REQ-CHN-006,
+//! REQ-CHN-009).
 //!
-//! Phase 2 of Phoenix Chains v1: bundles per-member context, invokes a
-//! mid-tier model with the user's question, and persists the resulting Q&A
-//! row through its lifecycle (`in_flight` → `completed` | `failed`).
-//!
-//! Phase 3 will move the answer-generation invocation onto a streaming path
-//! and wrap it in a chain-scoped SSE broadcaster. The bundling and
-//! persistence helpers in this module are shaped so that swap is a
-//! reuse-and-rewrap, not a rewrite — see [`ChainQa::run_answer_invocation`].
-
-// Phase 4 wires this module into AppState via the chains API handlers; the
-// per-item `#[allow(dead_code)]` annotations remaining below cover surface
-// that's still test-only (e.g. `submit_question_blocking`) or reserved for
-// near-future callers.
+//! Each question runs a **read-only agentic loop** (REQ-CHN-009): a fresh
+//! agent is given two scope-bound tools — `search_conversations` (ranked
+//! retrieval over the chain via `specs/conversation-retrieval/`) and
+//! `read_conversation` (byte-budgeted full-content read of one member) — plus
+//! a lightweight chain skeleton for orientation. It iterates (search → read →
+//! search) until it can answer, then the final answer streams over the
+//! chain-scoped SSE broadcaster. The agent has no state-mutating tools and is
+//! bound to the chain's members, so it can dig arbitrarily deep within the
+//! chain but cannot reach outside it or change anything. Each question is a
+//! fresh run with no memory of prior Q&A (REQ-CHN-006). The Q&A row is
+//! persisted through its lifecycle (`in_flight` → `completed` | `failed`).
 
 use crate::chain_runtime::{ChainRuntime, ChainRuntimeRegistry, ChainSseEvent};
 use crate::db::{
-    ChainQaRow, Conversation, Database, DbError, Message, MessageContent, MessageType, NewChainQa,
+    ChainQaRow, Conversation, Database, DbError, Message, MessageContent, MessageRetriever,
+    MessageType, NewChainQa, RetrievalScope, RetrievedChunk,
 };
 use crate::llm::{
     ContentBlock, LlmError, LlmMessage, LlmRequest, LlmService, MessageRole, ModelRegistry,
-    PromptCacheKey, SystemContent, TokenChunk,
+    PromptCacheKey, SystemContent, TokenChunk, ToolDefinition,
 };
 use chrono::Utc;
+use std::fmt::Write as _;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 
-/// Maximum leaf message count for direct (un-summarized) inclusion (REQ-CHN-006).
-///
-/// Pinned alongside [`LEAF_DIRECT_TOKEN_BUDGET`]: if either threshold is
-/// exceeded, the leaf is summarized in-process before invocation. Pinning
-/// these as constants instead of per-call inputs prevents identical
-/// questions on the same chain from getting different bundling decisions.
-pub const LEAF_DIRECT_MESSAGE_LIMIT: usize = 20;
+/// Maximum number of tool-using turns the Q&A agent may take before it must
+/// answer (REQ-CHN-009). Bounds cost/latency so the loop terminates; the
+/// agent typically searches once or twice and reads a member or two.
+const MAX_QA_TURNS: usize = 6;
 
-/// Maximum approximate-token budget for a directly-included leaf transcript.
-/// Token approximation uses `text.len() / 4` (REQ-CHN-006 spec); when the
-/// leaf transcript exceeds this, it is summarized via the mid-tier model
-/// in-process and discarded after the request.
-pub const LEAF_DIRECT_TOKEN_BUDGET: usize = 4000;
+/// Maximum tool calls actually executed in one planning turn. Providers may
+/// batch parallel tool calls in a single assistant message; without a cap a
+/// batch of `read_conversation`s could inject (batch × [`READ_PAGE_CHARS`])
+/// into the next turn, defeating the per-page budget. Calls beyond the cap get
+/// a "skipped" tool result (every `tool_use` must still be answered to keep the
+/// request valid) so the model re-requests fewer.
+const MAX_TOOL_CALLS_PER_TURN: usize = 4;
 
-// Chain Q&A system prompts are language-aware; the per-language text lives
-// in `crate::llm_language::chain_answer_system_prompt` /
-// `crate::llm_language::chain_leaf_summary_system_prompt`. Pinned cache
-// keys in `build_answer_request` / `summarize_leaf_in_process` include the
-// language so phoenix-native and caveman prompts don't share a cache slot.
+/// How many ranked chunks `search_conversations` returns per call.
+const SEARCH_TOP_K: usize = 8;
 
-/// Maximum tokens cap for the in-process leaf summary.
-const LEAF_SUMMARY_MAX_TOKENS: u32 = 1024;
+/// Host-fixed budget (in characters) for one `read_conversation` page
+/// (REQ-RET-008): the model cannot enlarge it, so a single read can never
+/// overflow the next turn's context. Continuation is by character offset, so
+/// the bound holds even within one oversized message.
+const READ_PAGE_CHARS: usize = 6000;
 
-/// Maximum tokens cap for the answer invocation. Sized to a typical recall
-/// answer; the model can stop earlier via `end_turn`.
+/// Maximum tokens cap for an answer turn. Sized to a typical recall answer;
+/// the model can stop earlier via `end_turn`.
 const ANSWER_MAX_TOKENS: u32 = 2048;
 
-/// Result of bundling a chain into model-ready context blocks.
-#[derive(Debug, Clone)]
-pub struct BundledContext {
-    /// One block per chain member, in chain order (root → leaf).
-    pub blocks: Vec<MemberContextBlock>,
-    /// `model_id` used for any leaf-summary pre-step (None if the leaf was
-    /// taken directly). Threaded through for diagnostics; not persisted.
-    #[allow(dead_code)] // Diagnostic surface; consumed by tests asserting summarization fired.
-    pub leaf_summary_model: Option<String>,
-}
+/// Block-wait budget for the chain's index to become fresh before answering
+/// (REQ-CHN-009): up to `INDEX_WAIT_ATTEMPTS * INDEX_POLL_MS` ms. After that we
+/// answer anyway (`read_conversation` reads live `messages`, so the agent can
+/// still answer — only search coverage may lag). The reconcile sweep is fast,
+/// so this only ever bites in the first moments after startup.
+const INDEX_WAIT_ATTEMPTS: usize = 100;
+const INDEX_POLL_MS: u64 = 100;
 
-impl BundledContext {
-    /// Render the bundled context as a single string suitable for use as
-    /// the user-message body of the answer invocation.
-    pub fn render_for_prompt(&self) -> String {
-        let mut out = String::new();
-        for block in &self.blocks {
-            let tag = block.kind.tag(&block.conv_id);
-            out.push('[');
-            out.push_str(&tag);
-            out.push_str("]\n");
-            out.push_str(&block.body);
-            if !block.body.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push('\n');
-        }
-        out
-    }
-}
-
-/// One context block contributed by a single chain member.
-#[derive(Debug, Clone)]
-pub struct MemberContextBlock {
-    pub conv_id: String,
-    pub kind: MemberBlockKind,
-    pub body: String,
-}
-
-/// Distinguishes the four ways a member can contribute to the bundle.
-///
-/// The kind is the structural label rendered into the prompt — making
-/// "this came from the persisted continuation summary" vs. "this is the
-/// in-process leaf summary because the leaf was too big" visible to both
-/// the model and to humans reading transcripts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemberBlockKind {
-    /// Non-leaf member — body is its trailing `MessageType::Continuation`
-    /// summary, persisted by `Effect::persist_continuation_message` during
-    /// the AwaitingContinuation→ContextExhausted transition.
-    ContinuationSummary,
-    /// Non-leaf member that has no trailing Continuation message in the DB
-    /// (a degenerate state — the chain edge exists but the summary message
-    /// was never persisted). Surfaced as a logged-debug capability gap and
-    /// a structural tag rather than silently dropped.
-    ContinuationSummaryMissing,
-    /// Leaf member — body is the raw transcript (≤ thresholds in
-    /// [`LEAF_DIRECT_MESSAGE_LIMIT`] / [`LEAF_DIRECT_TOKEN_BUDGET`]).
-    LeafTranscript,
-    /// Leaf member — body is an in-process LLM summary (transcript exceeded
-    /// the direct budget). Held in memory only; not persisted (see design.md).
-    LeafSummary,
-}
-
-impl MemberBlockKind {
-    fn tag(self, conv_id: &str) -> String {
-        let prefix = match self {
-            Self::ContinuationSummary => "summary",
-            Self::ContinuationSummaryMissing => "summary-missing",
-            Self::LeafTranscript => "leaf",
-            Self::LeafSummary => "leaf-summary",
-        };
-        format!("{prefix}:#{conv_id}")
-    }
-}
-
-/// Snapshot of chain shape captured at question-submission time
-/// (REQ-CHN-005). Two integers replace what would otherwise be a JSON
-/// snapshot of the full member graph; the UI compares these against
-/// current chain state to decide whether to show a "snapshot stale" tag.
+/// Snapshot of chain shape captured at answer time (REQ-CHN-005). Two integers
+/// stand in for a full member-graph snapshot; the UI compares them against
+/// current chain state to show an age-of-answer freshness tag (whether the
+/// chain has grown since this answer was produced).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChainSnapshot {
     pub member_count: i64,
@@ -173,30 +106,37 @@ impl From<LlmError> for ChainQaError {
     }
 }
 
-/// Identifier returned to the caller of [`ChainQa::submit_question`] —
-/// doubles as the SSE-stream demux key in Phase 3.
+/// Identifier returned to the caller of [`ChainQa::submit_question`] — doubles
+/// as the SSE-stream demux key on the chain broadcaster.
 pub type ChainQaId = String;
 
 /// Chain Q&A entry point.
 ///
-/// Phase 3: holds a reference to the [`ChainRuntimeRegistry`] so each
-/// submission can publish streaming token events through the chain-scoped
-/// broadcaster. The public submission shape (`submit_question` returns the
-/// `chain_qa_id` synchronously, then streaming + DB finalize run in the
-/// background) mirrors how Phoenix's per-conversation runtime returns a
-/// handle synchronously and runs the executor in a spawned task.
+/// `submit_question` returns the `chain_qa_id` synchronously — once the
+/// `chain_qa` row is inserted in `in_flight` — and runs the agent loop plus DB
+/// finalize in a detached `tokio::spawn`'d task, mirroring how Phoenix's
+/// per-conversation runtime returns a handle synchronously and runs the
+/// executor in a spawned task.
 #[derive(Clone)]
 pub struct ChainQa {
     db: Database,
     llm_registry: Arc<ModelRegistry>,
+    /// Scope-filtered message retrieval the Q&A agent drives as a tool
+    /// (`specs/conversation-retrieval/` REQ-RET-008, chains REQ-CHN-009).
+    retriever: Arc<dyn MessageRetriever>,
     runtime_registry: ChainRuntimeRegistry,
 }
 
 impl ChainQa {
-    pub fn new(db: Database, llm_registry: Arc<ModelRegistry>) -> Self {
+    pub fn new(
+        db: Database,
+        llm_registry: Arc<ModelRegistry>,
+        retriever: Arc<dyn MessageRetriever>,
+    ) -> Self {
         Self {
             db,
             llm_registry,
+            retriever,
             runtime_registry: ChainRuntimeRegistry::new(),
         }
     }
@@ -208,11 +148,13 @@ impl ChainQa {
     pub fn with_registry(
         db: Database,
         llm_registry: Arc<ModelRegistry>,
+        retriever: Arc<dyn MessageRetriever>,
         runtime_registry: ChainRuntimeRegistry,
     ) -> Self {
         Self {
             db,
             llm_registry,
+            retriever,
             runtime_registry,
         }
     }
@@ -223,25 +165,10 @@ impl ChainQa {
         &self.runtime_registry
     }
 
-    /// Submit a question on the chain rooted at `root_id`. Phase 3 returns
-    /// the `chain_qa_id` synchronously — once the `chain_qa` row is
-    /// inserted in `in_flight` — and runs the streaming model invocation
-    /// plus DB finalize in a detached `tokio::spawn`'d task.
-    ///
-    /// The returned id doubles as the SSE-stream demux key on the chain
-    /// broadcaster; subscribers filter events whose `chain_qa_id` matches.
-    ///
-    /// Internal flow:
-    /// 1. [`Self::prepare_invocation`] — validate, load members, snapshot,
-    ///    bundle context, INSERT the `in_flight` row.
-    /// 2. Spawn a background task that:
-    ///    - increments the chain runtime's in-flight count (pinning the
-    ///      broadcaster alive past zero subscribers);
-    ///    - calls [`Self::run_answer_invocation`] which streams
-    ///      `ChainSseEvent::Token` events as the model produces them;
-    ///    - calls [`Self::finalize`] to UPDATE the row to
-    ///      `completed`/`failed` and publishes the matching terminal
-    ///      `ChainSseEvent`.
+    /// Submit a question on the chain rooted at `root_id`. Returns the
+    /// `chain_qa_id` synchronously — once the `chain_qa` row is inserted in
+    /// `in_flight` — and runs the agent loop plus DB finalize in a detached
+    /// task. The id doubles as the SSE-stream demux key.
     pub async fn submit_question(
         &self,
         root_id: &str,
@@ -265,11 +192,6 @@ impl ChainQa {
             this.finalize(&qa_id_for_task, invocation_result, &runtime_for_task)
                 .await;
             drop(in_flight_guard);
-            // Best-effort tidy: if subscribers and in-flight are both zero
-            // now, the runtime can leave the registry. A fresh subscriber
-            // arriving after this point goes through `get_or_create` and
-            // builds a new runtime — the persisted row in `chain_qa` is
-            // canonical for any reader who missed the live stream.
             this.runtime_registry
                 .release_if_idle(runtime_for_task.root_conv_id())
                 .await;
@@ -278,10 +200,9 @@ impl ChainQa {
         Ok(qa_id_for_caller)
     }
 
-    /// Test/foreground-driven variant: runs the streaming invocation and
-    /// finalize in the current task instead of spawning. Used by
-    /// integration tests that need deterministic completion before
-    /// asserting on the persisted row.
+    /// Test/foreground-driven variant: runs the agent loop and finalize in the
+    /// current task instead of spawning. Used by integration tests that need
+    /// deterministic completion before asserting on the persisted row.
     #[cfg(test)]
     pub async fn submit_question_blocking(
         &self,
@@ -306,11 +227,10 @@ impl ChainQa {
 
     /// Phase 1 of the submission flow.
     ///
-    /// Validates the chain, snapshots its shape, bundles its context, and
-    /// INSERTs the row in `in_flight` — all *before* the answer invocation
-    /// fires, so the question is durable even if the model call panics
-    /// mid-flight (REQ-CHN-005: question text is preserved across failure
-    /// modes).
+    /// Validates the chain, snapshots its shape, builds the orientation
+    /// skeleton, and INSERTs the row in `in_flight` — all *before* the agent
+    /// loop fires, so the question is durable even if the loop panics
+    /// mid-flight (REQ-CHN-005: question text is preserved across failures).
     async fn prepare_invocation(
         &self,
         root_id: &str,
@@ -340,11 +260,10 @@ impl ChainQa {
             .get_mid_tier_model()
             .ok_or(ChainQaError::NoModelAvailable)?;
 
-        // The chain root pins the language for all members (chain continuations
-        // inherit it at creation time). Default-fallback covers an empty member
-        // list, but that branch was already rejected above.
+        // The chain root pins the language for all members (continuations
+        // inherit it at creation time).
         let language = members.first().map(|c| c.llm_language).unwrap_or_default();
-        let bundled = bundle_chain_context(&self.db, &members, service.as_ref(), language).await?;
+        let skeleton = self.build_chain_skeleton(&members).await?;
 
         let qa_id = uuid::Uuid::new_v4().to_string();
         let created_at = Utc::now();
@@ -363,47 +282,198 @@ impl ChainQa {
         Ok(PreparedInvocation {
             row_id: qa_id,
             question: question.to_string(),
-            bundled,
+            skeleton,
+            root_id: root_id.to_string(),
+            snapshot,
             service,
             model_id,
             language,
         })
     }
 
-    /// Phase 2 of the submission flow — the model invocation.
+    /// Build the orientation skeleton: one line per member with its id, title,
+    /// and trailing continuation summary (or a "latest member" marker for the
+    /// leaf). Substance comes from the tools, not the skeleton; this just
+    /// orients the agent (REQ-CHN-009).
+    async fn build_chain_skeleton(&self, members: &[Conversation]) -> Result<String, ChainQaError> {
+        let leaf_idx = members.len().saturating_sub(1);
+        let mut out = String::new();
+        for (i, conv) in members.iter().enumerate() {
+            let title = conv
+                .title
+                .as_deref()
+                .or(conv.slug.as_deref())
+                .unwrap_or(&conv.id);
+            let note = if i == leaf_idx {
+                "(latest / current member)".to_string()
+            } else {
+                let msgs = self.db.get_messages(&conv.id).await?;
+                trailing_continuation_summary(&msgs)
+                    .unwrap_or_else(|| "(no continuation summary persisted)".to_string())
+            };
+            let _ = writeln!(out, "- #{} \"{}\": {}", conv.id, title, note.trim());
+        }
+        Ok(out)
+    }
+
+    /// Phase 2 — the read-only agent loop (REQ-CHN-009).
     ///
-    /// Phase 3 streams tokens through `runtime` as they arrive: each text
-    /// chunk emitted by the LLM is republished as a
-    /// [`ChainSseEvent::Token`] tagged with `prep.row_id` so multi-tab
-    /// subscribers can demultiplex concurrent Q&As (REQ-CHN-006). The
-    /// returned tuple carries the assembled answer plus whatever was
-    /// observed via the chunk channel before the model call returned —
-    /// useful as the `partial_answer` on failure.
-    ///
-    /// The non-streaming `complete()` fallback is preserved by
-    /// `LlmService::complete_streaming`'s default impl, so providers that
-    /// haven't implemented streaming still produce a single (non-empty)
-    /// answer block.
+    /// First blocks until the chain's index is fresh (so search sees the whole
+    /// chain), then runs **planning turns** that may call the scope-bound
+    /// search/read tools. Planning turns run non-streamed, so intermediate
+    /// "I'll search…" narration never reaches the user. When the model stops
+    /// calling tools (or the turn cap is hit), a dedicated final turn with no
+    /// tools streams the answer token-by-token over the chain broadcaster.
     async fn run_answer_invocation(
         &self,
         prep: &PreparedInvocation,
         runtime: &Arc<ChainRuntime>,
+    ) -> Result<AnswerOutcome, RunInvocationError> {
+        // Block-wait for the chain's index to catch up before answering, so the
+        // agent doesn't search a partial index right after startup (REQ-CHN-009).
+        // If the wait budget elapses while the index is still not fresh, we
+        // cannot rule out stale/orphaned rows that ranked search would surface
+        // as deleted/edited-away content — so `search_conversations` is withheld
+        // (only `read_conversation`, which reads live `messages`, is offered) and
+        // the agent is told to read members directly (REQ-RET: deleted content
+        // is never returned).
+        let index_fresh = self.await_index_fresh(&prep.root_id).await;
+        let coverage_note = if index_fresh {
+            ""
+        } else {
+            "\n\nNote: search is unavailable for this question because the index \
+             is not yet confirmed up to date. Read the relevant members directly \
+             with read_conversation to answer."
+        };
+
+        let mut messages = vec![LlmMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::text(format!(
+                "Chain skeleton (members in order):\n{}\n---\nQuestion: {}{}",
+                prep.skeleton, prep.question, coverage_note
+            ))],
+        }];
+
+        for turn in 0..MAX_QA_TURNS {
+            // Final allowed turn: answer directly (streamed, no tools).
+            if turn + 1 == MAX_QA_TURNS {
+                break;
+            }
+
+            // Planning turn: offer tools, non-streamed so its (possibly
+            // narrated) text never reaches the user.
+            let request = build_agent_request(&messages, prep.language, false, index_fresh);
+            let resp = prep
+                .service
+                .complete(&request)
+                .await
+                .map_err(|e| RunInvocationError {
+                    error: ChainQaError::from(e),
+                    partial_answer: None,
+                })?;
+
+            let tool_calls: Vec<(String, String, serde_json::Value)> = resp
+                .tool_uses()
+                .into_iter()
+                .map(|(id, name, input)| (id.to_string(), name.to_string(), input.clone()))
+                .collect();
+
+            // No tool call → the agent is ready; stream the final answer.
+            if tool_calls.is_empty() {
+                break;
+            }
+
+            // Execute the tools and feed results back. Re-resolve the chain's
+            // members live so a continuation added mid-run is in scope
+            // (REQ-RET-008 host-bound-to-root, REQ-CHN-009). A lookup failure
+            // here would silently empty the scope (every search a miss, every
+            // read "not part of this chain"), so fail the Q&A instead of
+            // answering against a fabricated empty chain.
+            let members = self
+                .db
+                .chain_members_forward(&prep.root_id)
+                .await
+                .map_err(|e| RunInvocationError {
+                    error: ChainQaError::from(e),
+                    partial_answer: None,
+                })?;
+            messages.push(LlmMessage {
+                role: MessageRole::Assistant,
+                content: resp.content.clone(),
+            });
+            let mut results = Vec::with_capacity(tool_calls.len());
+            for (idx, (id, name, input)) in tool_calls.iter().enumerate() {
+                // Cap the executed calls so a batched response can't blow past
+                // the per-page budget; still answer every tool_use so the next
+                // request stays valid.
+                let (content, is_error) = if idx < MAX_TOOL_CALLS_PER_TURN {
+                    self.execute_tool(name, input, &members).await
+                } else {
+                    (
+                        format!(
+                            "error: too many tool calls in one turn (limit {MAX_TOOL_CALLS_PER_TURN}); \
+                             this call was not run — issue fewer calls per turn"
+                        ),
+                        true,
+                    )
+                };
+                results.push(ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content,
+                    images: vec![],
+                    is_error,
+                });
+            }
+            messages.push(LlmMessage {
+                role: MessageRole::User,
+                content: results,
+            });
+        }
+
+        // Recompute the freshness snapshot from the chain's live shape *before*
+        // the final request runs: this is the latest chain state the answer can
+        // reflect (planning resolved members live; the final turn sees only
+        // what's already in `messages`). Capturing it here — not after the
+        // stream returns — means a write that lands while the answer is
+        // generating is correctly counted as newer than the answer, so the UI
+        // shows the age-of-answer tag. Falls back to the submission-time
+        // snapshot on a DB error.
+        let snapshot = self
+            .live_snapshot(&prep.root_id)
+            .await
+            .unwrap_or(prep.snapshot);
+        let answer = self.stream_final_answer(&messages, prep, runtime).await?;
+        Ok(AnswerOutcome { answer, snapshot })
+    }
+
+    /// Recompute the chain snapshot from its current members. Returns `None` on
+    /// any DB error so the caller can fall back to the submission-time value
+    /// rather than fail an otherwise-successful answer.
+    async fn live_snapshot(&self, root_id: &str) -> Option<ChainSnapshot> {
+        let member_ids = self.db.chain_members_forward(root_id).await.ok()?;
+        let mut members = Vec::with_capacity(member_ids.len());
+        for id in &member_ids {
+            members.push(self.db.get_conversation(id).await.ok()?);
+        }
+        Some(compute_chain_snapshot(&members))
+    }
+
+    /// Final turn: a no-tools invocation whose tokens stream live onto the
+    /// chain broadcaster as they arrive (REQ-CHN-004). Only this turn is
+    /// published — planning turns ran non-streamed — so the user sees a working
+    /// indicator, then the answer streaming in.
+    async fn stream_final_answer(
+        &self,
+        messages: &[LlmMessage],
+        prep: &PreparedInvocation,
+        runtime: &Arc<ChainRuntime>,
     ) -> Result<String, RunInvocationError> {
-        let request = build_answer_request(&prep.bundled, &prep.question, prep.language);
-
-        // Channel between the LLM provider and the chain broadcaster. The
-        // provider sends `TokenChunk::Text` deltas; we forward each one to
-        // the chain broadcaster and accumulate a partial answer in case the
-        // provider errors mid-stream.
+        // Final turn forces an answer with an empty tool set; search gating is
+        // irrelevant here.
+        let request = build_agent_request(messages, prep.language, true, false);
         let (chunk_tx, mut chunk_rx) = broadcast::channel::<TokenChunk>(256);
-
         let qa_id = prep.row_id.clone();
         let runtime_handle = Arc::clone(runtime);
-
-        // Forwarder task: drains chunks until the broadcast sender is dropped
-        // (which happens when the model call returns and the local `chunk_tx`
-        // goes out of scope below). Accumulates the partial answer in the
-        // task's result so finalize/failed can carry it.
         let forwarder = tokio::spawn(async move {
             let mut partial = String::new();
             loop {
@@ -415,70 +485,192 @@ impl ChainQa {
                             delta,
                         });
                     }
-                    // Chain Q&A has no UI surface for mid-stream quota state.
                     Ok(TokenChunk::RateLimitSnapshot(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // The forwarder cannot keep up with the provider —
-                        // shouldn't happen at our 256 capacity, but log so
-                        // a stuck buffer is visible.
+                    // The forwarder fell behind the provider and the channel
+                    // dropped `skipped` token chunks. They're unrecoverable, but
+                    // the failed-row contract preserves *what streamed* — so
+                    // record the gap (in both the persisted partial and the live
+                    // view) instead of silently concatenating a misleading
+                    // suffix.
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(
-                            qa_id = %qa_id,
-                            lagged_by = n,
-                            "chain Q&A token forwarder lagged",
+                            chain_qa_id = %qa_id, skipped,
+                            "chain Q&A answer stream lagged; dropped token chunks",
                         );
+                        let marker = "\n[… some streamed tokens were dropped …]\n".to_string();
+                        partial.push_str(&marker);
+                        runtime_handle.publish(ChainSseEvent::Token {
+                            chain_qa_id: qa_id.clone(),
+                            delta: marker,
+                        });
                     }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
             partial
         });
 
         let response = prep.service.complete_streaming(&request, &chunk_tx).await;
-        // Drop the producer-side sender so the forwarder's recv() returns
-        // `Closed` and the task completes. Holding chunk_tx past this point
-        // would leave the forwarder hanging.
         drop(chunk_tx);
-        let partial_answer = forwarder.await.unwrap_or_default();
+        let partial = forwarder.await.unwrap_or_default();
 
         match response {
-            Ok(resp) => {
-                // The provider's assembled `text()` is canonical for the
-                // persisted answer. Streamed deltas may have decomposed
-                // identically, but providers are free to return a single
-                // text block independent of stream order; preferring the
-                // assembled response keeps `chain_qa.answer` byte-aligned
-                // with what `complete()` would have returned.
-                Ok(resp.text())
-            }
+            Ok(resp) => Ok(resp.text()),
             Err(e) => Err(RunInvocationError {
                 error: ChainQaError::from(e),
-                partial_answer: if partial_answer.is_empty() {
-                    None
-                } else {
-                    Some(partial_answer)
-                },
+                partial_answer: (!partial.is_empty()).then_some(partial),
             }),
         }
     }
 
-    /// Phase 3 of the submission flow — terminal status transition.
-    ///
-    /// Updates the persisted `chain_qa` row to `completed` / `failed` and
-    /// publishes the matching terminal event on the chain broadcaster so
+    /// Block until the chain's index is fresh for its members, or the wait
+    /// budget elapses (REQ-CHN-009). Returns whether the index is fresh:
+    /// `false` means the caller should warn the agent that search coverage may
+    /// be partial. Best-effort — on a DB/retriever error it returns `false`
+    /// (treat as partial) and the caller answers anyway, since
+    /// `read_conversation` reads live `messages` regardless of the index.
+    async fn await_index_fresh(&self, root_id: &str) -> bool {
+        let Ok(members) = self.db.chain_members_forward(root_id).await else {
+            return false;
+        };
+        if members.is_empty() {
+            return true;
+        }
+        for _ in 0..INDEX_WAIT_ATTEMPTS {
+            match self.retriever.is_fresh_for(&members).await {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(root = %root_id, error = %e, "chain index freshness check failed; answering on a partial index");
+                    return false;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(INDEX_POLL_MS)).await;
+        }
+        tracing::warn!(root = %root_id, "chain index not fresh after wait; answering on a partial index");
+        false
+    }
+
+    /// Execute one tool call. Read-only: `search_conversations` runs ranked
+    /// retrieval scoped to the chain's members; `read_conversation` returns a
+    /// byte-budgeted page of one member's full transcript. Both are bound to
+    /// the chain — a read outside the member set is refused (REQ-RET-008).
+    /// Returns `(content, is_error)` for the tool result.
+    async fn execute_tool(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+        member_ids: &[String],
+    ) -> (String, bool) {
+        match name {
+            "search_conversations" => {
+                let query = input
+                    .get("query")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if query.is_empty() {
+                    return (
+                        "error: search_conversations requires a non-empty 'query'".to_string(),
+                        true,
+                    );
+                }
+                // Re-validate freshness against the *live* member set at call
+                // time: the scope is re-resolved each turn, so a continuation
+                // added since the warmup wait could carry an unconfirmed/stale
+                // FTS row. Refuse the search rather than risk returning
+                // deleted/edited-away content (REQ-RET); the agent can still
+                // read members directly.
+                match self.retriever.is_fresh_for(member_ids).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return (
+                            "search unavailable: the index is not current for this chain \
+                             (it may have just grown); read members directly with read_conversation"
+                                .to_string(),
+                            true,
+                        );
+                    }
+                    Err(e) => return (format!("error: index freshness check failed: {e}"), true),
+                }
+                match self
+                    .retriever
+                    .retrieve(
+                        query,
+                        RetrievalScope::Conversations(member_ids.to_vec()),
+                        SEARCH_TOP_K,
+                    )
+                    .await
+                {
+                    Ok(hits) if hits.is_empty() => (
+                        "No matching messages found in this chain.".to_string(),
+                        false,
+                    ),
+                    Ok(hits) => (format_search_hits(&hits), false),
+                    Err(e) => (format!("error: search failed: {e}"), true),
+                }
+            }
+            "read_conversation" => {
+                // The skeleton and search hits render ids with a leading `#`
+                // (`#<id>`), and the tool tells the model to pass an id "from
+                // the skeleton or a search result" — so accept that exact token
+                // by stripping a leading `#` before the membership check.
+                let conv_id = input
+                    .get("conversation_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let conv_id = conv_id.strip_prefix('#').unwrap_or(conv_id);
+                if conv_id.is_empty() {
+                    return (
+                        "error: read_conversation requires 'conversation_id'".to_string(),
+                        true,
+                    );
+                }
+                if !member_ids.iter().any(|m| m == conv_id) {
+                    return (
+                        format!("error: conversation {conv_id} is not part of this chain"),
+                        true,
+                    );
+                }
+                let cursor = usize::try_from(
+                    input
+                        .get("cursor")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                )
+                .unwrap_or(0);
+                match self.db.get_messages(conv_id).await {
+                    Ok(msgs) => (read_page(&msgs, cursor), false),
+                    Err(e) => (format!("error: read failed: {e}"), true),
+                }
+            }
+            other => (format!("error: unknown tool '{other}'"), true),
+        }
+    }
+
+    /// Terminal status transition. Updates the persisted `chain_qa` row to
+    /// `completed` / `failed` and publishes the matching terminal event so
     /// live subscribers can clear their streaming UI state.
-    ///
-    /// Errors from the DB UPDATE are logged but not surfaced — the row's
-    /// next reader (via `list_chain_qa`) is the canonical state source, and
-    /// the spawn'd task path has no caller waiting on its result.
     async fn finalize(
         &self,
         qa_id: &str,
-        result: Result<String, RunInvocationError>,
+        result: Result<AnswerOutcome, RunInvocationError>,
         runtime: &Arc<ChainRuntime>,
     ) {
         match result {
-            Ok(answer) => {
-                if let Err(e) = self.db.complete_chain_qa(qa_id, &answer, Utc::now()).await {
+            Ok(AnswerOutcome { answer, snapshot }) => {
+                if let Err(e) = self
+                    .db
+                    .complete_chain_qa(
+                        qa_id,
+                        &answer,
+                        snapshot.member_count,
+                        snapshot.total_messages,
+                        Utc::now(),
+                    )
+                    .await
+                {
                     tracing::error!(
                         qa_id = %qa_id, error = %e,
                         "chain Q&A complete UPDATE failed; row will be swept on restart",
@@ -520,219 +712,310 @@ impl ChainQa {
 }
 
 /// Per-submission state passed from `prepare_invocation` to
-/// `run_answer_invocation` and `finalize`. The broadcaster handle is held by
-/// `submit_question` directly (not threaded through here) so the in-flight
-/// guard's lifetime is anchored to the spawned task scope.
+/// `run_answer_invocation` and `finalize`.
 struct PreparedInvocation {
     row_id: ChainQaId,
     question: String,
-    bundled: BundledContext,
+    /// Orientation skeleton (member ids + titles + continuation summaries).
+    skeleton: String,
+    /// The chain root. The tool scope is re-resolved live from this per turn
+    /// (`chain_members_forward`), so a continuation added mid-run is in scope
+    /// (REQ-RET-008 host-bound-to-root, REQ-CHN-009).
+    root_id: String,
+    /// Chain shape at submission time. Used as the fallback freshness snapshot
+    /// if the completion-time recompute fails — never staler than the row's
+    /// inserted value.
+    snapshot: ChainSnapshot,
     service: Arc<dyn LlmService>,
-    #[allow(dead_code)] // Persisted into chain_qa.model via insert_chain_qa
+    #[allow(dead_code)] // Persisted into chain_qa.model via insert_chain_qa.
     model_id: String,
-    /// Language inherited from the chain's root conversation. Switches both
-    /// the answer-time system prompt and any leaf-summary pre-step.
+    /// Language inherited from the chain's root conversation.
     language: crate::llm_language::LlmLanguage,
 }
 
-/// Internal error wrapper that pairs a [`ChainQaError`] with whatever
-/// partial answer streamed before the failure (so `finalize` can persist
-/// the partial into `chain_qa.answer` per REQ-CHN-005).
+/// Successful outcome of an agent run: the answer plus the chain snapshot as
+/// of completion. The snapshot is recomputed at completion (not reused from
+/// submission) because the tool scope resolves chain members live, so a
+/// continuation added mid-run can legitimately inform the answer — the
+/// persisted freshness counters must reflect the shape the answer actually saw
+/// (REQ-CHN-005, REQ-CHN-009).
+struct AnswerOutcome {
+    answer: String,
+    snapshot: ChainSnapshot,
+}
+
+/// Internal error wrapper pairing a [`ChainQaError`] with whatever partial
+/// answer streamed before the failure (so `finalize` can persist the partial
+/// into `chain_qa.answer` per REQ-CHN-005).
 struct RunInvocationError {
     error: ChainQaError,
     partial_answer: Option<String>,
 }
 
-/// Build the answer-time `LlmRequest` from a bundled context and a question.
-fn build_answer_request(
-    bundled: &BundledContext,
-    question: &str,
+/// Build one turn's `LlmRequest`. Offers the Q&A tools unless `force_answer`
+/// (the final allowed turn), where an empty tool set forces the model to answer
+/// with what it has. `search_enabled` gates the `search_conversations` tool on
+/// index freshness (see [`qa_tools`]).
+fn build_agent_request(
+    messages: &[LlmMessage],
     language: crate::llm_language::LlmLanguage,
+    force_answer: bool,
+    search_enabled: bool,
 ) -> LlmRequest {
-    let prompt = format!(
-        "{context}\n---\nQuestion: {question}\n",
-        context = bundled.render_for_prompt(),
-        question = question,
-    );
+    let tools = if force_answer {
+        vec![]
+    } else {
+        qa_tools(search_enabled)
+    };
     LlmRequest {
         system: vec![SystemContent::new(
-            crate::llm_language::chain_answer_system_prompt(language),
+            crate::llm_language::chain_qa_agent_system_prompt(language),
         )],
-        messages: vec![LlmMessage {
-            role: MessageRole::User,
-            content: vec![ContentBlock::text(prompt)],
-        }],
-        tools: vec![],
+        messages: messages.to_vec(),
+        tools,
         max_tokens: Some(ANSWER_MAX_TOKENS),
         // One cache key per language so phoenix-native and caveman prompts
         // don't collide on a shared cache slot.
-        cache_key: PromptCacheKey::stable(format!("chain-qa-answer/{}", language.as_str())),
+        cache_key: PromptCacheKey::stable(format!("chain-qa-agent/{}", language.as_str())),
     }
 }
 
-/// Bundle a chain's pre-loaded members into model-ready context blocks
-/// (REQ-CHN-001).
+/// The read-only, scope-bound tools the Q&A agent drives (REQ-CHN-009). The
+/// scope is fixed by the host (the chain's members); the model supplies only
+/// the query / target — it cannot widen its reach (REQ-RET-008).
 ///
-/// Caller passes `members` already loaded as `Conversation`s (so
-/// `message_count` is populated from the SELECT). The leaf member's body
-/// is either its raw transcript (when ≤ thresholds) or an in-process
-/// summary generated via `service`.
-pub async fn bundle_chain_context(
-    db: &Database,
-    members: &[Conversation],
-    service: &dyn LlmService,
-    language: crate::llm_language::LlmLanguage,
-) -> Result<BundledContext, ChainQaError> {
-    if members.is_empty() {
-        return Ok(BundledContext {
-            blocks: vec![],
-            leaf_summary_model: None,
+/// `search_conversations` is offered only when the index is fresh: a stale or
+/// still-pruning index could otherwise surface deleted/edited-away content
+/// through ranked search, which `read_conversation` (live `messages`) never
+/// can — so when freshness can't be established the agent gets the read tool
+/// alone (REQ-RET: deleted content is never returned).
+fn qa_tools(search_enabled: bool) -> Vec<ToolDefinition> {
+    let mut tools = Vec::with_capacity(2);
+    if search_enabled {
+        tools.push(ToolDefinition {
+            name: "search_conversations".to_string(),
+            description: "Search this chain's messages by relevance to a natural-language query. \
+                Returns ranked snippets, each tagged with its source conversation id. Use this to \
+                locate where something was discussed, then read that conversation in full."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "A natural-language search query (e.g. 'rate limiter token bucket')."
+                    }
+                },
+                "required": ["query"]
+            }),
+            defer_loading: false,
         });
     }
-
-    let mut blocks: Vec<MemberContextBlock> = Vec::with_capacity(members.len());
-    let leaf_idx = members.len() - 1;
-    let mut leaf_summary_model: Option<String> = None;
-
-    for (i, conv) in members.iter().enumerate() {
-        if i == leaf_idx {
-            let transcript = db.get_messages(&conv.id).await?;
-            let direct_text = render_leaf_transcript(&transcript);
-            let approx_tokens = approx_token_count(&direct_text);
-
-            if transcript.len() <= LEAF_DIRECT_MESSAGE_LIMIT
-                && approx_tokens <= LEAF_DIRECT_TOKEN_BUDGET
-            {
-                blocks.push(MemberContextBlock {
-                    conv_id: conv.id.clone(),
-                    kind: MemberBlockKind::LeafTranscript,
-                    body: direct_text,
-                });
-            } else {
-                tracing::debug!(
-                    conv_id = %conv.id,
-                    msg_count = transcript.len(),
-                    approx_tokens,
-                    "Chain leaf exceeds direct budget; summarizing in-process",
-                );
-                let summary = summarize_leaf_in_process(service, &direct_text, language).await?;
-                leaf_summary_model = Some(service.model_id().to_string());
-                blocks.push(MemberContextBlock {
-                    conv_id: conv.id.clone(),
-                    kind: MemberBlockKind::LeafSummary,
-                    body: summary,
-                });
-            }
-        } else {
-            // Non-leaf: pull the trailing Continuation message.
-            let messages = db.get_messages(&conv.id).await?;
-            if let Some(text) = trailing_continuation_summary(&messages) {
-                blocks.push(MemberContextBlock {
-                    conv_id: conv.id.clone(),
-                    kind: MemberBlockKind::ContinuationSummary,
-                    body: text,
-                });
-            } else {
-                tracing::debug!(
-                    conv_id = %conv.id,
-                    "Non-leaf chain member missing trailing Continuation message; \
-                     emitting summary-missing tag",
-                );
-                blocks.push(MemberContextBlock {
-                    conv_id: conv.id.clone(),
-                    kind: MemberBlockKind::ContinuationSummaryMissing,
-                    body: String::from("(no continuation summary persisted for this member)"),
-                });
-            }
-        }
-    }
-
-    Ok(BundledContext {
-        blocks,
-        leaf_summary_model,
-    })
+    tools.push(ToolDefinition {
+        name: "read_conversation".to_string(),
+        description: "Read the full content of one chain member — including complete tool \
+            output — one bounded page at a time. Pass a conversation_id from the skeleton or a \
+            search result. If the page ends with a 'more' marker, call again with the given \
+            cursor to continue."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "conversation_id": {
+                    "type": "string",
+                    "description": "A conversation id from the chain skeleton or a search result."
+                },
+                "cursor": {
+                    "type": "integer",
+                    "description": "Resume offset returned by a previous read_conversation page; omit to start at the beginning."
+                }
+            },
+            "required": ["conversation_id"]
+        }),
+        defer_loading: false,
+    });
+    tools
 }
 
-/// Approximate token count via `len / 4` (REQ-CHN-006 spec; exact
-/// tokenization is out of scope for v1).
-fn approx_token_count(text: &str) -> usize {
-    text.len() / 4
-}
-
-/// Render a leaf transcript as a human-readable plain-text block.
-///
-/// Tool calls and tool results are folded into compact one-line markers so
-/// the leaf budget heuristic isn't dominated by JSON. Continuation messages
-/// inside a leaf transcript would be unusual but are passed through verbatim.
-fn render_leaf_transcript(messages: &[Message]) -> String {
+/// Format ranked search hits into a compact, citable tool result.
+fn format_search_hits(hits: &[RetrievedChunk]) -> String {
     let mut out = String::new();
-    for m in messages {
-        let label = match m.message_type {
-            MessageType::User => "User",
-            MessageType::Agent => "Agent",
-            MessageType::Tool => "Tool",
-            MessageType::System => "System",
-            MessageType::Error => "Error",
-            MessageType::Continuation => "Continuation",
-            MessageType::Skill => "Skill",
-        };
-        let body = match &m.content {
-            MessageContent::User(c) => c.text.clone(),
-            MessageContent::Agent(blocks) => blocks
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-            MessageContent::Tool(c) => format!("(tool result: {} chars)", c.content.len()),
-            MessageContent::System(c) => c.text.clone(),
-            MessageContent::Error(c) => c.message.clone(),
-            MessageContent::Continuation(c) => c.summary.clone(),
-            MessageContent::Skill(c) => format!("/{} {}", c.name, c.trigger),
-        };
-        out.push_str(label);
-        out.push_str(": ");
-        out.push_str(&body);
-        out.push('\n');
+    for hit in hits {
+        let _ = writeln!(
+            out,
+            "[#{} · {} · {}] {}",
+            hit.conversation_id,
+            hit.message_type,
+            hit.created_at.format("%Y-%m-%d"),
+            hit.snippet.trim()
+        );
     }
     out
 }
 
-/// Find the **trailing** `MessageType::Continuation` message and extract
-/// its summary. Returns None when the conversation has no Continuation
-/// message at all (degenerate non-leaf state).
+/// Return one host-budgeted page of a conversation's full transcript starting
+/// at character `cursor`. The budget is fixed by the host ([`READ_PAGE_CHARS`],
+/// REQ-RET-008); paging by character offset bounds the page even within one
+/// oversized message.
+fn read_page(messages: &[Message], cursor: usize) -> String {
+    let end = cursor.saturating_add(READ_PAGE_CHARS);
+    let mut out = String::new();
+    let mut pos = 0usize; // char offset into the full (non-hidden) transcript
+    let mut has_more = false;
+    'outer: for m in messages {
+        if message_is_hidden(m) {
+            continue;
+        }
+        // Render one message at a time and copy only the window chars, so a
+        // multi-message transcript is never fully materialized; stop as soon as
+        // the page is filled (the next char proves there's more).
+        for ch in render_message_line(m).chars() {
+            if pos >= end {
+                has_more = true;
+                break 'outer;
+            }
+            if pos >= cursor {
+                out.push(ch);
+            }
+            pos += 1;
+        }
+    }
+    // `pos` is now the total transcript length (unless we stopped early).
+    if out.is_empty() && !has_more {
+        return "(end of conversation)".to_string();
+    }
+    if has_more {
+        format!("{out}\n[… more content; call read_conversation again with cursor={end}]")
+    } else {
+        out
+    }
+}
+
+/// Render a whole conversation transcript by concatenating
+/// [`render_message_line`] over non-hidden messages. The production read path
+/// ([`read_page`]) streams the window incrementally instead; this materializes
+/// the full transcript and is used only to assert rendering in tests.
+#[cfg(test)]
+fn render_full_transcript(messages: &[Message]) -> String {
+    let mut out = String::new();
+    for m in messages {
+        // Mirror the index extractor: never surface UI-hidden recovery/
+        // dismissal markers, so the agent can't answer from suppressed
+        // implementation artifacts.
+        if message_is_hidden(m) {
+            continue;
+        }
+        out.push_str(&render_message_line(m));
+    }
+    out
+}
+
+/// Render one (non-hidden) message as a `"Label: body\n"` line for the read
+/// path. Factored out so [`read_page`] can stream the transcript a message at a
+/// time without materializing the whole thing.
+fn render_message_line(m: &Message) -> String {
+    let label = match m.message_type {
+        MessageType::User => "User",
+        MessageType::Agent => "Agent",
+        MessageType::Tool => "Tool",
+        MessageType::System => "System",
+        MessageType::Error => "Error",
+        MessageType::Continuation => "Continuation",
+        MessageType::Skill => "Skill",
+    };
+    let body = match &m.content {
+        // `llm_text()` is the expanded form the model actually saw (e.g.
+        // @file content), not the display shorthand. Attached images aren't
+        // representable in the text read path — surface the gap rather than
+        // presenting an apparently complete message.
+        MessageContent::User(c) => {
+            let mut text = c.llm_text().to_string();
+            // Non-image attachments contribute their context tag (name /
+            // path / metadata) to LLM history at runtime; include it so the
+            // agent can answer about attached files it reads.
+            for f in &c.files {
+                text.push('\n');
+                text.push_str(&f.llm_context_tag());
+            }
+            if !c.images.is_empty() {
+                tracing::debug!(
+                        n = c.images.len(),
+                        "chain Q&A read_conversation: dropping user-message images — image recall is unsupported",
+                    );
+                let _ = write!(
+                        text,
+                        "\n[{} image(s) attached to this message are not shown — chain Q&A reads text only]",
+                        c.images.len()
+                    );
+            }
+            text
+        }
+        // Keep text AND a readable rendering of every tool block (local,
+        // server-side, and MCP tool calls/results) — recall questions about
+        // what was searched, fetched, run, or returned live in those blocks.
+        MessageContent::Agent(blocks) => blocks
+            .iter()
+            .map(ContentBlock::render_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        // Keep the full tool-result text. Tool results can also carry image
+        // payloads bound for the LLM, but the chain Q&A read path is
+        // text-only — surface the gap to the agent (and the logs) rather
+        // than silently stranding the images.
+        MessageContent::Tool(c) => {
+            if c.images.is_empty() {
+                c.content.clone()
+            } else {
+                tracing::debug!(
+                    tool_use_id = %c.tool_use_id,
+                    n = c.images.len(),
+                    "chain Q&A read_conversation: dropping tool-result images — image recall is unsupported",
+                );
+                format!(
+                        "{}\n[{} image(s) in this tool result are not shown — chain Q&A reads text only]",
+                        c.content,
+                        c.images.len()
+                    )
+            }
+        }
+        MessageContent::System(c) => c.text.clone(),
+        MessageContent::Error(c) => c.message.clone(),
+        MessageContent::Continuation(c) => c.summary.clone(),
+        // Include the expanded skill body (and any attached file tags), not
+        // just the trigger — when a question depends on instructions a skill
+        // injected, that text lives in `body`.
+        MessageContent::Skill(c) => {
+            let mut body = format!("/{} {}\n{}", c.name, c.trigger, c.body);
+            for f in &c.files {
+                body.push('\n');
+                body.push_str(&f.llm_context_tag());
+            }
+            body
+        }
+    };
+    format!("{label}: {body}\n")
+}
+
+/// Whether the UI hides this message (`display_data.hidden == true`) — e.g.
+/// dismissed-error/question recovery markers. Mirrors the index extractor's
+/// hidden guard so the read path and the search index agree on what content
+/// is user-visible.
+fn message_is_hidden(m: &Message) -> bool {
+    m.display_data
+        .as_ref()
+        .and_then(|d| d.get("hidden"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Find the **trailing** `MessageType::Continuation` message and extract its
+/// summary. Returns None when the conversation has no Continuation message
+/// (degenerate non-leaf state).
 fn trailing_continuation_summary(messages: &[Message]) -> Option<String> {
     messages.iter().rev().find_map(|m| match &m.content {
         MessageContent::Continuation(c) => Some(c.summary.clone()),
         _ => None,
     })
-}
-
-/// Generate an in-process leaf summary via the same mid-tier model. The
-/// result is held in memory only; not persisted (see design.md "Leaf
-/// summarization is in-process, not persisted").
-async fn summarize_leaf_in_process(
-    service: &dyn LlmService,
-    transcript_text: &str,
-    language: crate::llm_language::LlmLanguage,
-) -> Result<String, ChainQaError> {
-    let request = LlmRequest {
-        system: vec![SystemContent::new(
-            crate::llm_language::chain_leaf_summary_system_prompt(language),
-        )],
-        messages: vec![LlmMessage {
-            role: MessageRole::User,
-            content: vec![ContentBlock::text(transcript_text.to_string())],
-        }],
-        tools: vec![],
-        max_tokens: Some(LEAF_SUMMARY_MAX_TOKENS),
-        // Per-language cache key so different prompts don't collide.
-        cache_key: PromptCacheKey::stable(format!("chain-qa-leaf-summary/{}", language.as_str())),
-    };
-    let response = service.complete(&request).await?;
-    Ok(response.text())
 }
 
 #[cfg(test)]
