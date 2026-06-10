@@ -17,8 +17,7 @@ function makeView(overrides: Partial<ChainView> = {}): ChainView {
     qa_history: [],
     current_member_count: 1,
     current_total_messages: 0,
-    snapshot_member_count: 1,
-    snapshot_total_messages: 0,
+    work_identity: null,
     ...overrides,
   } as ChainView;
 }

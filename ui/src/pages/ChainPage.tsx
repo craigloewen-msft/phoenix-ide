@@ -39,12 +39,14 @@ import {
   api,
   subscribeToChainStream,
   type ChainView,
+  type ChainWorkIdentity,
   type ChainQaRow,
   type ChainMemberSummary,
   type ChainSseEventData,
 } from '../api';
 import { ChainDeleteConfirm } from '../components/ChainDeleteConfirm';
 import { WorkScopePanel } from '../components/WorkScopePanel';
+import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
 import { useChainAtom, type InflightQa } from '../chain';
 import { useScopedState, useResizablePane } from '../hooks';
 
@@ -440,7 +442,10 @@ export function ChainPage() {
         {/* REQ-WSUI-009: the same work-scope panel as the conversation page,
             querying the ONE scope key for the chain root. No live SSE channel
             here — the panel's own initial fetch is the data source. */}
-        <ChainWorkScopeDock rootConvId={chain.root_conv_id} />
+        <ChainWorkScopeDock
+          rootConvId={chain.root_conv_id}
+          workIdentity={chain.work_identity}
+        />
       </div>
       <ChainDeleteConfirm
         visible={deleteConfirmOpen}
@@ -477,7 +482,13 @@ export function ChainPage() {
  * the chain page, so the panel's own initial fetch is the data source;
  * `liveInventory` is intentionally omitted.
  */
-function ChainWorkScopeDock({ rootConvId }: { rootConvId: string }) {
+function ChainWorkScopeDock({
+  rootConvId,
+  workIdentity,
+}: {
+  rootConvId: string;
+  workIdentity: ChainWorkIdentity | null;
+}) {
   const [scopeKey, setScopeKey] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(true);
   const pane = useResizablePane({
@@ -506,12 +517,18 @@ function ChainWorkScopeDock({ rootConvId }: { rootConvId: string }) {
 
   if (!scopeKey) return null;
   return (
-    <WorkScopePanel
-      scopeKey={scopeKey}
-      collapsed={collapsed}
-      onToggle={() => setCollapsed((c) => !c)}
-      width={collapsed ? undefined : pane.size}
-    />
+    <div className="chain-work-dock">
+      {/* The identity facet only shows when the dock is expanded — a collapsed
+          dock is a narrow rail with no room for it (and the runtime panel below
+          flexes into the remaining height). */}
+      {!collapsed && <ChainWorkIdentityBlock identity={workIdentity} />}
+      <WorkScopePanel
+        scopeKey={scopeKey}
+        collapsed={collapsed}
+        onToggle={() => setCollapsed((c) => !c)}
+        width={collapsed ? undefined : pane.size}
+      />
+    </div>
   );
 }
 
@@ -1056,20 +1073,20 @@ function renderPersistedAnswer(
  *  snapshot matches current chain state. */
 function stalenessLabel(row: ChainQaRow, chain: ChainView): string | null {
   const memberDelta =
-    row.snapshot_member_count !== chain.current_member_count;
+    row.chain_members_at_answer !== chain.current_member_count;
   const messageDelta =
-    row.snapshot_total_messages !== chain.current_total_messages;
+    row.chain_messages_at_answer !== chain.current_total_messages;
   if (!memberDelta && !messageDelta) return null;
 
   if (memberDelta) {
     // Member count change is the more visible signal; phrase it that way and
     // collapse the message-count change into the same sentence.
-    return `answered when chain had ${row.snapshot_member_count} ${
-      row.snapshot_member_count === 1 ? 'conversation' : 'conversations'
+    return `answered when chain had ${row.chain_members_at_answer} ${
+      row.chain_members_at_answer === 1 ? 'conversation' : 'conversations'
     } (now ${chain.current_member_count})`;
   }
   // member count same, message count moved
-  return `answered with ${row.snapshot_total_messages} prior ${
-    row.snapshot_total_messages === 1 ? 'message' : 'messages'
+  return `answered with ${row.chain_messages_at_answer} prior ${
+    row.chain_messages_at_answer === 1 ? 'message' : 'messages'
   } (now ${chain.current_total_messages})`;
 }
