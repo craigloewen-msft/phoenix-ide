@@ -5012,6 +5012,7 @@ def generate_launchd_plist(
     # Merge .phoenix-ide.env overrides (LLM_API_KEY_HELPER, base URLs, etc.)
     if extra_env:
         env_vars.update(extra_env)
+    launchd_socket_port = env_vars["PHOENIX_PORT"]
 
     # XML-escape both keys and values: PATH (and arbitrary env values from
     # .phoenix-ide.env) can contain `&`, `<`, `>` which would otherwise
@@ -5037,6 +5038,21 @@ def generate_launchd_plist(
   <key>EnvironmentVariables</key>
   <dict>
 {env_xml}
+  </dict>
+
+  <key>Sockets</key>
+  <dict>
+    <key>Listeners</key>
+    <dict>
+      <key>SockFamily</key>
+      <string>IPv4v6</string>
+      <key>SockProtocol</key>
+      <string>TCP</string>
+      <key>SockServiceName</key>
+      <string>{_xml_escape(launchd_socket_port)}</string>
+      <key>SockType</key>
+      <string>stream</string>
+    </dict>
   </dict>
 
   <key>RunAtLoad</key>
@@ -5263,6 +5279,12 @@ def launchd_prod_stop():
     print(f"Stopped {LAUNCHD_LABEL}")
 
 
+def _sync_launchd_socket_port(plist: dict) -> None:
+    env_vars = plist.get("EnvironmentVariables", {})
+    socket_port = env_vars.get("PHOENIX_PORT", str(PROD_PORT))
+    plist.setdefault("Sockets", {}).setdefault("Listeners", {})["SockServiceName"] = socket_port
+
+
 def launchd_prod_override_set(name: str, value: str):
     """Set an environment variable in the launchd plist and reload."""
     import plistlib
@@ -5277,6 +5299,8 @@ def launchd_prod_override_set(name: str, value: str):
     if "EnvironmentVariables" not in plist:
         plist["EnvironmentVariables"] = {}
     plist["EnvironmentVariables"][name] = value
+    if name == "PHOENIX_PORT":
+        _sync_launchd_socket_port(plist)
 
     with open(LAUNCHD_PLIST_PATH, "wb") as f:
         plistlib.dump(plist, f, fmt=plistlib.FMT_XML)
@@ -5309,6 +5333,8 @@ def launchd_prod_override_unset(name: str):
         return
 
     del env_vars[name]
+    if name == "PHOENIX_PORT":
+        _sync_launchd_socket_port(plist)
 
     with open(LAUNCHD_PLIST_PATH, "wb") as f:
         plistlib.dump(plist, f, fmt=plistlib.FMT_XML)
@@ -5660,3 +5686,4 @@ if __name__ == "__main__":
             stderr = e.stderr if isinstance(e.stderr, str) else e.stderr.decode(errors="replace")
             print(stderr, file=sys.stderr, end="")
         sys.exit(e.returncode)
+
