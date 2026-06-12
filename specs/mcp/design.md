@@ -39,23 +39,34 @@ trait McpTransport: Send + Sync {
 // Failures the lifecycle dispatches on must be typed, not stringly-encoded.
 // Each variant maps to a distinct ConnState/OAuthPhase transition, so the
 // transport classifies the failure once and the state machine never
-// string-matches to recover it.
+// string-matches to recover it. String payloads are human-readable detail
+// for logs and surfaced errors; dispatch is on the variant alone.
 enum TransportError {
     Unauthorized { www_authenticate: Option<String> }, // 401 -> OAuth discovery
     InsufficientScope { www_authenticate: Option<String> }, // 403 -> step-up
     SessionExpired,                                     // HTTP 404 -> re-initialize
-    Disconnected,                                       // reset/timeout/EOF -> reconnect/respawn
+    Disconnected(String),                               // reset/EOF -> reconnect/respawn
+    Timeout(String),                                    // deadline elapsed -> per-transport policy
     Rpc { code: i64, message: String },                 // JSON-RPC error result
     Protocol(String),                                   // malformed frame, etc.
 }
 ```
 
+A timeout is classified apart from `Disconnected` because the two demand
+different recovery under stdio: `Disconnected` evidences a dead pipe/process
+and triggers the respawn path (`StdioCrashed` in `mcp.allium` requires process
+exit), while a deadline elapsing against a live-but-slow server is surfaced as
+the call's error without killing the server. The HTTP transport, by contrast,
+treats an elapsed deadline as a reconnectable transport error (REQ-MCP-007).
+
 `StdioTransport` holds the `Child` + the stdin/stdout mutexes that serialize a
 stdio round trip. `HttpTransport` holds a `reqwest::Client`, the endpoint URL,
-the session id, and the resolved auth. `McpServer` becomes transport-agnostic:
-it owns a `Box<dyn McpTransport>`, the cached `Vec<McpToolDef>`, the
-`tools_changed` flag, and the per-server name -- the protocol methods
-(`initialize`, `list_tools`, `call_tool`) move to operate over the trait.
+the session id, and the resolved auth. `McpServer` is transport-agnostic: it
+owns a `Box<dyn McpTransport>`, the cached `Vec<McpToolDef>`, the
+`tools_changed` flag, the per-server name, and the `McpServerConfig` it was
+built from (the reload comparison key, and the recipe for rebuilding the
+transport on respawn) -- the protocol methods (`initialize`, `list_tools`,
+`call_tool`) operate over the trait.
 
 The `ServerMessageSink` keeps protocol dispatch in the protocol layer: a
 `text/event-stream` POST reply may carry server-initiated requests/notifications
@@ -126,7 +137,12 @@ struct PreconfiguredClient {
 ```
 
 `read_all_configs` classifies each `mcpServers` entry into a variant
-(REQ-MCP-001). Crucially, presence of the generic `headers` map alone does
+(REQ-MCP-001). The JSON shape of an HTTP entry is `{"type": "http", "url":
+..., "headers": {...}, "auth": ...}` where `auth` is absent (`HttpAuth::None`),
+`{"bearer": "<token>"}`, or `{"headers": {...}}` (the two `StaticCred` shapes).
+An entry whose `auth` has an unrecognized shape is skipped at `debug` rather
+than downgraded to no-auth -- silently dropping an intended credential would
+change which authorization path a 401 takes. Crucially, presence of the generic `headers` map alone does
 **not** make a server `Static`: only an explicit auth credential
 (`StaticCred`) does. So three cases are distinct: a header-authed internal
 server (`Static(Headers)`) whose rejected key yields `StaticAuthRejected`; an
