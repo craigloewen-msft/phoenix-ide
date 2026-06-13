@@ -96,6 +96,14 @@ impl std::fmt::Display for TransportError {
 /// transport boundary.
 pub trait ServerMessageSink: Send + Sync {
     fn on_message(&self, message: Value);
+
+    /// The transport observed its session reset out-of-band -- a session-bearing
+    /// GET-stream 404 (REQ-MCP-005, REQ-MCP-006). The stream cannot rebuild the
+    /// transport itself; marking the tool list stale routes the next
+    /// `tool_definitions` read through the lazy-refresh path, whose
+    /// `SessionExpired` re-establishes the connection (new session + fresh GET
+    /// stream). Default no-op for sinks with no such state.
+    fn on_session_reset(&self) {}
 }
 
 /// How a request's bytes leave and a response's bytes arrive. The JSON-RPC
@@ -134,6 +142,9 @@ pub trait McpTransport: Send + Sync {
 /// builds the client (the connection itself is exercised by `initialize`).
 /// `oauth_bearer` is the server's shared OAuth bearer cell, attached by the
 /// HTTP transport to every request unless a static credential supersedes it.
+/// `sink` is the protocol-layer handler the HTTP transport drives from its
+/// server-initiated GET stream (REQ-MCP-006); stdio has no such stream and
+/// ignores it (its notifications ride inline on the per-request sink).
 ///
 /// # Errors
 /// Returns a display string when the transport cannot be established.
@@ -142,6 +153,7 @@ async fn connect_transport(
     config: &McpServerConfig,
     pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
     oauth_bearer: &SharedBearer,
+    sink: Arc<dyn ServerMessageSink>,
 ) -> Result<Box<dyn McpTransport>, String> {
     match config {
         McpServerConfig::Stdio { command, args, env } => Ok(Box::new(
@@ -153,6 +165,7 @@ async fn connect_transport(
             headers,
             auth,
             Arc::clone(oauth_bearer),
+            sink,
         )?)),
     }
 }
@@ -354,13 +367,16 @@ impl std::fmt::Display for HandshakeFailure {
 
 /// Protocol-layer handling of server-initiated messages forwarded by the
 /// transport: flags `tools/list_changed` for lazy refresh, logs and drops
-/// everything else.
-struct NotificationSink<'a> {
-    server: &'a str,
-    tools_changed: &'a AtomicBool,
+/// everything else. The same sink handles messages on a POST reply stream and
+/// on the long-lived server-initiated GET stream (REQ-MCP-006), so it owns its
+/// state (shared `tools_changed`) rather than borrowing the server: the GET
+/// stream runs in a detached task that outlives any one request.
+struct NotificationSink {
+    server: String,
+    tools_changed: Arc<AtomicBool>,
 }
 
-impl ServerMessageSink for NotificationSink<'_> {
+impl ServerMessageSink for NotificationSink {
     fn on_message(&self, message: Value) {
         let method = message
             .get("method")
@@ -380,6 +396,25 @@ impl ServerMessageSink for NotificationSink<'_> {
             );
         }
     }
+
+    fn on_session_reset(&self) {
+        // The session is gone; force the next definitions read to re-verify,
+        // which re-establishes the connection on the expired-session tools/list.
+        tracing::info!(
+            server = %self.server,
+            "GET stream observed a session reset -- will re-establish on next definitions() call"
+        );
+        self.tools_changed.store(true, Ordering::Release);
+    }
+}
+
+/// Build the protocol-layer sink for a server, shared between the per-request
+/// path and the transport's server-initiated GET stream.
+fn notification_sink(name: &str, tools_changed: &Arc<AtomicBool>) -> Arc<dyn ServerMessageSink> {
+    Arc::new(NotificationSink {
+        server: name.to_string(),
+        tools_changed: Arc::clone(tools_changed),
+    })
 }
 
 /// One MCP server connection: the transport-agnostic JSON-RPC protocol layer
@@ -397,8 +432,10 @@ pub struct McpServer {
     /// recovery).
     generation: u64,
     /// Set when the server sends `notifications/tools/list_changed`.
-    /// Cleared after the next `list_tools()` refresh.
-    tools_changed: AtomicBool,
+    /// Cleared after the next `list_tools()` refresh. Shared (`Arc`) because
+    /// the HTTP transport's server-initiated GET stream sets it from a
+    /// detached task (REQ-MCP-006), not only the per-request sink.
+    tools_changed: Arc<AtomicBool>,
     /// Shared map of server name → OAuth URL; written by the stdio stderr
     /// drain, read by `McpClientManager::status()`. Retained so a respawned
     /// transport keeps feeding the same map.
@@ -428,11 +465,13 @@ impl McpServer {
         pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
         oauth_bearer: SharedBearer,
     ) -> Result<Self, String> {
+        let tools_changed = Arc::new(AtomicBool::new(false));
         let transport = connect_transport(
             name,
             &config,
             Arc::clone(&pending_oauth_urls),
             &oauth_bearer,
+            notification_sink(name, &tools_changed),
         )
         .await?;
         Ok(Self {
@@ -441,7 +480,7 @@ impl McpServer {
             tools: Vec::new(),
             config,
             generation: next_generation(),
-            tools_changed: AtomicBool::new(false),
+            tools_changed,
             pending_oauth_urls,
             oauth_bearer,
         })
@@ -456,8 +495,8 @@ impl McpServer {
         timeout: Duration,
     ) -> Result<Value, TransportError> {
         let sink = NotificationSink {
-            server: &self.name,
-            tools_changed: &self.tools_changed,
+            server: self.name.clone(),
+            tools_changed: Arc::clone(&self.tools_changed),
         };
         self.transport.request(method, params, timeout, &sink).await
     }
@@ -735,6 +774,7 @@ impl McpServer {
             &self.config,
             Arc::clone(&self.pending_oauth_urls),
             &self.oauth_bearer,
+            notification_sink(&self.name, &self.tools_changed),
         )
         .await
         .map_err(HandshakeFailure::Other)?;
@@ -767,6 +807,7 @@ impl McpServer {
             &self.config,
             Arc::clone(&self.pending_oauth_urls),
             &self.oauth_bearer,
+            notification_sink(&self.name, &self.tools_changed),
         )
         .await
         .map_err(HandshakeFailure::Other)?;
@@ -3550,7 +3591,7 @@ mod tests {
             tools: Vec::new(),
             config,
             generation: next_generation(),
-            tools_changed: AtomicBool::new(false),
+            tools_changed: Arc::new(AtomicBool::new(false)),
             pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
             oauth_bearer: Arc::default(),
         };

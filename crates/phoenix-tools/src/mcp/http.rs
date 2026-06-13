@@ -15,13 +15,19 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION}
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
 
 const MCP_SESSION_ID: HeaderName = HeaderName::from_static("mcp-session-id");
 const MCP_PROTOCOL_VERSION: HeaderName = HeaderName::from_static("mcp-protocol-version");
+const LAST_EVENT_ID: HeaderName = HeaderName::from_static("last-event-id");
 
 /// Both response framings a Streamable HTTP server may choose (REQ-MCP-004).
 const ACCEPT_BOTH: &str = "application/json, text/event-stream";
+
+/// The lone framing the server-initiated GET stream may return (REQ-MCP-006).
+const ACCEPT_EVENT_STREAM: &str = "text/event-stream";
 
 /// Streamable HTTP transport for one MCP server.
 pub struct HttpTransport {
@@ -38,10 +44,18 @@ pub struct HttpTransport {
     /// `MCP-Protocol-Version` header on every later request (REQ-MCP-004).
     protocol_version: std::sync::Mutex<Option<String>>,
     /// The server's shared OAuth bearer, attached as `Authorization: Bearer`
-    /// on every request — initialize, tools/*, and the session DELETE
-    /// (REQ-MCP-012). `None` for static-credential servers, whose config
+    /// on every request — initialize, tools/*, the GET stream, and the session
+    /// DELETE (REQ-MCP-012). `None` for static-credential servers, whose config
     /// authorization is already in `base_headers` and must not be shadowed.
     oauth_bearer: Option<SharedBearer>,
+    /// Protocol-layer handler for messages the server pushes on its
+    /// server-initiated GET stream (REQ-MCP-006).
+    sink: Arc<dyn ServerMessageSink>,
+    /// The detached task reading the server-initiated GET stream, spawned once
+    /// the `initialize` handshake has negotiated the session and protocol
+    /// version. Aborted on shutdown and on drop so a torn-down transport never
+    /// leaves a stream task reconnecting against a dead connection.
+    stream_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     next_id: AtomicU64,
 }
 
@@ -58,6 +72,7 @@ impl HttpTransport {
         headers: &HashMap<String, String>,
         auth: &HttpAuth,
         oauth_bearer: SharedBearer,
+        sink: Arc<dyn ServerMessageSink>,
     ) -> Result<Self, String> {
         let mut base_headers = HeaderMap::new();
         for (key, value) in headers {
@@ -110,14 +125,39 @@ impl HttpTransport {
                 HttpAuth::None | HttpAuth::OAuth(_) => Some(oauth_bearer),
                 HttpAuth::Static(_) => None,
             },
+            sink,
+            stream_task: std::sync::Mutex::new(None),
             next_id: AtomicU64::new(1),
         })
     }
 
     /// The current OAuth bearer header value, when one applies.
     fn bearer_header(&self) -> Option<HeaderValue> {
-        let token = self.oauth_bearer.as_ref()?.read().unwrap().clone()?;
-        HeaderValue::from_str(&format!("Bearer {token}")).ok()
+        bearer_header(self.oauth_bearer.as_ref())
+    }
+
+    /// Open the server-initiated GET stream once `initialize` has negotiated
+    /// the session and protocol version (REQ-MCP-006). Idempotent: a transport
+    /// runs `initialize` once, but a second call is a no-op rather than a
+    /// second stream. The task is detached and survives until the transport is
+    /// torn down (`shutdown`/`Drop`), so `tools/list_changed` keeps arriving
+    /// between requests instead of only on a POST reply.
+    fn start_server_stream(&self) {
+        let mut slot = self.stream_task.lock().unwrap();
+        if slot.is_some() {
+            return;
+        }
+        let stream = ServerStream {
+            client: self.client.clone(),
+            url: self.url.clone(),
+            base_headers: self.base_headers.clone(),
+            oauth_bearer: self.oauth_bearer.clone(),
+            session_id: self.session_id.lock().unwrap().clone(),
+            protocol_version: self.protocol_version.lock().unwrap().clone(),
+            name: self.name.clone(),
+            sink: Arc::clone(&self.sink),
+        };
+        *slot = Some(tokio::spawn(stream.run()));
     }
 
     /// A POST to the MCP endpoint carrying the base headers, the Accept pair,
@@ -244,14 +284,49 @@ impl HttpTransport {
     }
 }
 
+impl Drop for HttpTransport {
+    fn drop(&mut self) {
+        // Safety net for any teardown path that drops the transport without
+        // `shutdown` (e.g. a connect failure unwinding): the detached GET
+        // stream task must not outlive the transport it belongs to.
+        if let Ok(slot) = self.stream_task.get_mut() {
+            if let Some(task) = slot.take() {
+                task.abort();
+            }
+        }
+    }
+}
+
+/// The `Authorization: Bearer` header value for an OAuth bearer cell, when one
+/// applies and currently holds a token. Shared by the request path and the
+/// server-initiated GET stream so both attach the live, rotated token.
+fn bearer_header(oauth_bearer: Option<&SharedBearer>) -> Option<HeaderValue> {
+    let token = oauth_bearer?.read().unwrap().clone()?;
+    HeaderValue::from_str(&format!("Bearer {token}")).ok()
+}
+
+/// Whether a response is framed as a server-sent-event stream.
+fn is_event_stream(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| {
+            ct.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("text/event-stream")
+        })
+}
+
 fn insert_header(map: &mut HeaderMap, server: &str, key: &str, value: &str) -> Result<(), String> {
-    // The session and protocol-version headers are transport state; a
+    // The session, protocol-version, and resume headers are transport state; a
     // config-supplied copy would ride alongside the real value (reqwest's
     // `.header()` appends rather than replaces) and could bind a request to
-    // the wrong session. Reject loudly rather than silently dropping what
-    // the user wrote.
+    // the wrong session or replay from a stale event id. Reject loudly rather
+    // than silently dropping what the user wrote.
     if key.eq_ignore_ascii_case("mcp-session-id")
         || key.eq_ignore_ascii_case("mcp-protocol-version")
+        || key.eq_ignore_ascii_case("last-event-id")
     {
         return Err(format!(
             "MCP server '{server}': header '{key}' is transport-managed and cannot be set in config"
@@ -352,11 +427,13 @@ impl McpTransport for HttpTransport {
         };
 
         // The protocol version negotiated at initialize rides every later
-        // request (REQ-MCP-004).
+        // request (REQ-MCP-004); once it is known the server-initiated GET
+        // stream can open (REQ-MCP-006).
         if method == "initialize" {
             if let Some(version) = result.get("protocolVersion").and_then(Value::as_str) {
                 *self.protocol_version.lock().unwrap() = Some(version.to_string());
             }
+            self.start_server_stream();
         }
 
         Ok(result)
@@ -390,6 +467,12 @@ impl McpTransport for HttpTransport {
     }
 
     async fn shutdown(&mut self) {
+        // Stop the server-initiated GET stream before ending the session: a
+        // task still reconnecting would race the DELETE and re-open against a
+        // session about to vanish (REQ-MCP-006).
+        if let Some(task) = self.stream_task.lock().unwrap().take() {
+            task.abort();
+        }
         // End the server-side session explicitly so it does not linger until
         // expiry (REQ-MCP-005). Stateless servers have nothing to delete.
         let session_id = self.session_id.lock().unwrap().take();
@@ -435,21 +518,305 @@ impl HttpTransport {
 }
 
 // ---------------------------------------------------------------------------
+// Server-initiated GET stream (REQ-MCP-006)
+// ---------------------------------------------------------------------------
+
+/// What ended one attempt at the server-initiated GET stream.
+enum StreamOutcome {
+    /// The server does not offer a stream at this endpoint (HTTP 405). The MCP
+    /// spec's signal for "no server-initiated stream"; do not reconnect.
+    Unsupported,
+    /// A condition no reconnect can recover (a non-OAuth auth rejection, or a
+    /// 404 whose recovery is a fresh transport, not a re-GET). Stop the task.
+    Fatal(String),
+    /// The stream connected and then dropped, or failed to connect. `productive`
+    /// is true when it delivered at least one event or stayed open long enough
+    /// to count as healthy, which resets the reconnect backoff. `retry_after`
+    /// carries a server-sent SSE `retry:` hint, when one arrived, to time the
+    /// reconnect in place of local backoff.
+    Disconnected {
+        productive: bool,
+        reason: String,
+        retry_after: Option<Duration>,
+    },
+}
+
+/// The owned slice of an `HttpTransport` a detached GET-stream task needs. It
+/// captures the session/protocol version negotiated at `initialize` (fixed for
+/// the transport's life) and reads the OAuth bearer cell live, so a token
+/// rotated by a concurrent refresh is picked up on the next reconnect.
+struct ServerStream {
+    client: reqwest::Client,
+    url: String,
+    base_headers: HeaderMap,
+    oauth_bearer: Option<SharedBearer>,
+    session_id: Option<String>,
+    protocol_version: Option<String>,
+    name: String,
+    sink: Arc<dyn ServerMessageSink>,
+}
+
+impl ServerStream {
+    /// Reconnect backoff bounds. A productive connection resets to the base; an
+    /// immediately-closing one ramps to the cap, bounding a broken server to one
+    /// reconnect per `BACKOFF_MAX` rather than a hot loop.
+    const BACKOFF_BASE: Duration = Duration::from_secs(1);
+    const BACKOFF_MAX: Duration = Duration::from_secs(30);
+    /// Floor for a server-sent `retry:` hint, so a `retry: 0` cannot turn the
+    /// reconnect into a hot loop while still honoring sub-second requests.
+    const RETRY_MIN: Duration = Duration::from_millis(250);
+    /// A connection open at least this long counts as healthy even if it
+    /// delivered no events (an idle but live stream).
+    const HEALTHY_AFTER: Duration = Duration::from_secs(5);
+
+    async fn run(self) {
+        let mut last_event_id: Option<String> = None;
+        let mut backoff = Self::BACKOFF_BASE;
+        // A server-sent `retry:` sets the reconnection time until the server
+        // updates it (SSE processing model), so it persists across reconnects
+        // rather than applying only to the stream that carried it.
+        let mut retry_hint: Option<Duration> = None;
+        loop {
+            match self.connect_once(&mut last_event_id).await {
+                StreamOutcome::Unsupported => {
+                    tracing::debug!(
+                        server = %self.name,
+                        "MCP server offers no server-initiated SSE stream (HTTP 405); not reconnecting"
+                    );
+                    return;
+                }
+                StreamOutcome::Fatal(reason) => {
+                    tracing::debug!(
+                        server = %self.name,
+                        reason,
+                        "MCP server-initiated stream stopped"
+                    );
+                    return;
+                }
+                StreamOutcome::Disconnected {
+                    productive,
+                    reason,
+                    retry_after,
+                } => {
+                    if productive {
+                        backoff = Self::BACKOFF_BASE;
+                    }
+                    if let Some(hint) = retry_after {
+                        retry_hint = Some(hint.clamp(Self::RETRY_MIN, Self::BACKOFF_MAX));
+                    }
+                    // A remembered server `retry:` governs the delay; otherwise
+                    // local backoff applies and ramps when unproductive.
+                    let delay = retry_hint.unwrap_or(backoff);
+                    tracing::debug!(
+                        server = %self.name,
+                        reason,
+                        resume_from = ?last_event_id,
+                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        "MCP server-initiated stream dropped; reconnecting"
+                    );
+                    tokio::time::sleep(delay).await;
+                    if !productive && retry_hint.is_none() {
+                        backoff = (backoff * 2).min(Self::BACKOFF_MAX);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Open the GET stream once and pump its events into the sink until it
+    /// drops. Updates `last_event_id` as `id:` fields arrive so the caller
+    /// resumes from the right point (REQ-MCP-006).
+    async fn connect_once(&self, last_event_id: &mut Option<String>) -> StreamOutcome {
+        let response = match self.open(last_event_id.as_deref()).await {
+            Ok(response) => response,
+            Err(reason) => {
+                return StreamOutcome::Disconnected {
+                    productive: false,
+                    reason,
+                    retry_after: None,
+                }
+            }
+        };
+        if let Some(outcome) = self.classify_stream_status(response.status()) {
+            return outcome;
+        }
+        // A 2xx that is not `text/event-stream` (a JSON/HTML health page, a
+        // 204) carries no stream: framing it yields no events and `pump` would
+        // return at once, spinning a reconnect loop. The endpoint offers no
+        // server-initiated stream, so stop like a 405 (REQ-MCP-006).
+        if !is_event_stream(&response) {
+            return StreamOutcome::Unsupported;
+        }
+        self.pump(response, last_event_id).await
+    }
+
+    /// Build and send the GET, attaching auth, session, protocol-version, and
+    /// the resume cursor. Returns the open response or a display reason.
+    async fn open(&self, resume_from: Option<&str>) -> Result<reqwest::Response, String> {
+        let mut builder = self
+            .client
+            .get(&self.url)
+            .headers(self.base_headers.clone())
+            .header(ACCEPT, ACCEPT_EVENT_STREAM);
+        if let Some(bearer) = bearer_header(self.oauth_bearer.as_ref()) {
+            builder = builder.header(AUTHORIZATION, bearer);
+        }
+        if let Some(session_id) = &self.session_id {
+            builder = builder.header(MCP_SESSION_ID, session_id.as_str());
+        }
+        if let Some(version) = &self.protocol_version {
+            builder = builder.header(MCP_PROTOCOL_VERSION, version.as_str());
+        }
+        // Resume past the last delivered event so the server can replay what
+        // was missed across the drop (REQ-MCP-006).
+        if let Some(resume) = resume_from {
+            if let Ok(value) = HeaderValue::from_str(resume) {
+                builder = builder.header(LAST_EVENT_ID, value);
+            }
+        }
+        builder
+            .send()
+            .await
+            .map_err(|e| format!("GET stream request failed: {e}"))
+    }
+
+    /// Map a GET-stream response status to a terminal outcome, or `None` to
+    /// proceed reading the stream body.
+    fn classify_stream_status(&self, status: reqwest::StatusCode) -> Option<StreamOutcome> {
+        match status.as_u16() {
+            // A session-bearing 404 means the session is gone: signal the
+            // protocol layer so the next definitions read re-establishes (new
+            // session + fresh GET stream) rather than leaving the server
+            // `ready` on a dead session (REQ-MCP-005); a re-GET on the dead
+            // session would only 404 again.
+            404 if self.session_id.is_some() => {
+                self.sink.on_session_reset();
+                Some(StreamOutcome::Fatal(
+                    "GET stream session expired (HTTP 404)".to_string(),
+                ))
+            }
+            // No stream offered here: 405 (method not allowed) or a 404 on a
+            // stateless server. Stop without reconnecting.
+            404 | 405 => Some(StreamOutcome::Unsupported),
+            // A current token may be rotated by a concurrent refresh, so
+            // reconnect and re-read the shared cell. With no token in hand
+            // (a no-auth server, or one that never authorized) there is nothing
+            // to recover, so stop rather than loop on a permanent rejection --
+            // the presence of the shared cell alone (`HttpAuth::None` carries
+            // one) is not authorization.
+            401 | 403 if self.has_bearer() => Some(StreamOutcome::Disconnected {
+                productive: false,
+                reason: format!("GET stream rejected with HTTP {status}"),
+                retry_after: None,
+            }),
+            401 | 403 => Some(StreamOutcome::Fatal(format!(
+                "GET stream rejected with HTTP {status}"
+            ))),
+            _ if !status.is_success() => Some(StreamOutcome::Disconnected {
+                productive: false,
+                reason: format!("GET stream returned HTTP {status}"),
+                retry_after: None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Read the open stream's SSE body, forwarding each message to the sink,
+    /// until the body ends or errors. The resume cursor is taken from the
+    /// framer's last-event-id buffer at the drop, so an empty/bare `id` reset
+    /// clears it rather than leaving a stale cursor (REQ-MCP-006).
+    async fn pump(
+        &self,
+        response: reqwest::Response,
+        last_event_id: &mut Option<String>,
+    ) -> StreamOutcome {
+        let started = Instant::now();
+        let mut delivered = false;
+        let mut framer = SseFramer::default();
+        let mut stream = response.bytes_stream();
+        let reason = loop {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    for data in framer.push(&chunk) {
+                        self.dispatch(&data);
+                        delivered = true;
+                    }
+                }
+                Some(Err(e)) => break format!("GET stream read error: {e}"),
+                None => {
+                    if let Some(data) = framer.finish() {
+                        self.dispatch(&data);
+                        delivered = true;
+                    }
+                    break "GET stream closed by server".to_string();
+                }
+            }
+        };
+        last_event_id.clone_from(&framer.last_id);
+        StreamOutcome::Disconnected {
+            productive: delivered || started.elapsed() >= Self::HEALTHY_AFTER,
+            reason,
+            retry_after: framer.retry,
+        }
+    }
+
+    /// Whether a usable OAuth bearer token is currently held. Distinct from the
+    /// shared cell merely existing: a `HttpAuth::None` server carries the cell
+    /// but holds no token, and a GET-stream 401/403 there is unrecoverable.
+    fn has_bearer(&self) -> bool {
+        bearer_header(self.oauth_bearer.as_ref()).is_some()
+    }
+
+    /// Forward server-initiated messages in one SSE event to the protocol
+    /// layer. The MCP Streamable HTTP transport allows a JSON-RPC batch (an
+    /// array) here, so an array is unpacked and each member dispatched; a bare
+    /// object is dispatched directly. Only messages carrying a `method`
+    /// (notifications, or server-initiated requests) belong on this stream; a
+    /// stray response has no request of ours to answer.
+    fn dispatch(&self, data: &str) {
+        match serde_json::from_str::<Value>(data) {
+            Ok(Value::Array(batch)) => batch.into_iter().for_each(|m| self.dispatch_message(m)),
+            Ok(message) => self.dispatch_message(message),
+            Err(e) => tracing::debug!(
+                server = %self.name,
+                "Invalid JSON on server-initiated stream: {e}"
+            ),
+        }
+    }
+
+    fn dispatch_message(&self, message: Value) {
+        if message.get("method").is_some() {
+            self.sink.on_message(message);
+        } else {
+            tracing::debug!(
+                server = %self.name,
+                "Ignoring non-method message on server-initiated stream"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SSE framing
 // ---------------------------------------------------------------------------
 
 /// Incremental SSE event framer over a byte stream: yields the joined `data:`
-/// payload of each event. `event:`/`retry:` fields and comments are ignored;
-/// `id:` is ignored because POST replies are not resumed (`Last-Event-ID`
-/// replay belongs to the server-initiated GET stream, REQ-MCP-006).
+/// payload of each event. `event:` fields and comments are ignored. Per the
+/// SSE processing model the `id:` field sets a "last event id" buffer that
+/// persists across events (an empty or bare `id` resets it) and the `retry:`
+/// field sets the reconnection time; the server-initiated GET stream reads both
+/// off the framer to resume and pace reconnects (REQ-MCP-006). The POST reply
+/// path consumes only the data payloads.
 #[derive(Default)]
 struct SseFramer {
     buf: Vec<u8>,
     data_lines: Vec<String>,
+    last_id: Option<String>,
+    retry: Option<Duration>,
 }
 
 impl SseFramer {
-    /// Feed a chunk; returns the data payloads of any events completed by it.
+    /// Feed a chunk; returns the data payloads of the events completed by it.
     fn push(&mut self, chunk: &[u8]) -> Vec<String> {
         let mut events = Vec::new();
         self.buf.extend_from_slice(chunk);
@@ -465,6 +832,25 @@ impl SseFramer {
             } else if let Some(rest) = line.strip_prefix("data:") {
                 self.data_lines
                     .push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+            } else if line == "id" || line.starts_with("id:") {
+                // The `id` field sets the persistent last event id. An empty
+                // value (a bare `id` or `id:`) resets it so the next reconnect
+                // omits Last-Event-ID; a NUL value is ignored per the SSE spec.
+                let value = line
+                    .strip_prefix("id:")
+                    .map_or("", |rest| rest.strip_prefix(' ').unwrap_or(rest));
+                if !value.contains('\0') {
+                    self.last_id = (!value.is_empty()).then(|| value.to_string());
+                }
+            } else if let Some(rest) = line.strip_prefix("retry:") {
+                // Per the SSE spec a `retry:` value is the reconnection time in
+                // integer milliseconds; a non-integer value is ignored.
+                let value = rest.strip_prefix(' ').unwrap_or(rest);
+                if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+                    if let Ok(ms) = value.parse::<u64>() {
+                        self.retry = Some(Duration::from_millis(ms));
+                    }
+                }
             }
         }
         events
@@ -618,6 +1004,14 @@ mod tests {
         requests: Arc<Mutex<Vec<RecordedRequest>>>,
         responses: Arc<Mutex<VecDeque<CannedResponse>>>,
         routes: RouteMap,
+        /// The server-initiated GET stream is a channel of its own: GETs are
+        /// logged and answered separately from the POST queue so a transport's
+        /// background stream (REQ-MCP-006) neither steals a POST's canned reply
+        /// nor inflates the POST request count an assertion checks. Unconfigured,
+        /// a GET gets 405 (the spec's "no stream offered"), which parks the
+        /// stream task without disturbing a POST-only test.
+        get_requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        get_responses: Arc<Mutex<VecDeque<CannedResponse>>>,
         accept_task: tokio::task::JoinHandle<()>,
     }
 
@@ -635,10 +1029,14 @@ mod tests {
             let responses: Arc<Mutex<VecDeque<CannedResponse>>> =
                 Arc::new(Mutex::new(responses.into()));
             let routes: RouteMap = Arc::default();
+            let get_requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::default();
+            let get_responses: Arc<Mutex<VecDeque<CannedResponse>>> = Arc::default();
 
             let req_log = Arc::clone(&requests);
             let resp_queue = Arc::clone(&responses);
             let route_map = Arc::clone(&routes);
+            let get_req_log = Arc::clone(&get_requests);
+            let get_resp_queue = Arc::clone(&get_responses);
             let accept_task = tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
@@ -649,6 +1047,8 @@ mod tests {
                         Arc::clone(&req_log),
                         Arc::clone(&resp_queue),
                         Arc::clone(&route_map),
+                        Arc::clone(&get_req_log),
+                        Arc::clone(&get_resp_queue),
                     ));
                 }
             });
@@ -658,6 +1058,8 @@ mod tests {
                 requests,
                 responses,
                 routes,
+                get_requests,
+                get_responses,
                 accept_task,
             }
         }
@@ -705,10 +1107,72 @@ mod tests {
                 .map(|r| (r.http_method().to_string(), r.body.clone()))
                 .collect()
         }
+
+        /// Serve `responses` in order for server-initiated GET stream requests,
+        /// replaying the last one indefinitely. Each is sent as the full body
+        /// of one GET; the transport's stream task reconnects for the next.
+        fn set_get_responses(&self, responses: Vec<CannedResponse>) {
+            *self.get_responses.lock().unwrap() = responses.into();
+        }
+
+        /// The GET stream requests recorded so far.
+        fn get_recorded(&self) -> Vec<RecordedRequest> {
+            std::mem::take(&mut *self.get_requests.lock().unwrap())
+        }
     }
 
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// Pick the canned response for one parsed request and log it on the right
+    /// channel. A GET to the MCP endpoint -- whatever its path -- is the
+    /// server-initiated stream (REQ-MCP-006), answered from its own queue
+    /// (default 405) so it never touches the POST queue, routes, or request
+    /// log; only the OAuth metadata well-knowns stay ordinary routed GETs.
+    #[allow(clippy::too_many_arguments)]
+    fn select_response(
+        method: &str,
+        path: &str,
+        recorded: RecordedRequest,
+        requests: &Mutex<Vec<RecordedRequest>>,
+        responses: &Mutex<VecDeque<CannedResponse>>,
+        routes: &RouteMap,
+        get_requests: &Mutex<Vec<RecordedRequest>>,
+        get_responses: &Mutex<VecDeque<CannedResponse>>,
+    ) -> CannedResponse {
+        if method == "GET" && !path.starts_with("/.well-known") {
+            get_requests.lock().unwrap().push(recorded);
+            let mut queue = get_responses.lock().unwrap();
+            let picked = if queue.len() > 1 {
+                queue.pop_front()
+            } else {
+                queue.front().cloned()
+            };
+            return picked.unwrap_or_else(|| status_response(405, &[]));
+        }
+        requests.lock().unwrap().push(recorded);
+        let path_response = {
+            let mut routes = routes.lock().unwrap();
+            match routes.get_mut(path) {
+                Some(queue) if queue.len() > 1 => queue.pop_front(),
+                Some(queue) => queue.front().cloned(),
+                None => None,
+            }
+        };
+        path_response.unwrap_or_else(|| {
+            responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(CannedResponse {
+                    status: 500,
+                    headers: Vec::new(),
+                    body: String::new(),
+                    delay_ms: 0,
+                    echo_result: None,
+                })
+        })
     }
 
     async fn handle_connection(
@@ -716,6 +1180,8 @@ mod tests {
         requests: Arc<Mutex<Vec<RecordedRequest>>>,
         responses: Arc<Mutex<VecDeque<CannedResponse>>>,
         routes: RouteMap,
+        get_requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        get_responses: Arc<Mutex<VecDeque<CannedResponse>>>,
     ) {
         let mut buf: Vec<u8> = Vec::new();
         loop {
@@ -758,6 +1224,7 @@ mod tests {
             let request_id = serde_json::from_str::<Value>(&body)
                 .ok()
                 .and_then(|v| v.get("id").cloned());
+            let method = request_line.split(' ').next().unwrap_or("").to_string();
             let path = request_line
                 .split(' ')
                 .nth(1)
@@ -766,33 +1233,22 @@ mod tests {
                 .next()
                 .unwrap_or("")
                 .to_string();
-            requests.lock().unwrap().push(RecordedRequest {
+            let recorded = RecordedRequest {
                 request_line,
                 headers,
                 body,
-            });
-
-            let path_response = {
-                let mut routes = routes.lock().unwrap();
-                match routes.get_mut(&path) {
-                    Some(queue) if queue.len() > 1 => queue.pop_front(),
-                    Some(queue) => queue.front().cloned(),
-                    None => None,
-                }
             };
-            let response = path_response.unwrap_or_else(|| {
-                responses
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .unwrap_or(CannedResponse {
-                        status: 500,
-                        headers: Vec::new(),
-                        body: String::new(),
-                        delay_ms: 0,
-                        echo_result: None,
-                    })
-            });
+
+            let response = select_response(
+                &method,
+                &path,
+                recorded,
+                &requests,
+                &responses,
+                &routes,
+                &get_requests,
+                &get_responses,
+            );
             if response.delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(response.delay_ms)).await;
             }
@@ -1112,6 +1568,7 @@ mod tests {
             &HashMap::from([("Mcp-Session-Id".to_string(), "boo".to_string())]),
             &HttpAuth::None,
             Arc::default(),
+            discard_sink(),
         );
         let err = generic.err().expect("generic header must be rejected");
         assert!(err.contains("transport-managed"), "got: {err}");
@@ -1125,8 +1582,22 @@ mod tests {
                 "boo".to_string(),
             )]))),
             Arc::default(),
+            discard_sink(),
         );
         let err = auth.err().expect("auth header must be rejected");
+        assert!(err.contains("transport-managed"), "got: {err}");
+
+        // Last-Event-ID is the GET stream's runtime resume cursor; a config
+        // copy would ride the initial open and duplicate on reconnect.
+        let resume = HttpTransport::connect(
+            "s",
+            "http://127.0.0.1:1/mcp",
+            &HashMap::from([("Last-Event-ID".to_string(), "42".to_string())]),
+            &HttpAuth::None,
+            Arc::default(),
+            discard_sink(),
+        );
+        let err = resume.err().expect("Last-Event-ID must be rejected");
         assert!(err.contains("transport-managed"), "got: {err}");
 
         // Authorization is a credential: as a generic header it would dodge
@@ -1139,6 +1610,7 @@ mod tests {
             &HashMap::from([("Authorization".to_string(), "Bearer tok".to_string())]),
             &HttpAuth::None,
             Arc::default(),
+            discard_sink(),
         );
         let err = smuggled
             .err()
@@ -1154,6 +1626,7 @@ mod tests {
                 "Bearer tok".to_string(),
             )]))),
             Arc::default(),
+            discard_sink(),
         );
         assert!(explicit.is_ok(), "auth.headers Authorization stays valid");
     }
@@ -1165,6 +1638,12 @@ mod tests {
         fn on_message(&self, message: Value) {
             self.0.lock().unwrap().push(message);
         }
+    }
+
+    /// A throwaway sink for transports whose server-initiated stream the test
+    /// does not observe.
+    fn discard_sink() -> Arc<dyn ServerMessageSink> {
+        Arc::new(RecordingSink::default())
     }
 
     #[tokio::test]
@@ -1183,6 +1662,7 @@ mod tests {
             &HashMap::new(),
             &HttpAuth::None,
             Arc::default(),
+            discard_sink(),
         )
         .expect("connect");
 
@@ -1204,6 +1684,171 @@ mod tests {
             messages[0].get("method").and_then(Value::as_str),
             Some("ping")
         );
+    }
+
+    /// Poll `cond` until it holds, failing the test if it never does. Used to
+    /// await the detached server-initiated stream task's side effects.
+    async fn wait_for(label: &str, cond: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("condition '{label}' not met within timeout");
+    }
+
+    #[tokio::test]
+    async fn server_initiated_stream_delivers_list_changed_and_resumes() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        // The GET stream serves one list_changed carrying an event id, then
+        // closes; the reconnect is answered 405 to park the task. The
+        // responses must be queued before connect, since the stream opens as
+        // soon as `initialize` returns.
+        server.set_get_responses(vec![
+            sse_response(concat!(
+                "id: 7\n",
+                "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n",
+            )),
+            status_response(405, &[]),
+        ]);
+
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+
+        // The notification arriving on the GET stream flips the shared flag
+        // from the detached task, with no request in flight (REQ-MCP-006).
+        wait_for("tools_changed set from GET stream", || {
+            mcp.tools_changed.load(Ordering::Acquire)
+        })
+        .await;
+
+        // The initial open and the resume both landed.
+        wait_for("two GET stream requests", || {
+            server.get_requests.lock().unwrap().len() >= 2
+        })
+        .await;
+        let gets = server.get_recorded();
+        assert_eq!(gets.len(), 2, "open then resume");
+        assert_eq!(gets[0].http_method(), "GET");
+        assert_eq!(gets[0].header("accept"), Some("text/event-stream"));
+        assert_eq!(gets[0].header("mcp-session-id"), Some("sess-1"));
+        assert_eq!(gets[0].header("mcp-protocol-version"), Some("2025-03-26"));
+        // A generic config header rides the GET like any other request.
+        assert_eq!(gets[0].header("x-org"), Some("acme"));
+        assert_eq!(
+            gets[0].header("last-event-id"),
+            None,
+            "the first open does not resume"
+        );
+        // The reconnect resumes past the last delivered event (REQ-MCP-006).
+        assert_eq!(gets[1].header("last-event-id"), Some("7"));
+    }
+
+    #[tokio::test]
+    async fn server_initiated_stream_stops_on_non_sse_response() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        // A 200 application/json health page is not a stream. The task must
+        // stop rather than frame it as empty and reconnect forever.
+        server.set_get_responses(vec![json_response(
+            0,
+            &serde_json::json!({"status": "ok"}),
+            &[],
+        )]);
+        let _mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+
+        wait_for("a GET stream request", || {
+            !server.get_requests.lock().unwrap().is_empty()
+        })
+        .await;
+        // Past one local backoff interval a buggy poll loop would have issued a
+        // second GET; a stopped stream stays at one.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(
+            server.get_requests.lock().unwrap().len(),
+            1,
+            "a non-SSE 2xx response must stop the stream, not poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_initiated_stream_404_flags_session_reset() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        // The session-bearing GET stream observes the session expired (404). It
+        // must flag the server so the next definitions read re-establishes
+        // (REQ-MCP-005), not leave it ready on a dead session.
+        server.set_get_responses(vec![status_response(404, &[])]);
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+
+        wait_for("session-reset flag set from a GET-stream 404", || {
+            mcp.tools_changed.load(Ordering::Acquire)
+        })
+        .await;
+
+        // The GET carried the negotiated session, and the stream stopped rather
+        // than re-GETting a dead session in a loop.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let gets = server.get_recorded();
+        assert_eq!(gets.len(), 1, "a dead session must not be re-GETted");
+        assert_eq!(gets[0].header("mcp-session-id"), Some("sess-1"));
+    }
+
+    #[tokio::test]
+    async fn server_initiated_stream_handles_batched_notifications() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        // A JSON-RPC batch (array) on the stream carrying list_changed must
+        // flip tools_changed, not be dropped as a non-object payload.
+        server.set_get_responses(vec![
+            sse_response(
+                "data: [{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}]\n\n",
+            ),
+            status_response(405, &[]),
+        ]);
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+
+        wait_for(
+            "tools_changed set from a batched GET-stream notification",
+            || mcp.tools_changed.load(Ordering::Acquire),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn server_initiated_stream_carries_the_oauth_bearer() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        server.set_get_responses(vec![status_response(405, &[])]);
+        let manager = Arc::new(McpClientManager::new());
+        // A stored, unexpired token resumes the connection silently and seeds
+        // the bearer the GET stream must also carry (REQ-MCP-012).
+        manager
+            .oauth
+            .store()
+            .upsert_token(&stored_token(
+                &server,
+                "at-live",
+                Some("rt-1"),
+                &["read"],
+                far_future(),
+            ))
+            .await
+            .unwrap();
+        let _mcp = connect_http_managed(&manager, &server, HttpAuth::OAuth(None))
+            .await
+            .expect("connect");
+
+        wait_for("a GET stream request", || {
+            !server.get_requests.lock().unwrap().is_empty()
+        })
+        .await;
+        let gets = server.get_recorded();
+        assert_eq!(gets[0].header("authorization"), Some("Bearer at-live"));
     }
 
     #[tokio::test]
@@ -1858,6 +2503,7 @@ mod tests {
             &HashMap::new(),
             &HttpAuth::None,
             Arc::default(),
+            discard_sink(),
         )
         .expect("connect");
         *transport.session_id.lock().unwrap() = Some("sess-1".to_string());
@@ -1917,7 +2563,7 @@ mod tests {
         let mut framer = SseFramer::default();
         assert!(framer.push(b"data: line1\ndata: line2\n").is_empty());
         assert_eq!(framer.finish(), Some("line1\nline2".to_string()));
-        assert_eq!(framer.finish(), None);
+        assert!(framer.finish().is_none());
     }
 
     #[test]
@@ -1927,14 +2573,43 @@ mod tests {
         let mut framer = SseFramer::default();
         assert!(framer.push(b"data: {\"a\":1}").is_empty());
         assert_eq!(framer.finish(), Some("{\"a\":1}".to_string()));
-        assert_eq!(framer.finish(), None);
+        assert!(framer.finish().is_none());
     }
 
     #[test]
-    fn sse_framer_ignores_comments_and_ids() {
+    fn sse_framer_tracks_id_and_retry_and_ignores_comments() {
+        // `id:` sets the persistent last event id buffer and `retry:` the
+        // reconnect hint (REQ-MCP-006); comments are ignored.
         let mut framer = SseFramer::default();
         let events = framer.push(b": keepalive\nid: 7\nretry: 100\ndata: x\n\n");
         assert_eq!(events, vec!["x"]);
+        assert_eq!(framer.last_id.as_deref(), Some("7"));
+        assert_eq!(framer.retry, Some(Duration::from_millis(100)));
+        // The id persists across later events until the server changes it.
+        framer.push(b"data: y\n\n");
+        assert_eq!(framer.last_id.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn sse_framer_empty_or_bare_id_resets_the_cursor() {
+        // An empty or bare `id` resets the last-event-id buffer (SSE spec), so
+        // the next reconnect omits Last-Event-ID rather than resuming stale.
+        let mut framer = SseFramer::default();
+        framer.push(b"id: 7\ndata: x\n\n");
+        assert_eq!(framer.last_id.as_deref(), Some("7"));
+        framer.push(b"id:\ndata: y\n\n");
+        assert_eq!(framer.last_id, None, "empty id: resets");
+        framer.push(b"id: 9\ndata: z\n\n");
+        assert_eq!(framer.last_id.as_deref(), Some("9"));
+        framer.push(b"id\ndata: w\n\n");
+        assert_eq!(framer.last_id, None, "bare id resets");
+    }
+
+    #[test]
+    fn sse_framer_ignores_non_integer_retry() {
+        let mut framer = SseFramer::default();
+        framer.push(b"retry: soon\ndata: x\n\n");
+        assert_eq!(framer.retry, None);
     }
 
     // -----------------------------------------------------------------------
