@@ -1,19 +1,195 @@
 //! Authentication middleware and endpoints (REQ-AUTH-001 through REQ-AUTH-003)
 //!
-//! When `PHOENIX_PASSWORD` is set, all API requests require auth via cookie or
-//! Bearer token. When unset, auth is bypassed entirely (backward compatible).
+//! When `PHOENIX_PASSWORD` is set, all API requests require auth. Browsers
+//! authenticate with an opaque random **session token** minted at login and
+//! held server-side in [`SessionStore`]; the password itself never travels in a
+//! cookie. API clients may still present the password directly via
+//! `Authorization: Bearer <password>`. When `PHOENIX_PASSWORD` is unset, auth is
+//! bypassed entirely (backward compatible).
+
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{header, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
+use base64::Engine;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
+
+/// Server-side set of valid session tokens. A successful login mints a random
+/// token, inserts it here, and hands it to the browser in the `phoenix-auth`
+/// cookie. Each subsequent request is authenticated by membership, so the
+/// password never leaves the server in a cookie and tokens are independently
+/// revocable. Tokens are process-lifetime (cleared on restart).
+#[derive(Clone, Default)]
+pub struct SessionStore {
+    tokens: Arc<Mutex<HashSet<String>>>,
+}
+
+impl SessionStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mint a fresh 256-bit random session token and record it as valid.
+    fn mint(&self) -> String {
+        let mut bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        self.tokens
+            .lock()
+            .expect("session store poisoned")
+            .insert(token.clone());
+        token
+    }
+
+    /// Constant-time-ish membership check: a token is valid iff it was minted by
+    /// this process and not yet evicted.
+    fn is_valid(&self, token: &str) -> bool {
+        self.tokens
+            .lock()
+            .expect("session store poisoned")
+            .contains(token)
+    }
+}
+
+/// In-memory per-client login throttle. Counts consecutive failed logins and
+/// locks a client out for a back-off window once the threshold is exceeded. The
+/// counter resets on a successful login. Keyed on the connection's real peer IP
+/// (`ConnectInfo<SocketAddr>`), so a directly-reachable deployment cannot be
+/// induced to mint a fresh bucket per request by varying client-controlled
+/// headers. Forwarded headers are trusted only when an operator opts in via
+/// `PHOENIX_TRUST_PROXY` (see [`throttle_key`]).
+#[derive(Clone, Default)]
+pub struct LoginThrottle {
+    inner: Arc<Mutex<HashMap<String, AttemptRecord>>>,
+}
+
+#[derive(Clone)]
+struct AttemptRecord {
+    failures: u32,
+    locked_until: Option<Instant>,
+}
+
+/// Failures allowed before lockout engages.
+const MAX_FAILURES: u32 = 5;
+/// Lockout window once the threshold is crossed.
+const LOCKOUT_WINDOW: Duration = Duration::from_secs(60);
+
+impl LoginThrottle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns `true` if `key` is currently locked out and the attempt should be
+    /// rejected without checking the password.
+    fn is_locked(&self, key: &str) -> bool {
+        let mut guard = self.inner.lock().expect("login throttle poisoned");
+        match guard.get_mut(key) {
+            Some(rec) => match rec.locked_until {
+                Some(until) if Instant::now() < until => true,
+                Some(_) => {
+                    // Lockout window elapsed — reset and allow a fresh attempt.
+                    rec.failures = 0;
+                    rec.locked_until = None;
+                    false
+                }
+                None => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Record a failed attempt, engaging a lockout once the threshold is crossed.
+    fn record_failure(&self, key: &str) {
+        let mut guard = self.inner.lock().expect("login throttle poisoned");
+        let rec = guard.entry(key.to_string()).or_insert(AttemptRecord {
+            failures: 0,
+            locked_until: None,
+        });
+        rec.failures = rec.failures.saturating_add(1);
+        if rec.failures >= MAX_FAILURES {
+            rec.locked_until = Some(Instant::now() + LOCKOUT_WINDOW);
+        }
+    }
+
+    /// Clear a client's failure record after a successful login.
+    fn record_success(&self, key: &str) {
+        self.inner
+            .lock()
+            .expect("login throttle poisoned")
+            .remove(key);
+    }
+}
+
+/// Whether forwarded client-IP headers (`X-Forwarded-For` / `X-Real-IP`) may be
+/// trusted as the throttle identity. Off unless the operator sets
+/// `PHOENIX_TRUST_PROXY` to a truthy value (`1`/`true`/`on`/`yes`), asserting
+/// that a trusted reverse proxy sets/overwrites those headers. On a
+/// directly-reachable deployment these headers are fully client-controlled, so
+/// trusting them by default lets an attacker mint a fresh throttle bucket per
+/// request and bypass the lockout entirely.
+fn trust_forwarded_headers() -> bool {
+    matches!(
+        std::env::var("PHOENIX_TRUST_PROXY")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "on" | "yes"
+    )
+}
+
+/// Throttle identity for a login attempt.
+///
+/// The authoritative key is the connection's real peer IP (`peer`, from
+/// `ConnectInfo<SocketAddr>`), which a client cannot spoof on a direct TCP/TLS
+/// connection. Forwarded headers are consulted **only** when the operator has
+/// opted in via `PHOENIX_TRUST_PROXY` (a trusted proxy is then responsible for
+/// setting/overwriting them); in that mode the first `X-Forwarded-For` hop, then
+/// `X-Real-IP`, take precedence over the peer (which is the proxy's address).
+///
+/// `peer` is `None` only if `ConnectInfo` was not injected by the serve loop
+/// (it is wired through both the plain and TLS paths); such requests fall back
+/// to a shared `"direct"` bucket. Header trust never applies without the opt-in,
+/// so an unauthenticated client on a direct deployment cannot vary headers to
+/// escape its peer-keyed bucket.
+fn throttle_key(req_headers: &header::HeaderMap, peer: Option<SocketAddr>) -> String {
+    if trust_forwarded_headers() {
+        if let Some(xff) = req_headers.get("x-forwarded-for") {
+            if let Ok(s) = xff.to_str() {
+                if let Some(first) = s.split(',').next() {
+                    let first = first.trim();
+                    if first.parse::<IpAddr>().is_ok() {
+                        return first.to_string();
+                    }
+                }
+            }
+        }
+        if let Some(xri) = req_headers.get("x-real-ip") {
+            if let Ok(s) = xri.to_str() {
+                if s.parse::<IpAddr>().is_ok() {
+                    return s.to_string();
+                }
+            }
+        }
+    }
+
+    match peer {
+        Some(addr) => addr.ip().to_string(),
+        None => "direct".to_string(),
+    }
+}
 
 /// Constant-time string comparison to prevent timing attacks on password checks.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -38,31 +214,87 @@ fn extract_cookie_value(cookie_header: &str) -> Option<&str> {
     None
 }
 
-/// Check whether a request carries a valid auth credential.
-fn request_is_authenticated(req: &Request<Body>, password: &str) -> bool {
-    // Check cookie first
+/// Whether the request carries a valid **session-cookie** credential.
+///
+/// The `phoenix-auth` cookie must hold a valid session token (minted at login,
+/// held in [`SessionStore`]) — never the password. Cookie auth is **never**
+/// throttled: it proves prior possession of the password, so a legitimate
+/// browser user must never be locked out by an attacker brute-forcing Bearer
+/// guesses from the same peer IP.
+fn cookie_is_valid(req: &Request<Body>, sessions: &SessionStore) -> bool {
     if let Some(cookie_header) = req.headers().get(header::COOKIE) {
         if let Ok(cookie_str) = cookie_header.to_str() {
             if let Some(cookie_value) = extract_cookie_value(cookie_str) {
-                if constant_time_eq(cookie_value.as_bytes(), password.as_bytes()) {
-                    return true;
-                }
+                return sessions.is_valid(cookie_value);
             }
         }
     }
-
-    // Check Authorization: Bearer header
-    if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                if constant_time_eq(token.as_bytes(), password.as_bytes()) {
-                    return true;
-                }
-            }
-        }
-    }
-
     false
+}
+
+/// Extract the `Authorization: Bearer <token>` value, if present and parseable.
+///
+/// A `Some` result means the client is presenting a Bearer **password guess** —
+/// the unit subject to throttling. `None` means no Bearer credential was offered
+/// (anonymous traffic), which must never consume throttle budget.
+fn bearer_token(req: &Request<Body>) -> Option<&str> {
+    req.headers()
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+/// Outcome of validating a Bearer-password credential against the throttle.
+enum BearerCheck {
+    /// No Bearer credential was offered — throttle budget untouched.
+    Absent,
+    /// Bearer matched the password — counter cleared (like a login success).
+    Valid,
+    /// Bearer was wrong — a failure was recorded against `key`.
+    Invalid,
+    /// Peer is locked out; the guess was rejected without comparison.
+    LockedOut,
+}
+
+/// Validate a Bearer-password guess against the shared per-peer [`LoginThrottle`].
+///
+/// This is the throttled counterpart to [`cookie_is_valid`]: the password-equality
+/// brute-force oracle exposed by `auth_status` and `auth_middleware` is closed by
+/// routing every Bearer check through the same per-IP budget that gates
+/// `/api/auth/login`. A correct Bearer clears the counter; a wrong one records a
+/// failure; once locked out, further guesses are rejected without comparing.
+fn check_bearer_password(
+    req: &Request<Body>,
+    password: &str,
+    throttle: &LoginThrottle,
+    key: &str,
+) -> BearerCheck {
+    let Some(token) = bearer_token(req) else {
+        return BearerCheck::Absent;
+    };
+
+    if throttle.is_locked(key) {
+        return BearerCheck::LockedOut;
+    }
+
+    if constant_time_eq(token.as_bytes(), password.as_bytes()) {
+        throttle.record_success(key);
+        BearerCheck::Valid
+    } else {
+        throttle.record_failure(key);
+        BearerCheck::Invalid
+    }
+}
+
+/// Read the connection's real peer IP from request extensions, where the serve
+/// loop injects it (`into_make_service_with_connect_info` on the plain path, an
+/// `Extension(ConnectInfo(..))` layer on the TLS path). `None` when absent —
+/// [`throttle_key`] then falls back to the shared `"direct"` bucket.
+fn peer_from_extensions(req: &Request<Body>) -> Option<SocketAddr> {
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0)
 }
 
 /// Returns true if the request path is exempt from auth.
@@ -120,17 +352,30 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
-    // Check credentials
-    if request_is_authenticated(&req, password) {
+    // Session cookie wins and is never throttled — a legitimate browser must
+    // not be locked out by Bearer brute-force from the same peer IP.
+    if cookie_is_valid(&req, &state.sessions) {
         return next.run(req).await;
     }
 
-    // Reject unauthenticated request
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({ "error": "Authentication required" })),
-    )
-        .into_response()
+    // Bearer-password validation is throttled per peer IP, sharing the single
+    // login budget, so this 200/401 oracle cannot be used for unlimited guesses.
+    let key = throttle_key(req.headers(), peer_from_extensions(&req));
+    match check_bearer_password(&req, password, &state.login_throttle, &key) {
+        BearerCheck::Valid => next.run(req).await,
+        BearerCheck::LockedOut => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(
+                serde_json::json!({ "error": "Too many authentication attempts; try again later" }),
+            ),
+        )
+            .into_response(),
+        BearerCheck::Invalid | BearerCheck::Absent => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Authentication required" })),
+        )
+            .into_response(),
+    }
 }
 
 // ---- Auth endpoints ----
@@ -158,7 +403,20 @@ pub async fn auth_status(
             authenticated: true,
         }),
         Some(password) => {
-            let authenticated = request_is_authenticated(&req, password);
+            // Cookie auth is authoritative and never throttled.
+            let authenticated = if cookie_is_valid(&req, &state.sessions) {
+                true
+            } else {
+                // This endpoint is auth-exempt, so its Bearer check is an
+                // unauthenticated oracle for password equality. Route it through
+                // the shared per-peer throttle: once locked out, further guesses
+                // report `authenticated: false` without comparing.
+                let key = throttle_key(req.headers(), peer_from_extensions(&req));
+                matches!(
+                    check_bearer_password(&req, password, &state.login_throttle, &key),
+                    BearerCheck::Valid
+                )
+            };
             Json(AuthStatusResponse {
                 auth_required: true,
                 authenticated,
@@ -167,14 +425,33 @@ pub async fn auth_status(
     }
 }
 
-/// `POST /api/auth/login` — validate password and set an auth cookie on success.
-pub async fn auth_login(State(state): State<AppState>, Json(body): Json<LoginRequest>) -> Response {
+/// `POST /api/auth/login` — validate the password, mint a session token, and
+/// set it in an auth cookie on success. Rate-limited per client (see
+/// [`LoginThrottle`]).
+pub async fn auth_login(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req_headers: header::HeaderMap,
+    Json(body): Json<LoginRequest>,
+) -> Response {
     let Some(password) = &state.password else {
         // Auth not required — login is a no-op success
         return (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response();
     };
 
+    let key = throttle_key(&req_headers, Some(peer));
+
+    // Reject locked-out clients before touching the password.
+    if state.login_throttle.is_locked(&key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "Too many login attempts; try again later" })),
+        )
+            .into_response();
+    }
+
     if !constant_time_eq(body.password.as_bytes(), password.as_bytes()) {
+        state.login_throttle.record_failure(&key);
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "Invalid password" })),
@@ -182,9 +459,20 @@ pub async fn auth_login(State(state): State<AppState>, Json(body): Json<LoginReq
             .into_response();
     }
 
-    // Set cookie: HttpOnly, SameSite=Lax, 1-year expiry
+    state.login_throttle.record_success(&key);
+
+    // Mint an opaque session token; the password never enters the cookie.
+    let token = state.sessions.mint();
+
+    // `Secure` only when the server terminates TLS — sending it over plain HTTP
+    // would make the cookie undeliverable and silently break login.
+    let secure = if state.deployment.tls.enabled {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie_value =
-        format!("phoenix-auth={password}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000");
+        format!("phoenix-auth={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000{secure}");
 
     (
         StatusCode::OK,
@@ -243,5 +531,307 @@ mod tests {
         // Preview is NOT auth-exempt: it serves on-disk files and must sit
         // behind auth. The same-origin sandboxed iframe carries the cookie.
         assert!(!is_exempt_path("/preview/some/file.html"));
+    }
+
+    #[test]
+    fn session_token_is_opaque_and_never_the_password() {
+        let store = SessionStore::new();
+        let password = "hunter2";
+        let token = store.mint();
+
+        // The minted token must not be the password — the whole point of the
+        // scheme is that the cookie carries an opaque credential.
+        assert_ne!(token, password);
+        // A minted token validates; an arbitrary string (e.g. the password) does
+        // not, because only minted tokens are members of the store.
+        assert!(store.is_valid(&token));
+        assert!(!store.is_valid(password));
+        assert!(!store.is_valid("not-a-real-token"));
+    }
+
+    #[test]
+    fn session_tokens_are_unique_per_mint() {
+        let store = SessionStore::new();
+        let a = store.mint();
+        let b = store.mint();
+        assert_ne!(a, b);
+        assert!(store.is_valid(&a));
+        assert!(store.is_valid(&b));
+    }
+
+    #[test]
+    fn cookie_holding_a_valid_session_token_authenticates() {
+        let sessions = SessionStore::new();
+        let token = sessions.mint();
+        let req = Request::builder()
+            .header(header::COOKIE, format!("phoenix-auth={token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert!(cookie_is_valid(&req, &sessions));
+    }
+
+    #[test]
+    fn cookie_holding_the_raw_password_is_rejected() {
+        // Old scheme set the cookie to the password itself. The new scheme must
+        // reject a cookie that carries the password — only session tokens count.
+        let sessions = SessionStore::new();
+        let req = Request::builder()
+            .header(header::COOKIE, "phoenix-auth=the-password")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!cookie_is_valid(&req, &sessions));
+    }
+
+    /// A correct Bearer password authenticates an API client and, as a side
+    /// effect, clears any accumulated failures for that peer.
+    #[test]
+    fn bearer_password_still_authenticates_for_api_clients() {
+        let throttle = LoginThrottle::new();
+        let req = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer the-password")
+            .body(Body::empty())
+            .unwrap();
+        assert!(matches!(
+            check_bearer_password(&req, "the-password", &throttle, "1.2.3.4"),
+            BearerCheck::Valid
+        ));
+    }
+
+    fn bearer_req(token: &str) -> Request<Body> {
+        Request::builder()
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// (a) Repeated wrong-Bearer guesses from one peer lock that peer out, and a
+    /// subsequent *correct* Bearer is rejected (without comparison) while the
+    /// lockout window is active — closing the unlimited brute-force oracle.
+    #[test]
+    fn wrong_bearer_locks_out_and_correct_bearer_rejected_while_locked() {
+        let throttle = LoginThrottle::new();
+        let key = "10.0.0.5";
+
+        for _ in 0..MAX_FAILURES {
+            assert!(matches!(
+                check_bearer_password(&bearer_req("wrong"), "the-password", &throttle, key),
+                BearerCheck::Invalid
+            ));
+        }
+
+        // Even the correct password is now rejected without comparison.
+        assert!(matches!(
+            check_bearer_password(&bearer_req("the-password"), "the-password", &throttle, key),
+            BearerCheck::LockedOut
+        ));
+    }
+
+    /// (b) A valid session cookie authenticates regardless of throttle state:
+    /// cookie auth never consults the throttle, so a locked-out peer's browser
+    /// session still works.
+    #[test]
+    fn valid_cookie_authenticates_during_lockout() {
+        let throttle = LoginThrottle::new();
+        let sessions = SessionStore::new();
+        let key = "10.0.0.6";
+
+        // Drive the peer into lockout via Bearer guesses.
+        for _ in 0..MAX_FAILURES {
+            check_bearer_password(&bearer_req("wrong"), "the-password", &throttle, key);
+        }
+        assert!(throttle.is_locked(key));
+
+        // A valid cookie from that same peer still authenticates — cookie auth
+        // is independent of the throttle.
+        let token = sessions.mint();
+        let req = Request::builder()
+            .header(header::COOKIE, format!("phoenix-auth={token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert!(cookie_is_valid(&req, &sessions));
+    }
+
+    /// (c) A correct Bearer *before* the threshold clears the failure counter,
+    /// so accumulated near-misses don't strand a legitimate API client.
+    #[test]
+    fn correct_bearer_clears_counter_before_lockout() {
+        let throttle = LoginThrottle::new();
+        let key = "10.0.0.7";
+
+        // One short of lockout.
+        for _ in 0..(MAX_FAILURES - 1) {
+            check_bearer_password(&bearer_req("wrong"), "the-password", &throttle, key);
+        }
+        assert!(!throttle.is_locked(key));
+
+        // A correct Bearer clears the counter.
+        assert!(matches!(
+            check_bearer_password(&bearer_req("the-password"), "the-password", &throttle, key),
+            BearerCheck::Valid
+        ));
+
+        // The budget is fully reset: a fresh full run of failures is needed to
+        // lock out again, proving the counter was cleared rather than merely not
+        // incremented.
+        for _ in 0..(MAX_FAILURES - 1) {
+            assert!(matches!(
+                check_bearer_password(&bearer_req("wrong"), "the-password", &throttle, key),
+                BearerCheck::Invalid
+            ));
+        }
+        assert!(!throttle.is_locked(key));
+    }
+
+    /// (d) Anonymous / no-credential traffic never consumes throttle budget:
+    /// a request with neither cookie nor Bearer leaves the failure counter at
+    /// zero, so unauthenticated noise can't help (or hurt) lockout state.
+    #[test]
+    fn anonymous_traffic_does_not_consume_throttle_budget() {
+        let throttle = LoginThrottle::new();
+        let key = "10.0.0.8";
+
+        // Far more than MAX_FAILURES anonymous (no-Bearer) requests.
+        for _ in 0..(MAX_FAILURES * 4) {
+            let req = Request::builder().body(Body::empty()).unwrap();
+            assert!(matches!(
+                check_bearer_password(&req, "the-password", &throttle, key),
+                BearerCheck::Absent
+            ));
+        }
+
+        // Never locked out — anonymous traffic recorded no failures.
+        assert!(!throttle.is_locked(key));
+
+        // And the full Bearer budget is still available afterward.
+        for _ in 0..(MAX_FAILURES - 1) {
+            assert!(matches!(
+                check_bearer_password(&bearer_req("wrong"), "the-password", &throttle, key),
+                BearerCheck::Invalid
+            ));
+        }
+        assert!(!throttle.is_locked(key));
+    }
+
+    #[test]
+    fn login_throttle_locks_out_after_threshold() {
+        let throttle = LoginThrottle::new();
+        let key = "1.2.3.4";
+        assert!(!throttle.is_locked(key));
+        for _ in 0..MAX_FAILURES {
+            assert!(!throttle.is_locked(key));
+            throttle.record_failure(key);
+        }
+        // Threshold crossed — the client is now locked out.
+        assert!(throttle.is_locked(key));
+        // A successful login clears the lockout.
+        throttle.record_success(key);
+        assert!(!throttle.is_locked(key));
+    }
+
+    /// Serialize tests that mutate the process-global `PHOENIX_TRUST_PROXY`
+    /// env var so they don't race each other under the parallel test runner.
+    static TRUST_PROXY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn peer(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// By default (no trusted-proxy opt-in) the throttle key is the real peer
+    /// IP and forwarded headers are ignored entirely. This is the security
+    /// property: on a directly-reachable deployment a client cannot vary
+    /// `X-Forwarded-For` / `X-Real-IP` to escape its peer-keyed bucket.
+    #[test]
+    fn throttle_key_uses_peer_and_ignores_forwarded_headers_by_default() {
+        let _guard = TRUST_PROXY_ENV_LOCK.lock().unwrap();
+        // SAFETY: env mutation guarded by TRUST_PROXY_ENV_LOCK for this test.
+        unsafe { std::env::remove_var("PHOENIX_TRUST_PROXY") };
+
+        // A spoofed XFF is ignored; the key is the peer IP.
+        let mut headers = header::HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.7, 10.0.0.1".parse().unwrap());
+        assert_eq!(
+            throttle_key(&headers, Some(peer("198.51.100.9:54321"))),
+            "198.51.100.9"
+        );
+
+        // X-Real-IP is likewise ignored without the opt-in.
+        let mut headers = header::HeaderMap::new();
+        headers.insert("x-real-ip", "203.0.113.7".parse().unwrap());
+        assert_eq!(
+            throttle_key(&headers, Some(peer("198.51.100.9:1234"))),
+            "198.51.100.9"
+        );
+
+        // No peer info (ConnectInfo absent) falls back to the shared bucket.
+        assert_eq!(throttle_key(&header::HeaderMap::new(), None), "direct");
+    }
+
+    /// The bypass-is-closed regression: two login attempts that present
+    /// DIFFERENT spoofed `X-Forwarded-For` values from the SAME peer must land
+    /// in the SAME throttle bucket (both count toward lockout). Before the fix
+    /// each spoofed header minted a fresh bucket, defeating the lockout.
+    #[test]
+    fn spoofed_forwarded_headers_share_one_bucket_by_default() {
+        let _guard = TRUST_PROXY_ENV_LOCK.lock().unwrap();
+        // SAFETY: env mutation guarded by TRUST_PROXY_ENV_LOCK for this test.
+        unsafe { std::env::remove_var("PHOENIX_TRUST_PROXY") };
+
+        let attacker = peer("198.51.100.42:5555");
+
+        let mut h1 = header::HeaderMap::new();
+        h1.insert("x-forwarded-for", "1.1.1.1".parse().unwrap());
+        let mut h2 = header::HeaderMap::new();
+        h2.insert("x-forwarded-for", "2.2.2.2".parse().unwrap());
+
+        let k1 = throttle_key(&h1, Some(attacker));
+        let k2 = throttle_key(&h2, Some(attacker));
+        assert_eq!(k1, k2, "varying XFF must not mint a fresh bucket");
+        assert_eq!(k1, "198.51.100.42");
+
+        // And drive it through the throttle to prove both count toward lockout.
+        let throttle = LoginThrottle::new();
+        for _ in 0..MAX_FAILURES {
+            assert!(!throttle.is_locked(&k1));
+            // Alternate the spoofed header each attempt — same peer, same key.
+            throttle.record_failure(&throttle_key(
+                if rand::random() { &h1 } else { &h2 },
+                Some(attacker),
+            ));
+        }
+        assert!(
+            throttle.is_locked(&k2),
+            "attacker is locked out despite varying X-Forwarded-For"
+        );
+    }
+
+    /// With `PHOENIX_TRUST_PROXY` set, forwarded headers regain precedence over
+    /// the peer (which is now the trusted proxy's address): first XFF hop, then
+    /// X-Real-IP, then peer fallback.
+    #[test]
+    fn throttle_key_trusts_forwarded_headers_when_opted_in() {
+        let _guard = TRUST_PROXY_ENV_LOCK.lock().unwrap();
+        // SAFETY: env mutation guarded by TRUST_PROXY_ENV_LOCK for this test.
+        unsafe { std::env::set_var("PHOENIX_TRUST_PROXY", "1") };
+
+        let proxy = Some(peer("10.0.0.1:443"));
+
+        let mut headers = header::HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.7, 10.0.0.1".parse().unwrap());
+        assert_eq!(throttle_key(&headers, proxy), "203.0.113.7");
+
+        let mut headers = header::HeaderMap::new();
+        headers.insert("x-real-ip", "198.51.100.4".parse().unwrap());
+        assert_eq!(throttle_key(&headers, proxy), "198.51.100.4");
+
+        // A non-IP forwarding value is ignored; fall back to the peer (proxy) IP.
+        let mut headers = header::HeaderMap::new();
+        headers.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
+        assert_eq!(throttle_key(&headers, proxy), "10.0.0.1");
+
+        // No forwarding header at all — peer (proxy) IP.
+        assert_eq!(throttle_key(&header::HeaderMap::new(), proxy), "10.0.0.1");
+
+        // SAFETY: restore default for other tests; guarded by the lock.
+        unsafe { std::env::remove_var("PHOENIX_TRUST_PROXY") };
     }
 }

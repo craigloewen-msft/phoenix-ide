@@ -3609,8 +3609,30 @@ async fn get_by_slug(
 #[derive(Debug, Deserialize)]
 struct PathQuery {
     path: String,
+    /// Optional project working directory whose task/skill subtrees should be
+    /// readable even before a conversation exists for it. Only `read_file`
+    /// honors this, and only to widen the allowlist by `<cwd>/tasks`,
+    /// `<cwd>/.claude/skills`, `<cwd>/.agents/skills` — never the whole cwd.
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
+/// Query for `serve_preview_file`: an optional `cwd` mirroring `read_file`'s, so
+/// a file admitted only by the cwd-widened allowlist is also previewable.
+#[derive(serde::Deserialize)]
+struct PreviewQuery {
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+// `validate_cwd` and `list_directory` power the new-conversation directory
+// picker, which browses the filesystem to choose a cwd *before* any conversation
+// (and thus any preview root) exists. Confining them to `preview_roots()` would
+// make new-conversation creation impossible, so they are intentionally NOT
+// root-confined. They return only directory names and a git/exists boolean — no
+// file contents — so the recon surface is bounded to directory structure, which
+// the picker exists to expose. Content-reading handlers (`read_file`,
+// `list_files`) ARE confined via `canonicalize_within_roots`.
 async fn validate_cwd(Query(query): Query<PathQuery>) -> Json<ValidateCwdResponse> {
     // Normalize path: remove trailing slashes (except for root)
     let path_str = query.path.trim_end_matches('/');
@@ -3812,15 +3834,163 @@ fn percent_encode_path(path: &std::path::Path) -> String {
     out
 }
 
+/// Percent-encode a URL query-parameter value (e.g. the `cwd` carried on a
+/// `/preview` image URL). Unlike [`percent_encode_path`], `/` is encoded too,
+/// since this is a single opaque value, not a path.
+fn percent_encode_query_value(s: &str) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+/// Canonicalize `requested` and confine it to a directory Phoenix is actively
+/// serving. The allowed set is every conversation working directory
+/// ([`Database::preview_roots`]) plus the user's `~/.claude` config tree, which
+/// holds globally-discovered skills/tasks the file viewer legitimately reads.
+///
+/// This mirrors the containment in [`serve_preview_file`]: canonicalize first so
+/// `.`, `..`, and symlinks are resolved before the `starts_with` check, then
+/// require the resolved path to live under some allowed root. A path that does
+/// not resolve, or resolves outside every root, is reported as `NotFound` —
+/// indistinguishable from out-of-scope, so existence is never leaked.
+async fn canonicalize_within_roots(
+    state: &AppState,
+    requested: &std::path::Path,
+) -> Result<PathBuf, AppError> {
+    canonicalize_within_roots_with_cwd(state, requested, None).await
+}
+
+/// As [`canonicalize_within_roots`], but additionally admits the task/skill
+/// subtrees of `cwd` (see [`read_root_allowlist`]). `cwd == None` is identical
+/// to [`canonicalize_within_roots`]; a provided cwd only ever widens the set by
+/// the three bounded subtrees, never by arbitrary directories.
+async fn canonicalize_within_roots_with_cwd(
+    state: &AppState,
+    requested: &std::path::Path,
+    cwd: Option<&str>,
+) -> Result<PathBuf, AppError> {
+    let path = fs::canonicalize(requested)
+        .map_err(|_| AppError::NotFound("Path does not exist".to_string()))?;
+
+    let roots = read_root_allowlist(state, cwd).await;
+
+    if roots.iter().any(|root| path.starts_with(root)) {
+        Ok(path)
+    } else {
+        Err(AppError::NotFound("Path does not exist".to_string()))
+    }
+}
+
+/// The canonicalized set of directories Phoenix will serve files from: every
+/// conversation working directory ([`Database::preview_roots`]) plus the two
+/// globally-discovered skill trees.
+///
+/// Both [`canonicalize_within_roots`] (file viewer / `read_file` / `list_files`)
+/// and [`serve_preview_file`] (the `/preview/*` HTTP handler) MUST consult the
+/// same allowlist: `read_file` hands the UI a `/preview<path>` URL for any file
+/// it admits, and the follow-up preview request would 404 if the two disagreed.
+///
+/// The skill trees are included because globally-discovered skills resolve
+/// outside any conversation cwd, so the viewer must be able to read them. This
+/// is scoped to the skill directories ONLY — emphatically NOT all of `~/.claude`,
+/// which also holds `.credentials.json`, settings, and conversation history that
+/// must never be readable here.
+async fn preview_root_allowlist(state: &AppState) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = state
+        .db
+        .preview_roots()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .collect();
+
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let home = PathBuf::from(home);
+        for skill_root in [
+            home.join(".claude").join("skills"),
+            home.join(".agents").join("skills"),
+            home.join(".phoenix-ide").join("builtin-skills"),
+        ] {
+            if let Ok(dir) = fs::canonicalize(skill_root) {
+                roots.push(dir);
+            }
+        }
+    }
+
+    roots
+}
+
+/// The base [`preview_root_allowlist`] widened with the task/skill subtrees of an
+/// optional `cwd` — used by `read_file` so a project's tasks and skills are
+/// readable *before* any conversation exists for that project (and thus before
+/// the project dir is in [`Database::preview_roots`]). The new-conversation UI
+/// enumerates tasks (`/api/tasks?cwd=…`) and skills (`/api/skills?cwd=…`) for a
+/// freshly-picked directory, then opens a selected file via `/api/files/read`.
+///
+/// The widening is deliberately scoped to three subtrees of the provided cwd —
+/// the project's configured task directory (via `discover_or_default`),
+/// `<cwd>/.claude/skills`, and `<cwd>/.agents/skills` — each canonicalized, kept
+/// only if it exists AND resolves INSIDE the canonical cwd, NEVER the whole cwd.
+/// The inside-cwd check is load-bearing: it rejects a subtree that is a symlink
+/// escaping the project (e.g. `tasks -> /`), which would otherwise re-open
+/// arbitrary host-file read. An attacker passing `cwd=/` gains at most the
+/// task/skill subdirs of `/`, not `/etc/passwd`. With `cwd == None` the set is
+/// exactly the base allowlist, so existing callers are unchanged.
+async fn read_root_allowlist(state: &AppState, cwd: Option<&str>) -> Vec<PathBuf> {
+    let mut roots = preview_root_allowlist(state).await;
+
+    if let Some(cwd) = cwd {
+        let cwd = PathBuf::from(cwd);
+        // The canonical cwd anchors containment. A widened subtree is honored
+        // only if it resolves to a STRICT descendant of the canonical cwd —
+        // otherwise a project whose task/skill dir is a symlink to `/` or `/etc`
+        // would re-open arbitrary host-file read, and a symlink to the cwd itself
+        // (`tasks -> .`) would collapse the allowed root to the whole project
+        // (admitting e.g. `<cwd>/.env`), which this widening must never do.
+        let Ok(canonical_cwd) = fs::canonicalize(&cwd) else {
+            return roots;
+        };
+        // Honor the project's configured task directory (which may not be
+        // literally `tasks`), matching what `/api/tasks` enumerates.
+        let tasks_dir = taskmd_core::discover::discover_or_default(&cwd);
+        for subtree in [
+            cwd.join(&tasks_dir),
+            cwd.join(".claude").join("skills"),
+            cwd.join(".agents").join("skills"),
+        ] {
+            if let Ok(dir) = fs::canonicalize(subtree) {
+                if dir != canonical_cwd && dir.starts_with(&canonical_cwd) {
+                    roots.push(dir);
+                }
+            }
+        }
+    }
+
+    roots
+}
+
 /// List files in a directory with metadata (REQ-PF-001, REQ-PF-002)
-async fn list_files(Query(query): Query<PathQuery>) -> Result<Json<ListFilesResponse>, AppError> {
+async fn list_files(
+    State(state): State<AppState>,
+    Query(query): Query<PathQuery>,
+) -> Result<Json<ListFilesResponse>, AppError> {
     let path_str = query.path.trim_end_matches('/');
     let path_str = if path_str.is_empty() { "/" } else { path_str };
-    let path = PathBuf::from(path_str);
+    let requested = PathBuf::from(path_str);
 
-    if !path.exists() {
-        return Err(AppError::NotFound("Directory does not exist".to_string()));
-    }
+    // Confine to allowed roots before touching the filesystem. Canonicalization
+    // resolves traversal/symlink escape; out-of-scope is reported as NotFound.
+    let path = canonicalize_within_roots(&state, &requested).await?;
+
     if !path.is_dir() {
         return Err(AppError::BadRequest("Path is not a directory".to_string()));
     }
@@ -3901,12 +4071,19 @@ async fn list_files(Query(query): Query<PathQuery>) -> Result<Json<ListFilesResp
 }
 
 /// Read file contents with an explicit text/image contract (REQ-PF-005).
-async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileResponse>, AppError> {
-    let path = PathBuf::from(&query.path);
+async fn read_file(
+    State(state): State<AppState>,
+    Query(query): Query<PathQuery>,
+) -> Result<Json<ReadFileResponse>, AppError> {
+    let requested = PathBuf::from(&query.path);
 
-    if !path.exists() {
-        return Err(AppError::NotFound("File does not exist".to_string()));
-    }
+    // Confine to allowed roots before reading bytes. Without this the handler is
+    // an arbitrary host-file read of any non-binary file <=10MB. An optional
+    // `cwd` widens the allowlist by that project's task/skill subtrees only, so a
+    // freshly-picked project's tasks/skills are readable before a conversation
+    // (and thus a preview root) exists for it — without admitting arbitrary read.
+    let path = canonicalize_within_roots_with_cwd(&state, &requested, query.cwd.as_deref()).await?;
+
     if path.is_dir() {
         return Err(AppError::BadRequest("Path is a directory".to_string()));
     }
@@ -3924,9 +4101,21 @@ async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileRespon
         let mime_type = mime_guess::from_path(&path)
             .first_or_octet_stream()
             .to_string();
+        // Carry `cwd` into the preview URL so an image admitted only by the
+        // cwd-widened allowlist (a fresh project's task/skill subtree, before a
+        // conversation roots it) is also servable by `serve_preview_file`, which
+        // otherwise consults only the base allowlist and would 404 it.
+        let url = match query.cwd.as_deref() {
+            Some(cwd) => format!(
+                "{}?cwd={}",
+                preview_url_for_path(&path),
+                percent_encode_query_value(cwd)
+            ),
+            None => preview_url_for_path(&path),
+        };
         return Ok(Json(ReadFileResponse::Image {
             mime_type,
-            url: preview_url_for_path(&path),
+            url,
             file_type,
         }));
     }
@@ -3960,6 +4149,7 @@ async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileRespon
 async fn serve_preview_file(
     State(state): State<AppState>,
     Path(filepath): Path<String>,
+    Query(query): Query<PreviewQuery>,
 ) -> Result<axum::response::Response, AppError> {
     use axum::response::IntoResponse;
 
@@ -3972,35 +4162,35 @@ async fn serve_preview_file(
         .map_err(|_| AppError::NotFound("File does not exist".to_string()))?;
 
     // Containment: the resolved path must live inside a directory Phoenix is
-    // actively serving (a conversation working directory). Without this, the
-    // handler is an arbitrary host-file read — `/preview/etc/passwd`,
-    // `/preview/home/<user>/.ssh/id_rsa`, the prod DB, etc.
-    let in_scope = state
-        .db
-        .preview_roots()
-        .await
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|root| fs::canonicalize(root).ok())
-        .any(|root| path.starts_with(&root));
-    if !in_scope {
+    // actively serving (a conversation working directory or skill tree). Without
+    // this, the handler is an arbitrary host-file read — `/preview/etc/passwd`,
+    // `/preview/home/<user>/.ssh/id_rsa`, the prod DB, etc. The allowlist is
+    // shared with `read_file`'s `read_root_allowlist` (including the optional
+    // `cwd` widening) so any file `read_file` admits is also previewable.
+    let roots = read_root_allowlist(&state, query.cwd.as_deref()).await;
+    let within_roots = |p: &std::path::Path| roots.iter().any(|root| p.starts_with(root));
+
+    if !within_roots(&path) {
         return Err(AppError::NotFound("File does not exist".to_string()));
     }
 
     if path.is_dir() {
-        // Try index.html for directory requests
-        let index = path.join("index.html");
-        if index.exists() {
-            let content = fs::read(&index)
-                .map_err(|e| AppError::BadRequest(format!("Cannot read file: {e}")))?;
-            let content_type = mime_guess::from_path(&index)
-                .first_or_octet_stream()
-                .to_string();
-            return Ok(
-                ([(axum::http::header::CONTENT_TYPE, content_type)], content).into_response(),
-            );
+        // Directory request: serve index.html if present. Canonicalize the index
+        // target and re-check containment BEFORE reading — index.html may itself
+        // be a symlink pointing outside the served root, which would otherwise be
+        // an arbitrary-file-read escape through malicious project contents.
+        let Ok(index) = fs::canonicalize(path.join("index.html")) else {
+            return Err(AppError::BadRequest("Path is a directory".to_string()));
+        };
+        if !within_roots(&index) {
+            return Err(AppError::NotFound("File does not exist".to_string()));
         }
-        return Err(AppError::BadRequest("Path is a directory".to_string()));
+        let content =
+            fs::read(&index).map_err(|e| AppError::BadRequest(format!("Cannot read file: {e}")))?;
+        let content_type = mime_guess::from_path(&index)
+            .first_or_octet_stream()
+            .to_string();
+        return Ok(([(axum::http::header::CONTENT_TYPE, content_type)], content).into_response());
     }
 
     let metadata = fs::metadata(&path)
@@ -5202,6 +5392,8 @@ mod hard_delete_cascade_tests {
             mcp_manager,
             credential_helper: None,
             password: None,
+            sessions: super::super::auth::SessionStore::new(),
+            login_throttle: super::super::auth::LoginThrottle::new(),
             terminals,
             chain_qa,
             message_retriever,
@@ -7334,6 +7526,8 @@ mod upgrade_model_state_guard_tests {
             mcp_manager,
             credential_helper: None,
             password: None,
+            sessions: super::super::auth::SessionStore::new(),
+            login_throttle: super::super::auth::LoginThrottle::new(),
             terminals,
             chain_qa,
             message_retriever,
@@ -7438,6 +7632,59 @@ mod upgrade_model_state_guard_tests {
 #[cfg(test)]
 mod file_read_tests {
     use super::*;
+    use crate::chain_qa::ChainQa;
+    use crate::db::Database;
+    use crate::llm::ModelRegistry;
+    use crate::platform::PlatformCapability;
+    use crate::runtime::RuntimeManager;
+    use crate::tools::mcp::McpClientManager;
+    use std::sync::Arc;
+
+    /// Minimal `AppState` whose `preview_roots()` contains `cwd`, so the
+    /// containment check in `read_file`/`list_files` admits files under it.
+    async fn state_with_root(cwd: &std::path::Path) -> AppState {
+        let db = Database::open_in_memory().await.expect("open db");
+        db.create_conversation(
+            "c-read",
+            "read-test",
+            &cwd.to_string_lossy(),
+            true,
+            None,
+            None,
+        )
+        .await
+        .expect("seed conversation");
+        let llm_registry = Arc::new(ModelRegistry::new_empty());
+        let platform = PlatformCapability::None;
+        let mcp_manager = Arc::new(McpClientManager::new());
+        let runtime = Arc::new(RuntimeManager::new(
+            db.clone(),
+            llm_registry.clone(),
+            platform,
+            mcp_manager.clone(),
+            None,
+        ));
+        let terminals = runtime.terminals.clone();
+        let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
+            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+        let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
+        AppState {
+            runtime,
+            llm_registry,
+            db,
+            platform,
+            mcp_manager,
+            credential_helper: None,
+            password: None,
+            sessions: super::super::auth::SessionStore::new(),
+            login_throttle: super::super::auth::LoginThrottle::new(),
+            terminals,
+            chain_qa,
+            message_retriever,
+            codex_login: super::super::codex_login::CodexLoginManager::new(),
+            deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
+        }
+    }
 
     #[test]
     fn preview_url_percent_encodes_reserved_path_characters() {
@@ -7448,15 +7695,117 @@ mod file_read_tests {
         );
     }
 
+    /// Helper: request `dir` (a directory) through `serve_preview_file`, which
+    /// triggers the index.html fallback.
+    #[cfg(unix)]
+    async fn preview_dir(state: AppState, dir: &std::path::Path) -> Result<Response, AppError> {
+        let filepath = dir.to_string_lossy().trim_start_matches('/').to_string();
+        serve_preview_file(
+            State(state),
+            Path(filepath),
+            Query(PreviewQuery { cwd: None }),
+        )
+        .await
+    }
+
+    /// Helper: request a file through `serve_preview_file` with an optional `cwd`.
+    #[cfg(unix)]
+    async fn preview_file(
+        state: AppState,
+        file: &std::path::Path,
+        cwd: Option<String>,
+    ) -> Result<Response, AppError> {
+        let filepath = file.to_string_lossy().trim_start_matches('/').to_string();
+        serve_preview_file(State(state), Path(filepath), Query(PreviewQuery { cwd })).await
+    }
+
+    /// A file admitted only by the cwd-widened allowlist (a fresh project's
+    /// task/skill subtree) is previewable when `serve_preview_file` is given the
+    /// same `cwd`, and NOT previewable without it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preview_serves_cwd_widened_file_only_with_cwd() {
+        let conv_root = tempfile::tempdir().expect("conv root");
+        let project = tempfile::tempdir().expect("project");
+        let skills = project.path().join(".claude").join("skills").join("s");
+        std::fs::create_dir_all(&skills).expect("skill dir");
+        let img = skills.join("diagram.png");
+        std::fs::write(&img, [0x89, b'P', b'N', b'G', 0, 1, 2, 3]).expect("png");
+
+        // No conversation roots the project, so without cwd the file is rejected.
+        let state = state_with_root(conv_root.path()).await;
+        let err = preview_file(state, &img, None)
+            .await
+            .expect_err("not previewable without cwd");
+        assert!(matches!(err, AppError::NotFound(_)));
+
+        // With the project's cwd, the same file is served.
+        let state = state_with_root(conv_root.path()).await;
+        let resp = preview_file(
+            state,
+            &img,
+            Some(project.path().to_string_lossy().into_owned()),
+        )
+        .await
+        .expect("previewable with cwd");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    /// Regression: a directory's `index.html` that is a symlink pointing OUTSIDE
+    /// the served root must not be served — otherwise malicious project contents
+    /// turn `/preview/<dir>/` into an arbitrary host-file read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preview_directory_index_symlink_escape_is_rejected() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, b"TOP SECRET").expect("secret");
+
+        let site = root.path().join("site");
+        std::fs::create_dir(&site).expect("site dir");
+        std::os::unix::fs::symlink(&secret, site.join("index.html")).expect("symlink");
+
+        let state = state_with_root(root.path()).await;
+        let err = preview_dir(state, &site)
+            .await
+            .expect_err("symlinked index escaping the root must be rejected");
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    /// A real `index.html` inside the served root is still served.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preview_directory_index_within_root_is_served() {
+        let root = tempfile::tempdir().expect("root");
+        let site = root.path().join("site");
+        std::fs::create_dir(&site).expect("site dir");
+        std::fs::write(site.join("index.html"), b"<html>ok</html>").expect("index");
+
+        let state = state_with_root(root.path()).await;
+        let resp = preview_dir(state, &site)
+            .await
+            .expect("in-root index must serve");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn read_file_returns_image_preview_for_png_without_utf8_validation() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("screenshot.png");
         std::fs::write(&path, [0x89, b'P', b'N', b'G', 0, 1, 2, 3]).expect("png bytes");
+        let state = state_with_root(tmp.path()).await;
 
-        let Json(response) = read_file(Query(PathQuery {
-            path: path.to_string_lossy().to_string(),
-        }))
+        let Json(response) = read_file(
+            State(state),
+            Query(PathQuery {
+                path: path.to_string_lossy().to_string(),
+                cwd: None,
+            }),
+        )
         .await
         .expect("image response");
 
@@ -7468,7 +7817,11 @@ mod file_read_tests {
             } => {
                 assert_eq!(mime_type, "image/png");
                 assert_eq!(file_type, "image");
-                assert_eq!(url, preview_url_for_path(&path));
+                // URL reflects the canonicalized (symlink-resolved) path.
+                assert_eq!(
+                    url,
+                    preview_url_for_path(&std::fs::canonicalize(&path).unwrap())
+                );
             }
             other @ ReadFileResponse::Text { .. } => {
                 panic!("expected image response, got {other:?}")
@@ -7481,10 +7834,15 @@ mod file_read_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("notes.txt");
         std::fs::write(&path, "hello\n").expect("text");
+        let state = state_with_root(tmp.path()).await;
 
-        let Json(response) = read_file(Query(PathQuery {
-            path: path.to_string_lossy().to_string(),
-        }))
+        let Json(response) = read_file(
+            State(state),
+            Query(PathQuery {
+                path: path.to_string_lossy().to_string(),
+                cwd: None,
+            }),
+        )
         .await
         .expect("text response");
 
@@ -7501,6 +7859,295 @@ mod file_read_tests {
             other @ ReadFileResponse::Image { .. } => {
                 panic!("expected text response, got {other:?}")
             }
+        }
+    }
+
+    /// A file under a globally-discovered skill tree (`$HOME/.claude/skills`)
+    /// must be previewable, even though it lives under no conversation cwd:
+    /// `read_file` admits skill-tree files via `canonicalize_within_roots`, so
+    /// `serve_preview_file` must honor the same allowlist or the follow-up
+    /// `<img>`/HTML preview request 404s.
+    ///
+    /// `HOME` is process-global; this test mutates it via `HomeEnvGuard`, whose
+    /// lock serializes it against the other HOME-sensitive tests.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn preview_serves_file_under_skill_root() {
+        let home_guard = HomeEnvGuard::set(tempfile::tempdir().expect("home"));
+        let skill_dir = home_guard
+            .home()
+            .join(".claude")
+            .join("skills")
+            .join("my-skill");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        let img = skill_dir.join("diagram.png");
+        std::fs::write(&img, [0x89, b'P', b'N', b'G', 0, 1, 2, 3]).expect("png");
+
+        // A conversation root that does NOT contain the skill file, proving the
+        // skill file is admitted by the skill-root allowance, not the cwd.
+        let root = tempfile::tempdir().expect("root");
+        let state = state_with_root(root.path()).await;
+
+        let canonical = std::fs::canonicalize(&img).expect("canonicalize img");
+        let filepath = canonical
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .to_string();
+        let resp = serve_preview_file(
+            State(state),
+            Path(filepath),
+            Query(PreviewQuery { cwd: None }),
+        )
+        .await
+        .expect("skill-root file must be previewable");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    /// RAII guard that overrides `HOME` for the duration of a test and restores
+    /// the previous value (and keeps the tempdir alive) on drop.
+    /// Serializes every `HomeEnvGuard`-holding test. `HOME` is process-global,
+    /// and cargo runs `#[test]` functions concurrently across threads (the
+    /// `current_thread` tokio flavor only single-threads each runtime, not the
+    /// test harness), so without this lock two HOME-mutating tests interleave
+    /// and one observes the other's `HOME`.
+    #[cfg(unix)]
+    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    struct HomeEnvGuard {
+        prev: Option<std::ffi::OsString>,
+        dir: tempfile::TempDir,
+        // Held for the guard's lifetime so HOME stays this test's until restore.
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl HomeEnvGuard {
+        fn set(dir: tempfile::TempDir) -> Self {
+            let lock = HOME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prev = std::env::var_os("HOME");
+            // SAFETY: the HOME_ENV_LOCK mutex serializes all HOME-mutating tests
+            // and the value is restored on drop, so no other thread observes a
+            // torn value.
+            unsafe { std::env::set_var("HOME", dir.path()) };
+            Self {
+                prev,
+                dir,
+                _lock: lock,
+            }
+        }
+
+        fn home(&self) -> std::path::PathBuf {
+            self.dir.path().to_path_buf()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: see `set`.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_path_outside_roots() {
+        // A file that exists but lives under no conversation root must read as
+        // NotFound — existence is never leaked.
+        let root = tempfile::tempdir().expect("root tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "top secret\n").expect("write secret");
+        let state = state_with_root(root.path()).await;
+
+        let err = read_file(
+            State(state),
+            Query(PathQuery {
+                path: secret.to_string_lossy().to_string(),
+                cwd: None,
+            }),
+        )
+        .await
+        .expect_err("out-of-scope read must fail");
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    /// A task file under `<cwd>/tasks` must be readable via the `cwd` query
+    /// param even when `cwd` is NOT a conversation root — this is the
+    /// new-conversation flow opening a freshly-picked project's task before any
+    /// conversation (and thus preview root) exists for it.
+    #[tokio::test]
+    async fn read_file_admits_task_under_provided_cwd() {
+        // The conversation root is unrelated to `project`; only the `cwd` param
+        // makes the task readable, proving the widening — not preview_roots — is
+        // responsible.
+        let conv_root = tempfile::tempdir().expect("conv root");
+        let project = tempfile::tempdir().expect("project");
+        let tasks_dir = project.path().join("tasks");
+        std::fs::create_dir_all(&tasks_dir).expect("tasks dir");
+        let task = tasks_dir.join("00001-p1-ready--fix.md");
+        std::fs::write(&task, "task body\n").expect("write task");
+
+        let state = state_with_root(conv_root.path()).await;
+
+        // Without cwd: rejected (not under any base root).
+        let err = read_file(
+            State(state.clone()),
+            Query(PathQuery {
+                path: task.to_string_lossy().to_string(),
+                cwd: None,
+            }),
+        )
+        .await
+        .expect_err("task outside roots without cwd must fail");
+        assert!(matches!(err, AppError::NotFound(_)));
+
+        // With cwd: admitted.
+        let Json(response) = read_file(
+            State(state),
+            Query(PathQuery {
+                path: task.to_string_lossy().to_string(),
+                cwd: Some(project.path().to_string_lossy().to_string()),
+            }),
+        )
+        .await
+        .expect("task under cwd/tasks must be readable");
+        match response {
+            ReadFileResponse::Text { content, .. } => assert_eq!(content, "task body\n"),
+            other @ ReadFileResponse::Image { .. } => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// Regression: a task/skill subtree that is a symlink to the cwd ITSELF
+    /// (`tasks -> .`) must NOT collapse the allowed root to the whole project —
+    /// otherwise `read_file?cwd=<project>&path=<project>/.env` would be admitted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_rejects_cwd_subtree_symlinked_to_cwd_itself() {
+        let conv_root = tempfile::tempdir().expect("conv root");
+        let project = tempfile::tempdir().expect("project");
+        // `tasks` resolves to the project root itself.
+        std::os::unix::fs::symlink(project.path(), project.path().join("tasks"))
+            .expect("symlink tasks -> .");
+        let secret = project.path().join(".env");
+        std::fs::write(&secret, "SECRET=1\n").expect("write .env");
+
+        let state = state_with_root(conv_root.path()).await;
+        let err = read_file(
+            State(state),
+            Query(PathQuery {
+                path: secret.to_string_lossy().to_string(),
+                cwd: Some(project.path().to_string_lossy().to_string()),
+            }),
+        )
+        .await
+        .expect_err("a subtree symlinked to the cwd itself must not widen to the whole project");
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    /// Providing a `cwd` must NOT turn `read_file` into an arbitrary host-file
+    /// read: a file under `cwd` but OUTSIDE the three task/skill subtrees stays
+    /// rejected. Concretely, an attacker passing `cwd=<project>` cannot read
+    /// `<project>/secret.txt` (it is not under tasks/ or .claude/skills/ or
+    /// .agents/skills/), nor escape via `..`.
+    #[tokio::test]
+    async fn read_file_with_cwd_still_rejects_outside_subtrees() {
+        let conv_root = tempfile::tempdir().expect("conv root");
+        let project = tempfile::tempdir().expect("project");
+        // Make the subtrees exist so the widening actually adds roots, yet the
+        // requested file lives beside them, not within them.
+        std::fs::create_dir_all(project.path().join("tasks")).expect("tasks dir");
+        let secret = project.path().join("secret.txt");
+        std::fs::write(&secret, "top secret\n").expect("write secret");
+
+        let state = state_with_root(conv_root.path()).await;
+
+        let err = read_file(
+            State(state),
+            Query(PathQuery {
+                path: secret.to_string_lossy().to_string(),
+                cwd: Some(project.path().to_string_lossy().to_string()),
+            }),
+        )
+        .await
+        .expect_err("file outside the task/skill subtrees must stay rejected");
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    /// Regression: a project whose task subtree is a SYMLINK escaping the
+    /// project (e.g. `tasks -> /`) must not widen the allowlist to the symlink
+    /// target — otherwise `read_file?cwd=<project>&path=<outside file>` would
+    /// re-open arbitrary host-file read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_rejects_cwd_subtree_symlinked_outside_project() {
+        let conv_root = tempfile::tempdir().expect("conv root");
+        let project = tempfile::tempdir().expect("project");
+        let outside = tempfile::tempdir().expect("outside");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "top secret\n").expect("write secret");
+        // Malicious project: its task dir is a symlink escaping the project.
+        std::os::unix::fs::symlink(outside.path(), project.path().join("tasks"))
+            .expect("symlink tasks");
+
+        let state = state_with_root(conv_root.path()).await;
+
+        let err = read_file(
+            State(state),
+            Query(PathQuery {
+                path: secret.to_string_lossy().to_string(),
+                cwd: Some(project.path().to_string_lossy().to_string()),
+            }),
+        )
+        .await
+        .expect_err("a task subtree symlinked outside the project must not widen the allowlist");
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    /// A skill file under the global `$HOME/.agents/skills` tree must be
+    /// previewable through the base allowlist — `discover_skills` advertises
+    /// skills from `.agents/skills` as well as `.claude/skills`, so the viewer
+    /// must be able to read them.
+    ///
+    /// `HOME` is process-global; this test mutates it via `HomeEnvGuard`, whose
+    /// lock serializes it against the other HOME-sensitive tests.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_file_admits_global_agents_skill() {
+        let home_guard = HomeEnvGuard::set(tempfile::tempdir().expect("home"));
+        let skill_dir = home_guard
+            .home()
+            .join(".agents")
+            .join("skills")
+            .join("my-skill");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        let skill = skill_dir.join("SKILL.md");
+        std::fs::write(&skill, "skill prompt\n").expect("write skill");
+
+        // A conversation root that does NOT contain the skill, proving the
+        // `.agents/skills` allowance — not the cwd — admits it.
+        let root = tempfile::tempdir().expect("root");
+        let state = state_with_root(root.path()).await;
+
+        let Json(response) = read_file(
+            State(state),
+            Query(PathQuery {
+                path: skill.to_string_lossy().to_string(),
+                cwd: None,
+            }),
+        )
+        .await
+        .expect(".agents/skills file must be readable");
+        match response {
+            ReadFileResponse::Text { content, .. } => assert_eq!(content, "skill prompt\n"),
+            other @ ReadFileResponse::Image { .. } => panic!("expected text, got {other:?}"),
         }
     }
 }

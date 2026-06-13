@@ -572,6 +572,21 @@ impl MessageStore for InMemoryStorage {
         self.fork_proposals.lock().unwrap().push(proposal.clone());
         Ok(())
     }
+
+    async fn persist_tool_round(
+        &self,
+        conv_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+    ) -> Result<(), String> {
+        let mut messages = self.messages.lock().unwrap();
+        let bucket = messages.entry(conv_id.to_string()).or_default();
+        bucket.push(assistant.clone());
+        for msg in tool_results {
+            bucket.push(msg.clone());
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1766,6 +1781,79 @@ mod tests {
         // The event should have been received without error
         // (buffered since parent isn't in AwaitingSubAgents)
         // This is a basic smoke test - full integration would require more setup
+    }
+
+    /// `spawn_agents` rejects a batch that exceeds the per-call sub-agent cap
+    /// (`MAX_SUB_AGENTS_PER_SPAWN`), realising the bedrock `SpawnLimit`
+    /// invariant. The whole call is rejected with a tool error — no truncation —
+    /// before any spawn request is sent.
+    #[tokio::test]
+    async fn test_spawn_agents_rejects_over_cap() {
+        use crate::runtime::ConversationRuntime;
+        use crate::state_machine::state::{SpawnAgentsInput, SubAgentTask, ToolCall, ToolInput};
+        use crate::state_machine::{ConvContext, Event};
+        use std::path::PathBuf;
+        use tokio::sync::mpsc;
+
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        let tools = Arc::new(MockToolExecutor::new());
+        let storage = Arc::new(InMemoryStorage::new());
+        let context = ConvContext::new("parent-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let (event_tx, event_rx) = mpsc::channel(32);
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
+        let _broadcast_rx = broadcast_tx.subscribe();
+
+        let mut runtime = ConversationRuntime::new(
+            context,
+            ConvState::Idle,
+            storage,
+            llm,
+            tools,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            broadcast_tx,
+        );
+
+        // 11 tasks: one over the cap of 10.
+        let tasks: Vec<SubAgentTask> = (0..11)
+            .map(|i| SubAgentTask {
+                task: format!("task {i}"),
+                cwd: None,
+                mode: None,
+                model: None,
+                max_turns: None,
+                agent_type: None,
+            })
+            .collect();
+        let call = ToolCall::new(
+            "spawn-1",
+            ToolInput::SpawnAgents(SpawnAgentsInput { tasks }),
+        );
+
+        let event = runtime
+            .handle_spawn_agents_tool(call)
+            .await
+            .expect("handler must not error out");
+
+        match event {
+            Some(Event::ToolComplete { result, .. }) => {
+                assert!(
+                    result.is_error(),
+                    "over-cap spawn must produce an error result"
+                );
+                assert!(
+                    result.output().contains("at most 10"),
+                    "error should name the cap, got: {}",
+                    result.output()
+                );
+            }
+            other => panic!("expected ToolComplete error, got {other:?}"),
+        }
     }
 
     /// Test that tool output containing "[command cancelled]" does NOT trigger `ToolAborted`

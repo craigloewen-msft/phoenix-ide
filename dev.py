@@ -12,6 +12,7 @@ import dataclasses
 import datetime
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -822,11 +823,14 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
             env["LLM_GATEWAY"] = gateway
     env["PHOENIX_PORT"] = str(port)
     env["PHOENIX_DB_PATH"] = str(db_path)
-    # The binary fails closed on a non-loopback bind with no PHOENIX_PASSWORD
-    # (it binds 0.0.0.0 by default). The dev server is the developer's own
-    # machine, so opt into the insecure bind here. Prod deploy paths
-    # deliberately do NOT set this — they must carry a password to bind broadly.
-    env["PHOENIX_ALLOW_INSECURE_BIND"] = "1"
+    # Bind loopback so the dev server is never network-reachable: on a remote or
+    # shared dev host (or a port-forwarded sandbox) a 0.0.0.0 bind would expose an
+    # unauthenticated agent that runs arbitrary commands. A loopback bind also
+    # satisfies the binary's fail-closed guard with no password and no insecure-bind
+    # override. Vite proxies to localhost, so a loopback backend is fine — and the
+    # Vite dev server itself is bound loopback in passwordless mode (see
+    # `_dev_bind_host`) so its proxy can't re-expose this backend to the network.
+    env["PHOENIX_BIND_ADDR"] = "127.0.0.1"
     # Unified logging: the binary owns the log file (PHOENIX_LOG_FILE) and writes
     # JSON there directly. stdout is off so the only writer to the file is the
     # binary's appender; the Popen redirect below only captures pre-logger /
@@ -901,17 +905,41 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
     return phoenix_tls
 
 
+def _dev_bind_host() -> str:
+    """Network host for the Vite dev server.
+
+    Loopback by default. The Phoenix backend already binds loopback, but Vite
+    proxies `/api` and `/preview` to it, so a `0.0.0.0` Vite would re-expose the
+    unauthenticated dev API to anyone who can reach the Vite port (a shared or
+    port-forwarded host) — defeating the backend's loopback bind. Bind Vite to
+    `0.0.0.0` only when the API is actually protected (`PHOENIX_PASSWORD` set) or
+    the operator explicitly opts into the insecure bind
+    (`PHOENIX_ALLOW_INSECURE_BIND=1`), mirroring the binary's own guard.
+    """
+    env = os.environ.copy()
+    _load_env_file(env)
+    _load_env_file(env, ".phoenix-ide.dev.env")
+    if env.get("PHOENIX_PASSWORD") or env.get("PHOENIX_ALLOW_INSECURE_BIND") == "1":
+        return "0.0.0.0"
+    return "127.0.0.1"
+
+
 def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False) -> bool:
     """Start the Vite dev server. Returns whether Vite serves over HTTPS (h2)."""
     scheme = "https" if phoenix_tls else "http"
-    desired_proxy = f"{scheme}://localhost:{phoenix_port}"
+    vite_host = _dev_bind_host()
+    # The restart key includes the bind host so a later auth / insecure-bind env
+    # change (which flips `_dev_bind_host` between 127.0.0.1 and 0.0.0.0) actually
+    # restarts Vite instead of being masked by "already running". The proxy target
+    # is 127.0.0.1 to match the backend's IPv4 loopback bind.
+    desired_proxy = f"{scheme}://127.0.0.1:{phoenix_port}|host={vite_host}"
     cert_paths = phoenix_tls_cert_paths() if phoenix_tls else None
     if get_pid(VITE_PID_FILE):
         current_proxy = VITE_PROXY_FILE.read_text().strip() if VITE_PROXY_FILE.exists() else ""
         if current_proxy == desired_proxy:
             print("Vite dev server already running")
             return bool(cert_paths and all(p.exists() for p in cert_paths))
-        print("Restarting Vite dev server for API proxy change")
+        print("Restarting Vite dev server for API proxy/host change")
         stop_process(VITE_PID_FILE, "Vite")
 
     ensure_ui_deps()
@@ -934,10 +962,13 @@ def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False) -> bool:
         else:
             print(f"  ⚠ Vite HTTPS disabled: Phoenix TLS cert not found at {cert}")
 
-    # Start Vite in background (bind to 0.0.0.0 for external access).
+    # Start Vite in background. `vite_host` (loopback unless the API is password-
+    # protected or the insecure bind is opted into, see `_dev_bind_host`) was
+    # resolved above and folded into the restart key — a `0.0.0.0` Vite proxies
+    # the unauthenticated backend to the network.
     # pnpm passes args after the script name directly — no `--` separator.
     proc = subprocess.Popen(
-        ["pnpm", "run", "dev", "--port", str(port), "--strictPort", "--host", "0.0.0.0"],
+        ["pnpm", "run", "dev", "--port", str(port), "--strictPort", "--host", vite_host],
         cwd=UI_DIR,
         env=env,
         stdout=subprocess.DEVNULL,
@@ -4297,6 +4328,15 @@ def native_prod_deploy(version: str | None = None):
         print("  - This system does not have systemd available", file=sys.stderr)
         sys.exit(1)
 
+    # Refuse before building if the deploy would expose an unauthenticated server.
+    # The effective service env is .phoenix-ide.env (EnvironmentFile=) PLUS any
+    # systemd drop-in overrides written by `./dev.py prod set` — both reach the
+    # running service, so the preflight must consider both.
+    systemd_env: dict[str, str] = {}
+    _load_env_file(systemd_env)
+    systemd_env.update(_systemd_override_env())
+    _preflight_prod_bind_auth(systemd_env, socket_activated=True)
+
     # Build
     binary = prod_build(version)
     
@@ -4515,6 +4555,107 @@ def _load_env_file(env: dict[str, str], filename: str = ".phoenix-ide.env") -> s
     return str(env_file)
 
 
+def _bind_is_loopback(effective_env: dict[str, str]) -> bool:
+    """Mirror the binary's fallback-bind resolution to decide if it binds loopback.
+
+    The binary defaults the bind IP to 0.0.0.0 (non-loopback) and lets
+    PHOENIX_BIND_ADDR override it; an unparseable PHOENIX_BIND_ADDR also falls
+    back to 0.0.0.0. So the bind is loopback only when PHOENIX_BIND_ADDR is a
+    valid loopback IP (127.0.0.0/8 or ::1).
+    """
+    raw = effective_env.get("PHOENIX_BIND_ADDR")
+    if not raw:
+        return False  # default is 0.0.0.0, non-loopback
+    try:
+        return ipaddress.ip_address(raw.strip()).is_loopback
+    except ValueError:
+        return False  # binary falls back to 0.0.0.0 on an invalid value
+
+
+def _systemd_override_env() -> dict[str, str]:
+    """Environment values systemd applies from drop-in `*.conf` overrides
+    (written by `./dev.py prod set`), layered on top of the unit's
+    EnvironmentFile. These reach the running service, so the deploy preflight
+    must honour them when deciding whether auth is configured — otherwise an
+    operator who set PHOENIX_PASSWORD via `prod set` is wrongly refused."""
+    env: dict[str, str] = {}
+    for _name, content in list_systemd_overrides():
+        for raw in content.splitlines():
+            line = raw.strip()
+            if line.startswith("Environment="):
+                kv = line[len("Environment=") :].strip().strip('"')
+                key, sep, value = kv.partition("=")
+                if key and sep:
+                    env[key.strip()] = value
+    return env
+
+
+def _launchd_override_env() -> dict[str, str]:
+    """Environment values baked into the launchd plist's EnvironmentVariables
+    (written by `./dev.py prod set`), which the running service uses. The deploy
+    preflight must honour them for the same reason as the systemd drop-ins."""
+    if not LAUNCHD_PLIST_PATH.exists():
+        return {}
+    try:
+        import plistlib
+
+        with open(LAUNCHD_PLIST_PATH, "rb") as f:
+            plist = plistlib.load(f)
+        return dict(plist.get("EnvironmentVariables", {}))
+    except Exception:
+        return {}
+
+
+def _preflight_prod_bind_auth(effective_env: dict[str, str], socket_activated: bool) -> None:
+    """Refuse to deploy an unauthenticated, network-reachable prod server.
+
+    `effective_env` is the environment the deployed service will actually run
+    with, assembled the same way the calling deploy path assembles it:
+      - systemd: .phoenix-ide.env (EnvironmentFile=) plus any drop-in `*.conf`
+        overrides (`./dev.py prod set`), which systemd layers on top.
+      - launchd: .phoenix-ide.env plus the plist's existing EnvironmentVariables
+        (also written by `./dev.py prod set`).
+      - the non-systemd daemon inherits the deploying shell's os.environ and
+        then layers .phoenix-ide.env on top — so effective_env is that merge.
+
+    `socket_activated` is True for the systemd (.socket) and launchd (Sockets)
+    paths: the listener fd comes from the init system, which binds all
+    interfaces (`ListenStream={port}` / the launchd socket), and the binary
+    IGNORES PHOENIX_BIND_ADDR. So a loopback PHOENIX_BIND_ADDR does NOT make a
+    socket-activated deploy safe — only a password or the insecure override
+    does. The non-socket-activated daemon binds via the binary's own fallback,
+    so there PHOENIX_BIND_ADDR=127.0.0.1 genuinely yields a loopback listener.
+
+    The binary fails closed at startup on a non-loopback passwordless bind. This
+    turns that post-restart crash into a clear deploy-time error, mirroring the
+    binary's own guard.
+    """
+    if not socket_activated and _bind_is_loopback(effective_env):
+        return
+    if effective_env.get("PHOENIX_PASSWORD"):
+        return
+    if effective_env.get("PHOENIX_ALLOW_INSECURE_BIND") == "1":
+        return
+    loopback_hint = (
+        ""
+        if socket_activated
+        else "  To bind loopback-only instead, set PHOENIX_BIND_ADDR=127.0.0.1.\n"
+    )
+    print(
+        "ERROR: refusing to deploy an unauthenticated, network-reachable Phoenix.\n"
+        "  The prod server binds all interfaces; without a password anyone on the\n"
+        "  network can drive an agent that runs arbitrary commands as the service user.\n"
+        "\n"
+        "  Set PHOENIX_PASSWORD=<secret> in .phoenix-ide.env (the deployed service\n"
+        "  reads its environment from that file, not your shell), then redeploy.\n"
+        f"{loopback_hint}"
+        "  To deploy passwordless anyway (e.g. Phoenix sits behind your own auth\n"
+        "  proxy), set PHOENIX_ALLOW_INSECURE_BIND=1 in .phoenix-ide.env.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def _env_provides_llm_config(env: dict[str, str]) -> bool:
     """True if `env` already specifies how to reach an LLM, so the deploy paths
     should not auto-detect and inject a local gateway. Counts a credential
@@ -4657,6 +4798,14 @@ def prod_daemon_deploy():
     Used when systemd is not available (containers, non-systemd Linux).
     Daemonizes the process and returns to shell immediately.
     """
+    # Refuse before building if the deploy would expose an unauthenticated server.
+    # The daemon child inherits the deploying shell's os.environ and then layers
+    # .phoenix-ide.env on top (see env assembly below), so preflight against that
+    # same merge -- and honor PHOENIX_BIND_ADDR (a loopback bind is safe).
+    daemon_preflight_env = os.environ.copy()
+    _load_env_file(daemon_preflight_env)
+    _preflight_prod_bind_auth(daemon_preflight_env, socket_activated=False)
+
     # Build binary (keep debug symbols for debugging)
     binary = prod_build(version=None, strip=False)
 
@@ -5170,6 +5319,15 @@ def _launchd_stop_if_loaded():
 
 def launchd_prod_deploy(version: str | None = None):
     """Build and deploy to production via launchd (native macOS)."""
+    # Refuse before building if the deploy would expose an unauthenticated server.
+    # The launchd service runs with the plist's EnvironmentVariables: those baked
+    # from .phoenix-ide.env at deploy time PLUS any set later via `./dev.py prod
+    # set`. The preflight must honour the existing plist overrides too.
+    launchd_env: dict[str, str] = {}
+    _load_env_file(launchd_env)
+    launchd_env.update(_launchd_override_env())
+    _preflight_prod_bind_auth(launchd_env, socket_activated=True)
+
     # Build native macOS binary
     binary = prod_build(version, target=None)
 
