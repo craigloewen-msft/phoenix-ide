@@ -353,6 +353,123 @@ function formatToolInput(name: string, input: Record<string, unknown>, displayOv
   }
 }
 
+function parseSlashCommand(text: string): { token: string; args: string } | null {
+  const match = text.trim().match(/^(\/[A-Za-z0-9][\w:-]*)(?:\s+([\s\S]*))?$/);
+  if (!match) return null;
+  return { token: match[1] ?? '/skill', args: match[2] ?? '' };
+}
+
+function skillTitle(token: string, source?: string, snippet?: string): string {
+  return [
+    `Skill invocation: ${token}`,
+    source ? `Source: ${source}` : '',
+    snippet ? `Preview: ${snippet}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+export function SkillCommandText({
+  text,
+  source,
+  snippet,
+}: {
+  text: string;
+  source?: string | undefined;
+  snippet?: string | undefined;
+}) {
+  const parsed = parseSlashCommand(text);
+  if (!parsed) return <>{text}</>;
+  return (
+    <span className="skill-command-inline">
+      <span className="skill-command-chip" title={skillTitle(parsed.token, source, snippet)}>
+        <span className="skill-command-slash">/</span>
+        <span className="skill-command-name">{parsed.token.slice(1)}</span>
+      </span>
+      {parsed.args && <span className="skill-command-args"> {parsed.args}</span>}
+    </span>
+  );
+}
+
+function extractSkillResultDetails(resultText: string): { source?: string | undefined; snippet?: string | undefined } {
+  const source = resultText.match(/^Base directory for this skill:\s*(.+)$/m)?.[1]?.trim();
+  const contentLines = resultText
+    .split('\n')
+    .filter(line => line.trim() && !line.startsWith('Base directory for this skill:'));
+  const snippet = contentLines.find(line => line.startsWith('# ')) || contentLines[0] || '';
+  return {
+    source,
+    snippet: snippet ? truncateValue(snippet.replace(/^#\s*/, '').trim(), 120) : undefined,
+  };
+}
+
+function skillCommandFromInput(input: Record<string, unknown>): string {
+  const skillName = String(input['skill_name'] || 'skill').replace(/^\/+/, '');
+  const args = String(input['args'] || '').trim();
+  return args ? `/${skillName} ${args}` : `/${skillName}`;
+}
+
+function SkillToolBlock({
+  input,
+  resultText,
+  result,
+  isError,
+  durationMs,
+  toolStartedAtMs,
+  inflightElapsedSeconds,
+  onOpenFile,
+  toolId,
+}: {
+  input: Record<string, unknown>;
+  resultText: string;
+  result: Message | undefined;
+  isError: boolean;
+  durationMs: number | undefined;
+  toolStartedAtMs: number | null | undefined;
+  inflightElapsedSeconds: number;
+  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+  toolId: string;
+}) {
+  const details = extractSkillResultDetails(resultText);
+  const sourcePath = details.source ? `${details.source}/SKILL.md` : undefined;
+  const status = result == null ? 'loading' : isError ? 'failed' : 'loaded';
+  const statusClass = result == null ? 'pending' : isError ? 'error' : 'success';
+
+  return (
+    <div className={`tool-block skill-tool-block ${statusClass}`} data-tool-id={toolId}>
+      <div className="skill-tool-status-row">
+        <SkillCommandText
+          text={skillCommandFromInput(input)}
+          source={sourcePath}
+          snippet={details.snippet}
+        />
+        <span className={`skill-tool-status ${statusClass}`}>
+          {status}
+          {durationMs !== undefined && <span className="tool-block-duration">&bull; {formatToolDuration(durationMs)}</span>}
+          {result == null && toolStartedAtMs != null && <span className="tool-block-duration">&bull; {inflightElapsedSeconds}s</span>}
+        </span>
+      </div>
+      {(sourcePath || details.snippet) && (
+        <div className="skill-tool-detail-row">
+          {sourcePath && (
+            onOpenFile ? (
+              <button
+                type="button"
+                className="skill-source-link"
+                onClick={() => onOpenFile(sourcePath, new Set(), 0)}
+                title={`Open ${sourcePath}`}
+              >
+                SKILL.md
+              </button>
+            ) : (
+              <span className="skill-source-link static" title={sourcePath}>SKILL.md</span>
+            )
+          )}
+          {details.snippet && <span className="skill-tool-snippet">{details.snippet}</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function truncateValue(s: string, max = 40): string {
   return s.length > max ? s.slice(0, max) + '…' : s;
 }
@@ -487,7 +604,7 @@ function UserMessageImpl({ message }: { message: Message }) {
         {!isMeta && <span className="message-status sent" title="Sent">&#x2713;</span>}
       </div>
       <div className="message-content">
-        {text}
+        <SkillCommandText text={text} />
         {images.length > 0 && (
           <div className="message-images">
             {images.map((img, idx) => (
@@ -544,7 +661,7 @@ function QueuedUserMessageImpl({
         )}
       </div>
       <div className="message-content">
-        {message.text}
+        <SkillCommandText text={message.text} />
         {message.images.length > 0 && (
           <div className="message-images">
             {message.images.map((img, idx) => (
@@ -1631,6 +1748,22 @@ function ToolUseBlockImpl({ block, result, onOpenFile, toolStartedAtMs }: ToolUs
   })();
 
   // Get the raw input for copying (not the formatted display)
+  if (name === 'skill') {
+    return (
+      <SkillToolBlock
+        input={input as Record<string, unknown>}
+        resultText={resultText}
+        result={result}
+        isError={isError}
+        durationMs={durationMs}
+        toolStartedAtMs={toolStartedAtMs}
+        inflightElapsedSeconds={inflightElapsedSeconds}
+        onOpenFile={onOpenFile}
+        toolId={toolId}
+      />
+    );
+  }
+
   const rawInput = name === 'bash' ? bashInputCopyText(input as Record<string, unknown>) :
                    name === 'think' ? String(input['thoughts'] || '') :
                    name === 'read_file' ? String(input['path'] || '') :

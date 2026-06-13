@@ -1125,6 +1125,90 @@ body {
   font-family: var(--font-mono);
 }
 
+.skill-tool-block {
+  margin: 6px 0;
+  border: 1px solid color-mix(in srgb, var(--accent-blue, #3b82f6) 22%, var(--border-color));
+  border-radius: 6px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 4%, var(--bg-secondary));
+}
+
+.skill-tool-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  min-width: 0;
+}
+
+.skill-tool-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  padding: 2px 7px;
+  border-radius: 5px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.skill-tool-status.success {
+  background: color-mix(in srgb, var(--accent-green) 16%, var(--bg-primary));
+  color: var(--accent-green);
+}
+
+.skill-tool-status.error {
+  background: color-mix(in srgb, var(--accent-red) 14%, var(--bg-primary));
+  color: var(--accent-red);
+}
+
+.skill-tool-status.pending {
+  background: color-mix(in srgb, var(--accent-yellow) 16%, var(--bg-primary));
+  color: var(--accent-yellow);
+}
+
+.skill-tool-detail-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.skill-source-link {
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  background: var(--bg-primary);
+  padding: 1px 6px;
+  color: var(--accent-blue);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.skill-source-link:hover:not(.static) {
+  border-color: color-mix(in srgb, var(--accent-blue, #3b82f6) 35%, var(--border-color));
+  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 8%, var(--bg-primary));
+}
+
+.skill-source-link.static {
+  color: var(--text-muted);
+  cursor: help;
+}
+
+.skill-tool-snippet {
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .tool-block-status {
   margin-left: auto;
   font-size: 14px;
@@ -8888,31 +8972,60 @@ html * {
 
 /* --- Skill Invocation Messages --- */
 
-.message.skill {
-  padding: 4px 16px;
-  margin: 4px 0;
-}
-
-.skill-indicator {
-  display: flex;
+.skill-command-inline {
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--text-muted);
-  background: var(--bg-secondary);
-  padding: 4px 12px;
-  border-radius: 12px;
-  width: fit-content;
+  flex-wrap: wrap;
+  gap: 4px;
 }
 
-.skill-label {
-  font-weight: 600;
-  color: var(--accent-blue, #3b82f6);
+.skill-command-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  padding: 1px 12px 2px 6px;
+  border-left: 1px solid color-mix(in srgb, var(--accent-blue, #3b82f6) 22%, var(--border-color));
+  border-top: 1px solid color-mix(in srgb, var(--accent-blue, #3b82f6) 22%, var(--border-color));
+  border-bottom: 1px solid color-mix(in srgb, var(--accent-blue, #3b82f6) 22%, var(--border-color));
+  border-radius: 6px 0 0 6px;
+  background: linear-gradient(
+    to right,
+    color-mix(in srgb, var(--accent-blue, #3b82f6) 7%, var(--bg-primary)) 0,
+    color-mix(in srgb, var(--accent-blue, #3b82f6) 7%, var(--bg-primary)) calc(100% - 14px),
+    transparent 100%
+  );
+  color: var(--accent-blue, #2563eb);
+  font-weight: 500;
+  line-height: 1.25;
+  white-space: nowrap;
+  mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 14px), transparent 100%);
+  cursor: help;
 }
 
-.skill-trigger {
-  color: var(--text-muted);
-  opacity: 0.7;
+.skill-command-chip:hover {
+  border-left-color: color-mix(in srgb, var(--accent-blue, #3b82f6) 35%, var(--border-color));
+  border-top-color: color-mix(in srgb, var(--accent-blue, #3b82f6) 35%, var(--border-color));
+  border-bottom-color: color-mix(in srgb, var(--accent-blue, #3b82f6) 35%, var(--border-color));
+  background: linear-gradient(
+    to right,
+    color-mix(in srgb, var(--accent-blue, #3b82f6) 10%, var(--bg-primary)) 0,
+    color-mix(in srgb, var(--accent-blue, #3b82f6) 10%, var(--bg-primary)) calc(100% - 14px),
+    transparent 100%
+  );
+}
+
+.skill-command-slash {
+  opacity: 0.66;
+  font-weight: 650;
+}
+
+.skill-command-name {
+  font-weight: 500;
+}
+
+.skill-command-args {
+  color: var(--text-primary);
 }
 
 /* --- System Messages (task approval, completion, etc.) --- */
