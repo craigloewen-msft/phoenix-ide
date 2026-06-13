@@ -8,6 +8,7 @@ mod chain_qa;
 mod chain_runtime;
 pub(crate) mod git_ops;
 mod llm;
+mod mcp_oauth_store;
 mod message_expander;
 mod resolution_root;
 mod runtime;
@@ -409,9 +410,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Create MCP manager and start background server discovery (non-blocking).
-    // Servers connect in parallel; tools become available as each finishes.
+    // Create the MCP manager. Discovery starts after the listener is bound,
+    // below: the OAuth flow needs the server's own address for its callback
+    // redirect before any server can 401 (REQ-MCP-011).
     let mcp_manager = Arc::new(crate::tools::mcp::McpClientManager::new());
+    mcp_manager.set_oauth_store(Arc::new(mcp_oauth_store::DbOAuthStore::new(db.clone())));
 
     // Load persisted disabled-server set before discovery starts.
     let disabled = db.get_disabled_mcp_servers().await.unwrap_or_default();
@@ -419,8 +422,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(count = disabled.len(), servers = ?disabled, "Loaded disabled MCP servers from DB");
     }
     mcp_manager.set_disabled_servers(disabled).await;
-
-    mcp_manager.start_background_discovery();
 
     // Read optional auth password (REQ-AUTH-001)
     let password = std::env::var("PHOENIX_PASSWORD")
@@ -463,6 +464,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+
+    // The MCP OAuth callback redirect must point at an address the
+    // *operator's browser* can reach. PHOENIX_EXTERNAL_URL pins it for
+    // remote deployments — an all-interfaces bind says nothing about the
+    // name remote browsers reach the host by, so the derived fallback
+    // (localhost for unspecified/loopback binds, the bare IP otherwise) only
+    // serves same-machine access. With the redirect base known, background
+    // MCP discovery (which may immediately hit a 401 and start an OAuth
+    // flow) can start.
+    {
+        let configured = std::env::var("PHOENIX_EXTERNAL_URL")
+            .ok()
+            .map(|url| url.trim().trim_end_matches('/').to_string())
+            .filter(|url| !url.is_empty());
+        let redirect_base = if let Some(external) = configured {
+            external
+        } else {
+            let scheme = if loaded_tls.is_some() {
+                "https"
+            } else {
+                "http"
+            };
+            let ip = bind_address.ip();
+            let host = if ip.is_unspecified() || ip.is_loopback() {
+                "localhost".to_string()
+            } else if let std::net::IpAddr::V6(v6) = ip {
+                // An IPv6 literal needs brackets to form a valid authority
+                // next to the port.
+                format!("[{v6}]")
+            } else {
+                ip.to_string()
+            };
+            if ip.is_unspecified() {
+                tracing::info!(
+                    "MCP OAuth redirect base defaulting to {scheme}://localhost:{}; set \
+                     PHOENIX_EXTERNAL_URL to the browser-reachable URL when operating \
+                     Phoenix from another machine",
+                    bind_address.port()
+                );
+            }
+            format!("{scheme}://{host}:{}", bind_address.port())
+        };
+        mcp_manager.set_oauth_redirect_base(redirect_base);
+    }
+    mcp_manager.start_background_discovery();
 
     // Static deployment facts served read-only by GET /api/deployment
     // (specs/deployment-info/).
