@@ -368,6 +368,10 @@ pub struct McpServerStatus {
     /// The failure cause when `state = failed`, cleared on a successful
     /// reconnect (REQ-MCP-018).
     pub last_error: Option<String>,
+    /// On an `unauthorized` entry, a diagnostic when the OAuth redirect base is
+    /// unreachable from another machine, so the authorize link will fail
+    /// (REQ-MCP-020).
+    pub auth_redirect_warning: Option<String>,
 }
 
 /// A connect/handshake/authorization failure retained for the status API
@@ -1016,6 +1020,11 @@ impl PendingAuthFlow {
 struct OAuthRuntime {
     store: std::sync::RwLock<Arc<dyn OAuthStore>>,
     redirect_base: std::sync::Mutex<Option<String>>,
+    /// A diagnostic surfaced on `unauthorized` status entries when the resolved
+    /// redirect base is unreachable from another machine (a loopback redirect
+    /// on a remote-reachable bind, REQ-MCP-020), so the operator sees why the
+    /// authorize link will fail before opening it.
+    redirect_warning: std::sync::Mutex<Option<String>>,
     pending: std::sync::Mutex<HashMap<String, PendingAuthFlow>>,
 }
 
@@ -1024,6 +1033,7 @@ impl Default for OAuthRuntime {
         Self {
             store: std::sync::RwLock::new(Arc::new(oauth::MemoryOAuthStore::default())),
             redirect_base: std::sync::Mutex::new(None),
+            redirect_warning: std::sync::Mutex::new(None),
             pending: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -1032,6 +1042,11 @@ impl Default for OAuthRuntime {
 impl OAuthRuntime {
     fn store(&self) -> Arc<dyn OAuthStore> {
         Arc::clone(&self.store.read().unwrap())
+    }
+
+    /// The redirect-unreachable diagnostic, when one applies (REQ-MCP-020).
+    fn redirect_warning(&self) -> Option<String> {
+        self.redirect_warning.lock().unwrap().clone()
     }
 
     /// The local callback the authorization server redirects to; `None` until
@@ -1163,6 +1178,73 @@ async fn oauth_refresh(
     Ok(response.access_token)
 }
 
+/// Resolve the OAuth client identity for an authorization server (REQ-MCP-010):
+/// reuse a cached client whose registered `redirect_uri` still matches the
+/// resolved redirect base (or is unknown), otherwise dynamically register
+/// (RFC 7591). A cached client registered with a *different* `redirect_uri` is
+/// re-registered so an authorization server that binds clients to their
+/// redirect accepts the new callback after the canonical base changed
+/// (REQ-MCP-020); when the server advertises no registration endpoint it is
+/// reused best-effort with a warning. Phoenix hosts no Client ID Metadata
+/// Document, so that step resolves to nothing.
+async fn acquire_client_registration(
+    oauth_rt: &OAuthRuntime,
+    client: &reqwest::Client,
+    name: &str,
+    metadata: &oauth::AuthServerMetadata,
+    cached: Option<OAuthRegistrationRecord>,
+    redirect_uri: &str,
+) -> Result<OAuthRegistrationRecord, String> {
+    if let Some(cached) = &cached {
+        if cached
+            .redirect_uri
+            .as_deref()
+            .is_none_or(|registered| registered == redirect_uri)
+        {
+            return Ok(cached.clone());
+        }
+    }
+
+    let Some(endpoint) = metadata.registration_endpoint.clone() else {
+        return match cached {
+            Some(cached) => {
+                tracing::warn!(
+                    server = %name,
+                    auth_server = %metadata.issuer,
+                    "OAuth redirect base changed but the authorization server advertises no \
+                     registration endpoint; reusing the existing client (its registered \
+                     redirect_uri may no longer match)"
+                );
+                Ok(cached)
+            }
+            None => Err(format!(
+                "authorization server '{}' has no client registration for Phoenix and does not \
+                 advertise a registration endpoint (RFC 7591); configure a pre-registered OAuth \
+                 client for it",
+                metadata.issuer
+            )),
+        };
+    };
+
+    let registration = oauth::register_client(client, metadata, &endpoint, redirect_uri).await?;
+    oauth_rt.store().upsert_registration(&registration).await?;
+    if cached.is_some() {
+        tracing::info!(
+            server = %name,
+            auth_server = %metadata.issuer,
+            "Re-registered OAuth client after a redirect base change"
+        );
+    } else {
+        tracing::info!(
+            server = %name,
+            auth_server = %metadata.issuer,
+            client_id = %registration.client_id,
+            "Registered OAuth client via dynamic client registration"
+        );
+    }
+    Ok(registration)
+}
+
 /// Run discovery → client identity → PKCE for an HTTP server that needs the
 /// operator's authorization, park the pending flow, and surface its URL
 /// (REQ-MCP-009..011, REQ-MCP-013). `extra_scopes` carries prior grants for a
@@ -1192,40 +1274,15 @@ async fn begin_oauth_flow(
     let (metadata, cached_registration) =
         resolve_authorization_server(oauth_rt, &client, &prm).await?;
 
-    // Client identity preference (REQ-MCP-010): pre-configured/cached
-    // registration (keyed by authorization server) → Client ID Metadata
-    // Document → dynamic client registration. Phoenix hosts no client
-    // metadata document, so the CIMD step resolves to nothing; logged so the
-    // capability gap is visible.
-    let registration = if let Some(registration) = cached_registration {
-        registration
-    } else {
-        {
-            tracing::debug!(
-                server = %name,
-                auth_server = %metadata.issuer,
-                "no hosted Client ID Metadata Document available; falling back to dynamic client registration"
-            );
-            let Some(endpoint) = metadata.registration_endpoint.clone() else {
-                return Err(format!(
-                    "authorization server '{}' has no client registration for Phoenix and does \
-                     not advertise a registration endpoint (RFC 7591); configure a \
-                     pre-registered OAuth client for it",
-                    metadata.issuer
-                ));
-            };
-            let registration =
-                oauth::register_client(&client, &metadata, &endpoint, &redirect_uri).await?;
-            oauth_rt.store().upsert_registration(&registration).await?;
-            tracing::info!(
-                server = %name,
-                auth_server = %metadata.issuer,
-                client_id = %registration.client_id,
-                "Registered OAuth client via dynamic client registration"
-            );
-            registration
-        }
-    };
+    let registration = acquire_client_registration(
+        oauth_rt,
+        &client,
+        name,
+        &metadata,
+        cached_registration,
+        &redirect_uri,
+    )
+    .await?;
 
     // Requested scopes: the challenge's `scope` when present, else the
     // resource's advertised set; unioned with any prior grants (step-up,
@@ -1430,6 +1487,15 @@ impl McpClientManager {
     /// Panics if the internal lock is poisoned (a prior panic is already fatal).
     pub fn set_oauth_redirect_base(&self, base: String) {
         *self.oauth.redirect_base.lock().unwrap() = Some(base);
+    }
+
+    /// Set (or clear) the redirect-unreachable diagnostic surfaced on
+    /// `unauthorized` status entries (REQ-MCP-020).
+    ///
+    /// # Panics
+    /// Panics if the internal lock is poisoned (a prior panic is already fatal).
+    pub fn set_oauth_redirect_warning(&self, warning: Option<String>) {
+        *self.oauth.redirect_warning.lock().unwrap() = warning;
     }
 
     /// Drop a pending authorization flow, releasing any held claim and the
@@ -2012,6 +2078,9 @@ impl McpClientManager {
         let disabled = self.disabled_servers.read().await;
         let pending = self.pending_oauth_urls.read().await;
         let failed = self.failed_servers.read().await;
+        // Surfaced only on `unauthorized` entries: the authorize link those
+        // carry is the one a loopback-on-remote redirect breaks (REQ-MCP-020).
+        let redirect_warning = self.oauth.redirect_warning();
 
         // Connected servers are ready.
         let mut result: Vec<McpServerStatus> = servers
@@ -2026,6 +2095,7 @@ impl McpClientManager {
                 enabled: !disabled.contains(name),
                 pending_oauth_url: None,
                 last_error: None,
+                auth_redirect_warning: None,
             })
             .collect();
 
@@ -2045,6 +2115,7 @@ impl McpClientManager {
                     enabled: !disabled.contains(name),
                     pending_oauth_url: Some(url.clone()),
                     last_error: None,
+                    auth_redirect_warning: redirect_warning.clone(),
                 });
             }
         }
@@ -2064,6 +2135,7 @@ impl McpClientManager {
                     enabled: !disabled.contains(name),
                     pending_oauth_url: None,
                     last_error: Some(failure.error.clone()),
+                    auth_redirect_warning: None,
                 });
             }
         }
@@ -2503,6 +2575,10 @@ impl McpClientManager {
                     client_id: preconfigured.client_id.clone(),
                     client_secret: preconfigured.client_secret.clone(),
                     token_endpoint_auth_method: preconfigured.token_endpoint_auth_method.clone(),
+                    // A pre-configured client's redirect is registered out of
+                    // band by the operator; Phoenix does not manage or compare
+                    // it, so it is left unknown (REQ-MCP-020).
+                    redirect_uri: None,
                 })
                 .await
                 .map_err(|e| {
@@ -4048,6 +4124,25 @@ mod tests {
         assert!(
             !status[0].enabled,
             "a disabled failed server reports disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthorized_entry_carries_the_redirect_warning() {
+        let manager = McpClientManager::new();
+        manager.set_oauth_redirect_warning(Some("callback unreachable".to_string()));
+        manager.pending_oauth_urls.write().await.insert(
+            "remote".to_string(),
+            "https://auth.example/authorize".to_string(),
+        );
+
+        let status = manager.status().await;
+        assert_eq!(status.len(), 1);
+        assert!(matches!(status[0].state, McpConnState::Unauthorized));
+        assert_eq!(
+            status[0].auth_redirect_warning.as_deref(),
+            Some("callback unreachable"),
+            "the redirect diagnostic rides the unauthorized entry (REQ-MCP-020)"
         );
     }
 
