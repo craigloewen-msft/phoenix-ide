@@ -327,7 +327,7 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
           found: true,
           number: 137,
           display_state: 'open',
-          feedback_freshness: { state: 'new', new_count: 3 },
+          feedback_freshness: { state: 'new', count: 3 },
         })}
       />,
     );
@@ -335,10 +335,10 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
     expect(screen.getByRole('button', { name: /Address CI & comments 3 new/i })).toBeInTheDocument();
   });
 
-  it('shows a coarse updated marker when feedback cannot be counted', () => {
+  it('shows an edited-comment marker when existing feedback changed', () => {
     renderWithProviders(
       <WorkControlBar
-        conversationId="conv-updated"
+        conversationId="conv-edited"
         convModeLabel="Work"
         phaseType="idle"
         continuedInConvId={null}
@@ -347,12 +347,63 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
           found: true,
           number: 138,
           display_state: 'open',
-          feedback_freshness: { state: 'updated' },
+          feedback_freshness: { state: 'edited', count: 1 },
         })}
       />,
     );
 
-    expect(screen.getByRole('button', { name: /Address CI & comments updated/i })).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /Address CI & comments 1 comment updated/i }),
+    ).toBeInTheDocument();
+  });
+
+  it('renders the count as a lower bound and a warning when feedback coverage is degraded', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-incomplete"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={prStatusHandle({
+          found: true,
+          number: 140,
+          display_state: 'open',
+          feedback_freshness: { state: 'new', count: 2 },
+          feedback_coverage: { kind: 'incomplete', surfaces: ['review_threads'] },
+        })}
+      />,
+    );
+
+    expect(
+      screen.getByRole('button', { name: /Address CI & comments at least 2 new ⚠/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText('⚠')).toHaveAttribute(
+      'title',
+      expect.stringContaining('review threads'),
+    );
+  });
+
+  it('shows an actionable sign-in marker when feedback auth failed', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-auth"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={prStatusHandle({
+          found: true,
+          number: 141,
+          display_state: 'open',
+          feedback_coverage: { kind: 'auth_required', surfaces: ['review_threads'] },
+        })}
+      />,
+    );
+
+    expect(
+      screen.getByRole('button', { name: /Address CI & comments ⚠ GitHub sign-in needed/i }),
+    ).toBeInTheDocument();
   });
 
   it('keeps remediation loading until send completes and then refreshes PR status', async () => {
@@ -363,7 +414,7 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
       found: true,
       number: 139,
       display_state: 'open',
-      feedback_freshness: { state: 'new', new_count: 2 },
+      feedback_freshness: { state: 'new', count: 2 },
     });
 
     renderWithProviders(

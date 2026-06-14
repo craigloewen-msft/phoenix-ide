@@ -737,7 +737,11 @@ pub enum PrFeedbackSource {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PrCheckLogSource {
+    /// No extractable logs; `snippet` explains why and `url` points at the
+    /// provider's web UI for the full logs.
     CheckUrl,
+    /// Failed-step logs extracted from a GitHub Actions job via `gh run view`.
+    GhActionsLog,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -840,18 +844,41 @@ pub struct PrIdentity {
     pub updated_at: Option<String>,
 }
 
+/// How the PR's feedback has moved since the last captured baseline. Each
+/// variant carries its own count, so a count is never absent and "new" can
+/// never be confused with "edited". Serializes with an internal `state` tag:
+/// `{ "state": "new", "count": 3 }` / `{ "state": "edited", "count": 1 }`.
+///
+/// Coverage gaps and fetch failures are deliberately *not* represented here —
+/// they are an error condition, not a content change, and surface separately.
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PrFeedbackFreshnessState {
-    New,
-    Updated,
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PrFeedbackFreshness {
+    /// `count` feedback items are present that were not in the baseline.
+    New { count: u32 },
+    /// `count` baseline feedback items changed content (e.g. a reviewer edited
+    /// an existing comment) with no net-new items.
+    Edited { count: u32 },
 }
 
+/// Health of the feedback fetch that produced a freshness signal. Orthogonal to
+/// [`PrFeedbackFreshness`]: when a surface can't be read, any freshness count is
+/// only a lower bound (the UI renders "at least N"). Absent when every surface
+/// was fetched. Auth precedes transient unavailability because only the former
+/// is user-actionable. Serializes with an internal `kind` tag.
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
-pub struct PrFeedbackFreshness {
-    pub state: PrFeedbackFreshnessState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub new_count: Option<u32>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PrFeedbackCoverageHealth {
+    /// At least one surface couldn't be read because the GitHub CLI is not
+    /// authenticated — the user can fix this (`gh auth login`).
+    AuthRequired {
+        surfaces: Vec<PrFeedbackCoverageSurface>,
+    },
+    /// At least one surface was transiently unavailable (no auth problem);
+    /// feedback may be incomplete.
+    Incomplete {
+        surfaces: Vec<PrFeedbackCoverageSurface>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -888,6 +915,11 @@ pub struct PrStatusResponse {
     pub display_state: Option<PrDisplayState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub feedback_freshness: Option<PrFeedbackFreshness>,
+    /// Degraded coverage of the feedback fetch, if any — distinct from
+    /// `feedback_freshness` so an incomplete fetch is never mistaken for a
+    /// content change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feedback_coverage: Option<PrFeedbackCoverageHealth>,
 }
 
 impl PrStatusResponse {
@@ -917,6 +949,7 @@ impl PrStatusResponse {
             updated_at: None,
             display_state: None,
             feedback_freshness: None,
+            feedback_coverage: None,
         }
     }
 

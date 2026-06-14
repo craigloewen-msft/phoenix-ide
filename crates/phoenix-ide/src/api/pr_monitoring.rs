@@ -1,7 +1,7 @@
 use super::types::{
     PrAutoFixContextResponse, PrCheckDetail, PrCheckLogSnippet, PrCheckLogSource, PrCheckState,
-    PrCheckSummary, PrDisplayState, PrFeedbackCoverage, PrFeedbackCoverageStatus,
-    PrFeedbackCoverageSurface, PrFeedbackFreshness, PrFeedbackFreshnessState, PrFeedbackItem,
+    PrCheckSummary, PrDisplayState, PrFeedbackCoverage, PrFeedbackCoverageHealth,
+    PrFeedbackCoverageStatus, PrFeedbackCoverageSurface, PrFeedbackFreshness, PrFeedbackItem,
     PrFeedbackSource, PrFeedbackSummary, PrIdentity, PrRefreshMetadata, PrRefreshState,
     PrStatusResponse, PrUnavailableReason,
 };
@@ -318,13 +318,129 @@ impl GhClient for ShellGhClient<'_> {
         let Some(url) = check.link.clone() else {
             return Ok(None);
         };
-        Ok(Some(PrCheckLogSnippet {
-            check_name: check.name.clone().unwrap_or_else(|| "unnamed check".to_string()),
-            source: PrCheckLogSource::CheckUrl,
-            url: Some(url),
-            snippet: "Phoenix captured a check URL for this failure, but direct log extraction is not available for this check provider. Open the URL for full logs.".to_string(),
-            truncated: false,
-        }))
+        let check_name = check
+            .name
+            .clone()
+            .unwrap_or_else(|| "unnamed check".to_string());
+
+        // Only GitHub Actions job URLs expose extractable failed-step logs.
+        let Some((run_id, job_id)) = parse_actions_job_url(&url) else {
+            return Ok(Some(url_only_snippet(
+                check_name,
+                url,
+                "This check is not a GitHub Actions job, so Phoenix cannot extract its logs. Open the URL for full logs.",
+            )));
+        };
+
+        // Per-job budget: bound each fetch independently of the client deadline
+        // so one slow log download cannot starve the others.
+        let job_deadline =
+            earliest_deadline(self.deadline, Instant::now() + LOG_FETCH_PER_JOB_TIMEOUT);
+        // A single check's log fetch failing (timeout, empty, non-zero exit)
+        // must not fail the whole capture — fall back to the URL. But always
+        // record *why* at debug, so a logless bundle is diagnosable (bad job id,
+        // permissions, expired logs) rather than silently indistinguishable from
+        // an intentional URL-only provider.
+        match run_gh_raw_with_deadline(
+            self.cwd,
+            &["run", "view", &run_id, "--job", &job_id, "--log-failed"],
+            Some(job_deadline),
+        ) {
+            Ok(out) if out.status.success() && !out.stdout.trim().is_empty() => {
+                Ok(Some(tail_log_snippet(check_name, url, &out.stdout)))
+            }
+            Ok(out) => {
+                tracing::debug!(
+                    check = %check_name,
+                    code = out.status.code(),
+                    stderr = %out.stderr,
+                    "gh run view --log-failed produced no usable output"
+                );
+                Ok(Some(url_only_snippet(check_name, url, GH_LOG_FALLBACK_MSG)))
+            }
+            Err(e) => {
+                tracing::debug!(check = %check_name, error = %e.message, "gh run view --log-failed failed");
+                Ok(Some(url_only_snippet(check_name, url, GH_LOG_FALLBACK_MSG)))
+            }
+        }
+    }
+}
+
+const GH_LOG_FALLBACK_MSG: &str = "Phoenix could not extract logs for this failing check (gh returned no failed-step output). Open the URL for full logs.";
+
+/// Per-failing-check budget for `gh run view --log-failed`. Backstopped by the
+/// hard per-command cap in [`run_gh_raw_with_deadline`].
+const LOG_FETCH_PER_JOB_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Cap on how many failing checks we fetch logs for in a single capture, so a
+/// fully-red matrix cannot multiply the per-job budget without bound. Failing
+/// checks beyond the cap are logged and skipped (no silent truncation).
+const MAX_LOG_SNIPPET_FETCHES: usize = 6;
+
+fn earliest_deadline(client: Option<Instant>, job: Instant) -> Instant {
+    match client {
+        Some(client) if client < job => client,
+        _ => job,
+    }
+}
+
+/// Parse a GitHub Actions job URL into `(run_id, job_id)`. Accepts the shapes
+/// GitHub uses for job links — `.../actions/runs/<run>/job/<job>` and the
+/// documented `.../runs/<run>/jobs/<job>` (both `job`/`jobs`, with or without
+/// the `/actions` prefix). Returns `None` for any other URL (a non-Actions
+/// check provider).
+fn parse_actions_job_url(url: &str) -> Option<(String, String)> {
+    let after_runs = url
+        .split_once("/actions/runs/")
+        .or_else(|| url.split_once("/runs/"))
+        .map(|(_, rest)| rest)?;
+    let mut segments = after_runs.split('/');
+    let run_id = segments.next()?;
+    if !matches!(segments.next()?, "job" | "jobs") {
+        return None;
+    }
+    let job_id = segments
+        .next()?
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if all_digits(run_id) && all_digits(job_id) {
+        Some((run_id.to_string(), job_id.to_string()))
+    } else {
+        None
+    }
+}
+
+fn url_only_snippet(check_name: String, url: String, reason: &str) -> PrCheckLogSnippet {
+    PrCheckLogSnippet {
+        check_name,
+        source: PrCheckLogSource::CheckUrl,
+        url: Some(url),
+        snippet: reason.to_string(),
+        truncated: false,
+    }
+}
+
+/// Keep the tail of a captured log — CI failures surface at the end — bounded to
+/// [`LOG_SNIPPET_LIMIT`] on a UTF-8 char boundary.
+fn tail_log_snippet(check_name: String, url: String, log: &str) -> PrCheckLogSnippet {
+    let trimmed = log.trim();
+    let (snippet, truncated) = if trimmed.len() > LOG_SNIPPET_LIMIT {
+        let mut start = trimmed.len() - LOG_SNIPPET_LIMIT;
+        while start < trimmed.len() && !trimmed.is_char_boundary(start) {
+            start += 1;
+        }
+        (trimmed.get(start..).unwrap_or_default().to_string(), true)
+    } else {
+        (trimmed.to_string(), false)
+    };
+    PrCheckLogSnippet {
+        check_name,
+        source: PrCheckLogSource::GhActionsLog,
+        url: Some(url),
+        snippet,
+        truncated,
     }
 }
 
@@ -647,6 +763,7 @@ fn fresh_response(
         updated_at: pr.updated_at.clone().or_else(|| Some(refreshed_at.clone())),
         display_state: Some(pr.display_state.clone()),
         feedback_freshness: None,
+        feedback_coverage: None,
         pr: Some(pr),
         refresh: PrRefreshMetadata {
             state: PrRefreshState::Fresh,
@@ -723,6 +840,7 @@ pub(crate) fn stale_response_with_refresh_state(
         updated_at: identity.updated_at.clone(),
         display_state: Some(identity.display_state.clone()),
         feedback_freshness: None,
+        feedback_coverage: None,
         pr: Some(identity),
         refresh: PrRefreshMetadata {
             state: refresh_state,
@@ -779,6 +897,7 @@ pub(crate) fn persisted_primary_response(
         updated_at: identity.updated_at.clone(),
         display_state: Some(identity.display_state.clone()),
         feedback_freshness: None,
+        feedback_coverage: None,
         pr: Some(identity),
         refresh,
     }
@@ -838,16 +957,30 @@ fn unavailable_reason_message(reason: &PrUnavailableReason) -> &'static str {
 }
 
 fn capture_log_snippets(client: &dyn GhClient, checks: &[GhPrCheck]) -> Vec<PrCheckLogSnippet> {
-    checks
-        .iter()
-        .filter_map(|check| match client.failed_log_snippet(check) {
-            Ok(snippet) => snippet.map(limit_log_snippet),
+    let mut snippets = Vec::new();
+    let mut fetches = 0usize;
+    for check in checks {
+        if classify_check(check) != CheckBucket::Failing {
+            continue;
+        }
+        if fetches >= MAX_LOG_SNIPPET_FETCHES {
+            tracing::debug!(
+                check = ?check.name,
+                cap = MAX_LOG_SNIPPET_FETCHES,
+                "skipping log extraction for failing check beyond per-capture cap"
+            );
+            continue;
+        }
+        fetches += 1;
+        match client.failed_log_snippet(check) {
+            Ok(Some(snippet)) => snippets.push(limit_log_snippet(snippet)),
+            Ok(None) => {}
             Err(e) => {
                 tracing::debug!(check = ?check.name, error = %e.message, "failed to capture check log snippet");
-                None
             }
-        })
-        .collect()
+        }
+    }
+    snippets
 }
 
 fn limit_log_snippet(mut snippet: PrCheckLogSnippet) -> PrCheckLogSnippet {
@@ -1217,60 +1350,76 @@ pub(crate) fn pr_updated_after_baseline(
 
 pub(crate) fn feedback_freshness_from_baseline(
     baseline: &WorkScopePrFeedbackBaseline,
-    current_pr_updated_at: Option<&str>,
     current_feedback: Option<&PrFeedbackSummary>,
 ) -> Option<PrFeedbackFreshness> {
-    if let Some(feedback) = current_feedback {
-        let baseline_ids: HashSet<&str> = baseline
-            .feedback_identities
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let new_count = feedback
-            .items
-            .iter()
-            .map(feedback_identity)
-            .filter(|identity| !baseline_ids.contains(identity.as_str()))
-            .count();
-        if new_count > 0 {
-            return Some(PrFeedbackFreshness {
-                state: PrFeedbackFreshnessState::New,
-                new_count: Some(u32::try_from(new_count).unwrap_or(u32::MAX)),
-            });
-        }
-        let baseline_fingerprints: HashSet<&str> = baseline
-            .feedback_fingerprints
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let content_changed = feedback
-            .items
-            .iter()
-            .map(feedback_fingerprint)
-            .any(|fingerprint| !baseline_fingerprints.contains(fingerprint.as_str()));
-        if content_changed
-            || feedback
-                .coverage
-                .iter()
-                .any(|coverage| coverage.status != PrFeedbackCoverageStatus::Fetched)
-                && current_pr_updated_at.is_some()
-        {
-            return Some(PrFeedbackFreshness {
-                state: PrFeedbackFreshnessState::Updated,
-                new_count: None,
-            });
-        }
-        return None;
-    }
+    // No feedback to compare (the fetch failed) is an error condition, not a
+    // content change — report no freshness rather than a misleading signal.
+    let feedback = current_feedback?;
 
-    let updated_at = current_pr_updated_at?;
-    if pr_updated_after_baseline(baseline, updated_at) {
-        return Some(PrFeedbackFreshness {
-            state: PrFeedbackFreshnessState::Updated,
-            new_count: None,
+    let baseline_ids: HashSet<&str> = baseline
+        .feedback_identities
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let new_count = feedback
+        .items
+        .iter()
+        .map(feedback_identity)
+        .filter(|identity| !baseline_ids.contains(identity.as_str()))
+        .count();
+    if new_count > 0 {
+        return Some(PrFeedbackFreshness::New {
+            count: u32::try_from(new_count).unwrap_or(u32::MAX),
         });
     }
 
+    // No net-new items, so every current identity is already in the baseline.
+    // Any item whose fingerprint is absent from the baseline is an edit of
+    // existing content.
+    let baseline_fingerprints: HashSet<&str> = baseline
+        .feedback_fingerprints
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let edited_count = feedback
+        .items
+        .iter()
+        .map(feedback_fingerprint)
+        .filter(|fingerprint| !baseline_fingerprints.contains(fingerprint.as_str()))
+        .count();
+    if edited_count > 0 {
+        return Some(PrFeedbackFreshness::Edited {
+            count: u32::try_from(edited_count).unwrap_or(u32::MAX),
+        });
+    }
+
+    None
+}
+
+/// Coverage health of a feedback fetch, derived from its per-surface coverage.
+/// Auth failures take precedence over transient unavailability because only
+/// they are user-actionable. Returns `None` when every surface was fetched.
+pub(crate) fn coverage_health(feedback: &PrFeedbackSummary) -> Option<PrFeedbackCoverageHealth> {
+    let surfaces_with = |target: PrFeedbackCoverageStatus| -> Vec<PrFeedbackCoverageSurface> {
+        feedback
+            .coverage
+            .iter()
+            .filter(|coverage| coverage.status == target)
+            .map(|coverage| coverage.surface)
+            .collect()
+    };
+    let auth_failed = surfaces_with(PrFeedbackCoverageStatus::AuthFailed);
+    if !auth_failed.is_empty() {
+        return Some(PrFeedbackCoverageHealth::AuthRequired {
+            surfaces: auth_failed,
+        });
+    }
+    let unavailable = surfaces_with(PrFeedbackCoverageStatus::Unavailable);
+    if !unavailable.is_empty() {
+        return Some(PrFeedbackCoverageHealth::Incomplete {
+            surfaces: unavailable,
+        });
+    }
     None
 }
 
@@ -1899,25 +2048,21 @@ mod tests {
             ],
         };
 
-        let freshness = feedback_freshness_from_baseline(
-            &baseline,
-            Some("2026-01-02T00:00:00Z"),
-            Some(&feedback),
-        )
-        .unwrap();
-        assert_eq!(freshness.state, PrFeedbackFreshnessState::New);
-        assert_eq!(freshness.new_count, Some(1));
+        let freshness = feedback_freshness_from_baseline(&baseline, Some(&feedback)).unwrap();
+        assert_eq!(freshness, PrFeedbackFreshness::New { count: 1 });
     }
 
     #[test]
-    fn feedback_freshness_degrades_to_updated_when_surface_unavailable() {
+    fn coverage_degradation_alone_yields_no_content_freshness() {
         let baseline = WorkScopePrFeedbackBaseline {
             work_scope_id: 1,
             pr_number: 7,
             captured_at: "2026-01-01T00:00:00Z".to_string(),
             github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
             feedback_identities: vec!["IssueComment:1".to_string()],
-            feedback_fingerprints: vec!["IssueComment:1::::::|old".to_string()],
+            // Matches the item below exactly (see feedback_fingerprint format),
+            // so the only signal that could fire is the degraded coverage.
+            feedback_fingerprints: vec!["IssueComment:1::u:::|old".to_string()],
         };
         let feedback = PrFeedbackSummary {
             total: 1,
@@ -1939,18 +2084,15 @@ mod tests {
             }],
         };
 
-        let freshness = feedback_freshness_from_baseline(
-            &baseline,
-            Some("2026-01-02T00:00:00Z"),
-            Some(&feedback),
-        )
-        .unwrap();
-        assert_eq!(freshness.state, PrFeedbackFreshnessState::Updated);
-        assert_eq!(freshness.new_count, None);
+        // An unfetchable surface is an error condition, not a content change:
+        // the only item is unchanged, so there is no freshness signal. (The
+        // "feedback incomplete" error state is tracked separately.)
+        let freshness = feedback_freshness_from_baseline(&baseline, Some(&feedback));
+        assert_eq!(freshness, None);
     }
 
     #[test]
-    fn feedback_freshness_marks_existing_feedback_edits_as_updated() {
+    fn feedback_freshness_marks_existing_feedback_edits_as_edited() {
         let baseline = WorkScopePrFeedbackBaseline {
             work_scope_id: 1,
             pr_number: 7,
@@ -1979,14 +2121,90 @@ mod tests {
             }],
         };
 
-        let freshness = feedback_freshness_from_baseline(
-            &baseline,
-            Some("2026-01-02T00:00:00Z"),
-            Some(&feedback),
-        )
-        .unwrap();
-        assert_eq!(freshness.state, PrFeedbackFreshnessState::Updated);
-        assert_eq!(freshness.new_count, None);
+        let freshness = feedback_freshness_from_baseline(&baseline, Some(&feedback)).unwrap();
+        assert_eq!(freshness, PrFeedbackFreshness::Edited { count: 1 });
+    }
+
+    #[test]
+    fn no_feedback_to_compare_yields_no_freshness() {
+        let baseline = WorkScopePrFeedbackBaseline {
+            work_scope_id: 1,
+            pr_number: 7,
+            captured_at: "2026-01-01T00:00:00Z".to_string(),
+            github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            feedback_identities: vec!["IssueComment:1".to_string()],
+            feedback_fingerprints: vec!["IssueComment:1::::::|old".to_string()],
+        };
+        assert_eq!(feedback_freshness_from_baseline(&baseline, None), None);
+    }
+
+    fn coverage_summary(coverage: Vec<PrFeedbackCoverage>) -> PrFeedbackSummary {
+        PrFeedbackSummary {
+            total: 0,
+            unresolved: 0,
+            items: vec![],
+            coverage,
+        }
+    }
+
+    fn coverage(
+        surface: PrFeedbackCoverageSurface,
+        status: PrFeedbackCoverageStatus,
+    ) -> PrFeedbackCoverage {
+        PrFeedbackCoverage {
+            surface,
+            status,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn coverage_health_flags_auth_over_transient() {
+        let feedback = coverage_summary(vec![
+            coverage(
+                PrFeedbackCoverageSurface::IssueComments,
+                PrFeedbackCoverageStatus::Unavailable,
+            ),
+            coverage(
+                PrFeedbackCoverageSurface::ReviewThreads,
+                PrFeedbackCoverageStatus::AuthFailed,
+            ),
+        ]);
+        assert_eq!(
+            coverage_health(&feedback),
+            Some(PrFeedbackCoverageHealth::AuthRequired {
+                surfaces: vec![PrFeedbackCoverageSurface::ReviewThreads],
+            })
+        );
+    }
+
+    #[test]
+    fn coverage_health_reports_incomplete_for_transient_only() {
+        let feedback = coverage_summary(vec![
+            coverage(
+                PrFeedbackCoverageSurface::IssueComments,
+                PrFeedbackCoverageStatus::Fetched,
+            ),
+            coverage(
+                PrFeedbackCoverageSurface::ReviewThreads,
+                PrFeedbackCoverageStatus::Unavailable,
+            ),
+        ]);
+        assert_eq!(
+            coverage_health(&feedback),
+            Some(PrFeedbackCoverageHealth::Incomplete {
+                surfaces: vec![PrFeedbackCoverageSurface::ReviewThreads],
+            })
+        );
+    }
+
+    #[test]
+    fn coverage_health_none_when_all_fetched() {
+        let feedback = coverage_summary(vec![coverage(
+            PrFeedbackCoverageSurface::IssueComments,
+            PrFeedbackCoverageStatus::Fetched,
+        )]);
+        assert_eq!(coverage_health(&feedback), None);
     }
 
     #[test]
@@ -2103,5 +2321,76 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, PrMonitorError::BadRequest(_)));
         assert!(!temp.path().join(".phoenix/pr-context").exists());
+    }
+
+    #[test]
+    fn parses_github_actions_job_url() {
+        assert_eq!(
+            parse_actions_job_url(
+                "https://github.com/owner/repo/actions/runs/27487410933/job/81246192119"
+            ),
+            Some(("27487410933".to_string(), "81246192119".to_string()))
+        );
+        // Trailing query/fragment on the job id is tolerated.
+        assert_eq!(
+            parse_actions_job_url(
+                "https://github.com/o/r/actions/runs/1/job/2?check_suite_focus=true"
+            ),
+            Some(("1".to_string(), "2".to_string()))
+        );
+        // GitHub also documents the plural `jobs` segment.
+        assert_eq!(
+            parse_actions_job_url("https://github.com/o/r/actions/runs/3/jobs/4"),
+            Some(("3".to_string(), "4".to_string()))
+        );
+        // ...and a job URL without the `/actions` prefix.
+        assert_eq!(
+            parse_actions_job_url("https://github.com/o/r/runs/5/jobs/6"),
+            Some(("5".to_string(), "6".to_string()))
+        );
+    }
+
+    #[test]
+    fn rejects_non_actions_job_urls() {
+        // Workflow-run URL without a /job/ segment.
+        assert_eq!(
+            parse_actions_job_url("https://github.com/owner/repo/actions/runs/27487410933"),
+            None
+        );
+        // A third-party CI check URL.
+        assert_eq!(
+            parse_actions_job_url("https://app.circleci.com/pipelines/github/o/r/42"),
+            None
+        );
+        // Non-numeric ids.
+        assert_eq!(
+            parse_actions_job_url("https://github.com/o/r/actions/runs/abc/job/def"),
+            None
+        );
+    }
+
+    #[test]
+    fn tail_log_snippet_keeps_the_end_when_oversized() {
+        let log = format!("{}TAIL-MARKER", "x".repeat(LOG_SNIPPET_LIMIT));
+        let snippet = tail_log_snippet("clippy".to_string(), "https://u".to_string(), &log);
+        assert_eq!(snippet.source, PrCheckLogSource::GhActionsLog);
+        assert!(snippet.truncated);
+        assert!(snippet.snippet.len() <= LOG_SNIPPET_LIMIT);
+        assert!(
+            snippet.snippet.ends_with("TAIL-MARKER"),
+            "tail must preserve the end of the log where failures surface"
+        );
+    }
+
+    #[test]
+    fn tail_log_snippet_passes_short_logs_through_untruncated() {
+        let snippet = tail_log_snippet(
+            "clippy".to_string(),
+            "https://u".to_string(),
+            "  short log  ",
+        );
+        assert!(!snippet.truncated);
+        assert_eq!(snippet.snippet, "short log");
+        assert_eq!(snippet.source, PrCheckLogSource::GhActionsLog);
     }
 }
