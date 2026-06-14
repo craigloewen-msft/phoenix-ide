@@ -20,6 +20,14 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
   const [reloading, setReloading] = useState(false);
   const [togglingServers, setTogglingServers] = useState<Set<string>>(new Set());
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Reload-retry polling: the backend reconnects retried servers in the
+  // background (up to the connect timeout), so after a reload we keep polling
+  // until every awaited server is `ready` or this deadline passes — long enough
+  // for a slow reconnect to flip failed/pending → ready without a manual
+  // refresh. `awaitingRef` is null while the reload request itself is in flight
+  // (the awaited set isn't known yet), then the names being (re)connected.
+  const reloadUntilRef = useRef<number>(0);
+  const awaitingRef = useRef<Set<string> | null>(null);
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -31,12 +39,23 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
     }
   }, []);
 
+  // Whether a reload's retried servers have settled (all `ready`) or its window
+  // has elapsed, so polling may stop. Outside a reload (deadline in the past)
+  // this is vacuously true, preserving the connect-once polling behavior.
+  const reloadSettled = useCallback((s: McpServerStatus[]) => {
+    if (Date.now() > reloadUntilRef.current) return true;
+    const awaiting = awaitingRef.current;
+    if (awaiting === null) return false; // reload request still in flight
+    const ready = new Set(s.filter(srv => srv.state === 'ready').map(srv => srv.name));
+    return [...awaiting].every(name => ready.has(name));
+  }, []);
+
   // Poll every 3s until servers are connected. Keep polling while any server
   // has a pending OAuth URL so the UI can update when auth completes.
   useEffect(() => {
     let cancelled = false;
     const shouldStopPolling = (s: McpServerStatus[]) =>
-      s.length > 0 && s.every(srv => !srv.pending_oauth_url);
+      s.length > 0 && s.every(srv => !srv.pending_oauth_url) && reloadSettled(s);
 
     fetchStatus().then(count => {
       if (cancelled) return;
@@ -52,22 +71,33 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
     };
   }, [fetchStatus]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Stop polling once all OAuth flows have resolved.
+  // Stop polling once all OAuth flows have resolved and any reload retry has
+  // settled.
   useEffect(() => {
-    if (servers.length > 0 && servers.every(s => !s.pending_oauth_url) && pollRef.current) {
+    if (
+      servers.length > 0 &&
+      servers.every(s => !s.pending_oauth_url) &&
+      reloadSettled(servers) &&
+      pollRef.current
+    ) {
       clearInterval(pollRef.current);
       pollRef.current = null;
     }
-  }, [servers]);
+  }, [servers, reloadSettled]);
 
   const handleReload = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation();
     if (reloading) return;
     setReloading(true);
-    // Synchronously drop stale pending-OAuth entries from local state so the
-    // settling effect below doesn't treat them as "fresh content arrived" and
-    // clear `reloading` prematurely. Connected servers are kept untouched.
-    setServers(prev => prev.filter(s => !s.pending_oauth_url));
+    // Open the retry-polling window (bounded by the backend connect timeout)
+    // and mark the awaited set unknown until the reload request returns it.
+    reloadUntilRef.current = Date.now() + 300_000;
+    awaitingRef.current = null;
+    // Synchronously drop stale pending-OAuth and failed entries from local
+    // state: the reload retries them as background connects, so their new
+    // outcome should repopulate from polling rather than the panel showing a
+    // stale state. Connected servers are kept untouched.
+    setServers(prev => prev.filter(s => s.state === 'ready'));
     // Ensure polling is active — connection happens as a background task on the
     // server, so the new OAuth URL won't be in the status we fetch immediately.
     if (!pollRef.current) {
@@ -75,6 +105,15 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
     }
     try {
       const result = await api.reloadMcp();
+      // The (re)connecting servers to await before polling settles: a slow one
+      // flips to `ready` later, within the window above. `failed` is included
+      // because a timed-out restart still has a background connect running that
+      // may publish successfully and clear the failure.
+      awaitingRef.current = new Set([
+        ...result.added,
+        ...result.restarted,
+        ...result.failed.map(f => f.server),
+      ]);
       await fetchStatus();
       const parts: string[] = [];
       if (result.added.length > 0) parts.push(`+${result.added.length} added`);
@@ -97,6 +136,10 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
     } catch {
       showError('MCP reload failed', 3000);
       setReloading(false);
+      // The reload never landed; close the retry window so polling settles
+      // normally instead of running for the full timeout.
+      reloadUntilRef.current = 0;
+      awaitingRef.current = null;
     }
   }, [reloading, fetchStatus, showToast, showError]);
 
@@ -145,13 +188,15 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
     });
   }, []);
 
-  const enabledServers = servers.filter(s => s.enabled);
-  const totalTools = enabledServers.reduce((sum, s) => sum + s.tool_count, 0);
-  const disabledCount = servers.length - enabledServers.length;
+  const readyServers = servers.filter(s => s.state === 'ready');
+  const enabledReady = readyServers.filter(s => s.enabled);
+  const totalTools = enabledReady.reduce((sum, s) => sum + s.tool_count, 0);
+  const disabledCount = readyServers.filter(s => !s.enabled).length;
 
-  const pendingOAuth = servers.filter(s => s.pending_oauth_url);
+  const pendingOAuth = servers.filter(s => s.state === 'unauthorized');
+  const failedServers = servers.filter(s => s.state === 'failed');
 
-  if (servers.length === 0 && pendingOAuth.length === 0 && !expanded && !reloading) {
+  if (servers.length === 0 && !expanded && !reloading) {
     return null;
   }
 
@@ -170,19 +215,35 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
           </a>
         </div>
       ))}
+      {!reloading && failedServers.map(s => (
+        <div key={s.name} className="mcp-error-banner">
+          <span className="mcp-error-label">Failed:</span>
+          <span className="mcp-error-text" title={s.last_error}>
+            {s.name} &mdash; {s.last_error ?? 'connection failed'}
+          </span>
+        </div>
+      ))}
       <button className="mcp-panel-header" onClick={() => setExpanded(!expanded)}>
         <span className={`mcp-panel-chevron ${expanded ? 'expanded' : ''}`}>&#9654;</span>
         <span className="mcp-panel-summary">
-          {pendingOAuth.length > 0 && enabledServers.length === 0
-            ? <span className="mcp-auth-needed">MCP &middot; auth needed</span>
-            : servers.length === 0
-              ? 'No MCP servers'
-              : <>
-                  MCP &middot; {enabledServers.length} server{enabledServers.length !== 1 ? 's' : ''} &middot; {totalTools} tool{totalTools !== 1 ? 's' : ''} &middot; ~{Math.round(totalTools * 250 / 1000)}k tokens
-                  {disabledCount > 0 && (
-                    <span className="mcp-disabled-count"> ({disabledCount} off)</span>
-                  )}
-                </>
+          {servers.length === 0
+            ? 'No MCP servers'
+            : enabledReady.length === 0 && pendingOAuth.length > 0
+              ? <span className="mcp-auth-needed">MCP &middot; auth needed</span>
+              : enabledReady.length === 0 && failedServers.length > 0
+                ? <span className="mcp-failed-count">MCP &middot; {failedServers.length} failed</span>
+                : <>
+                    MCP &middot; {enabledReady.length} server{enabledReady.length !== 1 ? 's' : ''} &middot; {totalTools} tool{totalTools !== 1 ? 's' : ''} &middot; ~{Math.round(totalTools * 250 / 1000)}k tokens
+                    {disabledCount > 0 && (
+                      <span className="mcp-disabled-count"> ({disabledCount} off)</span>
+                    )}
+                    {failedServers.length > 0 && (
+                      <span className="mcp-failed-count"> &middot; {failedServers.length} failed</span>
+                    )}
+                    {pendingOAuth.length > 0 && (
+                      <span className="mcp-auth-needed"> &middot; auth needed</span>
+                    )}
+                  </>
           }
         </span>
         {(servers.length > 0 || pendingOAuth.length > 0) && (
@@ -215,8 +276,15 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
                   <span className={`mcp-server-name ${!server.enabled ? 'mcp-name-disabled' : ''}`}>
                     {server.name}
                   </span>
+                  <span className="mcp-server-meta">
+                    {server.transport}{server.auth !== 'none' ? ` · ${server.auth}` : ''}
+                  </span>
                   <span className="mcp-server-count">
-                    {server.tool_count} tool{server.tool_count !== 1 ? 's' : ''}
+                    {server.state === 'failed'
+                      ? <span className="mcp-state-failed">failed</span>
+                      : server.state === 'unauthorized'
+                        ? <span className="mcp-auth-needed">auth needed</span>
+                        : `${server.tool_count} tool${server.tool_count !== 1 ? 's' : ''}`}
                   </span>
                   <span
                     className={`mcp-server-toggle ${server.enabled ? 'on' : 'off'} ${togglingServers.has(server.name) ? 'toggling' : ''}`}
@@ -240,11 +308,15 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
                   </span>
                 </button>
                 {expandedServers.has(server.name) && (
-                  <div className="mcp-tool-list">
-                    {server.tools.map(tool => (
-                      <span key={tool} className={`mcp-tool-name ${!server.enabled ? 'mcp-tool-disabled' : ''}`}>{tool}</span>
-                    ))}
-                  </div>
+                  server.state === 'failed' ? (
+                    <div className="mcp-server-error">{server.last_error ?? 'connection failed'}</div>
+                  ) : (
+                    <div className="mcp-tool-list">
+                      {server.tools.map(tool => (
+                        <span key={tool} className={`mcp-tool-name ${!server.enabled ? 'mcp-tool-disabled' : ''}`}>{tool}</span>
+                      ))}
+                    </div>
+                  )
                 )}
               </div>
             ))
