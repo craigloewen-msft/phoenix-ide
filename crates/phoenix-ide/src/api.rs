@@ -122,6 +122,14 @@ impl AppState {
         // through one registry.
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let codex_login = codex_login::CodexLoginManager::new();
+        // Bind sessions to the configured password so rotating it invalidates
+        // them. Empty when auth is disabled (password None) — never consulted,
+        // since the auth middleware short-circuits in that mode.
+        let session_password_fingerprint = password
+            .as_deref()
+            .map(auth::password_fingerprint)
+            .unwrap_or_default();
+        let sessions = auth::SessionStore::new(db.clone(), session_password_fingerprint);
         Self {
             runtime,
             llm_registry,
@@ -130,7 +138,7 @@ impl AppState {
             mcp_manager,
             credential_helper,
             password,
-            sessions: auth::SessionStore::new(),
+            sessions,
             login_throttle: auth::LoginThrottle::new(),
             terminals,
             chain_qa,
