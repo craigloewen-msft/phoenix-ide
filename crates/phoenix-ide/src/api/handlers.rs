@@ -78,6 +78,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/codex/login", get(serve_spa))
         // About this deployment page (SPA-rendered)
         .route("/about", get(serve_spa))
+        // Usage analytics page (SPA-rendered)
+        .route("/usage", get(serve_spa))
         // Service worker
         .route("/service-worker.js", get(serve_service_worker))
         // Favicon (referenced from index.html)
@@ -296,6 +298,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/version", get(get_version_json))
         // About this deployment (read-only diagnostics)
         .route("/api/deployment", get(super::deployment::deployment_info))
+        // Usage analytics (read-only)
+        .route("/api/usage", get(super::usage::usage_overview))
+        .route(
+            "/api/usage/conversation/:id",
+            get(super::usage::usage_conversation_detail),
+        )
         // Auth endpoints (REQ-AUTH-002, REQ-AUTH-003)
         .route("/api/auth/status", get(super::auth::auth_status))
         .route("/api/auth/login", post(super::auth::auth_login))
