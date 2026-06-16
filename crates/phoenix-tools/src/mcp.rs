@@ -926,15 +926,15 @@ impl McpServer {
 // protocol mechanics in `mcp/oauth.rs`.
 // ---------------------------------------------------------------------------
 
-/// The authorization server a config pins via a pre-configured client, as a
-/// normalized issuer key. `None` for a dynamically discovered issuer and for
-/// non-OAuth configs.
-fn pinned_auth_server(config: &McpServerConfig) -> Option<String> {
+/// The pre-configured OAuth client id a config carries, if any. `None` for a
+/// dynamically registered client and for non-OAuth configs. A change here
+/// invalidates a stored token: it was minted under the old client identity.
+fn preconfigured_client_id(config: &McpServerConfig) -> Option<&str> {
     match config {
         McpServerConfig::Http {
             auth: HttpAuth::OAuth(Some(preconfigured)),
             ..
-        } => Some(oauth::normalize_issuer(&preconfigured.auth_server)),
+        } => Some(&preconfigured.client_id),
         McpServerConfig::Http { .. } | McpServerConfig::Stdio { .. } => None,
     }
 }
@@ -1026,6 +1026,14 @@ struct OAuthRuntime {
     /// authorize link will fail before opening it.
     redirect_warning: std::sync::Mutex<Option<String>>,
     pending: std::sync::Mutex<HashMap<String, PendingAuthFlow>>,
+    /// Loopback callback listeners, keyed by server name. A server whose
+    /// pre-registered OAuth app only allows a fixed `http://localhost:<port>/callback`
+    /// redirect (it cannot register Phoenix's own callback route) gets a listener
+    /// on that port that bounces the browser to the real callback route
+    /// (REQ-MCP-020). The `JoinHandle` is held so a re-prompt can abort *and
+    /// await* a stale listener — releasing the port before rebinding it — and so
+    /// a completed flow can abort its listener.
+    loopback_listeners: std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 impl Default for OAuthRuntime {
@@ -1035,6 +1043,7 @@ impl Default for OAuthRuntime {
             redirect_base: std::sync::Mutex::new(None),
             redirect_warning: std::sync::Mutex::new(None),
             pending: std::sync::Mutex::new(HashMap::new()),
+            loopback_listeners: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -1057,6 +1066,12 @@ impl OAuthRuntime {
             .unwrap()
             .as_ref()
             .map(|base| format!("{}/api/mcp/oauth/callback", base.trim_end_matches('/')))
+    }
+
+    /// Phoenix's own externally reachable origin (no callback path), the bounce
+    /// target for a loopback listener. `None` until the server address is known.
+    fn redirect_base(&self) -> Option<String> {
+        self.redirect_base.lock().unwrap().clone()
     }
 }
 
@@ -1083,7 +1098,13 @@ async fn resolve_authorization_server(
     let mut fallback: Option<oauth::AuthServerMetadata> = None;
     let mut errors: Vec<String> = Vec::new();
     for issuer in &prm.authorization_servers {
-        let metadata = match oauth::fetch_auth_server_metadata(client, issuer).await {
+        let metadata = match oauth::fetch_auth_server_metadata(
+            client,
+            issuer,
+            oauth::IssuerTrust::ResourceAdvertised,
+        )
+        .await
+        {
             Ok(metadata) => metadata,
             Err(e) => {
                 errors.push(e);
@@ -1193,16 +1214,48 @@ async fn acquire_client_registration(
     name: &str,
     metadata: &oauth::AuthServerMetadata,
     cached: Option<OAuthRegistrationRecord>,
+    preconfigured: Option<&PreconfiguredClient>,
     redirect_uri: &str,
 ) -> Result<OAuthRegistrationRecord, String> {
     if let Some(cached) = &cached {
-        if cached
+        // Reuse a cached registration only if it still matches the current
+        // client identity and redirect. A changed pre-configured client_id
+        // (the config was re-keyed) must replace the stale row, not authorize
+        // against the old app forever (the registration is keyed by issuer, so
+        // the client_id is not in the key).
+        let client_matches = preconfigured.is_none_or(|pre| pre.client_id == cached.client_id);
+        let redirect_matches = cached
             .redirect_uri
             .as_deref()
-            .is_none_or(|registered| registered == redirect_uri)
-        {
+            .is_none_or(|registered| registered == redirect_uri);
+        if client_matches && redirect_matches {
             return Ok(cached.clone());
         }
+    }
+
+    // A pre-configured client identity is seeded — discovery has resolved the
+    // issuer the config could not name (REQ-MCP-010, preferred over DCR).
+    // Reached when there is no cached row or the cached one no longer matches
+    // the configured client_id; the upsert (keyed by issuer) replaces a stale
+    // registration. The redirect is registered out of band by the operator, so
+    // it is left unknown and not compared (REQ-MCP-020). Public client: no
+    // secret, so the token endpoint uses `none` client authentication (PKCE).
+    if let Some(pre) = preconfigured {
+        let registration = OAuthRegistrationRecord {
+            auth_server: metadata.issuer.clone(),
+            client_id: pre.client_id.clone(),
+            client_secret: None,
+            token_endpoint_auth_method: "none".to_string(),
+            redirect_uri: None,
+        };
+        oauth_rt.store().upsert_registration(&registration).await?;
+        tracing::info!(
+            server = %name,
+            auth_server = %metadata.issuer,
+            client_id = %registration.client_id,
+            "Seeded pre-configured OAuth client (authorization server disables DCR)"
+        );
+        return Ok(registration);
     }
 
     let Some(endpoint) = metadata.registration_endpoint.clone() else {
@@ -1250,6 +1303,120 @@ async fn acquire_client_registration(
 /// (REQ-MCP-009..011, REQ-MCP-013). `extra_scopes` carries prior grants for a
 /// step-up union; `claim` keeps callers parked until re-authorization
 /// completes (it is released on every failure path by drop).
+/// Extract the query string (including the leading `?`) from an HTTP request's
+/// first line — e.g. `GET /callback?code=x&state=y HTTP/1.1` yields
+/// `?code=x&state=y`. Empty when the target has no query. The bytes are
+/// forwarded verbatim to Phoenix's real callback route, so the percent-encoding
+/// the authorization server produced is preserved.
+fn callback_request_query(request: &str) -> String {
+    let target = request
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("");
+    target
+        .split_once('?')
+        .map(|(_, query)| format!("?{query}"))
+        .unwrap_or_default()
+}
+
+/// Bind loopback listeners on `port` for both IPv4 (`127.0.0.1`) and IPv6
+/// (`::1`), so a browser resolving `localhost` to either family reaches the
+/// callback (REQ-MCP-020). Returns every address that bound; errs only if
+/// *neither* did (the port is genuinely unavailable). A few short retries
+/// absorb the brief window where a just-aborted prior listener is still
+/// releasing the port.
+async fn bind_loopback_listeners(port: u16) -> std::io::Result<Vec<tokio::net::TcpListener>> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    let mut last_err = None;
+    for attempt in 0..5 {
+        let mut bound = Vec::new();
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            match tokio::net::TcpListener::bind((ip, port)).await {
+                Ok(listener) => bound.push(listener),
+                // An IPv6-less host (or vice versa) is fine as long as the
+                // other family bound; only a total failure is fatal.
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if !bound.is_empty() {
+            return Ok(bound);
+        }
+        if attempt < 4 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::AddrInUse, "no loopback bound")))
+}
+
+/// Bounce the authorization server's callbacks (arriving on the pre-bound
+/// loopback `listeners`) to Phoenix's real callback route under `target_base`
+/// (REQ-MCP-020). Accepts in a loop so a retry after a failed token exchange —
+/// which leaves the flow pending — is still received, until the flow resolves
+/// (the listener is aborted) or the 5-minute flow window elapses.
+async fn run_loopback_redirect(
+    server: String,
+    listeners: Vec<tokio::net::TcpListener>,
+    target_base: String,
+) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            tracing::debug!(server = %server, "OAuth loopback listener window elapsed");
+            return;
+        }
+        let accepts = listeners
+            .iter()
+            .map(|l| Box::pin(l.accept()))
+            .collect::<Vec<_>>();
+        match tokio::time::timeout(remaining, futures::future::select_all(accepts)).await {
+            Ok((Ok((stream, _)), _, _)) => bounce_loopback_callback(stream, &target_base).await,
+            Ok((Err(e), _, _)) => {
+                tracing::warn!(server = %server, "OAuth loopback accept failed: {e}");
+            }
+            Err(_) => {
+                tracing::debug!(server = %server, "OAuth loopback listener window elapsed");
+                return;
+            }
+        }
+    }
+}
+
+/// Read one callback request off `stream` and reply `302` to Phoenix's real
+/// callback route, forwarding the query verbatim.
+async fn bounce_loopback_callback(mut stream: tokio::net::TcpStream, target_base: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = vec![0u8; 8192];
+    let n = stream.read(&mut buf).await.unwrap_or(0);
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let query = callback_request_query(&request);
+    let location = format!(
+        "{}/api/mcp/oauth/callback{}",
+        target_base.trim_end_matches('/'),
+        query
+    );
+    let body = "<!DOCTYPE html><html><body><p>Completing authorization, \
+                returning to Phoenix…</p></body></html>";
+    let response = format!(
+        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.flush().await;
+    tracing::debug!("OAuth loopback callback bounced to {location}");
+}
+
+#[allow(clippy::too_many_lines)] // One ordered sequence: discover, acquire client, bind callback, publish.
 async fn begin_oauth_flow(
     oauth_rt: &OAuthRuntime,
     pending_oauth_urls: &Arc<RwLock<HashMap<String, String>>>,
@@ -1262,9 +1429,23 @@ async fn begin_oauth_flow(
     let Some(url) = oauth_resource_url(entry) else {
         return Err("server is not OAuth-eligible".to_string());
     };
-    let redirect_uri = oauth_rt
-        .redirect_uri()
-        .ok_or("OAuth redirect base not configured (server address unknown)")?;
+    let preconfigured = match entry {
+        McpServerConfig::Http {
+            auth: HttpAuth::OAuth(Some(pre)),
+            ..
+        } => Some(pre),
+        McpServerConfig::Http { .. } | McpServerConfig::Stdio { .. } => None,
+    };
+    // A pre-registered app whose allowlist pins a fixed loopback port redirects
+    // there; Phoenix bounces that callback to its own route (REQ-MCP-020).
+    // Otherwise the redirect is Phoenix's own server-route callback.
+    let loopback_port = preconfigured.and_then(|pre| pre.callback_port);
+    let redirect_uri = match loopback_port {
+        Some(port) => format!("http://localhost:{port}/callback"),
+        None => oauth_rt
+            .redirect_uri()
+            .ok_or("OAuth redirect base not configured (server address unknown)")?,
+    };
     let client = oauth::oauth_http_client()?;
     let challenge = www_authenticate
         .map(oauth::parse_bearer_challenge)
@@ -1280,6 +1461,7 @@ async fn begin_oauth_flow(
         name,
         &metadata,
         cached_registration,
+        preconfigured,
         &redirect_uri,
     )
     .await?;
@@ -1324,6 +1506,39 @@ async fn begin_oauth_flow(
         scopes,
         claim,
     };
+    // Bind the loopback listener BEFORE anything is published, so a bind
+    // failure (port in use) fails the flow with a clear error instead of
+    // surfacing a sign-in URL whose callback can never be received. The
+    // listener bounces the fixed-port callback to Phoenix's real route; the
+    // server-route case needs no listener.
+    if let Some(port) = loopback_port {
+        let Some(base) = oauth_rt.redirect_base() else {
+            return Err(format!(
+                "MCP server '{name}': loopback OAuth callback needs Phoenix's own address to \
+                 bounce to, but none is configured"
+            ));
+        };
+        // Abort and await any prior listener for this server so the port is
+        // released before we rebind it (a re-prompt during an active flow).
+        let prior = oauth_rt.loopback_listeners.lock().unwrap().remove(name);
+        if let Some(prior) = prior {
+            prior.abort();
+            let _ = prior.await;
+        }
+        let listeners = bind_loopback_listeners(port).await.map_err(|e| {
+            format!(
+                "MCP server '{name}': cannot bind OAuth callback port {port} on loopback \
+                 (already in use?): {e}"
+            )
+        })?;
+        let handle = tokio::spawn(run_loopback_redirect(name.to_string(), listeners, base));
+        oauth_rt
+            .loopback_listeners
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), handle);
+    }
+
     // Inserting rotates the nonce: a displaced older flow (and its claim)
     // drops, so its callback no longer matches any pending flow.
     oauth_rt
@@ -1513,10 +1728,9 @@ impl McpClientManager {
     }
 
     /// Discard a stored token the reloaded config can no longer use: the
-    /// resource was repointed, auth moved away from OAuth, or the pinned
-    /// authorization server changed — a token minted under the old issuer
-    /// must not restore against the new one (`ReloadInvalidatesOAuth`,
-    /// REQ-MCP-012).
+    /// resource was repointed, auth moved away from OAuth, or the pre-configured
+    /// client identity changed — a token minted under the old client must not
+    /// restore against the new one (`ReloadInvalidatesOAuth`, REQ-MCP-012).
     async fn invalidate_oauth_on_config_change(
         &self,
         name: &str,
@@ -1533,18 +1747,18 @@ impl McpClientManager {
         };
         let resource_matches = oauth_resource_url(new_config)
             .is_some_and(|url| oauth::canonical_resource(url) == token.resource);
-        // The token row does not record its issuer, so an authorization-server
-        // change is detected from the config delta: any change to the pinned
-        // auth server (repinned, newly pinned, or unpinned) invalidates. A
-        // dynamically discovered issuer that changed server-side is caught at
-        // use instead: the resource 401s, the refresh against the new issuer
-        // fails, and the failure path discards the token and re-prompts.
-        let pinned_auth_server_changed =
-            pinned_auth_server(old_config) != pinned_auth_server(new_config);
-        if !resource_matches || pinned_auth_server_changed {
+        // The token row records neither its issuer nor its client, so a client
+        // identity change is detected from the config delta: a token minted
+        // under the old pre-configured client_id must not restore under a new
+        // one. A dynamically discovered issuer that changed server-side is
+        // caught at use instead: the resource 401s, the refresh fails, and the
+        // failure path discards the token and re-prompts.
+        let client_id_changed =
+            preconfigured_client_id(old_config) != preconfigured_client_id(new_config);
+        if !resource_matches || client_id_changed {
             tracing::info!(
                 server = %name,
-                "Reload repointed, de-OAuthed, or re-pinned this server; discarding its stored token"
+                "Reload repointed, de-OAuthed, or re-keyed this server's client; discarding its stored token"
             );
             if let Err(e) = self.oauth.store().delete_token(name).await {
                 tracing::warn!(server = %name, "Failed to delete invalidated OAuth token: {e}");
@@ -1663,6 +1877,13 @@ impl McpClientManager {
             .map_err(|e| format!("MCP server '{name}': failed to persist OAuth token: {e}"))?;
 
         self.pending_oauth_urls.write().await.remove(&name);
+        // The flow is resolved; stop its loopback listener (if any) so it does
+        // not hold the port for the rest of its window. On exchange *failure*
+        // the flow stays pending and this is not reached, so the listener keeps
+        // accepting for a retry (REQ-MCP-020).
+        if let Some(handle) = self.oauth.loopback_listeners.lock().unwrap().remove(&name) {
+            handle.abort();
+        }
         let claim = resolved.claim;
         let config = resolved.config;
 
@@ -2555,37 +2776,9 @@ impl McpClientManager {
         pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
         oauth_rt: Arc<OAuthRuntime>,
     ) -> Result<McpServer, String> {
-        // A pre-configured client (for a DCR-less authorization server) seeds
-        // the registration row at discovery, so the later 401 reuses it
-        // instead of attempting registration (REQ-MCP-010,
-        // PreconfiguredClientSeeded). Idempotent per authorization server.
-        if let McpServerConfig::Http {
-            auth: HttpAuth::OAuth(Some(preconfigured)),
-            ..
-        } = entry
-        {
-            oauth_rt
-                .store()
-                .upsert_registration(&OAuthRegistrationRecord {
-                    // Normalized: lookups are keyed by the metadata-advertised
-                    // issuer, which fetch_auth_server_metadata normalizes the
-                    // same way, so a trailing-slash difference between config
-                    // and metadata cannot strand the seeded client.
-                    auth_server: oauth::normalize_issuer(&preconfigured.auth_server),
-                    client_id: preconfigured.client_id.clone(),
-                    client_secret: preconfigured.client_secret.clone(),
-                    token_endpoint_auth_method: preconfigured.token_endpoint_auth_method.clone(),
-                    // A pre-configured client's redirect is registered out of
-                    // band by the operator; Phoenix does not manage or compare
-                    // it, so it is left unknown (REQ-MCP-020).
-                    redirect_uri: None,
-                })
-                .await
-                .map_err(|e| {
-                    format!("MCP server '{name}': failed to seed pre-configured OAuth client: {e}")
-                })?;
-        }
-
+        // A pre-configured client (Claude Code's `oauth` shape) is seeded only
+        // once discovery resolves the authorization server's issuer, since the
+        // config does not name it — see `acquire_client_registration`.
         let bearer: SharedBearer = Arc::default();
         if oauth_resource_url(entry).is_none() {
             // The config no longer selects OAuth (static credentials or
@@ -2804,9 +2997,15 @@ impl McpClientManager {
                 tracing::debug!(server = %name, "HTTP MCP server without 'url' field");
                 return None;
             };
+            // An explicit static credential under `auth` wins; otherwise the
+            // top-level `oauth` object (Claude Code's shape) selects OAuth;
+            // otherwise no credential, and a 401 still drives OAuth discovery.
             let auth = match cfg.get("auth") {
-                None => HttpAuth::None,
                 Some(auth) => Self::classify_http_auth(name, auth)?,
+                None => match cfg.get("oauth") {
+                    Some(oauth) => Self::classify_oauth_auth(name, oauth)?,
+                    None => HttpAuth::None,
+                },
             };
             return Some(McpServerConfig::Http {
                 url: url.to_string(),
@@ -2839,18 +3038,14 @@ impl McpClientManager {
     }
 
     /// Classify an HTTP entry's `auth` object: `{"bearer": "<token>"}` or
-    /// `{"headers": {...}}` is an explicit static credential (REQ-MCP-008);
-    /// `{"oauth": {...}}` declares OAuth, optionally carrying a
-    /// pre-configured client for a DCR-less authorization server
-    /// (REQ-MCP-010). An unrecognized or malformed shape skips the server --
-    /// silently downgrading an intended credential to no-auth (or dropping
-    /// part of it) would change which authorization path a 401 takes.
+    /// `{"headers": {...}}` is an explicit static credential (REQ-MCP-008). An
+    /// unrecognized or malformed shape skips the server -- silently
+    /// downgrading an intended credential to no-auth would change which
+    /// authorization path a 401 takes. OAuth is declared by the sibling
+    /// top-level `oauth` field (Claude Code's shape), not under `auth`.
     fn classify_http_auth(name: &str, auth: &Value) -> Option<HttpAuth> {
         if let Some(token) = auth.get("bearer").and_then(|v| v.as_str()) {
             return Some(HttpAuth::Static(StaticCred::Bearer(token.to_string())));
-        }
-        if let Some(oauth_value) = auth.get("oauth") {
-            return Self::classify_oauth_auth(name, oauth_value);
         }
         if let Some(headers_value) = auth.get("headers") {
             let Some(object) = headers_value.as_object() else {
@@ -2875,50 +3070,65 @@ impl McpClientManager {
             }
             return Some(HttpAuth::Static(StaticCred::Headers(headers)));
         }
+        if auth.get("oauth").is_some() {
+            tracing::warn!(
+                server = %name,
+                "'auth.oauth' is no longer read; move the OAuth config to the top-level \
+                 'oauth' field (Claude Code's shape). Skipping this server until then."
+            );
+            return None;
+        }
         tracing::debug!(server = %name, "HTTP MCP server with unrecognized 'auth' shape");
         None
     }
 
-    /// Classify the `auth.oauth` value: `true` or `{}` selects OAuth with a
-    /// dynamically acquired client; an object carrying `auth_server` +
-    /// `client_id` pre-configures the client identity. A partial
-    /// pre-configured client skips the server -- half a client identity
-    /// would attempt DCR against an authorization server the user said
-    /// disables it.
+    /// Classify the top-level `oauth` value (Claude Code's shape): `true` or
+    /// an object without a `clientId` selects OAuth with a dynamically
+    /// registered client; an object carrying `clientId` pre-configures the
+    /// (public) client identity for an authorization server that disables DCR
+    /// (REQ-MCP-010). The authorization server is *not* named in config — it
+    /// is discovered from the resource's metadata. `callbackPort` is read but
+    /// ignored: Phoenix receives the redirect on its own server route, not a
+    /// throwaway localhost port. No client secret is read: the flow is
+    /// authorization-code + PKCE, a public client.
     fn classify_oauth_auth(name: &str, oauth_value: &Value) -> Option<HttpAuth> {
         match oauth_value {
             Value::Bool(true) => Some(HttpAuth::OAuth(None)),
-            Value::Object(fields) if fields.is_empty() => Some(HttpAuth::OAuth(None)),
-            Value::Object(fields) => {
-                let auth_server = fields.get("auth_server").and_then(Value::as_str);
-                let client_id = fields.get("client_id").and_then(Value::as_str);
-                let (Some(auth_server), Some(client_id)) = (auth_server, client_id) else {
-                    tracing::debug!(
-                        server = %name,
-                        "'auth.oauth' pre-configured client needs both 'auth_server' and 'client_id'"
-                    );
-                    return None;
-                };
-                Some(HttpAuth::OAuth(Some(PreconfiguredClient {
-                    auth_server: auth_server.to_string(),
-                    client_id: client_id.to_string(),
-                    client_secret: fields
-                        .get("client_secret")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    token_endpoint_auth_method: fields
-                        .get("token_endpoint_auth_method")
-                        .and_then(Value::as_str)
-                        .unwrap_or("none")
-                        .to_string(),
-                })))
-            }
+            Value::Object(fields) => match fields.get("clientId").and_then(Value::as_str) {
+                Some(client_id) => {
+                    // A present-but-malformed callbackPort (non-integer, 0, or
+                    // out of range) would silently fall back to the server-route
+                    // redirect, which a fixed-allowlist app rejects — a confusing
+                    // failure. Treat it as an unusable config and skip the server.
+                    let callback_port = match fields.get("callbackPort") {
+                        None => None,
+                        Some(value) => match value.as_u64().and_then(|p| u16::try_from(p).ok()) {
+                            Some(port) if port != 0 => Some(port),
+                            _ => {
+                                tracing::debug!(
+                                    server = %name,
+                                    "'oauth.callbackPort' must be an integer 1-65535; skipping server"
+                                );
+                                return None;
+                            }
+                        },
+                    };
+                    Some(HttpAuth::OAuth(Some(PreconfiguredClient {
+                        client_id: client_id.to_string(),
+                        callback_port,
+                    })))
+                }
+                // An object with no clientId (e.g. only callbackPort/scopes):
+                // OAuth via dynamic client registration, where DCR registers
+                // Phoenix's own callback, so a fixed loopback port is moot.
+                None => Some(HttpAuth::OAuth(None)),
+            },
             Value::Null
             | Value::Bool(false)
             | Value::Number(_)
             | Value::String(_)
             | Value::Array(_) => {
-                tracing::debug!(server = %name, "'auth.oauth' must be true or an object");
+                tracing::debug!(server = %name, "'oauth' must be true or an object");
                 None
             }
         }
@@ -3546,16 +3756,30 @@ pub enum StaticCred {
     Headers(HashMap<String, String>),
 }
 
-/// A pre-configured OAuth client for an authorization server that disables
-/// dynamic client registration. Registration *metadata*, not a credential:
-/// it seeds the persisted registration so a later 401 reuses it instead of
-/// attempting DCR. It does not pre-authorize the server (REQ-MCP-010).
+/// A pre-configured public OAuth client for an authorization server that
+/// disables dynamic client registration (Claude Code's `oauth` config shape).
+/// The identity, not a credential: once discovery resolves the authorization
+/// server's issuer, this seeds the persisted registration under that issuer so
+/// the flow reuses it instead of attempting DCR. It does not pre-authorize the
+/// server (REQ-MCP-010). The authorization server is *not* named here — it is
+/// learned from the resource's advertised metadata at discovery time.
+///
+/// Public client only: the flow is OAuth 2.1 authorization-code + PKCE, which
+/// needs no client secret. Phoenix neither accepts nor stores a pre-configured
+/// client secret — keeping a long-lived app credential out of the app is the
+/// point. A server that mandates confidential client authentication is out of
+/// scope here.
+///
+/// `callback_port` (Claude Code's `oauth.callbackPort`) is set when the
+/// pre-registered app's redirect allowlist only contains a fixed
+/// `http://localhost:<port>/callback` loopback URI — it cannot register
+/// Phoenix's own server-route callback. Phoenix then uses that loopback
+/// redirect and bounces the browser to its real callback via an ephemeral
+/// listener on that port (REQ-MCP-020). Absent, Phoenix uses its server route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreconfiguredClient {
-    pub auth_server: String,
     pub client_id: String,
-    pub client_secret: Option<String>,
-    pub token_endpoint_auth_method: String,
+    pub callback_port: Option<u16>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3759,12 +3983,18 @@ mod tests {
 
     #[test]
     fn classify_entry_parses_oauth_shapes() {
-        // Bare OAuth: client identity acquired dynamically.
-        for oauth_value in [serde_json::json!(true), serde_json::json!({})] {
+        // Bare OAuth (Claude Code's shape): client identity acquired
+        // dynamically. An object without `clientId` (here, only callbackPort)
+        // is still dynamic — the extra fields are Claude-Code-only.
+        for oauth_value in [
+            serde_json::json!(true),
+            serde_json::json!({}),
+            serde_json::json!({"callbackPort": 3118}),
+        ] {
             let cfg = serde_json::json!({
                 "type": "http",
                 "url": "https://example.com/mcp",
-                "auth": {"oauth": oauth_value},
+                "oauth": oauth_value,
             });
             assert_eq!(
                 McpClientManager::classify_config_entry("s", &cfg),
@@ -3773,43 +4003,98 @@ mod tests {
                     headers: HashMap::new(),
                     auth: HttpAuth::OAuth(None),
                 }),
-                "auth.oauth = {oauth_value} must select OAuth"
+                "oauth = {oauth_value} must select dynamic-client OAuth"
             );
         }
 
-        // Pre-configured client for a DCR-less authorization server.
+        // Pre-configured client for a DCR-less authorization server: `clientId`
+        // names the pre-registered app; the authorization server and the
+        // client secret are not in config (discovered / from the environment).
         let preconfigured = serde_json::json!({
             "type": "http",
             "url": "https://example.com/mcp",
-            "auth": {"oauth": {
-                "auth_server": "https://as.example.com",
-                "client_id": "cid-1",
-                "client_secret": "sec",
-                "token_endpoint_auth_method": "client_secret_post",
-            }},
+            "oauth": {"clientId": "cid-1", "callbackPort": 3118},
         });
         assert_eq!(
-            McpClientManager::classify_config_entry("s", &preconfigured),
+            McpClientManager::classify_config_entry("slack", &preconfigured),
             Some(McpServerConfig::Http {
                 url: "https://example.com/mcp".to_string(),
                 headers: HashMap::new(),
                 auth: HttpAuth::OAuth(Some(PreconfiguredClient {
-                    auth_server: "https://as.example.com".to_string(),
                     client_id: "cid-1".to_string(),
-                    client_secret: Some("sec".to_string()),
-                    token_endpoint_auth_method: "client_secret_post".to_string(),
+                    callback_port: Some(3118),
                 })),
             })
         );
 
-        // Half a pre-configured client must skip the server, not silently
-        // fall back to DCR against a server the user said disables it.
-        let partial = serde_json::json!({
+        // An explicit static `auth` credential wins over a sibling `oauth`.
+        let static_wins = serde_json::json!({
             "type": "http",
             "url": "https://example.com/mcp",
-            "auth": {"oauth": {"client_id": "cid-1"}},
+            "auth": {"bearer": "tok"},
+            "oauth": {"clientId": "cid-1"},
         });
-        assert_eq!(McpClientManager::classify_config_entry("s", &partial), None);
+        assert_eq!(
+            McpClientManager::classify_config_entry("s", &static_wins),
+            Some(McpServerConfig::Http {
+                url: "https://example.com/mcp".to_string(),
+                headers: HashMap::new(),
+                auth: HttpAuth::Static(StaticCred::Bearer("tok".to_string())),
+            })
+        );
+    }
+
+    #[test]
+    fn classify_oauth_rejects_malformed_callback_port() {
+        // A present-but-unusable callbackPort skips the server rather than
+        // silently falling back to a redirect the fixed-allowlist app rejects.
+        for bad in [
+            serde_json::json!("3118"),
+            serde_json::json!(0),
+            serde_json::json!(70000),
+            serde_json::json!(-1),
+            serde_json::json!(3.5),
+        ] {
+            let cfg = serde_json::json!({
+                "type": "http",
+                "url": "https://example.com/mcp",
+                "oauth": {"clientId": "cid", "callbackPort": bad},
+            });
+            assert_eq!(
+                McpClientManager::classify_config_entry("s", &cfg),
+                None,
+                "callbackPort {bad} must skip the server"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_legacy_auth_oauth_shape_is_skipped() {
+        // The removed `auth.oauth` shape is no longer read; the server is
+        // skipped (with a migration warning) rather than silently downgraded
+        // to no-auth. OAuth now lives under the top-level `oauth` field.
+        let cfg = serde_json::json!({
+            "type": "http",
+            "url": "https://example.com/mcp",
+            "auth": {"oauth": true},
+        });
+        assert_eq!(McpClientManager::classify_config_entry("s", &cfg), None);
+    }
+
+    #[test]
+    fn callback_request_query_extracts_query_verbatim() {
+        assert_eq!(
+            callback_request_query("GET /callback?code=abc&state=xyz HTTP/1.1\r\nHost: x\r\n"),
+            "?code=abc&state=xyz"
+        );
+        // An error callback's query is forwarded just the same.
+        assert_eq!(
+            callback_request_query("GET /callback?error=access_denied&state=xyz HTTP/1.1"),
+            "?error=access_denied&state=xyz"
+        );
+        // No query → empty (the real callback then reports a missing code).
+        assert_eq!(callback_request_query("GET /callback HTTP/1.1"), "");
+        assert_eq!(callback_request_query(""), "");
     }
 
     #[test]

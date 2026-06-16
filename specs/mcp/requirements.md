@@ -201,11 +201,27 @@ THE SYSTEM SHALL discover the authorization server by:
   OpenID Connect Discovery (`.well-known/openid-configuration`) well-known
   endpoints, to learn the authorization, token, and registration endpoints
 
+When an authorization server is located via the protected resource's advertised
+`authorization_servers` list, THE SYSTEM SHALL accept the fetched metadata's
+self-declared `issuer` as authoritative even when it differs from the URL the
+metadata was fetched from, and SHALL use that declared issuer as the
+registration key and flow issuer. THE SYSTEM SHALL reject metadata that
+declares no issuer. An authorization server named directly (a pre-configured
+issuer, not reached through a resource's advertised list) SHALL be held to
+exact issuer equality (RFC 8414 §3.3).
+
 **Rationale:** OAuth 2.1 for MCP is discovery-driven; the client is not
 pre-configured with endpoints. A 401 is the entry point. A server may signal
 its metadata via `resource_metadata` or rely on the well-known locations, and
 its authorization server may expose only OIDC discovery -- a conformant client
-handles all of these rather than assuming one.
+handles all of these rather than assuming one. RFC 8414 §3.3 requires the
+advertised issuer to equal the metadata URL, a mix-up defense for a
+directly-named issuer; but a provider may legitimately serve its authorization
+server metadata from the resource host while issuing under a parent domain. The
+resource's own advertised `authorization_servers` list is a trusted hop -- the
+resource already determines where tokens are sent -- so the metadata's declared
+issuer is accepted there. The `iss` callback check (REQ-MCP-011) remains the
+mix-up defense at code-exchange time, against that declared issuer.
 
 ---
 
@@ -214,9 +230,13 @@ handles all of these rather than assuming one.
 THE SYSTEM SHALL obtain a client identity for the authorization server,
 preferring in order:
 
-- a pre-configured client id/secret supplied for that authorization server
 - a cached client registration previously obtained for that authorization
   server
+- a pre-configured **public** client supplied in config: a `clientId` only. The
+  authorization server is not named in config; once discovery resolves its
+  issuer, the pre-configured client is seeded as the registration under that
+  issuer, authenticating at the token endpoint with no client secret (PKCE
+  alone).
 - a Client ID Metadata Document, where the authorization server supports it
 - Dynamic Client Registration (RFC 7591) as the fallback, where the
   authorization server advertises a registration endpoint
@@ -228,7 +248,15 @@ server.
 **Rationale:** The MCP authorization model prefers pre-registered or
 metadata-document client identity and treats DCR as the fallback. Keying the
 registration by the authorization server -- not the MCP server -- lets multiple
-resources behind one authorization server share a single client identity.
+resources behind one authorization server share a single client identity. The
+pre-configured client matches the config shape operators already use for the
+same servers in other MCP clients, so a server with a pre-registered app (no
+DCR) needs only its `clientId` in config. THE SYSTEM SHALL NOT accept or store a
+pre-configured client secret: the flow is OAuth 2.1 authorization-code with
+PKCE, which authenticates a public client without one, and keeping a long-lived
+app credential out of the system removes it as something to protect. A server
+that mandates confidential client authentication for a pre-configured client is
+out of scope.
 
 ---
 
@@ -420,6 +448,21 @@ THE SYSTEM SHALL NOT derive the redirect origin from request-controlled headers
 (`Host`, `Forwarded`), so a forged header cannot redirect an authorization code
 to an attacker-chosen destination.
 
+WHERE a pre-configured client supplies a fixed loopback callback port (its
+pre-registered authorization app allows only `http://localhost:<port>/callback`
+and cannot register Phoenix's own callback route), THE SYSTEM SHALL use that
+loopback redirect URI for the flow and bind a listener on that port that bounces
+each received callback to its real callback route. THE SYSTEM SHALL bind the
+listener before surfacing the authorization URL and fail the flow if the port
+cannot be bound, so a sign-in URL is never published when its callback could not
+be received. The listener SHALL bind loopback only (both IP families), accept
+callbacks until the flow resolves or the flow window elapses (a failed exchange
+leaves the flow retryable, so the listener must remain), and a prior listener
+for the same server SHALL be cancelled and its port released before a new flow
+binds it. A malformed `callbackPort` (non-integer, zero, or out of range)
+SHALL make the server config unusable rather than silently falling back to a
+redirect the app will reject.
+
 **Rationale:** The redirect URI must name an origin the operator's browser can
 reach and that routes back to this instance; the reachable domain already chosen
 for the certificate is exactly that origin, so binding the two removes a
@@ -427,4 +470,12 @@ redundant, divergence-prone knob. A redirect target taken from a request header
 is attacker-influenceable in a way the `state` nonce and `iss` check do not
 defend -- they bind the callback to its flow and its authorization server, not
 its destination -- so the origin is taken from trusted configuration instead.
+An authorization server whose registered redirect allowlist Phoenix cannot edit
+(a shared pre-registered app) forces the redirect to a value already on that
+list -- a fixed loopback port with a `/callback` path -- which Phoenix cannot
+serve from its own bound port; the ephemeral loopback listener receives that
+callback on the same machine and bounces it to the real route, so the flow
+completes without a second token store or a proxy process. Loopback binding
+keeps it same-machine only, matching where a browser-on-the-same-host operator
+already is.
 </content>
