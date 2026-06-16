@@ -10,6 +10,7 @@ use super::transition::*;
 use super::*;
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult};
 use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+use phoenix_core::domain::quota_details::QuotaDetails;
 use proptest::prelude::*;
 use std::path::PathBuf;
 
@@ -1930,17 +1931,13 @@ fn test_spawn_agents_complete_accumulates_ids() {
 use super::outcome::{AbortReason, EffectOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 
 fn arb_abort_reason() -> impl Strategy<Value = AbortReason> {
-    prop_oneof![
-        Just(AbortReason::CancellationRequested),
-        Just(AbortReason::Timeout),
-        Just(AbortReason::ParentCancelled),
-    ]
+    Just(AbortReason::CancellationRequested)
 }
 
 fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
-    // Use (0..8u8) selector + string to avoid Clone requirement on LlmOutcome
+    // Use selector + string to avoid Clone requirement on LlmOutcome.
     (
-        0..8u8,
+        0..10u8,
         proptest::collection::vec(arb_tool_call(), 0..3),
         "[a-zA-Z ]{1,20}",
     )
@@ -1977,6 +1974,20 @@ fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
                 recovery_in_progress: false,
             },
             6 => LlmOutcome::RequestRejected { message: msg },
+            7 => LlmOutcome::UsageLimitReached {
+                details: QuotaDetails {
+                    plan_type: None,
+                    resets_at: None,
+                    limit_id: None,
+                    limit_name: None,
+                    primary: None,
+                    secondary: None,
+                    credits: None,
+                    promo_message: None,
+                },
+                message: msg,
+            },
+            8 => LlmOutcome::ServerOverloaded { message: msg },
             _ => LlmOutcome::Cancelled,
         })
 }
@@ -1996,7 +2007,6 @@ fn arb_tool_outcome() -> impl Strategy<Value = ToolExecOutcome> {
 }
 
 fn arb_persist_outcome() -> impl Strategy<Value = PersistOutcome> {
-    // Use bool selector to avoid Clone requirement on PersistOutcome
     (any::<bool>(), "[a-zA-Z ]{1,20}").prop_map(|(ok, error)| {
         if ok {
             PersistOutcome::Ok
@@ -2007,7 +2017,7 @@ fn arb_persist_outcome() -> impl Strategy<Value = PersistOutcome> {
 }
 
 fn arb_effect_outcome() -> impl Strategy<Value = EffectOutcome> {
-    // Use selector to avoid Clone requirement on EffectOutcome/LlmOutcome/PersistOutcome
+    // Use selector to avoid Clone requirement on EffectOutcome/LlmOutcome.
     (
         0..5u8,
         arb_llm_outcome(),
@@ -2050,7 +2060,6 @@ proptest! {
         let _ = handle_outcome(&state, &ctx, outcome);
     }
 
-
     // PersistOutcome::Ok returns the same state unchanged
     #[test]
     fn prop_persist_ok_returns_same_state(state in arb_state()) {
@@ -2077,7 +2086,6 @@ proptest! {
         prop_assert!(result.is_err());
     }
 
-    // LlmOutcome::AuthError always produces non-retryable error (goes to Error state)
     #[test]
     fn prop_auth_error_is_non_retryable(
         attempt in 1u32..5,

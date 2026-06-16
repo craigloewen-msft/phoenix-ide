@@ -71,8 +71,8 @@ pub enum LlmOutcome {
     },
     /// Request rejected (400, content filter, etc.) — non-retryable
     RequestRejected { message: String },
-    /// Request was cancelled (abort signal received)
-    #[allow(dead_code)] // Used when LLM abort is migrated to typed channels
+    /// Request was cancelled (abort signal received).
+    #[allow(dead_code)]
     Cancelled,
 }
 
@@ -101,12 +101,6 @@ pub enum ToolExecOutcome {
 pub enum AbortReason {
     /// User explicitly cancelled
     CancellationRequested,
-    /// Execution time exceeded limit
-    #[allow(dead_code)] // Will be used when timeout support is added
-    Timeout,
-    /// Parent conversation was cancelled
-    #[allow(dead_code)] // Will be used when sub-agent cancellation uses typed channels
-    ParentCancelled,
 }
 
 // ============================================================================
@@ -115,34 +109,12 @@ pub enum AbortReason {
 
 /// Outcome of a persistence operation, sent through a typed oneshot channel.
 #[derive(Debug)]
-#[allow(dead_code)] // Defined for architectural completeness; executor migrates incrementally
+#[allow(dead_code)]
 pub enum PersistOutcome {
     /// Persistence succeeded
     Ok,
     /// Persistence failed
     Failed { error: String },
-}
-
-// ============================================================================
-// SpawnAgents Outcome — returned by executor spawn task
-// ============================================================================
-
-/// Outcome of a `spawn_agents` tool execution. This is handled synchronously
-/// in the executor (not via oneshot), but the type constrains what can be produced.
-#[derive(Debug)]
-#[allow(dead_code)] // Defined for architectural completeness; spawn_agents still synchronous
-pub enum SpawnOutcome {
-    /// Agents were spawned successfully, tool result and pending agents returned
-    Spawned {
-        tool_use_id: String,
-        result: ToolResult,
-        spawned: Vec<crate::state::PendingSubAgent>,
-    },
-    /// Spawning failed (returns error as a `ToolResult`)
-    Failed {
-        tool_use_id: String,
-        result: ToolResult,
-    },
 }
 
 // ============================================================================
@@ -157,14 +129,14 @@ pub enum EffectOutcome {
     Llm(LlmOutcome),
     /// Tool execution completed
     Tool(ToolExecOutcome),
-    /// Sub-agent completed (arrives via event channel, wrapped here for `handle_outcome`)
-    #[allow(dead_code)] // Sub-agent results still flow through event channel for now
+    /// Sub-agent completed.
+    #[allow(dead_code)]
     SubAgent {
         agent_id: String,
         outcome: SubAgentOutcome,
     },
-    /// Persistence completed
-    #[allow(dead_code)] // Persistence effects are still synchronous for now
+    /// Persistence completed.
+    #[allow(dead_code)]
     Persist(PersistOutcome),
     /// Retry timer fired
     RetryTimeout { attempt: u32 },
