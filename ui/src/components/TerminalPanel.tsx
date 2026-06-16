@@ -673,9 +673,30 @@ export function TerminalPanel({
     wsRef.current = ws;
     setStatus('Connecting…');
 
+    // Outbound input buffer. xterm hands us a keystroke the instant it's
+    // typed, which can be before the WebSocket finishes its handshake
+    // (readyState CONNECTING) — e.g. typing into a freshly-opened terminal
+    // while the connection is still being established. Sending only when
+    // OPEN silently dropped those bytes; instead we queue them here and
+    // flush in order on open. A keystroke xterm accepted is therefore
+    // always either in flight or queued — never discarded.
+    let pendingInput: Uint8Array[] = [];
+    const flushPendingInput = () => {
+      if (pendingInput.length === 0) return;
+      const queued = pendingInput;
+      pendingInput = [];
+      for (const payload of queued) {
+        ws.send(dataFrame(payload));
+      }
+    };
+
     ws.onopen = () => {
       const { cols, rows } = term;
+      // Resize frame first: the server's initial handshake reads frames
+      // until the first resize and the PTY is sized from it. Flushing
+      // buffered input only after the resize keeps that ordering intact.
       ws.send(resizeFrame(cols, rows));
+      flushPendingInput();
       setStatus('');
       setActivity('idle');
     };
@@ -737,10 +758,24 @@ export function TerminalPanel({
     };
 
     const disposeOnData = term.onData((text) => {
+      const encoded = new TextEncoder().encode(text);
       if (ws.readyState === WebSocket.OPEN) {
-        const encoded = new TextEncoder().encode(text);
         ws.send(dataFrame(encoded));
+      } else if (ws.readyState === WebSocket.CONNECTING) {
+        // Pre-handshake: queue rather than drop; onopen flushes in order, so
+        // input typed into a freshly-opened terminal reaches the shell once
+        // the handshake completes. The debug log makes a would-be-dropped
+        // keystroke visible (capability gaps are logged, not silenced) so a
+        // recurrence is diagnosable.
+        pendingInput.push(encoded);
+        console.debug(
+          `[terminal] buffered ${encoded.length}B of input during WS handshake (readyState=CONNECTING)`,
+        );
       }
+      // CLOSING/CLOSED: the session is dead (e.g. "Shell exited"). This
+      // socket can never fire onopen, so buffering would leak memory + logs
+      // and never deliver. Drop — clicking reconnect spawns a fresh WS with
+      // its own buffer.
     });
 
     const handleResize = () => {
