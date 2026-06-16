@@ -23,7 +23,6 @@ export type {
   SseAgentDoneData,
   SseConversationBecameTerminalData,
   SseErrorData,
-  SseBreadcrumb,
   ChainQaTokenData,
   ChainQaCompletedData,
   ChainQaFailedData,
