@@ -624,6 +624,123 @@ def _list_dev_processes() -> list[tuple[int, str]]:
     return procs
 
 
+def _path_hash(path: str) -> str:
+    """The dev-DB/registry hash of a worktree path (matches get_worktree_hash)."""
+    return hashlib.md5(str(path).encode()).hexdigest()[:8]
+
+
+def _worktree_entries() -> list[tuple[str, bool]] | None:
+    """`(path, prunable)` for every worktree git currently tracks.
+
+    `prunable` is true when git has flagged the entry's directory as gone (it
+    keeps emitting the path until `git worktree prune` runs). Returns None when
+    the list cannot be obtained, so the caller skips pruning rather than guess.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=ROOT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    entries: list[tuple[str, bool]] = []
+    path: str | None = None
+    prunable = False
+    for line in out.stdout.splitlines() + [""]:
+        if line.startswith("worktree "):
+            path = line[len("worktree "):]
+            prunable = False
+        elif line.startswith("prunable "):
+            prunable = True
+        elif line == "" and path is not None:
+            entries.append((path, prunable))
+            path = None
+    return entries
+
+
+def _registry_snapshot() -> list[tuple[str, int]]:
+    """`(worktree_path, pid)` for every dev-server registry record, read before
+    `reap_orphans` mutates the registry so DB pruning can still resolve hashes
+    back to their owning paths."""
+    snapshot: list[tuple[str, int]] = []
+    if not DEV_REGISTRY_DIR.exists():
+        return snapshot
+    for rec_file in DEV_REGISTRY_DIR.glob("*.json"):
+        try:
+            rec = json.loads(rec_file.read_text())
+            snapshot.append((str(rec["worktree"]), int(rec["pid"])))
+        except (OSError, KeyError, ValueError, json.JSONDecodeError):
+            continue
+    return snapshot
+
+
+def prune_orphan_dbs(
+    registry: list[tuple[str, int]], verbose: bool = True, dry_run: bool = False
+) -> int:
+    """Delete per-worktree dev databases whose owning worktree is gone.
+
+    A dev DB is `phoenix-<hash>.db` (plus `-wal`/`-shm`/`.lock` sidecars), where
+    `<hash>` is the worktree-path hash. The `~/.phoenix-ide` namespace is shared
+    across every Phoenix checkout on the machine, and the hash is not invertible,
+    so a DB is pruned only with *positive evidence* its owning path is gone —
+    never merely because this checkout's `git worktree list` doesn't mention it
+    (that would delete another live checkout's database).
+
+    Evidence that a hash is gone: a `git worktree` entry whose path is missing or
+    `prunable`, or a registry record whose `worktree` path no longer exists. A
+    hash is protected when any source maps it to an existing path or a live
+    process; protection wins over gone-evidence. A DB whose hash matches no known
+    path is left untouched. Runs after the process reap so a just-reaped server's
+    DB is collected in the same pass.
+    """
+    entries = _worktree_entries()
+    if entries is None:
+        if verbose:
+            print("  Skipping DB prune: could not list worktrees.")
+        return 0
+
+    gone: set[str] = set()
+    keep: set[str] = set()
+    for path, prunable in entries:
+        (gone if (prunable or not Path(path).exists()) else keep).add(_path_hash(path))
+    for path, pid in registry:
+        h = _path_hash(path)
+        if is_process_running(pid):
+            keep.add(h)  # live server — protect regardless of path state
+        elif not Path(path).exists():
+            gone.add(h)
+        else:
+            keep.add(h)
+
+    prunable_hashes = gone - keep
+    verb = "Would prune" if dry_run else "Pruned"
+    pruned = 0
+    freed = 0
+    db_re = re.compile(r"^phoenix-([0-9a-f]{8})\.db$")
+    for db in sorted(DB_DIR.glob("phoenix-*.db")):
+        m = db_re.match(db.name)
+        if not m or m.group(1) not in prunable_hashes:
+            continue
+        h = m.group(1)
+        sidecars = sorted(DB_DIR.glob(f"phoenix-{h}.*"))
+        size = sum(f.stat().st_size for f in sidecars if f.exists())
+        if not dry_run:
+            for f in sidecars:
+                f.unlink(missing_ok=True)
+        pruned += 1
+        freed += size
+        if verbose:
+            print(f"  {verb} orphaned dev DB phoenix-{h} ({size / 1e6:.1f} MB)")
+    if pruned and not verbose:
+        print(f"{verb} {pruned} orphaned dev database(s), {freed / 1e6:.1f} MB.")
+    return pruned
+
+
 def reap_orphans(verbose: bool = True, dry_run: bool = False) -> int:
     """Kill dev servers orphaned when their worktree was deleted without `down`.
 
@@ -638,6 +755,11 @@ def reap_orphans(verbose: bool = True, dry_run: bool = False) -> int:
     verb = "Would reap" if dry_run else "Reaped"
     reaped = 0
     handled: set[int] = set()
+
+    # Snapshot the registry before the loop below unlinks records: DB pruning
+    # needs the hash->path mapping these records carry, including for worktrees
+    # this pass is about to reap.
+    registry = _registry_snapshot()
 
     if DEV_REGISTRY_DIR.exists():
         for rec_file in sorted(DEV_REGISTRY_DIR.glob("*.json")):
@@ -688,8 +810,12 @@ def reap_orphans(verbose: bool = True, dry_run: bool = False) -> int:
         if verbose:
             print(f"  {verb} orphan (PID {pid}) — cwd {cwd}")
 
-    if verbose and reaped == 0:
-        print("No orphaned dev servers found.")
+    # Reclaim DB files of deleted worktrees. Runs after the process reap so a
+    # server just killed above has its DB collected in the same pass.
+    pruned = prune_orphan_dbs(registry, verbose=verbose, dry_run=dry_run)
+
+    if verbose and reaped == 0 and pruned == 0:
+        print("No orphaned dev servers or databases found.")
     return reaped
 
 
