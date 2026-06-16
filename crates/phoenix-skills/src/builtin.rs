@@ -37,17 +37,17 @@ use std::path::{Path, PathBuf};
 struct BuiltinAssets;
 
 /// Subdirectory under the phoenix data dir where built-ins are extracted.
-pub const EXTRACT_SUBDIR: &str = "builtin-skills";
+/// Single source of truth lives in `phoenix-core` so the deployment-info disk
+/// row and the extraction target can never drift.
+pub const EXTRACT_SUBDIR: &str = phoenix_core::runtime_env::BUILTIN_SKILLS_SUBDIR;
 
-/// Default extraction target: `<HOME>/.phoenix-ide/builtin-skills/`.
-/// Returns `None` if `$HOME` is unset.
+/// Default extraction target (`<home>/.phoenix-ide/builtin-skills/`), resolved
+/// through [`PhoenixRuntimeEnvironment`]. `Option` is retained for callers that
+/// treat a missing built-in directory as "no built-ins"; the environment always
+/// resolves a home (falling back to the temp dir), so this is always `Some`.
 #[must_use]
 pub fn default_extract_dir() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(|home| {
-        PathBuf::from(home)
-            .join(".phoenix-ide")
-            .join(EXTRACT_SUBDIR)
-    })
+    Some(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect().builtin_skills_dir())
 }
 
 /// Names of built-in skills (top-level directories that contain `SKILL.md`).

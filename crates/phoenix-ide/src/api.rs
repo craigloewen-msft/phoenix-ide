@@ -31,6 +31,7 @@ use crate::platform::PlatformCapability;
 use crate::runtime::RuntimeManager;
 use crate::terminal::ActiveTerminals;
 use crate::tools::mcp::McpClientManager;
+use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use std::sync::Arc;
 
 /// Application state shared across handlers
@@ -68,10 +69,20 @@ pub struct AppState {
     /// Static deployment facts (binding, TLS, on-disk layout) resolved once at
     /// startup. Served read-only by `GET /api/deployment`. See [`deployment`].
     pub deployment: Arc<DeploymentConfig>,
+    /// Filesystem-environment paths (`$HOME` / `$CODEX_HOME` / `temp_dir` and
+    /// the Phoenix layout under them) resolved once at startup. The single
+    /// authority handlers read on-disk locations from. See
+    /// [`PhoenixRuntimeEnvironment`].
+    pub runtime_env: Arc<PhoenixRuntimeEnvironment>,
 }
 
 impl AppState {
     /// Create new application state and start the sub-agent handler
+    // Each argument is a distinct startup-resolved dependency (db, registry,
+    // platform, mcp, credentials, password, deployment facts, runtime env);
+    // bundling them into a struct would only move the same fields behind one
+    // more name.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         db: Database,
         llm_registry: Arc<ModelRegistry>,
@@ -80,6 +91,7 @@ impl AppState {
         credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
         password: Option<String>,
         deployment: Arc<DeploymentConfig>,
+        runtime_env: Arc<PhoenixRuntimeEnvironment>,
     ) -> Self {
         let runtime = Arc::new(RuntimeManager::new(
             db.clone(),
@@ -146,6 +158,7 @@ impl AppState {
             message_retriever,
             codex_login,
             deployment,
+            runtime_env,
         }
     }
 }

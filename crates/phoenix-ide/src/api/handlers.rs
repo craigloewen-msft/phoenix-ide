@@ -398,10 +398,14 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
         // spawn path reads `$SHELL` from the same env, so this matches what
         // the user's shell will actually be.
         shell: std::env::var("SHELL").ok(),
-        // REQ-SEED-*: surface $HOME so the UI can spawn a seeded conversation
-        // scoped to the user's home directory (e.g. for shell integration
-        // setup).
-        home_dir: std::env::var("HOME").ok(),
+        // REQ-SEED-*: surface the home directory so the UI can spawn a seeded
+        // conversation scoped to it (e.g. for shell integration setup).
+        home_dir: Some(
+            phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
+                .home()
+                .to_string_lossy()
+                .into_owned(),
+        ),
         seed_parent_slug: None,
         parent_conversation_slug: None,
         // Default to `false`; callers that have access to `AppState` set
@@ -738,7 +742,7 @@ const MAX_ATTACHMENTS_PER_MESSAGE: usize = 10;
 const ATTACHMENT_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 fn attachment_root() -> PathBuf {
-    std::env::temp_dir().join("phoenix-ide-attachments")
+    phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect().attachments_dir()
 }
 
 fn collect_file_paths_from_content(value: &serde_json::Value, paths: &mut HashSet<PathBuf>) {
@@ -3708,7 +3712,10 @@ async fn list_directory(
 }
 
 /// Create a directory (with parents if needed)
-async fn mkdir(Json(payload): Json<PathQuery>) -> Json<MkdirResponse> {
+async fn mkdir(
+    State(state): State<AppState>,
+    Json(payload): Json<PathQuery>,
+) -> Json<MkdirResponse> {
     // Normalize path: remove trailing slashes (except for root)
     let path_str = payload.path.trim_end_matches('/');
     let path_str = if path_str.is_empty() { "/" } else { path_str };
@@ -3723,11 +3730,9 @@ async fn mkdir(Json(payload): Json<PathQuery>) -> Json<MkdirResponse> {
     }
 
     // Don't allow creating directories outside of user's home or /tmp
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_default();
+    let home = state.runtime_env.home().to_string_lossy();
     let path_str = path.to_string_lossy();
-    if (home.is_empty() || !path_str.starts_with(&home)) && !path_str.starts_with("/tmp/") {
+    if (home.is_empty() || !path_str.starts_with(home.as_ref())) && !path_str.starts_with("/tmp/") {
         return Json(MkdirResponse {
             created: false,
             error: Some(format!(
@@ -3914,16 +3919,14 @@ async fn preview_root_allowlist(state: &AppState) -> Vec<PathBuf> {
         .filter_map(|root| fs::canonicalize(root).ok())
         .collect();
 
-    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        let home = PathBuf::from(home);
-        for skill_root in [
-            home.join(".claude").join("skills"),
-            home.join(".agents").join("skills"),
-            home.join(".phoenix-ide").join("builtin-skills"),
-        ] {
-            if let Ok(dir) = fs::canonicalize(skill_root) {
-                roots.push(dir);
-            }
+    let home = state.runtime_env.home();
+    for skill_root in [
+        home.join(".claude").join("skills"),
+        home.join(".agents").join("skills"),
+        state.runtime_env.builtin_skills_dir(),
+    ] {
+        if let Ok(dir) = fs::canonicalize(skill_root) {
+            roots.push(dir);
         }
     }
 
@@ -4845,10 +4848,8 @@ async fn invalidate_credential(State(state): State<AppState>) -> impl IntoRespon
 // Environment Info
 // ============================================================
 
-async fn get_env() -> Json<serde_json::Value> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_default();
+async fn get_env(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let home = state.runtime_env.home().to_string_lossy().into_owned();
     Json(serde_json::json!({ "home_dir": home }))
 }
 
@@ -5407,6 +5408,7 @@ mod hard_delete_cascade_tests {
             message_retriever,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
+            runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
         }
     }
 
@@ -7542,6 +7544,7 @@ mod upgrade_model_state_guard_tests {
             message_retriever,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
+            runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
         }
     }
 
@@ -7693,6 +7696,7 @@ mod file_read_tests {
             message_retriever,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
+            runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
         }
     }
 
@@ -7878,17 +7882,12 @@ mod file_read_tests {
     /// `serve_preview_file` must honor the same allowlist or the follow-up
     /// `<img>`/HTML preview request 404s.
     ///
-    /// `HOME` is process-global; this test mutates it via `HomeEnvGuard`, whose
-    /// lock serializes it against the other HOME-sensitive tests.
-    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn preview_serves_file_under_skill_root() {
-        let home_guard = HomeEnvGuard::set(tempfile::tempdir().expect("home"));
-        let skill_dir = home_guard
-            .home()
-            .join(".claude")
-            .join("skills")
-            .join("my-skill");
+        // The home directory is supplied to the state via a `with_root`
+        // PhoenixRuntimeEnvironment — no process-global `$HOME` mutation.
+        let home = tempfile::tempdir().expect("home");
+        let skill_dir = home.path().join(".claude").join("skills").join("my-skill");
         std::fs::create_dir_all(&skill_dir).expect("skill dir");
         let img = skill_dir.join("diagram.png");
         std::fs::write(&img, [0x89, b'P', b'N', b'G', 0, 1, 2, 3]).expect("png");
@@ -7896,7 +7895,9 @@ mod file_read_tests {
         // A conversation root that does NOT contain the skill file, proving the
         // skill file is admitted by the skill-root allowance, not the cwd.
         let root = tempfile::tempdir().expect("root");
-        let state = state_with_root(root.path()).await;
+        let mut state = state_with_root(root.path()).await;
+        state.runtime_env =
+            Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(home.path()));
 
         let canonical = std::fs::canonicalize(&img).expect("canonicalize img");
         let filepath = canonical
@@ -7911,60 +7912,6 @@ mod file_read_tests {
         .await
         .expect("skill-root file must be previewable");
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
-    }
-
-    /// RAII guard that overrides `HOME` for the duration of a test and restores
-    /// the previous value (and keeps the tempdir alive) on drop.
-    /// Serializes every `HomeEnvGuard`-holding test. `HOME` is process-global,
-    /// and cargo runs `#[test]` functions concurrently across threads (the
-    /// `current_thread` tokio flavor only single-threads each runtime, not the
-    /// test harness), so without this lock two HOME-mutating tests interleave
-    /// and one observes the other's `HOME`.
-    #[cfg(unix)]
-    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[cfg(unix)]
-    struct HomeEnvGuard {
-        prev: Option<std::ffi::OsString>,
-        dir: tempfile::TempDir,
-        // Held for the guard's lifetime so HOME stays this test's until restore.
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    #[cfg(unix)]
-    impl HomeEnvGuard {
-        fn set(dir: tempfile::TempDir) -> Self {
-            let lock = HOME_ENV_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let prev = std::env::var_os("HOME");
-            // SAFETY: the HOME_ENV_LOCK mutex serializes all HOME-mutating tests
-            // and the value is restored on drop, so no other thread observes a
-            // torn value.
-            unsafe { std::env::set_var("HOME", dir.path()) };
-            Self {
-                prev,
-                dir,
-                _lock: lock,
-            }
-        }
-
-        fn home(&self) -> std::path::PathBuf {
-            self.dir.path().to_path_buf()
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for HomeEnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: see `set`.
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
     }
 
     #[tokio::test]
@@ -8126,17 +8073,12 @@ mod file_read_tests {
     /// skills from `.agents/skills` as well as `.claude/skills`, so the viewer
     /// must be able to read them.
     ///
-    /// `HOME` is process-global; this test mutates it via `HomeEnvGuard`, whose
-    /// lock serializes it against the other HOME-sensitive tests.
-    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn read_file_admits_global_agents_skill() {
-        let home_guard = HomeEnvGuard::set(tempfile::tempdir().expect("home"));
-        let skill_dir = home_guard
-            .home()
-            .join(".agents")
-            .join("skills")
-            .join("my-skill");
+        // Home supplied via a `with_root` PhoenixRuntimeEnvironment — no
+        // process-global `$HOME` mutation.
+        let home = tempfile::tempdir().expect("home");
+        let skill_dir = home.path().join(".agents").join("skills").join("my-skill");
         std::fs::create_dir_all(&skill_dir).expect("skill dir");
         let skill = skill_dir.join("SKILL.md");
         std::fs::write(&skill, "skill prompt\n").expect("write skill");
@@ -8144,7 +8086,9 @@ mod file_read_tests {
         // A conversation root that does NOT contain the skill, proving the
         // `.agents/skills` allowance — not the cwd — admits it.
         let root = tempfile::tempdir().expect("root");
-        let state = state_with_root(root.path()).await;
+        let mut state = state_with_root(root.path()).await;
+        state.runtime_env =
+            Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(home.path()));
 
         let Json(response) = read_file(
             State(state),
