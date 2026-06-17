@@ -38,6 +38,7 @@ import { PillStrip, type PillItem } from './PillStrip';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, CONVERSATION_MARKDOWN_COMPONENTS } from './conversationMarkdown';
+import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
 
 const CheckIcon = () => (
@@ -142,6 +143,10 @@ function usesGfmSyntax(text: string): boolean {
     || /www\.\S+/.test(text)
     || /(^|[^\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/.test(text)
     || /\[\^[^\]]+\]/.test(text);
+}
+
+function containsMermaidFence(text: string): boolean {
+  return /(^|\n)```\s*mermaid(?:\s|\n|$)/i.test(text);
 }
 
 /** Format a tool execution duration for display in the tool block header.
@@ -913,7 +918,11 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
       // Inline code with file paths becomes clickable
       code: ({ inline, className, children, node, ...props }: { inline?: boolean | undefined; className?: string | undefined; children?: React.ReactNode; node?: unknown }) => {
         void node;
-        const match = /language-(\w+)/.exec(className || '');
+        const match = /language-([^\s]+)/.exec(className || '');
+        const language = match?.[1]?.toLowerCase();
+        if (!inline && language === 'mermaid') {
+          return <MermaidDiagram code={String(children)} />;
+        }
         if (!inline && match?.[1]) {
           return (
             <DeferredSyntaxHighlighter
@@ -1015,7 +1024,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
               const remarkPlugins = usesGfmSyntax(block.text) ? REMARK_PLUGINS : NO_REMARK_PLUGINS;
               // Compact: short prose folds to a faded expandable one-liner.
               // Substantial prose (>= threshold) always renders full.
-              if (compact && !isSignificantText(block.text)) {
+              if (compact && !isSignificantText(block.text) && !containsMermaidFence(block.text)) {
                 return (
                   <CollapsibleText
                     key={i}
