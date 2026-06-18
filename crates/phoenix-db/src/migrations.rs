@@ -144,6 +144,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "strip_message_content_attachments",
         sql: MIGRATION_026,
     },
+    Migration {
+        version: 27,
+        name: "create_steering_message_tables",
+        sql: MIGRATION_027,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -657,6 +662,231 @@ WHERE message_type = 'skill'
   AND json_type(content, '$.files') IS NOT NULL;
 ";
 
+/// Normalize `conversations.steering_queue` into child tables (task 58035,
+/// follows the message-attachment normalization).
+///
+/// Creates `steering_messages` and its grandchild attachment tables, then
+/// extracts the pending queue out of the blob via `json_each`. The column holds
+/// either the versioned envelope (`{"v":"v1","entries":[…]}`) or a pre-envelope
+/// bare array; the `norm` CTE normalizes both to one array. `e.key` is the FIFO
+/// ordinal; per-entry `files`/`images` become grandchild rows; `skill_invocation`
+/// flattens to the `skill_*` columns. The blob column is left in place but unread
+/// after the code cutover (it carries no data — every write defaults it to `[]`).
+///
+/// The backfill is at least as tolerant as the `decode_steering_queue` it
+/// replaces, because a migration abort here would brick startup: malformed-JSON
+/// rows are skipped (`json_valid` guard), entries missing the required
+/// `message_id`/`text` are dropped, duplicate `message_id`s keep the first FIFO
+/// occurrence (the column had no uniqueness), the `skill_*` trio is written only
+/// when complete (else NULL, honoring the CHECK), and attachment rows missing a
+/// NOT NULL field are skipped.
+const MIGRATION_027: &str = r"
+CREATE TABLE IF NOT EXISTS steering_messages (
+    message_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    llm_text TEXT,
+    user_agent TEXT,
+    skill_name TEXT,
+    skill_body TEXT,
+    skill_dir TEXT,
+    UNIQUE (conversation_id, ordinal),
+    CHECK ((skill_name IS NULL) = (skill_body IS NULL)
+       AND (skill_name IS NULL) = (skill_dir IS NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_steering_messages_conversation
+    ON steering_messages(conversation_id, ordinal);
+
+CREATE TABLE IF NOT EXISTS steering_message_files (
+    message_id TEXT NOT NULL REFERENCES steering_messages(message_id) ON DELETE CASCADE,
+    file_ordinal INTEGER NOT NULL,
+    original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    stored_path TEXT NOT NULL,
+    PRIMARY KEY (message_id, file_ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS steering_message_images (
+    message_id TEXT NOT NULL REFERENCES steering_messages(message_id) ON DELETE CASCADE,
+    image_ordinal INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (message_id, image_ordinal)
+);
+
+INSERT INTO steering_messages
+    (message_id, conversation_id, ordinal, text, llm_text, user_agent,
+     skill_name, skill_body, skill_dir)
+WITH norm AS (
+    SELECT c.id AS conversation_id,
+           CASE
+               WHEN NOT json_valid(c.steering_queue) THEN '[]'
+               WHEN json_type(c.steering_queue, '$.entries') = 'array'
+                   THEN json_extract(c.steering_queue, '$.entries')
+               WHEN json_type(c.steering_queue, '$') = 'array'
+                   THEN c.steering_queue
+               ELSE '[]'
+           END AS arr
+    FROM conversations c
+),
+elems AS (
+    -- Substitute an empty object for any non-object array element so the
+    -- json_extract predicates below never parse a scalar element (a bare
+    -- string would raise SQLite 'malformed JSON' and abort the migration).
+    SELECT norm.conversation_id AS conversation_id,
+           e.key AS ordinal,
+           CASE WHEN e.type = 'object' THEN e.value ELSE '{}' END AS entry
+    FROM norm, json_each(norm.arr) e
+),
+valid_entries AS (
+    SELECT conversation_id, ordinal, entry FROM (
+        SELECT conversation_id, ordinal, entry,
+               ROW_NUMBER() OVER (
+                   PARTITION BY json_extract(entry, '$.message_id')
+                   ORDER BY conversation_id, ordinal
+               ) AS rn
+        FROM elems
+        WHERE json_extract(entry, '$.message_id') IS NOT NULL
+          AND json_extract(entry, '$.text') IS NOT NULL
+    )
+    WHERE rn = 1
+)
+SELECT json_extract(entry, '$.message_id'),
+       conversation_id,
+       ordinal,
+       json_extract(entry, '$.text'),
+       json_extract(entry, '$.llm_text'),
+       json_extract(entry, '$.user_agent'),
+       CASE WHEN json_extract(entry, '$.skill_invocation.name') IS NOT NULL
+             AND json_extract(entry, '$.skill_invocation.body') IS NOT NULL
+             AND json_extract(entry, '$.skill_invocation.skill_dir') IS NOT NULL
+            THEN json_extract(entry, '$.skill_invocation.name') END,
+       CASE WHEN json_extract(entry, '$.skill_invocation.name') IS NOT NULL
+             AND json_extract(entry, '$.skill_invocation.body') IS NOT NULL
+             AND json_extract(entry, '$.skill_invocation.skill_dir') IS NOT NULL
+            THEN json_extract(entry, '$.skill_invocation.body') END,
+       CASE WHEN json_extract(entry, '$.skill_invocation.name') IS NOT NULL
+             AND json_extract(entry, '$.skill_invocation.body') IS NOT NULL
+             AND json_extract(entry, '$.skill_invocation.skill_dir') IS NOT NULL
+            THEN json_extract(entry, '$.skill_invocation.skill_dir') END
+FROM valid_entries;
+
+INSERT INTO steering_message_files
+    (message_id, file_ordinal, original_name, media_type, size_bytes, stored_path)
+WITH norm AS (
+    SELECT c.id AS conversation_id,
+           CASE
+               WHEN NOT json_valid(c.steering_queue) THEN '[]'
+               WHEN json_type(c.steering_queue, '$.entries') = 'array'
+                   THEN json_extract(c.steering_queue, '$.entries')
+               WHEN json_type(c.steering_queue, '$') = 'array'
+                   THEN c.steering_queue
+               ELSE '[]'
+           END AS arr
+    FROM conversations c
+),
+elems AS (
+    -- Substitute an empty object for any non-object array element so the
+    -- json_extract predicates below never parse a scalar element (a bare
+    -- string would raise SQLite 'malformed JSON' and abort the migration).
+    SELECT norm.conversation_id AS conversation_id,
+           e.key AS ordinal,
+           CASE WHEN e.type = 'object' THEN e.value ELSE '{}' END AS entry
+    FROM norm, json_each(norm.arr) e
+),
+valid_entries AS (
+    SELECT conversation_id, ordinal, entry FROM (
+        SELECT conversation_id, ordinal, entry,
+               ROW_NUMBER() OVER (
+                   PARTITION BY json_extract(entry, '$.message_id')
+                   ORDER BY conversation_id, ordinal
+               ) AS rn
+        FROM elems
+        WHERE json_extract(entry, '$.message_id') IS NOT NULL
+          AND json_extract(entry, '$.text') IS NOT NULL
+    )
+    WHERE rn = 1
+),
+file_elems AS (
+    SELECT json_extract(entry, '$.message_id') AS message_id,
+           f.key AS file_ordinal,
+           CASE WHEN f.type = 'object' THEN f.value ELSE '{}' END AS fval
+    FROM valid_entries, json_each(entry, '$.files') f
+    WHERE json_type(entry, '$.files') = 'array'
+)
+SELECT message_id,
+       file_ordinal,
+       json_extract(fval, '$.original_name'),
+       json_extract(fval, '$.media_type'),
+       json_extract(fval, '$.size_bytes'),
+       json_extract(fval, '$.stored_path')
+FROM file_elems
+WHERE json_extract(fval, '$.original_name') IS NOT NULL
+  AND json_extract(fval, '$.media_type') IS NOT NULL
+  AND json_extract(fval, '$.size_bytes') IS NOT NULL
+  AND json_extract(fval, '$.stored_path') IS NOT NULL;
+
+INSERT INTO steering_message_images
+    (message_id, image_ordinal, media_type, data)
+WITH norm AS (
+    SELECT c.id AS conversation_id,
+           CASE
+               WHEN NOT json_valid(c.steering_queue) THEN '[]'
+               WHEN json_type(c.steering_queue, '$.entries') = 'array'
+                   THEN json_extract(c.steering_queue, '$.entries')
+               WHEN json_type(c.steering_queue, '$') = 'array'
+                   THEN c.steering_queue
+               ELSE '[]'
+           END AS arr
+    FROM conversations c
+),
+elems AS (
+    -- Substitute an empty object for any non-object array element so the
+    -- json_extract predicates below never parse a scalar element (a bare
+    -- string would raise SQLite 'malformed JSON' and abort the migration).
+    SELECT norm.conversation_id AS conversation_id,
+           e.key AS ordinal,
+           CASE WHEN e.type = 'object' THEN e.value ELSE '{}' END AS entry
+    FROM norm, json_each(norm.arr) e
+),
+valid_entries AS (
+    SELECT conversation_id, ordinal, entry FROM (
+        SELECT conversation_id, ordinal, entry,
+               ROW_NUMBER() OVER (
+                   PARTITION BY json_extract(entry, '$.message_id')
+                   ORDER BY conversation_id, ordinal
+               ) AS rn
+        FROM elems
+        WHERE json_extract(entry, '$.message_id') IS NOT NULL
+          AND json_extract(entry, '$.text') IS NOT NULL
+    )
+    WHERE rn = 1
+),
+image_elems AS (
+    SELECT json_extract(entry, '$.message_id') AS message_id,
+           im.key AS image_ordinal,
+           CASE WHEN im.type = 'object' THEN im.value ELSE '{}' END AS imval
+    FROM valid_entries, json_each(entry, '$.images') im
+    WHERE json_type(entry, '$.images') = 'array'
+)
+SELECT message_id,
+       image_ordinal,
+       json_extract(imval, '$.media_type'),
+       json_extract(imval, '$.data')
+FROM image_elems
+WHERE json_extract(imval, '$.media_type') IS NOT NULL
+  AND json_extract(imval, '$.data') IS NOT NULL;
+
+-- Clear the now-migrated blob so the column carries no data: the child tables
+-- are the single source of truth and nothing reads this column anymore.
+UPDATE conversations
+SET steering_queue = '[]'
+WHERE steering_queue IS NOT NULL AND steering_queue <> '[]';
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -754,6 +984,7 @@ mod tests {
                 user_initiated BOOLEAN NOT NULL DEFAULT 1, \
                 archived BOOLEAN NOT NULL DEFAULT 0, \
                 model TEXT, \
+                steering_queue TEXT NOT NULL DEFAULT '[]', \
                 state_updated_at TEXT NOT NULL DEFAULT '2025-01-01', \
                 created_at TEXT NOT NULL DEFAULT '2025-01-01', \
                 updated_at TEXT NOT NULL DEFAULT '2025-01-01'\
@@ -784,10 +1015,226 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 26);
+        assert_eq!(first, 27);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
+    }
+
+    /// Migration 027: pending steering entries are extracted from the
+    /// `steering_queue` blob (both envelope and bare-array shapes) into
+    /// `steering_messages` + grandchild attachment tables, preserving FIFO
+    /// order and the `skill_invocation` trio.
+    #[tokio::test]
+    async fn migration_027_backfills_steering_message_tables() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+
+        // c-env: versioned envelope, two entries — first with a file + image,
+        // second a skill invocation.
+        let env = r#"{"v":"v1","entries":[
+            {"text":"first","llm_text":"first-expanded","message_id":"s1","user_agent":"UA",
+             "images":[{"data":"IMG","media_type":"image/png"}],
+             "files":[{"original_name":"a.txt","media_type":"text/plain","size_bytes":9,"stored_path":"/p/a"}],
+             "skill_invocation":null},
+            {"text":"second","llm_text":null,"message_id":"s2","user_agent":null,
+             "images":[],"files":[],
+             "skill_invocation":{"name":"build","body":"BODY","skill_dir":"/skills/build"}}
+        ]}"#;
+        // c-bare: pre-envelope bare array, one plain entry.
+        let bare = r#"[{"text":"legacy","llm_text":null,"message_id":"s3","user_agent":null,"images":[],"files":[]}]"#;
+        for (id, q) in [("c-env", env), ("c-bare", bare), ("c-empty", "[]")] {
+            sqlx::query(
+                "INSERT INTO conversations (id, steering_queue, state_updated_at, created_at, updated_at) \
+                 VALUES (?1, ?2, '2025-01-01', '2025-01-01', '2025-01-01')",
+            )
+            .bind(id)
+            .bind(q)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        run_pending_migrations(&pool).await.unwrap();
+
+        // steering_messages: FIFO order (conversation_id, ordinal, message_id, text).
+        let msgs: Vec<(String, i64, String, String)> = sqlx::query(
+            "SELECT conversation_id, ordinal, message_id, text \
+             FROM steering_messages ORDER BY conversation_id, ordinal",
+        )
+        .map(|r: sqlx::sqlite::SqliteRow| {
+            (
+                r.get::<String, _>("conversation_id"),
+                r.get::<i64, _>("ordinal"),
+                r.get::<String, _>("message_id"),
+                r.get::<String, _>("text"),
+            )
+        })
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            msgs,
+            vec![
+                ("c-bare".into(), 0, "s3".into(), "legacy".into()),
+                ("c-env".into(), 0, "s1".into(), "first".into()),
+                ("c-env".into(), 1, "s2".into(), "second".into()),
+            ]
+        );
+
+        // Scalar columns: llm_text preserved on s1, skill trio only on s2.
+        let s1_llm: Option<String> =
+            sqlx::query_scalar("SELECT llm_text FROM steering_messages WHERE message_id = 's1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(s1_llm.as_deref(), Some("first-expanded"));
+        let s1_skill: Option<String> =
+            sqlx::query_scalar("SELECT skill_name FROM steering_messages WHERE message_id = 's1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(s1_skill.is_none());
+        let s2_skill: Option<String> =
+            sqlx::query_scalar("SELECT skill_name FROM steering_messages WHERE message_id = 's2'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(s2_skill.as_deref(), Some("build"));
+
+        // Skill trio fully populated for s2.
+        let skill: (Option<String>, Option<String>) = sqlx::query(
+            "SELECT skill_body, skill_dir FROM steering_messages WHERE message_id = 's2'",
+        )
+        .map(|r: sqlx::sqlite::SqliteRow| {
+            (
+                r.get::<Option<String>, _>("skill_body"),
+                r.get::<Option<String>, _>("skill_dir"),
+            )
+        })
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(skill, (Some("BODY".into()), Some("/skills/build".into())));
+
+        // Grandchild files/images for s1.
+        let file: (String, i64, String) = sqlx::query(
+            "SELECT original_name, size_bytes, stored_path FROM steering_message_files WHERE message_id = 's1'",
+        )
+        .map(|r: sqlx::sqlite::SqliteRow| {
+            (r.get::<String, _>("original_name"), r.get::<i64, _>("size_bytes"), r.get::<String, _>("stored_path"))
+        })
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(file, ("a.txt".into(), 9, "/p/a".into()));
+
+        let img_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM steering_message_images WHERE message_id = 's1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(img_count, 1);
+
+        // Empty queue contributes nothing.
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM steering_messages")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+    }
+
+    /// Migration 027 must be at least as tolerant as the decoder it replaced: a
+    /// corrupt/duplicate/invalid legacy `steering_queue` must not abort the
+    /// migration (which would brick startup). Malformed-JSON rows are skipped,
+    /// duplicate `message_id`s keep the first FIFO occurrence, and entries
+    /// missing required fields are dropped — without raising.
+    #[tokio::test]
+    async fn migration_027_tolerates_corrupt_duplicate_and_invalid_queues() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+
+        // c-bad: not valid JSON at all.
+        // c-scalar: valid array but a non-object element + an object whose
+        //   `files` array holds a scalar element (both must be skipped, not raise).
+        // c-dup: same message_id twice (first FIFO occurrence wins).
+        // c-missing: an entry with no `text` (dropped) alongside a valid one.
+        // c-partial-skill: skill_invocation missing `body` → skill_* left NULL.
+        let scalar =
+            r#"["bad",{"text":"ok2","message_id":"m-scalar","images":[],"files":["junk"]}]"#;
+        let dup = r#"[{"text":"a","message_id":"d1","images":[],"files":[]},
+                      {"text":"b","message_id":"d1","images":[],"files":[]}]"#;
+        let missing = r#"[{"message_id":"m-notext","images":[],"files":[]},
+                          {"text":"ok","message_id":"m-ok","images":[],"files":[]}]"#;
+        let partial = r#"[{"text":"s","message_id":"p1","images":[],"files":[],
+                           "skill_invocation":{"name":"build","skill_dir":"/d"}}]"#;
+        for (id, q) in [
+            ("c-bad", "{not json"),
+            ("c-scalar", scalar),
+            ("c-dup", dup),
+            ("c-missing", missing),
+            ("c-partial-skill", partial),
+        ] {
+            sqlx::query(
+                "INSERT INTO conversations (id, steering_queue, state_updated_at, created_at, updated_at) \
+                 VALUES (?1, ?2, '2025-01-01', '2025-01-01', '2025-01-01')",
+            )
+            .bind(id)
+            .bind(q)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Must not raise despite the corrupt/scalar/duplicate/invalid rows.
+        run_pending_migrations(&pool).await.unwrap();
+
+        let ids = |conv: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT message_id FROM steering_messages WHERE conversation_id = ?1 ORDER BY ordinal",
+                )
+                .bind(conv)
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+            }
+        };
+
+        // Malformed JSON → no rows (skipped, not aborted).
+        assert!(ids("c-bad").await.is_empty());
+        // Non-object array element skipped; the valid object survives with no
+        // file rows (its scalar `files` element is dropped, not extracted).
+        assert_eq!(ids("c-scalar").await, vec!["m-scalar".to_string()]);
+        let scalar_files: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM steering_message_files WHERE message_id = 'm-scalar'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(scalar_files, 0);
+        // Duplicate message_id → exactly one row kept.
+        assert_eq!(ids("c-dup").await, vec!["d1".to_string()]);
+        // Missing-text entry dropped, valid one kept.
+        assert_eq!(ids("c-missing").await, vec!["m-ok".to_string()]);
+
+        // Partial skill trio → all skill_* columns NULL (CHECK satisfied).
+        let skill_name: Option<String> =
+            sqlx::query_scalar("SELECT skill_name FROM steering_messages WHERE message_id = 'p1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(skill_name.is_none());
+
+        // The legacy blob is cleared on every migrated row (no parallel rep).
+        let dirty: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE steering_queue <> '[]'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(dirty, 0);
     }
 
     /// Migration 025: attachments embedded in `messages.content` are extracted
