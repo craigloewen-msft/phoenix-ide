@@ -3423,6 +3423,7 @@ where
         let storage = self.storage.clone();
         let event_tx = self.event_tx.clone();
         let conv_id = self.context.conversation_id.clone();
+        let context_window = self.context.context_window;
 
         // Build continuation prompt
         let continuation_prompt = build_continuation_prompt(&rejected_tool_calls);
@@ -3438,14 +3439,37 @@ where
                 }
             };
 
-            // The continuation request is tool-less: strip every tool-related
-            // block (regular ToolUse/ToolResult, server-handled ServerToolUse,
-            // ToolSearchToolResult, MCP, etc.) so the API doesn't reject the
-            // request because history references tools we're no longer
-            // declaring. The model still has the assistant's narration to
-            // summarize from. Rejected tool calls are described in prose in
-            // the continuation prompt instead of synthetic tool_result blocks.
-            let mut messages = strip_all_tool_blocks(messages);
+            // The continuation request declares no tools, so any tool_use /
+            // tool_result / server-handled block left in history would make the
+            // API 400 ("tool reference not found"). Flatten them to text rather
+            // than deleting them — the diffs applied, commands run, and output
+            // observed are exactly what the summary should draw on. Each block's
+            // text is capped so a single huge result can't dominate.
+            let messages = flatten_tool_blocks(messages);
+
+            // Proactive overflow guard: continuation fires near the top of the
+            // window, so the flattened history can still exceed it. Keep the
+            // most-recent messages within a token budget, dropping oldest first,
+            // so the request can't 400 with ContextWindowExceeded and loop
+            // deterministically to the fallback summary. The budget reserves the
+            // model's reply plus the *actual* size of the continuation prompt
+            // and system text — both grow (the prompt with rejected-call args)
+            // and must not be allowed to push the request over the window after
+            // history has filled the budget.
+            let fixed_tokens = estimate_text_tokens(&continuation_prompt)
+                + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT)
+                + CONTINUATION_OUTPUT_RESERVE_TOKENS
+                + CONTINUATION_SAFETY_MARGIN_TOKENS;
+            let input_budget = context_window.saturating_sub(fixed_tokens);
+            let (mut messages, dropped) = cap_messages_to_token_budget(messages, input_budget);
+            if dropped > 0 {
+                tracing::debug!(
+                    dropped,
+                    context_window,
+                    input_budget,
+                    "continuation: dropped oldest messages to fit token budget"
+                );
+            }
 
             // Add the continuation request as a user message
             messages.push(LlmMessage {
@@ -3456,12 +3480,11 @@ where
             // Build a tool-less request
             let request = LlmRequest {
                 messages,
-                system: vec![SystemContent::new(
-                    "You are wrapping up a conversation that has reached its context limit. \
-                    Provide a concise summary to help continue in a new conversation.",
-                )],
-                tools: vec![],          // No tools for continuation
-                max_tokens: Some(2000), // Limit summary length
+                system: vec![SystemContent::new(CONTINUATION_SYSTEM_PROMPT)],
+                tools: vec![], // No tools for continuation
+                // Handoff quality favors completeness; cap high enough that a
+                // thorough summary is not truncated mid-thought.
+                max_tokens: Some(4096),
                 // Same conversation as the main loop — different system
                 // prompt won't share a prefix in practice, but using the
                 // conv id keeps the cache cohort coherent.
@@ -3483,6 +3506,23 @@ where
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
+
+                    if summary.trim().is_empty() {
+                        // An empty summary is indistinguishable to the user from
+                        // "no summary" but silently seeds a blank continuation.
+                        // Route it through the same fallback path as a failure
+                        // so the terminal state carries an explanatory message.
+                        tracing::warn!(
+                            conv_id = %conv_id,
+                            "continuation: model returned an empty summary; using fallback"
+                        );
+                        let _ = event_tx
+                            .send(Event::ContinuationFailed {
+                                error: "the model returned an empty summary".to_string(),
+                            })
+                            .await;
+                        return;
+                    }
 
                     let _ = event_tx.send(Event::ContinuationResponse { summary }).await;
                 }
@@ -3921,36 +3961,159 @@ struct TaskApprovalResult {
     base_branch: String,
 }
 
-/// Drop every tool-related block from the message history.
+/// Per-block character cap when flattening tool blocks for the continuation
+/// request. Bounds a single huge tool result (a large file read, verbose
+/// command output) so it cannot dominate the summary input. Overall request
+/// size is bounded separately by [`cap_messages_to_token_budget`].
+const CONTINUATION_BLOCK_CHAR_CAP: usize = 2000;
+
+/// Reserve (tokens) for the continuation reply — kept in lockstep with the
+/// `max_tokens` on the continuation request.
+const CONTINUATION_OUTPUT_RESERVE_TOKENS: usize = 4096;
+
+/// Safety margin (tokens) against the chars/token estimate being optimistic.
+/// The prompt and system text are budgeted from their actual size separately,
+/// so this only covers estimate error, not their bulk.
+const CONTINUATION_SAFETY_MARGIN_TOKENS: usize = 512;
+
+/// Rough chars-per-token ratio for the proactive budget estimate. Deliberately
+/// conservative (English prose is ~4); paired with the per-message overhead and
+/// ceiling rounding below it errs toward dropping a message rather than
+/// overflowing the window.
+const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+
+/// Per-message token overhead for role framing and wire envelope. Charged on
+/// top of content so a long run of tiny messages (e.g. repeated one-word turns)
+/// cannot slip under the budget at an estimated zero cost each.
+const MESSAGE_OVERHEAD_TOKENS: usize = 4;
+
+/// System prompt for the continuation request. A module const so the budget
+/// estimate and the request that is actually sent draw from the same text and
+/// cannot drift.
+const CONTINUATION_SYSTEM_PROMPT: &str = "You are an agent writing a handoff note for the next \
+    agent, who will continue this work in the same working directory with no memory of this \
+    session, with the same tools available to you now. Be precise and concrete: real file paths, \
+    real commands, and an honest split between what you verified and what you only assumed.";
+
+/// Estimate the token cost of a string for the proactive budget. Ceiling
+/// division so a sub-`CHARS_PER_TOKEN_ESTIMATE` string still costs at least one
+/// token rather than rounding to zero.
+fn estimate_text_tokens(text: &str) -> usize {
+    text.chars().count().div_ceil(CHARS_PER_TOKEN_ESTIMATE)
+}
+
+/// Flatten tool-related blocks into text for the tool-less continuation request.
 ///
-/// Used by the continuation summary path: that request is sent with
-/// `tools: []`, so any `tool_use`, `tool_result`, `server_tool_use`,
-/// `tool_search_tool_result`, or MCP block in history would cause the
-/// API to 400 with "Tool reference X not found in available tools".
-/// The summary still has the assistant's text narration to work with.
-fn strip_all_tool_blocks(messages: Vec<LlmMessage>) -> Vec<LlmMessage> {
+/// The continuation request declares no tools, so any `tool_use`, `tool_result`,
+/// `server_tool_use`, `tool_search_tool_result`, or MCP block left in history
+/// would make the API 400 with "Tool reference X not found in available tools".
+/// Rather than delete those blocks — discarding the work record the summary
+/// should draw on — each is rendered to text via the exhaustive
+/// [`ContentBlock::render_text`] and capped at [`CONTINUATION_BLOCK_CHAR_CAP`].
+/// `Text` and `Image` blocks pass through untouched; a tool result's images are
+/// preserved as image blocks so screenshots remain available to the summary.
+fn flatten_tool_blocks(messages: Vec<LlmMessage>) -> Vec<LlmMessage> {
     use crate::llm::ContentBlock;
 
     messages
         .into_iter()
         .map(|msg| {
-            let filtered: Vec<ContentBlock> = msg
-                .content
-                .into_iter()
-                .filter(|block| {
-                    matches!(
-                        block,
-                        ContentBlock::Text { .. } | ContentBlock::Image { .. }
-                    )
-                })
-                .collect();
+            let mut flattened: Vec<ContentBlock> = Vec::with_capacity(msg.content.len());
+            for block in msg.content {
+                match block {
+                    ContentBlock::Text { .. } | ContentBlock::Image { .. } => {
+                        flattened.push(block);
+                    }
+                    ContentBlock::ToolResult {
+                        content,
+                        images,
+                        is_error,
+                        ..
+                    } => {
+                        let marker = if is_error {
+                            "[tool result (error)]: "
+                        } else {
+                            "[tool result]: "
+                        };
+                        flattened.push(ContentBlock::text(format!(
+                            "{marker}{}",
+                            cap_block_text(content)
+                        )));
+                        for source in images {
+                            flattened.push(ContentBlock::Image { source });
+                        }
+                    }
+                    other => {
+                        flattened.push(ContentBlock::text(cap_block_text(other.render_text())));
+                    }
+                }
+            }
             LlmMessage {
                 role: msg.role,
-                content: filtered,
+                content: flattened,
             }
         })
         .filter(|msg| !msg.content.is_empty())
         .collect()
+}
+
+/// Truncate flattened-block text to [`CONTINUATION_BLOCK_CHAR_CAP`] chars,
+/// counting by chars so the result is always valid UTF-8.
+fn cap_block_text(text: String) -> String {
+    if text.chars().count() <= CONTINUATION_BLOCK_CHAR_CAP {
+        return text;
+    }
+    let truncated: String = text.chars().take(CONTINUATION_BLOCK_CHAR_CAP).collect();
+    format!("{truncated}…[truncated]")
+}
+
+/// Estimate the token cost of a single message for the proactive budget.
+fn estimate_message_tokens(msg: &LlmMessage) -> usize {
+    use crate::llm::ContentBlock;
+    // A flattened-and-replayed image still costs a fixed block of tokens on the
+    // wire; approximate rather than under-count it to zero.
+    const IMAGE_TOKEN_ESTIMATE: usize = 1500;
+    let content: usize = msg
+        .content
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
+            other => estimate_text_tokens(&other.render_text()),
+        })
+        .sum();
+    // Per-message overhead bounds the count of tiny messages so a long run of
+    // them cannot be retained wholesale under a small budget.
+    content + MESSAGE_OVERHEAD_TOKENS
+}
+
+/// Keep the most-recent messages whose combined estimated token cost fits
+/// `budget_tokens`, dropping the oldest first to preserve a contiguous recent
+/// window. The single most-recent message is always kept even if it alone
+/// exceeds the budget (sending an over-budget request is strictly better than
+/// sending none). Returns the kept messages and the number dropped.
+fn cap_messages_to_token_budget(
+    messages: Vec<LlmMessage>,
+    budget_tokens: usize,
+) -> (Vec<LlmMessage>, usize) {
+    let total = messages.len();
+    if total == 0 {
+        return (messages, 0);
+    }
+    let mut running = 0usize;
+    let mut keep_from = 0usize;
+    for (i, msg) in messages.iter().enumerate().rev() {
+        let est = estimate_message_tokens(msg);
+        // Always keep the newest message; for older ones, stop once adding
+        // would exceed the budget so the kept window stays contiguous.
+        if i != total - 1 && running + est > budget_tokens {
+            keep_from = i + 1;
+            break;
+        }
+        running += est;
+    }
+    let dropped = keep_from;
+    let kept = messages.into_iter().skip(keep_from).collect();
+    (kept, dropped)
 }
 
 /// Merge a `duration_ms` value into an existing `display_data` JSON blob.
@@ -4186,22 +4349,39 @@ mod strip_tool_blocks_tests {
         }
     }
 
-    // ----- strip_all_tool_blocks -----
+    // ----- flatten_tool_blocks -----
+
+    /// No block survives that the tool-less continuation request could not
+    /// declare — i.e. nothing but `Text`/`Image` remains. This is the
+    /// invariant that keeps the API from 400ing on an undeclared tool ref.
+    fn assert_no_tool_blocks(out: &[LlmMessage]) {
+        for msg in out {
+            for block in &msg.content {
+                assert!(
+                    matches!(
+                        block,
+                        ContentBlock::Text { .. } | ContentBlock::Image { .. }
+                    ),
+                    "flatten left a non-text/image block: {block:?}"
+                );
+            }
+        }
+    }
 
     #[test]
-    fn strip_all_keeps_text_only_history_unchanged() {
+    fn flatten_keeps_text_only_history_unchanged() {
         let msgs = vec![
             user_text("hello"),
             assistant(vec![ContentBlock::text("hi")]),
         ];
-        let out = strip_all_tool_blocks(msgs.clone());
+        let out = flatten_tool_blocks(msgs.clone());
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].content.len(), 1);
         assert_eq!(out[1].content.len(), 1);
     }
 
     #[test]
-    fn strip_all_keeps_image_blocks() {
+    fn flatten_keeps_image_blocks() {
         // Continuation summary should retain images (e.g. screenshots from
         // the user's earlier turns) so the model has the visual context.
         let msgs = vec![user(vec![
@@ -4213,13 +4393,13 @@ mod strip_tool_blocks_tests {
                 },
             },
         ])];
-        let out = strip_all_tool_blocks(msgs);
+        let out = flatten_tool_blocks(msgs);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].content.len(), 2);
     }
 
     #[test]
-    fn strip_all_drops_regular_tool_use_and_result() {
+    fn flatten_renders_tool_use_and_result_as_text() {
         let msgs = vec![
             assistant(vec![
                 ContentBlock::text("calling bash"),
@@ -4228,25 +4408,27 @@ mod strip_tool_blocks_tests {
             user(vec![tool_result("t1")]),
             assistant(vec![ContentBlock::text("done")]),
         ];
-        let out = strip_all_tool_blocks(msgs);
-        assert_eq!(
-            out.len(),
-            2,
-            "tool-result-only user message must be dropped"
-        );
-        // First survivor: assistant with just text (tool_use stripped)
-        assert_eq!(out[0].content.len(), 1);
+        let out = flatten_tool_blocks(msgs);
+        // Every message survives now — the work record is preserved as text
+        // rather than deleted.
+        assert_eq!(out.len(), 3);
+        assert_no_tool_blocks(&out);
+        // tool_use is flattened alongside the narration it accompanied.
+        assert_eq!(out[0].content.len(), 2);
         assert!(
             matches!(&out[0].content[0], ContentBlock::Text { text } if text == "calling bash")
         );
-        // Second survivor: assistant "done"
-        assert!(matches!(&out[1].content[0], ContentBlock::Text { text } if text == "done"));
+        assert!(matches!(&out[0].content[1], ContentBlock::Text { text } if text.contains("bash")));
+        // tool_result becomes a marked text block carrying its content.
+        assert!(matches!(&out[1].content[0], ContentBlock::Text { text }
+            if text.contains("tool result") && text.contains("ok")));
     }
 
     #[test]
-    fn strip_all_drops_server_tool_use_and_tool_search_result() {
+    fn flatten_renders_server_blocks_as_text() {
         // Reproduces the production failure shape: tool_search-discovered MCP
-        // tool referenced in history with tools=[] in the request.
+        // tool referenced in history. With tools=[] the request would 400 on
+        // these blocks; flattening renders them to text so it can't.
         let msgs = vec![
             assistant(vec![
                 server_tool_use("srv1", "tool_search_tool_regex"),
@@ -4256,25 +4438,84 @@ mod strip_tool_blocks_tests {
             user(vec![tool_result("call1")]),
             assistant(vec![ContentBlock::text("summary so far")]),
         ];
-        let out = strip_all_tool_blocks(msgs);
-        // Only the two text-bearing messages should remain (the tool_result
-        // user message and the all-server-blocks message after stripping
-        // are empty, but the first assistant survives if it had any text;
-        // here it had no text, so it should be dropped entirely).
-        assert_eq!(out.len(), 1);
-        assert!(
-            matches!(&out[0].content[0], ContentBlock::Text { text } if text == "summary so far")
+        let out = flatten_tool_blocks(msgs);
+        assert_eq!(out.len(), 3);
+        assert_no_tool_blocks(&out);
+        assert_eq!(
+            out[0].content.len(),
+            3,
+            "three server/tool blocks flattened"
         );
     }
 
     #[test]
-    fn strip_all_drops_messages_that_become_empty() {
+    fn flatten_preserves_tool_only_messages_as_text() {
+        // A message whose only blocks were tool blocks is no longer dropped —
+        // its work record is rendered to text.
         let msgs = vec![
             assistant(vec![tool_use("t1", "bash")]),
             user(vec![tool_result("t1")]),
         ];
-        let out = strip_all_tool_blocks(msgs);
-        assert!(out.is_empty());
+        let out = flatten_tool_blocks(msgs);
+        assert_eq!(out.len(), 2);
+        assert_no_tool_blocks(&out);
+    }
+
+    #[test]
+    fn cap_block_text_truncates_by_chars() {
+        let capped = cap_block_text("é".repeat(CONTINUATION_BLOCK_CHAR_CAP + 100));
+        assert!(capped.ends_with("…[truncated]"));
+        assert!(capped.chars().count() <= CONTINUATION_BLOCK_CHAR_CAP + 12);
+    }
+
+    #[test]
+    fn budget_cap_keeps_recent_drops_oldest() {
+        // Each message ~5 chars of text => ~1 token. Budget of 2 tokens keeps
+        // roughly the two newest; oldest are dropped, newest always survives.
+        let msgs = vec![
+            user_text("aaaaaaaa"),
+            assistant(vec![ContentBlock::text("bbbbbbbb")]),
+            user_text("cccccccc"),
+        ];
+        let (kept, dropped) = cap_messages_to_token_budget(msgs, 2);
+        assert!(dropped >= 1, "oldest should be dropped");
+        assert_eq!(kept.len() + dropped, 3);
+        // The newest message is always retained.
+        assert!(matches!(&kept.last().unwrap().content[0],
+            ContentBlock::Text { text } if text == "cccccccc"));
+    }
+
+    #[test]
+    fn budget_cap_keeps_single_oversized_newest_message() {
+        let msgs = vec![user_text(&"x".repeat(10_000))];
+        let (kept, dropped) = cap_messages_to_token_budget(msgs, 1);
+        assert_eq!(kept.len(), 1, "the sole newest message is always kept");
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn budget_cap_charges_overhead_for_tiny_messages() {
+        // A run of sub-CHARS_PER_TOKEN messages must still be bounded: the
+        // per-message overhead (and ceiling rounding) keeps them from being
+        // retained wholesale at an estimated zero cost each.
+        let msgs: Vec<LlmMessage> = (0..100).map(|_| user_text("x")).collect();
+        let (kept, dropped) = cap_messages_to_token_budget(msgs, 20);
+        assert!(
+            dropped > 0,
+            "tiny messages must still be charged and dropped"
+        );
+        assert!(kept.len() < 100, "not every tiny message should fit");
+    }
+
+    #[test]
+    fn estimate_text_tokens_rounds_up() {
+        assert_eq!(estimate_text_tokens(""), 0);
+        assert_eq!(
+            estimate_text_tokens("x"),
+            1,
+            "sub-ratio text costs >= 1 token"
+        );
+        assert_eq!(estimate_text_tokens(&"x".repeat(5)), 2);
     }
 
     // ----- strip_unavailable_tool_blocks -----
@@ -4717,30 +4958,77 @@ fn execute_approve_plain_markdown_blocking(
     })
 }
 
-/// Build the continuation prompt (REQ-BED-020)
+/// Build the continuation prompt (REQ-BED-020).
+///
+/// The summary seeds a fresh agent that restarts with no memory of this session
+/// in the same working directory. That successor inherits this conversation's
+/// mode and tool set (continuation copies `conv_mode` verbatim), so the prompt
+/// promises "the same tools you have now" rather than full access — an Explore
+/// continuation stays in Explore mode and cannot run write/edit tools. It asks
+/// for an operational handoff (exact paths, repo state, verified-vs-assumed)
+/// rather than a human-facing recap.
 fn build_continuation_prompt(rejected_tool_calls: &[ToolCall]) -> String {
     let mut prompt = String::from(
-        "The conversation context is nearly full. Please provide a brief continuation summary \
-        that could seed a new conversation.\n\n\
-        Include:\n\
-        1. Current task status and progress\n\
-        2. Key files, concepts, or decisions discussed\n\
-        3. Suggested next steps to continue the work\n\n\
-        Keep your response concise and actionable.",
+        "This conversation has reached its context limit. Write a handoff that lets a fresh \
+        agent — no memory of this session, but the same tools you have now, in the same working \
+        directory — pick up exactly where you left off.\n\n\
+        Cover:\n\
+        1. The goal: what you were asked to do, and the current status toward it.\n\
+        2. Work done: concrete changes made, with exact file paths; commands run and their \
+        outcome.\n\
+        3. Verified vs. assumed: what you confirmed works (tests run, output observed) versus \
+        what you believe but have not checked.\n\
+        4. Repo state: branch, what is committed vs. uncommitted, anything pushed.\n\
+        5. Next steps: the specific actions to take next, the first concrete one first.\n\
+        6. Pitfalls: dead ends, gotchas, or context the next agent would otherwise have to \
+        rediscover the hard way.\n\n\
+        Favor completeness over brevity — a dropped file path or an unstated caveat costs the \
+        next agent far more than length does. Write directly to that agent.",
     );
 
     if !rejected_tool_calls.is_empty() {
         use std::fmt::Write;
         prompt.push_str(
-            "\n\nNote: The following tool calls were requested but not executed due to context limits:\n",
+            "\n\nThese tool calls were pending when the limit hit and did not run. Fold the \
+            intended actions into the next steps:\n",
         );
         for tool in rejected_tool_calls {
-            let _ = writeln!(prompt, "- {}", tool.name());
+            let _ = writeln!(prompt, "- {}", render_rejected_tool_call(tool));
         }
-        prompt.push_str("Include these pending actions in your summary.");
     }
 
     prompt
+}
+
+/// Render a pending (rejected) tool call as `name: {compact-json-args}`, with
+/// the arguments truncated on a char boundary so one oversized payload cannot
+/// bloat the prompt. The next agent needs to know *what* was about to run
+/// (which file the patch targeted, which command was queued), not just the
+/// tool type. The internal `_tool` discriminant is stripped since the name is
+/// already printed.
+fn render_rejected_tool_call(tool: &ToolCall) -> String {
+    const MAX_ARGS_CHARS: usize = 500;
+    let name = tool.name();
+    let args = match serde_json::to_value(&tool.input) {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("_tool");
+            }
+            serde_json::to_string(&v).unwrap_or_default()
+        }
+        Err(_) => String::new(),
+    };
+    if args.is_empty() || args == "{}" {
+        return name.to_string();
+    }
+    // Truncate by char count rather than byte slice: respects UTF-8 boundaries
+    // by construction and satisfies clippy::string_slice.
+    if args.chars().count() > MAX_ARGS_CHARS {
+        let truncated: String = args.chars().take(MAX_ARGS_CHARS).collect();
+        format!("{name}: {truncated}… (truncated)")
+    } else {
+        format!("{name}: {args}")
+    }
 }
 
 fn llm_error_to_db_error(kind: crate::llm::LlmErrorKind) -> crate::db::ErrorKind {
@@ -4811,6 +5099,55 @@ fn llm_error_to_outcome(error: crate::llm::LlmError) -> LlmOutcome {
         LlmErrorKind::InvalidRequest | LlmErrorKind::ContentFilter => LlmOutcome::RequestRejected {
             message: error.message,
         },
+    }
+}
+
+#[cfg(test)]
+mod continuation_prompt_tests {
+    use super::*;
+    use crate::state_machine::state::ToolInput;
+    use crate::tools::BashToolInput;
+
+    #[test]
+    fn rejected_tool_call_includes_arguments_without_tool_discriminant() {
+        let call = ToolCall::new("t1", ToolInput::Bash(BashToolInput::run("cargo test")));
+        let rendered = render_rejected_tool_call(&call);
+        assert!(rendered.starts_with("bash: "), "got: {rendered}");
+        assert!(rendered.contains("cargo test"), "args missing: {rendered}");
+        assert!(
+            !rendered.contains("_tool"),
+            "discriminant should be stripped: {rendered}"
+        );
+    }
+
+    #[test]
+    fn rejected_tool_call_truncates_oversized_arguments_on_char_boundary() {
+        let big = "é".repeat(2000); // multi-byte chars stress the boundary walk
+        let call = ToolCall::new("t1", ToolInput::Bash(BashToolInput::run(big)));
+        let rendered = render_rejected_tool_call(&call);
+        assert!(rendered.ends_with("… (truncated)"), "got tail: {rendered}");
+        // Truncated near the char cap, not the full 2000-char payload, and
+        // still valid UTF-8 (constructing it would have panicked otherwise).
+        assert!(
+            rendered.chars().count() < 600,
+            "not truncated: {} chars",
+            rendered.chars().count()
+        );
+    }
+
+    #[test]
+    fn continuation_prompt_lists_rejected_calls_and_drops_brevity_framing() {
+        let calls = vec![ToolCall::new(
+            "t1",
+            ToolInput::Bash(BashToolInput::run("git push")),
+        )];
+        let prompt = build_continuation_prompt(&calls);
+        assert!(prompt.contains("handoff"), "should frame as handoff");
+        assert!(prompt.contains("git push"), "rejected args should appear");
+        assert!(
+            !prompt.to_lowercase().contains("brief") && !prompt.to_lowercase().contains("concise"),
+            "brevity framing should be gone: {prompt}"
+        );
     }
 }
 

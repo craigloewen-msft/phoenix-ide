@@ -1284,33 +1284,59 @@ The check happens in `transition()` at the `(LlmRequesting, LlmResponse)` arm, B
 
 ### Continuation Prompt
 
-The continuation prompt includes context about rejected tools:
+The summary's consumer is a fresh agent that resumes in the same working
+directory with no memory of the session, so the prompt is framed as an
+operational handoff written agent-to-agent, not a human-facing recap. It asks
+for: the goal and current status; concrete work done with exact file paths and
+command outcomes; an honest split between what was verified and what was only
+assumed; repo state (branch, committed vs. uncommitted, pushed); ordered next
+steps; and pitfalls the next agent would otherwise rediscover. It instructs the
+model to favor completeness over brevity — a dropped path or unstated caveat
+costs the next agent more than length does — and the request's `max_tokens` is
+sized so a thorough handoff is not truncated mid-thought. The system prompt
+carries the agent-to-agent role and the verified-vs-assumed discipline; the user
+prompt carries the structure, so the two do not restate each other.
 
-```rust
-const CONTINUATION_PROMPT: &str = r#"
-The conversation context is nearly full. Please provide a brief continuation summary that could seed a new conversation.
+Rejected tool calls (requested but not executed when the limit hit) are listed
+with their intended arguments, not just the tool name, so the next agent knows
+*what* was about to run (which file a patch targeted, which command was queued).
+Arguments are serialized compactly and truncated on a char boundary so a single
+oversized payload cannot bloat the prompt.
 
-Include:
-1. Current task status (if any)
-2. Key files or concepts discussed
-3. Suggested next steps
+### Continuation Request Construction
 
-Keep your response concise.
-"#;
+The request declares no tools, so any `tool_use` / `tool_result` / server-handled
+block left in the replayed history would make the API reject the request for
+referencing a tool that is no longer available. Those blocks are *flattened to
+text* rather than deleted: the diffs applied, commands run, and output observed
+are the work record the summary should draw on, so each block is rendered to its
+textual form and capped at a per-block character limit (a single huge result
+cannot dominate). Text and image blocks pass through unchanged; a tool result's
+images are preserved as image blocks so screenshots remain available.
 
-fn build_continuation_prompt(rejected_tool_calls: &[ToolCall]) -> String {
-    let mut prompt = CONTINUATION_PROMPT.to_string();
-    
-    if !rejected_tool_calls.is_empty() {
-        prompt.push_str("\n\nNote: The following tool calls were requested but not executed due to context limits:\n");
-        for tool in rejected_tool_calls {
-            prompt.push_str(&format!("- {}\n", tool.name()));
-        }
-    }
-    
-    prompt
-}
-```
+Because continuation fires near the top of the context window, the flattened
+history can still exceed it. A proactive token-budget cap keeps the most-recent
+messages within the window minus reserves for the reply and the *actual* size of
+the continuation prompt and system text — both vary (the prompt grows with the
+rejected-call arguments it lists) and must be reserved from their measured size,
+not a fixed guess, or a large prompt would push the request over the window
+after history has filled the budget. The cap drops the oldest messages first to
+preserve a contiguous recent window (the single newest message is always kept).
+Each message is charged a small per-message overhead and token costs round up,
+so a long run of tiny messages cannot slip under the budget at zero estimated
+cost. This makes the request structurally unable to overflow, so it cannot fail
+with a context-window error and then deterministically replay the same oversized
+request until it falls back.
+
+The handoff prompt promises the successor "the same tools you have now," not full
+access: a continuation inherits the exhausted conversation's mode verbatim, so an
+Explore continuation stays in Explore mode with its restricted tool registry and
+must not be told it can run write/edit tools.
+
+An empty or whitespace-only summary is routed through the same fallback path as
+a generation failure: a blank summary is indistinguishable to the user from a
+missing one but would silently seed an empty continuation, so it instead yields
+the explanatory fallback message.
 
 ### Continuation Transitions
 
