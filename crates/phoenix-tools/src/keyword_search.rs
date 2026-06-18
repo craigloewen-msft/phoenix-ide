@@ -17,7 +17,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 const MAX_TERM_RESULTS: usize = 64 * 1024; // 64KB per term
 const MAX_COMBINED_RESULTS: usize = 128 * 1024; // 128KB combined
@@ -80,8 +82,21 @@ impl KeywordSearchTool {
         }
     }
 
-    /// Run ripgrep with given terms
-    async fn ripgrep(&self, dir: &PathBuf, terms: &[String]) -> Result<String, String> {
+    /// Run ripgrep with given terms.
+    ///
+    /// Cooperative cancellation (REQ-BED-005): the spawned `rg` child is raced
+    /// against `cancel.cancelled()`. On cancel the child is killed and reaped
+    /// promptly (`Child::kill` = `start_kill` + await exit, with `kill_on_drop` as
+    /// a backstop) and an error returns, so a search of a huge tree (e.g. an
+    /// unbounded scan) cannot block the tool task indefinitely. The executor's
+    /// deadline backstop (REQ-BED-005a) is then only a safety net for tools that
+    /// are not cooperative.
+    async fn ripgrep(
+        &self,
+        dir: &PathBuf,
+        terms: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<String, String> {
         let mut cmd = Command::new("rg");
         cmd.args(["-C", "10"]) // 10 lines context
             .arg("-i") // Case insensitive
@@ -95,24 +110,66 @@ impl KeywordSearchTool {
         cmd.current_dir(dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Kill the child if the JoinHandle::abort drops this future before
+            // the select below runs — backstop for the deadline-abort path.
+            .kill_on_drop(true);
 
-        let output = cmd
-            .output()
-            .await
+        let mut child = cmd
+            .spawn()
             .map_err(|e| format!("Failed to run ripgrep: {e}"))?;
 
+        // Take the piped handles so we can drain them concurrently with a
+        // borrowing `child.wait()`. Keeping ownership of `child` (rather than
+        // consuming it via `wait_with_output`) is what lets the cancel branch
+        // deterministically `kill()` (start_kill + reap) the OS process.
+        let mut stdout_pipe = child
+            .stdout
+            .take()
+            .ok_or_else(|| "ripgrep stdout pipe missing".to_string())?;
+        let mut stderr_pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| "ripgrep stderr pipe missing".to_string())?;
+
+        let mut stdout_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
+        let drain = async {
+            tokio::try_join!(
+                stdout_pipe.read_to_end(&mut stdout_buf),
+                stderr_pipe.read_to_end(&mut stderr_buf),
+            )
+        };
+
+        let status = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                // Cancellation requested: explicitly kill AND reap the child so
+                // a zombie cannot pile up while tokio's `kill_on_drop` reaper
+                // gets around to it. `Child::kill` does `start_kill` + awaits the
+                // exit. `kill_on_drop(true)` remains as a belt-and-suspenders
+                // backstop for the abort-without-select path.
+                let _ = child.kill().await;
+                return Err("ripgrep cancelled".to_string());
+            }
+            res = async { tokio::join!(child.wait(), drain) } => {
+                let (wait_res, drain_res) = res;
+                drain_res.map_err(|e| format!("Failed to read ripgrep output: {e}"))?;
+                wait_res.map_err(|e| format!("Failed to run ripgrep: {e}"))?
+            }
+        };
+
         // Exit code 1 = no matches (not an error)
-        if output.status.code() == Some(1) {
+        if status.code() == Some(1) {
             return Ok("No matches found".to_string());
         }
 
-        if !output.status.success() && output.status.code() != Some(1) {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        if !status.success() && status.code() != Some(1) {
+            let stderr = String::from_utf8_lossy(&stderr_buf);
             return Err(format!("ripgrep failed: {stderr}"));
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(String::from_utf8_lossy(&stdout_buf).to_string())
     }
 
     /// Select an LLM for filtering
@@ -219,7 +276,10 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
         // Filter out overly broad terms
         let mut usable_terms = Vec::new();
         for term in &input.search_terms {
-            match self.ripgrep(&search_root, std::slice::from_ref(term)).await {
+            match self
+                .ripgrep(&search_root, std::slice::from_ref(term), &ctx.cancel)
+                .await
+            {
                 Ok(result) => {
                     if result.len() <= MAX_TERM_RESULTS {
                         usable_terms.push(term.clone());
@@ -228,6 +288,13 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
                     }
                 }
                 Err(e) => {
+                    // Stop prechecking the moment cancellation fires — otherwise
+                    // a large term list spawns and kills one `rg` per remaining
+                    // term, churning processes and delaying the cooperative
+                    // cancel path. ripgrep() returns Err on cancel.
+                    if ctx.cancel.is_cancelled() {
+                        return ToolOutput::error("keyword_search cancelled");
+                    }
                     tracing::warn!(term = %term, error = %e, "Error checking term");
                 }
             }
@@ -242,7 +309,7 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
         // Search with usable terms, peeling off until results fit
         let mut results = String::new();
         while !usable_terms.is_empty() {
-            match self.ripgrep(&search_root, &usable_terms).await {
+            match self.ripgrep(&search_root, &usable_terms, &ctx.cancel).await {
                 Ok(r) => {
                     if r.len() <= MAX_COMBINED_RESULTS {
                         results = r;
@@ -286,7 +353,7 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
 mod tests {
     use super::*;
     use crate::browser::BrowserSessionManager;
-    use tokio_util::sync::CancellationToken;
+    use std::time::Duration;
 
     fn test_context(working_dir: PathBuf) -> ToolContext {
         ToolContext::new(
@@ -308,5 +375,93 @@ mod tests {
         let root = KeywordSearchTool::find_search_root(&ctx);
         // Should fall back to working dir since /tmp isn't a git repo
         assert_eq!(root, PathBuf::from("/tmp"));
+    }
+
+    /// Returns true if an `rg` process whose argv mentions `needle` is alive.
+    /// We match on the unique search term, which `ripgrep()` passes verbatim as
+    /// `-e <term>` — the scanned directory is set via `current_dir` and so does
+    /// not appear in argv, making the term the only reliable argv marker.
+    fn rg_child_alive(needle: &str) -> bool {
+        let out = std::process::Command::new("pgrep")
+            .args(["-f", needle])
+            .output();
+        match out {
+            Ok(out) => !String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            // pgrep unavailable: treat as "not alive" so the test degrades to a
+            // no-op rather than a false failure on platforms without it.
+            Err(_) => false,
+        }
+    }
+
+    /// REQ-BED-005: `ripgrep()` reaps its child and returns promptly when the
+    /// cancellation token fires mid-search, rather than blocking until the scan
+    /// completes. Hermetic and timing-independent: it builds a tree, waits until
+    /// the `rg` child is confirmed in-flight (via `pgrep`) before firing cancel,
+    /// then asserts both prompt return and that the OS child process is reaped.
+    #[tokio::test]
+    async fn ripgrep_reaps_child_on_cancel() {
+        // Build a sizeable tree. Size is not load-bearing for correctness here
+        // (we synchronize on the live child, not on scan duration), but a
+        // non-trivial tree keeps the child alive long enough to observe.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        for d in 0..40 {
+            let sub = dir.path().join(format!("d{d}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for f in 0..40 {
+                // Many lines, none matching the search term, so rg scans fully.
+                let body = "lorem ipsum dolor sit amet\n".repeat(2000);
+                std::fs::write(sub.join(format!("f{f}.txt")), &body).unwrap();
+            }
+        }
+
+        let tool = KeywordSearchTool;
+        let cancel = CancellationToken::new();
+        let dir_path = dir.path().to_path_buf();
+        // Unique per-run term so `pgrep -f <term>` cannot collide with another
+        // test's `rg` child. It is also the argv marker we synchronize on.
+        let needle = format!("zzz_nonexistent_term_{}_zzz", std::process::id());
+        let terms = vec![needle.clone()];
+
+        // Cancel only once the `rg` child is confirmed running (or after a
+        // generous deadline). This removes the dependency on scan-duration vs a
+        // fixed sleep that made the test flaky on fast workers / tmpfs.
+        let cancel_clone = cancel.clone();
+        let needle_for_canceller = needle.clone();
+        let canceller = tokio::spawn(async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !rg_child_alive(&needle_for_canceller) {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            cancel_clone.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let result = tool.ripgrep(&dir_path, &terms, &cancel).await;
+        let elapsed = start.elapsed();
+        canceller.await.unwrap();
+
+        assert!(
+            result.is_err(),
+            "cancelled ripgrep should return an error, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "cancelled ripgrep must return promptly after cancel, took {elapsed:?}"
+        );
+
+        // With the explicit kill+wait on the cancel path the child is reaped
+        // before `ripgrep()` returns; allow a brief grace for OS-level reaping,
+        // then confirm no `rg` child is still scanning our temp tree.
+        let reaped_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while rg_child_alive(&needle) && std::time::Instant::now() < reaped_deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !rg_child_alive(&needle),
+            "rg child for term {needle} should have been reaped"
+        );
     }
 }
