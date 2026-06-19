@@ -783,6 +783,19 @@ pub async fn cascade_tmux_on_delete(
         .await
 }
 
+/// Set an explicit environment on a tmux command so the spawned server (and
+/// thus its pane shells) match the direct-shell PTY contract: the fixed base
+/// env plus the `PtyEnvInjection` (the `phx` shim on PATH, `PHOENIX_API_URL`,
+/// `PHOENIX_SUGGEST_TOKEN`) and the safe-var allowlist — never a blind copy of
+/// the Phoenix process environment, which would leak server secrets (LLM API
+/// keys, gateway config) into every tmux-backed terminal. `build_env_for_tmux`
+/// is the single source for that env (`specs/terminal` REQ-TERM-002).
+fn set_tmux_server_env(cmd: &mut tokio::process::Command) {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned());
+    cmd.env_clear();
+    cmd.envs(phoenix_terminal::spawn::build_env_for_tmux(&shell));
+}
+
 /// Spawn a fresh detached tmux session named `main` against
 /// `socket_path` with `cwd` as the pane's start directory
 /// (REQ-TMUX-002 / `tmux_default_session`). This is the only place
@@ -804,20 +817,26 @@ pub async fn spawn_session(
     config_path: &Path,
     cwd: &Path,
 ) -> Result<(), TmuxError> {
-    let output = tokio::process::Command::new("tmux")
-        .args([
-            "-f",
-            &config_path.to_string_lossy(),
-            "-S",
-            &socket_path.to_string_lossy(),
-            "new-session",
-            "-d",
-            "-c",
-            &cwd.to_string_lossy(),
-            "-s",
-            TMUX_DEFAULT_SESSION,
-        ])
-        .env_remove("TMUX")
+    let mut cmd = tokio::process::Command::new("tmux");
+    cmd.args([
+        "-f",
+        &config_path.to_string_lossy(),
+        "-S",
+        &socket_path.to_string_lossy(),
+        "new-session",
+        "-d",
+        "-c",
+        &cwd.to_string_lossy(),
+        "-s",
+        TMUX_DEFAULT_SESSION,
+    ]);
+    // A tmux pane shell inherits the tmux *server's* environment, captured here.
+    // Build it explicitly (base + PtyEnvInjection + safe-var allowlist) rather
+    // than inheriting Phoenix's env, which would leak server secrets into every
+    // pane and diverge from the direct-shell path. env_clear also drops TMUX, so
+    // an outer-tmux invocation does not trip tmux's nesting refusal.
+    set_tmux_server_env(&mut cmd);
+    let output = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
