@@ -45,6 +45,11 @@ pub struct BashTool;
 
 #[async_trait]
 impl Tool for BashTool {
+    // clearable: re-queryable read (side effects aside) — see specs/stale-tool-results (REQ-STR-002).
+    fn clearable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "bash"
     }

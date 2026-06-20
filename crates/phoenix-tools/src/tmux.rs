@@ -56,6 +56,11 @@ struct TmuxInput {
 
 #[async_trait]
 impl Tool for TmuxTool {
+    // clearable: re-queryable read — see specs/stale-tool-results (REQ-STR-002).
+    fn clearable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "tmux"
     }

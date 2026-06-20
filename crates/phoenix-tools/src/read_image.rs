@@ -56,6 +56,11 @@ struct ReadImageInput {
 
 #[async_trait]
 impl Tool for ReadImageTool {
+    // clearable: re-queryable read — see specs/stale-tool-results (REQ-STR-002).
+    fn clearable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "read_image"
     }

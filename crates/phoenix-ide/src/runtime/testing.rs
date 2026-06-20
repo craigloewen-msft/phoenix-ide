@@ -139,6 +139,7 @@ impl LlmClient for StreamingMockLlmClient {
 pub struct MockToolExecutor {
     outputs: HashMap<String, ToolOutput>,
     definitions: Vec<ToolDefinition>,
+    clearable: std::collections::HashSet<String>,
     /// Record of tool executions
     pub executions: Mutex<Vec<(String, Value)>>,
 }
@@ -149,6 +150,7 @@ impl MockToolExecutor {
         Self {
             outputs: HashMap::new(),
             definitions: Vec::new(),
+            clearable: std::collections::HashSet::new(),
             executions: Mutex::new(Vec::new()),
         }
     }
@@ -163,6 +165,12 @@ impl MockToolExecutor {
             defer_loading: false,
         });
         self.outputs.insert(name, output);
+        self
+    }
+
+    /// Mark `name` as a clearable tool (its stale results may be cleared).
+    pub fn with_clearable_tool(mut self, name: impl Into<String>) -> Self {
+        self.clearable.insert(name.into());
         self
     }
 
@@ -192,6 +200,10 @@ impl ToolExecutor for MockToolExecutor {
 
     async fn definitions(&self) -> Vec<ToolDefinition> {
         self.definitions.clone()
+    }
+
+    fn clearable_tool_names(&self) -> std::collections::HashSet<String> {
+        self.clearable.clone()
     }
 }
 
@@ -474,6 +486,11 @@ pub struct InMemoryStorage {
     next_msg_id: Mutex<u64>,
     steering_queues: Mutex<HashMap<String, Vec<crate::state_machine::event::SteerEntry>>>,
     fork_proposals: Mutex<Vec<crate::db::ForkProposal>>,
+    clear_watermarks: Mutex<HashMap<String, i64>>,
+    last_prompt_tokens: Mutex<HashMap<String, i64>>,
+    // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
+    fail_watermark_read: Mutex<bool>,
+    fail_watermark_write: Mutex<bool>,
 }
 
 #[allow(dead_code)]
@@ -486,7 +503,29 @@ impl InMemoryStorage {
             next_msg_id: Mutex::new(1),
             steering_queues: Mutex::new(HashMap::new()),
             fork_proposals: Mutex::new(Vec::new()),
+            clear_watermarks: Mutex::new(HashMap::new()),
+            last_prompt_tokens: Mutex::new(HashMap::new()),
+            fail_watermark_read: Mutex::new(false),
+            fail_watermark_write: Mutex::new(false),
         }
+    }
+
+    /// Seed the most-recent-turn prompt size (the clearing pressure signal).
+    pub fn set_last_prompt_tokens(&self, conv_id: &str, tokens: i64) {
+        self.last_prompt_tokens
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), tokens);
+    }
+
+    /// Make `get_clear_watermark` return an error (test the read-failure path).
+    pub fn set_fail_watermark_read(&self, fail: bool) {
+        *self.fail_watermark_read.lock().unwrap() = fail;
+    }
+
+    /// Make `set_clear_watermark` return an error (test the write-failure path).
+    pub fn set_fail_watermark_write(&self, fail: bool) {
+        *self.fail_watermark_write.lock().unwrap() = fail;
     }
 
     /// Read back the persisted fork proposals (test-only).
@@ -812,6 +851,40 @@ impl StateStore for InMemoryStorage {
     ) -> Result<(), String> {
         // In-memory storage doesn't track cwd separately
         Ok(())
+    }
+
+    async fn get_clear_watermark(&self, conv_id: &str) -> Result<i64, String> {
+        if *self.fail_watermark_read.lock().unwrap() {
+            return Err("injected watermark read failure".to_string());
+        }
+        Ok(self
+            .clear_watermarks
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .copied()
+            .unwrap_or(0))
+    }
+
+    async fn set_clear_watermark(&self, conv_id: &str, watermark: i64) -> Result<(), String> {
+        if *self.fail_watermark_write.lock().unwrap() {
+            return Err("injected watermark write failure".to_string());
+        }
+        // Structurally monotonic, mirroring the production `MAX(...)` write: a
+        // value below the stored watermark never regresses it (REQ-STR-007).
+        let mut map = self.clear_watermarks.lock().unwrap();
+        let entry = map.entry(conv_id.to_string()).or_insert(0);
+        *entry = (*entry).max(watermark);
+        Ok(())
+    }
+
+    async fn get_last_turn_prompt_tokens(&self, conv_id: &str) -> Result<Option<i64>, String> {
+        Ok(self
+            .last_prompt_tokens
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .copied())
     }
 
     async fn insert_turn_usage(

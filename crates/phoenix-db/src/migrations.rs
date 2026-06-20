@@ -161,6 +161,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "drop_conv_mode_blob",
         sql: MIGRATION_029,
     },
+    Migration {
+        version: 30,
+        name: "add_clear_watermark_to_conversations",
+        sql: MIGRATION_030,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -940,6 +945,15 @@ const MIGRATION_029: &str = r"
 ALTER TABLE conversations DROP COLUMN conv_mode;
 ";
 
+/// Monotonic per-conversation clear watermark for stale tool-result clearing
+/// (`specs/stale-tool-results`): every clearable tool result at or before this
+/// message `sequence_id` is elided from the model-bound history. `DEFAULT 0`
+/// means "nothing cleared", the correct value for every existing row, so no
+/// backfill is owed.
+const MIGRATION_030: &str = r"
+ALTER TABLE conversations ADD COLUMN clear_watermark INTEGER NOT NULL DEFAULT 0;
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -1073,7 +1087,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 29);
+        assert_eq!(first, 30);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
@@ -1092,8 +1106,8 @@ mod tests {
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
 
-        // Create the ledger and stamp only the *highest* version, mimicking a
-        // seeder that left every lower migration un-stamped.
+        // Create the ledger and stamp a single high version, mimicking a
+        // seeder that left every other migration un-stamped.
         sqlx::raw_sql(
             "CREATE TABLE _migrations (\
                 version INTEGER PRIMARY KEY, \
@@ -1109,9 +1123,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Every version except the stamped 29 must run.
+        // Every version except the stamped 29 must run: 1–28 below the stamp
+        // and 30 (add_clear_watermark_to_conversations) above it.
         let applied = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(applied, 28);
+        assert_eq!(applied, 29);
 
         // Migration 005's effects must be present.
         let cols: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")

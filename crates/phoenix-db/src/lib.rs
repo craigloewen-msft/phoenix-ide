@@ -1917,6 +1917,47 @@ impl Database {
         Ok(())
     }
 
+    /// Read the conversation's clear watermark (stale tool-result clearing,
+    /// specs/stale-tool-results). Returns 0 for a conversation with nothing
+    /// cleared yet, or one that does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn get_clear_watermark(&self, id: &str) -> DbResult<i64> {
+        let watermark: Option<i64> =
+            sqlx::query_scalar("SELECT clear_watermark FROM conversations WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(watermark.unwrap_or(0))
+    }
+
+    /// Advance the conversation's clear watermark. The write is structurally
+    /// monotonic: `MAX(clear_watermark, ?1)` can never move the persisted value
+    /// backward, so a caller that passes a stale-low value (e.g. after a failed
+    /// watermark read) cannot regress it and re-expose already-cleared results
+    /// (specs/stale-tool-results, REQ-STR-007). The column is `NOT NULL DEFAULT
+    /// 0`, so `MAX` never sees a NULL operand.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the conversation does not exist or the
+    /// underlying database operation fails.
+    pub async fn update_clear_watermark(&self, id: &str, watermark: i64) -> DbResult<()> {
+        let result = sqlx::query(
+            "UPDATE conversations SET clear_watermark = MAX(clear_watermark, ?1) WHERE id = ?2",
+        )
+        .bind(watermark)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
     /// Create a fresh Work conversation for an approved-task handoff and link
     /// the Explore predecessor through `continued_in_conv_id`.
     ///
@@ -3852,7 +3893,34 @@ impl Database {
         Ok(())
     }
 
-    /// Return aggregated token usage for a conversation.
+    /// The total prompt size of the most recent turn for `conversation_id`:
+    /// `input_tokens + cache_read_tokens + cache_creation_tokens` (the full
+    /// context the model saw, cached portion included — the cached prefix still
+    /// counts against the window). `None` when the conversation has no turns yet.
+    ///
+    /// Used as the stale-tool-result clearing pressure signal (REQ-STR-001): the
+    /// provider's reported size is ground truth, so the trigger tracks reality
+    /// instead of a re-estimate that can drift below it (omitting system prompt
+    /// and tool schemas, undercounting on a well-cached turn).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn get_last_turn_prompt_tokens(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<i64>> {
+        let row: Option<i64> = sqlx::query_scalar(
+            "SELECT input_tokens + cache_read_tokens + cache_creation_tokens \
+             FROM turn_usage WHERE conversation_id = ?1 \
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     ///
     /// `own` covers only rows where `conversation_id` matches; `total` covers
     /// all rows under the same root (i.e. the top-level conversation plus all
@@ -5432,6 +5500,37 @@ mod tests {
 
         let fetched = db.get_conversation("test-id").await.unwrap();
         assert_eq!(fetched.id, conv.id);
+    }
+
+    /// The clear watermark write is structurally monotonic: a value below the
+    /// persisted watermark is ignored, never regressing it (REQ-STR-007). A
+    /// transient stale-low write (e.g. after a failed read re-planning from 0)
+    /// therefore cannot re-expose already-cleared results.
+    #[tokio::test]
+    async fn update_clear_watermark_never_regresses() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("wm-1", "wm-slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(db.get_clear_watermark("wm-1").await.unwrap(), 0);
+
+        db.update_clear_watermark("wm-1", 500).await.unwrap();
+        assert_eq!(db.get_clear_watermark("wm-1").await.unwrap(), 500);
+
+        // A lower value is ignored — the watermark holds at 500.
+        db.update_clear_watermark("wm-1", 300).await.unwrap();
+        assert_eq!(db.get_clear_watermark("wm-1").await.unwrap(), 500);
+
+        // A higher value advances it.
+        db.update_clear_watermark("wm-1", 900).await.unwrap();
+        assert_eq!(db.get_clear_watermark("wm-1").await.unwrap(), 900);
+
+        // A write to a missing conversation still reports not-found.
+        assert!(matches!(
+            db.update_clear_watermark("nope", 10).await,
+            Err(DbError::ConversationNotFound(_))
+        ));
     }
 
     #[tokio::test]

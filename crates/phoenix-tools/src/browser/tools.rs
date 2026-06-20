@@ -277,6 +277,11 @@ pub struct BrowserTakeScreenshotTool;
 
 #[async_trait]
 impl Tool for BrowserTakeScreenshotTool {
+    // clearable: re-queryable read — see specs/stale-tool-results (REQ-STR-002).
+    fn clearable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "browser_take_screenshot"
     }
@@ -403,6 +408,11 @@ pub struct BrowserRecentConsoleLogsTool;
 
 #[async_trait]
 impl Tool for BrowserRecentConsoleLogsTool {
+    // clearable: re-queryable read — see specs/stale-tool-results (REQ-STR-002).
+    fn clearable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "browser_recent_console_logs"
     }

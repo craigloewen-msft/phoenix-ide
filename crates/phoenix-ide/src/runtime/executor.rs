@@ -13,7 +13,7 @@
 //! forwarder stamps the dispatch generation and wraps each received outcome in
 //! `EffectOutcome` for `process_outcome()`.
 
-use super::traits::{LlmClient, Storage, ToolExecutor};
+use super::traits::{LlmClient, StateStore, Storage, ToolExecutor};
 use super::{
     SseBroadcaster, SseEvent, SubAgentCancelRequest, SubAgentSpawnRequest, TaskApprovalHandoffData,
     TaskApprovalHandoffRequest,
@@ -70,13 +70,35 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 100 * 1024;
 /// error rather than a silently-trimmed batch.
 const MAX_SUB_AGENTS_PER_SPAWN: usize = 10;
 
-/// Number of most-recent tool rounds whose persisted screenshots are replayed
-/// to the LLM. Older tool rounds have their base64 images replaced with a short
-/// text placeholder when history is assembled, bounding the permanent image
-/// prefix (≈30k tokens for 20 screenshots otherwise). 2 keeps the current and
-/// immediately-prior round's visual context, which is what the model usually
-/// needs to reason about a just-taken screenshot.
-const IMAGE_HISTORY_ROUNDS: usize = 2;
+// ── Stale tool-result clearing (specs/stale-tool-results) ───────────────────
+// Old, re-queryable tool-result bodies are replaced with a placeholder once the
+// request approaches the context window, governed by a monotonic per-conversation
+// watermark. The model, invariants, and rationale live in the spec.
+
+/// Recency floor: the most recent this-many tool rounds are always sent in full
+/// (REQ-STR-003). Covers the agent's working set and the trailing tool result
+/// the last cache breakpoint anchors on, and is >= the two rounds of visual
+/// context the prior image window preserved.
+const KEEP_RECENT_ROUNDS: usize = 3;
+
+/// Clearing activates once the last turn's reported prompt size exceeds this
+/// fraction (numerator/denominator) of the model context window (REQ-STR-001).
+const CLEAR_TRIGGER_NUM: usize = 7;
+const CLEAR_TRIGGER_DEN: usize = 10;
+
+/// Minimum tokens a sweep must free or the watermark holds this turn, bounding
+/// how often a sweep disturbs the cached prefix (REQ-STR-006).
+const CLEAR_AT_LEAST_TOKENS: usize = 8192;
+
+/// Placeholder body sent in place of a cleared tool result. The paired
+/// `tool_use` block is preserved, so this is never a silent gap (REQ-STR-004).
+const CLEARED_TOOL_RESULT_PLACEHOLDER: &str = "[tool result cleared to save context]";
+
+/// Approximate wire token cost of one image block. A flattened-and-replayed
+/// image still costs a fixed block of tokens; this drives both the budget
+/// estimator and the clearing sweep so image-heavy rounds register their true
+/// weight (REQ-STR-006, REQ-STR-011).
+const IMAGE_TOKEN_ESTIMATE: usize = 1500;
 
 /// Truncate `text` to at most [`MAX_TOOL_OUTPUT_BYTES`] bytes, keeping a head
 /// and tail slice joined by a marker that records how much was dropped.
@@ -324,72 +346,388 @@ async fn forward_llm_outcome(
     let _ = llm_outcome_tx.send((generation, llm_outcome)).await;
 }
 
-/// Indices into `db_messages` of the tool-result messages whose screenshots are
-/// retained when building the LLM message list.
-///
-/// Base64 images persisted in tool results replay in every LLM request forever
-/// (20 screenshots is ~30k permanent prefix tokens), so only the most recent
-/// `IMAGE_HISTORY_ROUNDS` tool *rounds* keep their images; older rounds are
-/// placeholdered by the caller.
-///
-/// Retention is counted by round, not by message. A round is one assistant
-/// tool-use turn plus the tool-result message(s) that answer it: a single
-/// assistant turn issuing several `tool_use` blocks produces several
-/// tool-result messages that all belong to one round. Counting messages would
-/// drop the earliest screenshots of a single recent multi-screenshot round; a
-/// kept round must retain all of its screenshots, and a round older than the
-/// window is fully placeholdered.
-///
-/// A new round opens at each `Agent` message that contains at least one
-/// `ToolUse` block; every tool-result message is attributed to the most
-/// recently opened round. The last `IMAGE_HISTORY_ROUNDS` distinct rounds that
-/// actually contain tool-result messages are kept.
-fn tool_msg_indices_keeping_images(
+/// The outcome of planning a stale tool-result clearing sweep over one
+/// conversation's history (specs/stale-tool-results).
+#[derive(Debug, Default, Clone)]
+struct ClearPlan {
+    /// The watermark after this turn's (possible) advance, persisted back to
+    /// the conversation.
+    new_watermark: i64,
+    /// Message `sequence_id`s of all clearable tool results at or before
+    /// `new_watermark` — the full set to render as placeholders this turn (stable
+    /// across turns). Keyed by `sequence_id`, not `tool_use_id`: the latter can be
+    /// reused across turns (provider-dependent), which would otherwise clear a
+    /// recent floor result that happens to share an old id.
+    cleared_sequence_ids: std::collections::HashSet<i64>,
+    /// Tokens freed by *this* turn's advance (newly cleared results only).
+    freed_tokens: usize,
+    /// Number of results newly cleared by this turn's advance.
+    cleared_count: usize,
+}
+
+/// A tool-result message reduced to the facts the clearing planner decides over.
+struct ToolResultFacts {
+    sequence_id: i64,
+    round: usize,
+    clearable: bool,
+    token_estimate: usize,
+}
+
+/// Image-aware token estimate for a persisted tool result: its text body plus a
+/// fixed cost per image block (REQ-STR-006, REQ-STR-011).
+fn estimate_tool_result_tokens(content: &str, image_count: usize) -> usize {
+    estimate_text_tokens(content) + image_count * IMAGE_TOKEN_ESTIMATE
+}
+
+/// Gather the per-result facts the clearing planner decides over, in history
+/// order, plus the highest round seen. A round opens at each `Agent` message
+/// carrying a `ToolUse` block; every tool-result message belongs to the most
+/// recently opened round (the first is numbered 0). A `tool_use` always precedes
+/// its result in `sequence_id` order, so the producing-tool lookup is filled
+/// inline in this single pass.
+fn collect_tool_result_facts(
     db_messages: &[crate::db::Message],
-) -> std::collections::HashSet<usize> {
+    clearable_tool_names: &std::collections::HashSet<String>,
+) -> (Vec<ToolResultFacts>, usize) {
     use crate::db::MessageContent;
     use crate::llm::ContentBlock as LlmContentBlock;
 
-    // (message index, owning round number) for each tool-result message.
-    let mut tool_round_of: Vec<(usize, usize)> = Vec::new();
+    let mut tool_name_of: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut results: Vec<ToolResultFacts> = Vec::new();
     let mut current_round: usize = 0;
+    let mut max_round: usize = 0;
     let mut opened_a_round = false;
-    for (i, m) in db_messages.iter().enumerate() {
+    for m in db_messages {
         match &m.content {
             MessageContent::Agent(blocks) => {
-                if blocks
-                    .iter()
-                    .any(|b| matches!(b, LlmContentBlock::ToolUse { .. }))
-                {
-                    // Bump only after the first tool-use turn so the first round
-                    // is numbered 0.
+                let mut has_tool_use = false;
+                for b in blocks {
+                    if let LlmContentBlock::ToolUse { id, name, .. } = b {
+                        tool_name_of.insert(id.as_str(), name.as_str());
+                        has_tool_use = true;
+                    }
+                }
+                if has_tool_use {
                     if opened_a_round {
                         current_round += 1;
                     }
                     opened_a_round = true;
                 }
             }
-            MessageContent::Tool(_) => tool_round_of.push((i, current_round)),
+            MessageContent::Tool(tc) => {
+                let name = tool_name_of
+                    .get(tc.tool_use_id.as_str())
+                    .copied()
+                    .unwrap_or("");
+                results.push(ToolResultFacts {
+                    sequence_id: m.sequence_id,
+                    round: current_round,
+                    clearable: clearable_tool_names.contains(name),
+                    token_estimate: estimate_tool_result_tokens(&tc.content, tc.images.len()),
+                });
+                max_round = current_round;
+            }
             _ => {}
         }
     }
+    (results, max_round)
+}
 
-    // Distinct rounds that contain tool-result messages, newest-first; keep the
-    // last `IMAGE_HISTORY_ROUNDS` so every message in a kept round survives.
-    let mut rounds_with_tools: Vec<usize> = tool_round_of.iter().map(|(_, r)| *r).collect();
-    rounds_with_tools.sort_unstable();
-    rounds_with_tools.dedup();
-    let kept_rounds: std::collections::HashSet<usize> = rounds_with_tools
+/// Plan a stale tool-result clearing sweep (specs/stale-tool-results.allium).
+///
+/// `reported_prompt_tokens` is the previous turn's actual prompt size — the
+/// pressure signal; `None` (no prior turn) is treated as not under pressure.
+/// When it exceeds the trigger and at least `CLEAR_AT_LEAST_TOKENS` are freeable
+/// outside the recency floor, the sweep clears *everything* outside the floor in
+/// one move.
+fn plan_tool_result_clearing(
+    db_messages: &[crate::db::Message],
+    clearable_tool_names: &std::collections::HashSet<String>,
+    prior_watermark: i64,
+    reported_prompt_tokens: Option<i64>,
+    context_window: usize,
+) -> ClearPlan {
+    let (results, max_round) = collect_tool_result_facts(db_messages, clearable_tool_names);
+
+    // Recency floor: rounds at or above `floor_first_round` are never cleared.
+    let floor_first_round = (max_round + 1).saturating_sub(KEEP_RECENT_ROUNDS);
+
+    // Worthwhile-gain gate: tokens freeable by clearing every eligible result
+    // (clearable, not yet cleared, outside the floor).
+    let eligible_freed: usize = results
         .iter()
-        .rev()
-        .take(IMAGE_HISTORY_ROUNDS)
-        .copied()
+        .filter(|f| f.clearable && f.sequence_id > prior_watermark && f.round < floor_first_round)
+        .map(|f| f.token_estimate)
+        .sum();
+
+    let trigger = context_window * CLEAR_TRIGGER_NUM / CLEAR_TRIGGER_DEN;
+    let trigger = i64::try_from(trigger).unwrap_or(i64::MAX);
+    let over_pressure = reported_prompt_tokens.is_some_and(|tokens| tokens > trigger);
+
+    let mut new_watermark = prior_watermark;
+    if over_pressure && eligible_freed >= CLEAR_AT_LEAST_TOKENS {
+        // Maximal sweep (REQ-STR-007): advance the watermark to the newest
+        // result below the floor, clearing the whole pre-floor prefix at once.
+        if let Some(floor_boundary) = results
+            .iter()
+            .filter(|f| f.round < floor_first_round)
+            .map(|f| f.sequence_id)
+            .max()
+        {
+            new_watermark = new_watermark.max(floor_boundary);
+        }
+    }
+
+    let cleared_sequence_ids: std::collections::HashSet<i64> = results
+        .iter()
+        .filter(|f| f.clearable && f.sequence_id <= new_watermark)
+        .map(|f| f.sequence_id)
         .collect();
-    tool_round_of
+    let (freed_tokens, cleared_count) = results
         .iter()
-        .filter(|(_, round)| kept_rounds.contains(round))
-        .map(|(idx, _)| *idx)
+        .filter(|f| {
+            f.clearable && f.sequence_id > prior_watermark && f.sequence_id <= new_watermark
+        })
+        .fold((0usize, 0usize), |(tok, cnt), f| {
+            (tok + f.token_estimate, cnt + 1)
+        });
+
+    ClearPlan {
+        new_watermark,
+        cleared_sequence_ids,
+        freed_tokens,
+        cleared_count,
+    }
+}
+
+/// Message `sequence_id`s of the clearable tool results at or before `watermark`.
+/// Renders a turn consistently with the durably-persisted watermark when a fresh
+/// sweep cannot be recorded (REQ-STR-007).
+fn clearable_sequence_ids_through_watermark(
+    db_messages: &[crate::db::Message],
+    clearable_tool_names: &std::collections::HashSet<String>,
+    watermark: i64,
+) -> std::collections::HashSet<i64> {
+    collect_tool_result_facts(db_messages, clearable_tool_names)
+        .0
+        .into_iter()
+        .filter(|f| f.clearable && f.sequence_id <= watermark)
+        .map(|f| f.sequence_id)
         .collect()
+}
+
+/// Assemble the LLM-bound message list for one request, applying stale
+/// tool-result clearing (specs/stale-tool-results): read the pressure signal and
+/// the persisted watermark, plan a sweep, persist any advance, and render the
+/// history once with the resulting cleared set.
+///
+/// The failure paths preserve the grow-only guarantee (REQ-STR-007):
+/// - watermark read error → fall back to `watermark_cache`, the last value this
+///   runtime durably read or wrote, so the cleared set never shrinks and
+///   previously-cleared results are not re-exposed; only if it was never read
+///   (cache empty) is the uncleared history sent;
+/// - usage read error → treat as not under pressure (hold the watermark);
+/// - watermark write error → render the prior watermark's set, matching what is
+///   durably recorded so the next turn cannot un-clear it.
+///
+/// `watermark_cache` mirrors the durable watermark in memory; it is the runtime's
+/// own state (the runtime is the sole writer for its conversation), so it can
+/// never be staler than the database after a successful read or write.
+async fn assemble_cleared_messages<S: StateStore>(
+    storage: &S,
+    conv_id: &str,
+    db_messages: &[crate::db::Message],
+    clearable_names: &std::collections::HashSet<String>,
+    context_window: usize,
+    watermark_cache: &std::sync::Mutex<Option<i64>>,
+) -> Vec<LlmMessage> {
+    let prior_watermark = match storage.get_clear_watermark(conv_id).await {
+        Ok(w) => {
+            *watermark_cache.lock().unwrap() = Some(w);
+            w
+        }
+        Err(e) => {
+            let cached = *watermark_cache.lock().unwrap();
+            return if let Some(w) = cached {
+                tracing::warn!(
+                    conv_id = %conv_id, error = %e, watermark = w,
+                    "failed to read clear watermark; rendering last known cleared set",
+                );
+                let cleared =
+                    clearable_sequence_ids_through_watermark(db_messages, clearable_names, w);
+                render_messages(db_messages, &cleared)
+            } else {
+                tracing::warn!(
+                    conv_id = %conv_id, error = %e,
+                    "failed to read clear watermark with none cached; sending uncleared history",
+                );
+                render_messages(db_messages, &std::collections::HashSet::new())
+            };
+        }
+    };
+
+    let reported_prompt_tokens = match storage.get_last_turn_prompt_tokens(conv_id).await {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            tracing::warn!(
+                conv_id = %conv_id, error = %e,
+                "failed to read last-turn usage; holding watermark this turn",
+            );
+            None
+        }
+    };
+
+    let plan = plan_tool_result_clearing(
+        db_messages,
+        clearable_names,
+        prior_watermark,
+        reported_prompt_tokens,
+        context_window,
+    );
+
+    let cleared = if plan.new_watermark == prior_watermark {
+        plan.cleared_sequence_ids
+    } else {
+        match storage
+            .set_clear_watermark(conv_id, plan.new_watermark)
+            .await
+        {
+            Ok(()) => {
+                *watermark_cache.lock().unwrap() = Some(plan.new_watermark);
+                tracing::debug!(
+                    conv_id = %conv_id,
+                    cleared_results = plan.cleared_count,
+                    freed_tokens = plan.freed_tokens,
+                    watermark = plan.new_watermark,
+                    "stale tool-result clearing swept old results",
+                );
+                plan.cleared_sequence_ids
+            }
+            Err(e) => {
+                tracing::warn!(
+                    conv_id = %conv_id, error = %e,
+                    "failed to persist clear watermark; holding prior cleared set this turn",
+                );
+                clearable_sequence_ids_through_watermark(
+                    db_messages,
+                    clearable_names,
+                    prior_watermark,
+                )
+            }
+        }
+    };
+
+    render_messages(db_messages, &cleared)
+}
+
+/// Fold persisted messages into the provider-agnostic LLM message list.
+///
+/// A tool result whose message `sequence_id` is in `cleared_sequence_ids` is
+/// rendered as a fixed placeholder with no image blocks (stale tool-result
+/// clearing, specs/stale-tool-results); the paired `tool_use` block is left
+/// intact, so a cleared result is never a silent gap. Every other tool result is
+/// sent verbatim with its images. The persisted messages are never mutated — the
+/// cleared form exists only in the returned list for this one request.
+fn render_messages(
+    db_messages: &[crate::db::Message],
+    cleared_sequence_ids: &std::collections::HashSet<i64>,
+) -> Vec<LlmMessage> {
+    use crate::db::{MessageContent, ToolContent};
+    use crate::llm::ImageSource;
+
+    let mut messages = Vec::new();
+    for msg in db_messages {
+        match &msg.content {
+            MessageContent::User(user_content) => {
+                // Use llm_text when expansion occurred (REQ-IR-001, REQ-IR-006):
+                // the model sees the fully resolved form while the DB stores the shorthand.
+                let mut text_for_llm = user_content.llm_text().to_string();
+                if !user_content.files.is_empty() {
+                    for file in &user_content.files {
+                        text_for_llm.push('\n');
+                        text_for_llm.push_str(&file.llm_context_tag());
+                    }
+                }
+                let mut content = vec![ContentBlock::text(text_for_llm)];
+
+                // Add images (REQ-BED-013)
+                for img in &user_content.images {
+                    content.push(ContentBlock::Image {
+                        source: img.to_image_source(),
+                    });
+                }
+
+                messages.push(LlmMessage {
+                    role: MessageRole::User,
+                    content,
+                });
+            }
+
+            MessageContent::Agent(blocks) => {
+                messages.push(LlmMessage {
+                    role: MessageRole::Assistant,
+                    content: blocks.clone(),
+                });
+            }
+
+            MessageContent::Tool(ToolContent {
+                tool_use_id,
+                content,
+                is_error,
+                images,
+            }) => {
+                // Cleared results render as a placeholder with no images; kept
+                // results carry their body and any images verbatim (REQ-STR-004,
+                // REQ-STR-011).
+                let (text, image_sources): (String, Vec<ImageSource>) =
+                    if cleared_sequence_ids.contains(&msg.sequence_id) {
+                        (CLEARED_TOOL_RESULT_PLACEHOLDER.to_string(), Vec::new())
+                    } else {
+                        let sources = images
+                            .iter()
+                            .map(|img| ImageSource::Base64 {
+                                media_type: img.media_type.clone(),
+                                data: img.data.clone(),
+                            })
+                            .collect();
+                        (content.clone(), sources)
+                    };
+
+                // Tool results go in user message
+                messages.push(LlmMessage {
+                    role: MessageRole::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: tool_use_id.clone(),
+                        content: text,
+                        images: image_sources,
+                        is_error: *is_error,
+                    }],
+                });
+            }
+
+            // Skill messages are delivered as user-role messages (REQ-SK-002)
+            MessageContent::Skill(skill_content) => {
+                let mut body = skill_content.body.clone();
+                for file in &skill_content.files {
+                    body.push('\n');
+                    body.push_str(&file.llm_context_tag());
+                }
+                messages.push(LlmMessage {
+                    role: MessageRole::User,
+                    content: vec![ContentBlock::text(body)],
+                });
+            }
+
+            // Ignore system, error, and continuation messages.
+            // System messages are UI-only bookkeeping (restart markers, task
+            // file renames, diff snapshots). LLM-directed messages use
+            // MessageContent::User with is_meta (e.g., grace turn prompt).
+            MessageContent::System(_)
+            | MessageContent::Error(_)
+            | MessageContent::Continuation(_) => {}
+        }
+    }
+    messages
 }
 
 /// Decide whether `path` is inside the worktree rooted at `root`.
@@ -483,6 +821,16 @@ where
     storage: S,
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
+    /// Names of tools whose stale results may be cleared (specs/stale-tool-results).
+    /// Static for the conversation's tool set, so it is computed once and only
+    /// recomputed on the Explore→Work upgrade, avoiding a registry lock +
+    /// `HashSet` rebuild on every LLM dispatch.
+    clearable_names: Arc<std::collections::HashSet<String>>,
+    /// In-memory mirror of the durable clear watermark (specs/stale-tool-results).
+    /// This runtime is the sole writer of its conversation's watermark, so the
+    /// cache is authoritative after any successful read/write; a transient
+    /// watermark read failure falls back to it instead of un-clearing history.
+    clear_watermark_cache: Arc<std::sync::Mutex<Option<i64>>>,
     /// Browser session manager for `ToolContext`
     browser_sessions: Arc<BrowserSessionManager>,
     /// Bash handle registry for `ToolContext` (REQ-BASH-014).
@@ -708,13 +1056,18 @@ where
         let (tool_outcome_tx, tool_outcome_rx) = mpsc::channel::<(u64, ToolExecOutcome)>(64);
         let (retry_outcome_tx, retry_outcome_rx) = mpsc::channel::<(u64, u32)>(64);
 
+        let tool_executor = Arc::new(tool_executor);
+        let clearable_names = Arc::new(tool_executor.clearable_tool_names());
+
         Self {
             context,
             state,
             state_updated_at: Utc::now(),
             storage,
             llm_client: Arc::new(llm_client),
-            tool_executor: Arc::new(tool_executor),
+            tool_executor,
+            clearable_names,
+            clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             browser_sessions,
             bash_handles,
             tmux_registry,
@@ -2931,8 +3284,11 @@ where
 
         let llm_client = self.llm_client.clone();
         let tool_executor = self.tool_executor.clone();
+        let clearable_names = self.clearable_names.clone();
+        let clear_watermark_cache = self.clear_watermark_cache.clone();
         let storage = self.storage.clone();
         let conv_id = self.context.conversation_id.clone();
+        let context_window = self.context.context_window;
         let root_conv_id = self.context.root_conversation_id.clone();
         let model_id = self.context.model_id.clone();
         let working_dir = self.context.working_dir.clone();
@@ -3023,8 +3379,11 @@ where
                 );
             }
 
-            // Build messages from history
-            let messages = match Self::build_llm_messages_static(&storage, &conv_id).await {
+            // Build messages from history, applying stale tool-result clearing
+            // (specs/stale-tool-results). The whole read/plan/persist/render
+            // policy — including its REQ-STR-007 failure handling — lives in
+            // assemble_cleared_messages so it is unit-testable apart from dispatch.
+            let db_messages = match storage.get_messages(&conv_id).await {
                 Ok(m) => m,
                 Err(e) => {
                     // Build error → treated as InvalidRequest
@@ -3032,6 +3391,15 @@ where
                     return;
                 }
             };
+            let messages = assemble_cleared_messages(
+                &storage,
+                &conv_id,
+                &db_messages,
+                &clearable_names,
+                context_window,
+                &clear_watermark_cache,
+            )
+            .await;
 
             // Build system prompt with AGENTS.md content + mode context
             // TODO(task 61006): snapshot system prompt per conversation to stop mid-session cache busts
@@ -3683,119 +4051,11 @@ where
         storage: &S,
         conv_id: &str,
     ) -> Result<Vec<LlmMessage>, String> {
-        use crate::db::{MessageContent, ToolContent};
-        use crate::llm::ImageSource;
-
         let db_messages = storage.get_messages(conv_id).await?;
-
-        // Prune aged screenshots from replayed history (token bound): keep
-        // images only for tool-result messages in the most recent
-        // `IMAGE_HISTORY_ROUNDS` tool rounds; older ones become placeholders.
-        // Retention is by round, not by message — see
-        // `tool_msg_indices_keeping_images`.
-        let kept_tool_msg_indices = tool_msg_indices_keeping_images(&db_messages);
-
-        let mut messages = Vec::new();
-
-        for (msg_idx, msg) in db_messages.into_iter().enumerate() {
-            match &msg.content {
-                MessageContent::User(user_content) => {
-                    // Use llm_text when expansion occurred (REQ-IR-001, REQ-IR-006):
-                    // the model sees the fully resolved form while the DB stores the shorthand.
-                    let mut text_for_llm = user_content.llm_text().to_string();
-                    if !user_content.files.is_empty() {
-                        for file in &user_content.files {
-                            text_for_llm.push('\n');
-                            text_for_llm.push_str(&file.llm_context_tag());
-                        }
-                    }
-                    let mut content = vec![ContentBlock::text(text_for_llm)];
-
-                    // Add images (REQ-BED-013)
-                    for img in &user_content.images {
-                        content.push(ContentBlock::Image {
-                            source: img.to_image_source(),
-                        });
-                    }
-
-                    messages.push(LlmMessage {
-                        role: MessageRole::User,
-                        content,
-                    });
-                }
-
-                MessageContent::Agent(blocks) => {
-                    messages.push(LlmMessage {
-                        role: MessageRole::Assistant,
-                        content: blocks.clone(),
-                    });
-                }
-
-                MessageContent::Tool(ToolContent {
-                    tool_use_id,
-                    content,
-                    is_error,
-                    images,
-                }) => {
-                    // Aged tool rounds drop their images: replace each with a
-                    // text placeholder and send no image blocks. Tool messages
-                    // belonging to a kept round (within the last
-                    // `IMAGE_HISTORY_ROUNDS` rounds) keep their images verbatim.
-                    let keep_images = kept_tool_msg_indices.contains(&msg_idx);
-                    let (text, image_sources): (String, Vec<ImageSource>) =
-                        if keep_images || images.is_empty() {
-                            let sources = images
-                                .iter()
-                                .map(|img| ImageSource::Base64 {
-                                    media_type: img.media_type.clone(),
-                                    data: img.data.clone(),
-                                })
-                                .collect();
-                            (content.clone(), sources)
-                        } else {
-                            let mut text = content.clone();
-                            for _ in 0..images.len() {
-                                text.push_str("\n[screenshot omitted from history]");
-                            }
-                            (text, Vec::new())
-                        };
-
-                    // Tool results go in user message
-                    messages.push(LlmMessage {
-                        role: MessageRole::User,
-                        content: vec![ContentBlock::ToolResult {
-                            tool_use_id: tool_use_id.clone(),
-                            content: text,
-                            images: image_sources,
-                            is_error: *is_error,
-                        }],
-                    });
-                }
-
-                // Skill messages are delivered as user-role messages (REQ-SK-002)
-                MessageContent::Skill(skill_content) => {
-                    let mut body = skill_content.body.clone();
-                    for file in &skill_content.files {
-                        body.push('\n');
-                        body.push_str(&file.llm_context_tag());
-                    }
-                    messages.push(LlmMessage {
-                        role: MessageRole::User,
-                        content: vec![ContentBlock::text(body)],
-                    });
-                }
-
-                // Ignore system, error, and continuation messages.
-                // System messages are UI-only bookkeeping (restart markers, task
-                // file renames, diff snapshots). LLM-directed messages use
-                // MessageContent::User with is_meta (e.g., grace turn prompt).
-                MessageContent::System(_)
-                | MessageContent::Error(_)
-                | MessageContent::Continuation(_) => {}
-            }
-        }
-
-        Ok(messages)
+        Ok(render_messages(
+            &db_messages,
+            &std::collections::HashSet::new(),
+        ))
     }
 
     /// Request continuation summary from LLM (REQ-BED-020)
@@ -3826,8 +4086,13 @@ where
             // API 400 ("tool reference not found"). Flatten them to text rather
             // than deleting them — the diffs applied, commands run, and output
             // observed are exactly what the summary should draw on. Each block's
-            // text is capped so a single huge result can't dominate.
-            let messages = flatten_tool_blocks(messages);
+            // text is capped so a single huge result can't dominate. Replayed
+            // screenshots are bounded to the most recent few so they cannot evict
+            // older textual context under the budget cap below.
+            let messages = cap_replayed_images(
+                flatten_tool_blocks(messages),
+                CONTINUATION_MAX_REPLAYED_IMAGES,
+            );
 
             // Proactive overflow guard: continuation fires near the top of the
             // window, so the flattened history can still exceed it. Keep the
@@ -4159,6 +4424,8 @@ where
                 // Upgrade tool registry from Explore to Work mode so the agent
                 // gets bash, patch, etc. for the rest of this conversation.
                 self.tool_executor.upgrade_to_work_mode();
+                // The tool set changed, so refresh the cached clearable-tool set.
+                self.clearable_names = Arc::new(self.tool_executor.clearable_tool_names());
 
                 tracing::info!(
                     task_id = %approval_result.task_id,
@@ -4373,6 +4640,12 @@ const CONTINUATION_OUTPUT_RESERVE_TOKENS: usize = 4096;
 /// so this only covers estimate error, not their bulk.
 const CONTINUATION_SAFETY_MARGIN_TOKENS: usize = 512;
 
+/// Most-recent image blocks replayed into a continuation/summarization request.
+/// Older screenshots are dropped to their text so an image-heavy session cannot
+/// fill the request with stale screenshots and evict the older textual context a
+/// summary needs (the continuation analogue of the recency floor).
+const CONTINUATION_MAX_REPLAYED_IMAGES: usize = 6;
+
 /// Rough chars-per-token ratio for the proactive budget estimate. Deliberately
 /// conservative (English prose is ~4); paired with the per-message overhead and
 /// ceiling rounding below it errs toward dropping a message rather than
@@ -4454,6 +4727,32 @@ fn flatten_tool_blocks(messages: Vec<LlmMessage>) -> Vec<LlmMessage> {
         .collect()
 }
 
+/// Keep only the most recent `max_images` image blocks across the flattened
+/// continuation history, dropping older ones (their tool-result text survives).
+///
+/// Without this bound, an image-heavy session replays every historical screenshot
+/// into the tool-less summarization request; `cap_messages_to_token_budget` then
+/// evicts the *oldest whole messages* first, so the budget fills with recent
+/// images and the older textual context the summary should draw on is dropped.
+/// Capping images first preserves that text (specs/stale-tool-results).
+fn cap_replayed_images(mut messages: Vec<LlmMessage>, max_images: usize) -> Vec<LlmMessage> {
+    let mut kept = 0usize;
+    // Walk newest message first so the retained images are the most recent.
+    for msg in messages.iter_mut().rev() {
+        msg.content.retain(|block| {
+            if matches!(block, ContentBlock::Image { .. }) {
+                let keep = kept < max_images;
+                kept += usize::from(keep);
+                keep
+            } else {
+                true
+            }
+        });
+    }
+    messages.retain(|msg| !msg.content.is_empty());
+    messages
+}
+
 /// Truncate flattened-block text to [`CONTINUATION_BLOCK_CHAR_CAP`] chars,
 /// counting by chars so the result is always valid UTF-8.
 fn cap_block_text(text: String) -> String {
@@ -4469,7 +4768,6 @@ fn estimate_message_tokens(msg: &LlmMessage) -> usize {
     use crate::llm::ContentBlock;
     // A flattened-and-replayed image still costs a fixed block of tokens on the
     // wire; approximate rather than under-count it to zero.
-    const IMAGE_TOKEN_ESTIMATE: usize = 1500;
     let content: usize = msg
         .content
         .iter()
@@ -4806,6 +5104,42 @@ mod strip_tool_blocks_tests {
         let out = flatten_tool_blocks(msgs);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].content.len(), 2);
+    }
+
+    #[test]
+    fn cap_replayed_images_keeps_only_most_recent() {
+        let img = || ContentBlock::Image {
+            source: ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "x".into(),
+            },
+        };
+        // Oldest → newest, each message carrying text plus one image.
+        let msgs = vec![
+            user(vec![ContentBlock::text("old"), img()]),
+            user(vec![ContentBlock::text("mid"), img()]),
+            user(vec![ContentBlock::text("new"), img()]),
+        ];
+        let out = cap_replayed_images(msgs, 1);
+
+        let images: usize = out
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter(|b| matches!(b, ContentBlock::Image { .. }))
+            .count();
+        assert_eq!(images, 1, "only the most-recent image survives the cap");
+        assert_eq!(out.len(), 3, "no message dropped — each keeps its text");
+        assert!(
+            matches!(out[2].content.last(), Some(ContentBlock::Image { .. })),
+            "the kept image is in the newest message",
+        );
+        assert!(
+            out[0]
+                .content
+                .iter()
+                .all(|b| matches!(b, ContentBlock::Text { .. })),
+            "older messages keep their text but lose their image",
+        );
     }
 
     #[test]
@@ -8576,30 +8910,34 @@ mod tool_output_cap_tests {
     }
 }
 
-/// Screenshot retention is counted by tool *round*, not by tool-result message.
-/// One assistant tool-use turn can produce several tool-result messages; all of
-/// them must survive together when the round is within the last
-/// `IMAGE_HISTORY_ROUNDS`, and an older round must be fully placeholdered.
+/// Stale tool-result clearing (specs/stale-tool-results): the planner advances a
+/// monotonic watermark under context pressure, never into the recency floor and
+/// only for re-queryable (clearable) results; the renderer placeholders cleared
+/// results and preserves kept ones with their images.
 #[cfg(test)]
-mod image_retention_by_round_tests {
+mod stale_tool_result_clearing_tests {
     use super::*;
     use crate::db::{MessageContent, ToolContentImage};
-    use crate::llm::{ContentBlock, ImageSource, MessageRole};
-    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
-    use crate::runtime::traits::MessageStore;
+    use crate::llm::{ContentBlock, MessageRole};
+    use crate::runtime::testing::InMemoryStorage;
+    use crate::runtime::traits::{MessageStore, StateStore};
+    use std::collections::HashSet;
     use std::sync::Arc;
 
-    type TestRuntime =
-        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>;
-
-    fn png(tag: &str) -> ToolContentImage {
-        ToolContentImage {
-            media_type: "image/png".to_string(),
-            data: format!("data-{tag}"),
-        }
+    // Each image is IMAGE_TOKEN_ESTIMATE (1500) tokens, divisor-independent — so
+    // a result's weight is exactly known. Six images = 9000 tokens, above
+    // CLEAR_AT_LEAST_TOKENS (8192).
+    fn pngs(tag: &str, n: usize) -> Vec<ToolContentImage> {
+        (0..n)
+            .map(|i| ToolContentImage {
+                media_type: "image/png".to_string(),
+                data: format!("data-{tag}-{i}"),
+            })
+            .collect()
     }
 
-    async fn add(storage: &Arc<InMemoryStorage>, conv: &str, content: MessageContent) {
+    /// Persist a message and return its assigned `sequence_id`.
+    async fn add(storage: &Arc<InMemoryStorage>, conv: &str, content: MessageContent) -> i64 {
         storage
             .add_message(
                 &uuid::Uuid::new_v4().to_string(),
@@ -8609,170 +8947,363 @@ mod image_retention_by_round_tests {
                 None,
             )
             .await
-            .expect("add_message");
+            .expect("add_message")
+            .sequence_id
     }
 
-    /// Append one tool round: an assistant message issuing `n` `tool_use` blocks
-    /// followed by `n` tool-result messages, each carrying one screenshot.
+    /// Append one tool round: an assistant `tool_use` for `tool_name` plus one
+    /// tool-result carrying `n_images` images. The `tool_use_id` is `{tag}-tool`;
+    /// returns the tool-result message's `sequence_id` (the cleared-set key).
     async fn add_round(
         storage: &Arc<InMemoryStorage>,
         conv: &str,
-        round_tag: &str,
-        n: usize,
-    ) -> Vec<String> {
-        let tool_uses: Vec<ContentBlock> = (0..n)
-            .map(|i| ContentBlock::ToolUse {
-                id: format!("{round_tag}-tool-{i}"),
-                name: "browser".to_string(),
+        tag: &str,
+        tool_name: &str,
+        n_images: usize,
+    ) -> i64 {
+        let id = format!("{tag}-tool");
+        add(
+            storage,
+            conv,
+            MessageContent::agent(vec![ContentBlock::ToolUse {
+                id: id.clone(),
+                name: tool_name.to_string(),
                 input: serde_json::json!({}),
+            }]),
+        )
+        .await;
+        add(
+            storage,
+            conv,
+            MessageContent::tool_with_images(&id, "result body", false, pngs(tag, n_images)),
+        )
+        .await
+    }
+
+    fn clearable(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Above the high-water mark, an old clearable round is swept: the watermark
+    /// advances, the round is in the cleared set, the recent floor is untouched,
+    /// and the freed-token / count figures are reported.
+    #[tokio::test]
+    async fn sweeps_old_clearable_round_under_pressure() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-sweep";
+        // Round 0 is the only round outside the KEEP_RECENT_ROUNDS=3 floor.
+        let old = add_round(&storage, conv, "old", "read_file", 6).await; // 9000 tokens
+        let r1 = add_round(&storage, conv, "r1", "read_file", 1).await;
+        let r2 = add_round(&storage, conv, "r2", "read_file", 1).await;
+        let r3 = add_round(&storage, conv, "r3", "read_file", 1).await;
+
+        let db = storage.get_messages(conv).await.unwrap();
+        // Last turn's reported prompt (12_000) is above the trigger (0.7 * 1000).
+        let plan =
+            plan_tool_result_clearing(&db, &clearable(&["read_file"]), 0, Some(12_000), 1_000);
+
+        assert!(plan.new_watermark > 0, "watermark must advance");
+        assert!(
+            plan.cleared_sequence_ids.contains(&old),
+            "old clearable round must be cleared",
+        );
+        for kept in [&r1, &r2, &r3] {
+            assert!(
+                !plan.cleared_sequence_ids.contains(kept),
+                "recency-floor round {kept} must never be cleared",
+            );
+        }
+        assert!(plan.freed_tokens >= CLEAR_AT_LEAST_TOKENS);
+        assert_eq!(plan.cleared_count, 1);
+    }
+
+    /// Below the high-water mark nothing is cleared, however old the rounds.
+    #[tokio::test]
+    async fn holds_below_high_water_mark() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-hold";
+        add_round(&storage, conv, "old", "read_file", 6).await;
+        add_round(&storage, conv, "r1", "read_file", 1).await;
+        add_round(&storage, conv, "r2", "read_file", 1).await;
+        add_round(&storage, conv, "r3", "read_file", 1).await;
+
+        let db = storage.get_messages(conv).await.unwrap();
+        // Reported prompt (5_000) sits far below the trigger (0.7 * 200_000).
+        let plan =
+            plan_tool_result_clearing(&db, &clearable(&["read_file"]), 0, Some(5_000), 200_000);
+
+        assert_eq!(plan.new_watermark, 0);
+        assert!(plan.cleared_sequence_ids.is_empty());
+        assert_eq!(plan.freed_tokens, 0);
+    }
+
+    /// An unclearable tool's result is never cleared, even old and under pressure.
+    #[tokio::test]
+    async fn never_clears_unclearable_tool() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-unclearable";
+        let old = add_round(&storage, conv, "old", "ask_user_question", 6).await;
+        add_round(&storage, conv, "r1", "read_file", 1).await;
+        add_round(&storage, conv, "r2", "read_file", 1).await;
+        add_round(&storage, conv, "r3", "read_file", 1).await;
+
+        let db = storage.get_messages(conv).await.unwrap();
+        // read_file is clearable; ask_user_question is not. Over pressure (12_000).
+        let plan =
+            plan_tool_result_clearing(&db, &clearable(&["read_file"]), 0, Some(12_000), 1_000);
+
+        assert!(
+            !plan.cleared_sequence_ids.contains(&old),
+            "unclearable result must never be cleared",
+        );
+    }
+
+    /// A maximal sweep clears *every* eligible round below the floor in one move
+    /// (not one round per turn), and once swept the watermark holds even while
+    /// pressure persists — there is nothing new below the floor to clear, so the
+    /// cached prefix stays stable across turns (REQ-STR-007).
+    #[tokio::test]
+    async fn maximal_sweep_clears_to_floor_then_holds() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-stable";
+        let names = clearable(&["read_file"]);
+        // Five rounds → floor_first_round = 2, so rounds 0 and 1 are both
+        // pre-floor. Each carries 6 images (9000 tokens), so together they clear
+        // far more than CLEAR_AT_LEAST_TOKENS.
+        let old0 = add_round(&storage, conv, "old0", "read_file", 6).await;
+        let old1 = add_round(&storage, conv, "old1", "read_file", 6).await;
+        let r2 = add_round(&storage, conv, "r2", "read_file", 1).await;
+        add_round(&storage, conv, "r3", "read_file", 1).await;
+        add_round(&storage, conv, "r4", "read_file", 1).await;
+        let window = 20_000; // trigger = 14_000
+
+        let db = storage.get_messages(conv).await.unwrap();
+
+        // Turn 1, over pressure: both pre-floor rounds are cleared in one sweep.
+        let first = plan_tool_result_clearing(&db, &names, 0, Some(18_000), window);
+        assert!(first.cleared_sequence_ids.contains(&old0));
+        assert!(
+            first.cleared_sequence_ids.contains(&old1),
+            "maximal sweep clears the whole pre-floor prefix, not just the oldest",
+        );
+        assert!(
+            !first.cleared_sequence_ids.contains(&r2),
+            "the recency floor is never cleared",
+        );
+        assert_eq!(first.cleared_count, 2);
+
+        // Turn 2, still over pressure, same history: nothing new is eligible below
+        // the floor, so the watermark holds and no further tokens are freed.
+        let second =
+            plan_tool_result_clearing(&db, &names, first.new_watermark, Some(18_000), window);
+        assert_eq!(
+            second.new_watermark, first.new_watermark,
+            "watermark holds once the pre-floor prefix is cleared, even under pressure",
+        );
+        assert!(second.cleared_sequence_ids.contains(&old0));
+        assert!(second.cleared_sequence_ids.contains(&old1));
+        assert_eq!(
+            second.freed_tokens, 0,
+            "no new tokens freed on a stable turn"
+        );
+    }
+
+    /// `None` reported usage (no prior turn) is treated as not under pressure, so
+    /// the watermark never advances on the very first turn however large history is.
+    #[tokio::test]
+    async fn no_reported_usage_holds_watermark() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-firstturn";
+        add_round(&storage, conv, "old", "read_file", 6).await;
+        add_round(&storage, conv, "r1", "read_file", 1).await;
+        add_round(&storage, conv, "r2", "read_file", 1).await;
+        add_round(&storage, conv, "r3", "read_file", 1).await;
+
+        let db = storage.get_messages(conv).await.unwrap();
+        let plan = plan_tool_result_clearing(&db, &clearable(&["read_file"]), 0, None, 1_000);
+
+        assert_eq!(plan.new_watermark, 0);
+        assert!(plan.cleared_sequence_ids.is_empty());
+    }
+
+    /// Production wraps the tool registry in `Arc`, and the runtime caches the
+    /// clearable set from it. The `Arc<T>` blanket impl must forward
+    /// `clearable_tool_names` — falling back to the empty default would silently
+    /// make nothing clearable, disabling the whole feature in production while
+    /// the planner unit tests (which pass the set directly) stay green.
+    #[tokio::test]
+    async fn arc_tool_executor_forwards_clearable_tool_names() {
+        use crate::runtime::testing::MockToolExecutor;
+        use crate::runtime::traits::ToolExecutor;
+
+        let arc: Arc<MockToolExecutor> =
+            Arc::new(MockToolExecutor::new().with_clearable_tool("bash"));
+        assert!(
+            arc.clearable_tool_names().contains("bash"),
+            "Arc<T> must forward clearable_tool_names, not use the empty default",
+        );
+    }
+
+    /// True if `tool_use_id` is rendered as a cleared placeholder (no images).
+    fn is_rendered_cleared(messages: &[LlmMessage], tool_use_id: &str) -> bool {
+        messages.iter().any(|m| {
+            m.content.iter().any(|b| {
+                matches!(b,
+                    ContentBlock::ToolResult { tool_use_id: id, content, images, .. }
+                    if id == tool_use_id
+                        && content == CLEARED_TOOL_RESULT_PLACEHOLDER
+                        && images.is_empty())
             })
-            .collect();
-        add(storage, conv, MessageContent::agent(tool_uses)).await;
-
-        let mut ids = Vec::new();
-        for i in 0..n {
-            let id = format!("{round_tag}-tool-{i}");
-            add(
-                storage,
-                conv,
-                MessageContent::tool_with_images(
-                    &id,
-                    "screenshot taken",
-                    false,
-                    vec![png(&format!("{round_tag}-{i}"))],
-                ),
-            )
-            .await;
-            ids.push(id);
-        }
-        ids
+        })
     }
 
-    /// Count the image blocks in the tool-result message for `tool_use_id`.
-    fn images_for<'a>(msgs: &'a [crate::llm::LlmMessage], tool_use_id: &str) -> &'a [ImageSource] {
-        for m in msgs {
-            if m.role == MessageRole::User {
-                for block in &m.content {
-                    if let ContentBlock::ToolResult {
-                        tool_use_id: id,
-                        images,
-                        ..
-                    } = block
-                    {
-                        if id == tool_use_id {
-                            return images;
+    /// assemble path, happy case: over pressure → sweep applied and persisted.
+    #[tokio::test]
+    async fn assemble_sweeps_and_persists_under_pressure() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "asm-happy";
+        let names = clearable(&["read_file"]);
+        add_round(&storage, conv, "old", "read_file", 6).await;
+        add_round(&storage, conv, "r1", "read_file", 1).await;
+        add_round(&storage, conv, "r2", "read_file", 1).await;
+        add_round(&storage, conv, "r3", "read_file", 1).await;
+        storage.set_last_prompt_tokens(conv, 12_000); // > trigger (0.7 * 1000)
+        let db = storage.get_messages(conv).await.unwrap();
+        let cache = std::sync::Mutex::new(None);
+
+        let messages = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
+        assert!(
+            is_rendered_cleared(&messages, "old-tool"),
+            "old round rendered as placeholder"
+        );
+        assert!(
+            storage.get_clear_watermark(conv).await.unwrap() > 0,
+            "advance persisted",
+        );
+    }
+
+    /// assemble path, watermark read failure with nothing cached: send the
+    /// uncleared history rather than re-plan from an unknown baseline (REQ-STR-007).
+    #[tokio::test]
+    async fn assemble_read_failure_with_empty_cache_sends_uncleared() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "asm-readfail";
+        let names = clearable(&["read_file"]);
+        add_round(&storage, conv, "old", "read_file", 6).await;
+        add_round(&storage, conv, "r1", "read_file", 1).await;
+        add_round(&storage, conv, "r2", "read_file", 1).await;
+        add_round(&storage, conv, "r3", "read_file", 1).await;
+        storage.set_last_prompt_tokens(conv, 12_000);
+        storage.set_fail_watermark_read(true);
+        let db = storage.get_messages(conv).await.unwrap();
+        let cache = std::sync::Mutex::new(None);
+
+        let messages = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
+        assert!(
+            !is_rendered_cleared(&messages, "old-tool"),
+            "read failure with empty cache → nothing cleared this turn",
+        );
+    }
+
+    /// assemble path, watermark read failure *after* a prior successful turn: the
+    /// in-memory cache holds the advanced watermark, so previously-cleared
+    /// results stay cleared rather than being re-exposed (REQ-STR-007).
+    #[tokio::test]
+    async fn assemble_read_failure_preserves_cached_cleared_set() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "asm-readfail-cached";
+        let names = clearable(&["read_file"]);
+        add_round(&storage, conv, "old", "read_file", 6).await;
+        add_round(&storage, conv, "r1", "read_file", 1).await;
+        add_round(&storage, conv, "r2", "read_file", 1).await;
+        add_round(&storage, conv, "r3", "read_file", 1).await;
+        storage.set_last_prompt_tokens(conv, 12_000);
+        let db = storage.get_messages(conv).await.unwrap();
+        let cache = std::sync::Mutex::new(None);
+
+        // Turn 1: a real sweep advances and caches the watermark; `old` is cleared.
+        let first = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
+        assert!(is_rendered_cleared(&first, "old-tool"));
+
+        // Turn 2: the watermark read fails, but the cache holds the advanced
+        // value, so the previously-cleared result stays cleared.
+        storage.set_fail_watermark_read(true);
+        let second = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
+        assert!(
+            is_rendered_cleared(&second, "old-tool"),
+            "read failure must preserve the cached cleared set, not un-clear it",
+        );
+    }
+
+    /// assemble path, watermark write failure: render the prior watermark's set
+    /// (here empty), matching what is durably recorded, and do not advance.
+    #[tokio::test]
+    async fn assemble_write_failure_holds_prior_set() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "asm-writefail";
+        let names = clearable(&["read_file"]);
+        add_round(&storage, conv, "old", "read_file", 6).await;
+        add_round(&storage, conv, "r1", "read_file", 1).await;
+        add_round(&storage, conv, "r2", "read_file", 1).await;
+        add_round(&storage, conv, "r3", "read_file", 1).await;
+        storage.set_last_prompt_tokens(conv, 12_000);
+        storage.set_fail_watermark_write(true);
+        let db = storage.get_messages(conv).await.unwrap();
+        let cache = std::sync::Mutex::new(None);
+
+        let messages = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
+        assert!(
+            !is_rendered_cleared(&messages, "old-tool"),
+            "write failure → prior (empty) cleared set rendered, not the failed advance",
+        );
+        assert_eq!(
+            storage.get_clear_watermark(conv).await.unwrap(),
+            0,
+            "watermark not advanced when the write failed",
+        );
+    }
+
+    /// The renderer placeholders cleared results (no images) and sends kept
+    /// results verbatim with their images.
+    #[tokio::test]
+    async fn render_placeholders_cleared_keeps_rest() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-render";
+        let cleared_seq = add_round(&storage, conv, "old", "read_file", 2).await;
+        add_round(&storage, conv, "new", "read_file", 2).await;
+
+        let db = storage.get_messages(conv).await.unwrap();
+        let cleared: HashSet<i64> = std::iter::once(cleared_seq).collect();
+        let msgs = render_messages(&db, &cleared);
+
+        let find = |id: &str| -> (String, usize) {
+            for m in &msgs {
+                if m.role == MessageRole::User {
+                    for b in &m.content {
+                        if let ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            images,
+                            ..
+                        } = b
+                        {
+                            if tool_use_id == id {
+                                return (content.clone(), images.len());
+                            }
                         }
                     }
                 }
             }
-        }
-        panic!("no tool result for {tool_use_id}");
-    }
+            panic!("no tool result for {id}");
+        };
 
-    fn placeholder_count(msgs: &[crate::llm::LlmMessage], tool_use_id: &str) -> usize {
-        for m in msgs {
-            if m.role == MessageRole::User {
-                for block in &m.content {
-                    if let ContentBlock::ToolResult {
-                        tool_use_id: id,
-                        content,
-                        ..
-                    } = block
-                    {
-                        if id == tool_use_id {
-                            return content.matches("[screenshot omitted from history]").count();
-                        }
-                    }
-                }
-            }
-        }
-        panic!("no tool result for {tool_use_id}");
-    }
+        let (cleared_body, cleared_imgs) = find("old-tool");
+        assert_eq!(cleared_body, CLEARED_TOOL_RESULT_PLACEHOLDER);
+        assert_eq!(cleared_imgs, 0, "cleared result emits no images");
 
-    /// A single recent round with three screenshot-producing tool results keeps
-    /// ALL three screenshots — retention must not count tool-result messages
-    /// (which would drop the first of the three with `IMAGE_HISTORY_ROUNDS` = 2).
-    #[tokio::test]
-    async fn single_round_with_three_screenshots_retains_all_three() {
-        let storage = Arc::new(InMemoryStorage::new());
-        let conv = "conv-round-3";
-
-        // Older round (round 0): two screenshots — must be placeholdered.
-        let old_ids = add_round(&storage, conv, "old", 2).await;
-        // Most recent round (round 1): three screenshots — must all survive.
-        let recent_ids = add_round(&storage, conv, "recent", 3).await;
-
-        let msgs = TestRuntime::build_llm_messages_static(&storage, conv)
-            .await
-            .expect("build messages");
-
-        // All three screenshots in the single most-recent round survive.
-        for id in &recent_ids {
-            assert_eq!(
-                images_for(&msgs, id).len(),
-                1,
-                "recent-round tool result {id} must keep its screenshot",
-            );
-            assert_eq!(
-                placeholder_count(&msgs, id),
-                0,
-                "recent-round tool result {id} must not be placeholdered",
-            );
-        }
-
-        // With IMAGE_HISTORY_ROUNDS = 2 and only two rounds, the older round is
-        // still within the window — confirm it is kept too (boundary sanity).
-        for id in &old_ids {
-            assert_eq!(
-                images_for(&msgs, id).len(),
-                1,
-                "round within the last IMAGE_HISTORY_ROUNDS must keep images: {id}",
-            );
-        }
-    }
-
-    /// A round older than the last `IMAGE_HISTORY_ROUNDS` is fully
-    /// placeholdered, even when a single recent round holds several
-    /// screenshots. Three rounds total, `IMAGE_HISTORY_ROUNDS` = 2 ⇒ the oldest
-    /// round drops its images while both newer rounds keep theirs.
-    #[tokio::test]
-    async fn round_older_than_window_is_placeholdered() {
-        let storage = Arc::new(InMemoryStorage::new());
-        let conv = "conv-round-old";
-
-        let r0 = add_round(&storage, conv, "r0", 1).await; // oldest — dropped
-        let r1 = add_round(&storage, conv, "r1", 3).await; // kept
-        let r2 = add_round(&storage, conv, "r2", 1).await; // kept
-
-        let msgs = TestRuntime::build_llm_messages_static(&storage, conv)
-            .await
-            .expect("build messages");
-
-        // Oldest round: images dropped, placeholder present.
-        for id in &r0 {
-            assert_eq!(
-                images_for(&msgs, id).len(),
-                0,
-                "round older than IMAGE_HISTORY_ROUNDS must drop images: {id}",
-            );
-            assert_eq!(
-                placeholder_count(&msgs, id),
-                1,
-                "dropped screenshot must leave a placeholder: {id}",
-            );
-        }
-
-        // The recent multi-screenshot round keeps all three.
-        for id in &r1 {
-            assert_eq!(
-                images_for(&msgs, id).len(),
-                1,
-                "kept recent round must retain every screenshot: {id}",
-            );
-        }
-        for id in &r2 {
-            assert_eq!(images_for(&msgs, id).len(), 1, "newest round kept: {id}");
-        }
+        let (kept_body, kept_imgs) = find("new-tool");
+        assert_eq!(kept_body, "result body");
+        assert_eq!(kept_imgs, 2, "kept result preserves its images");
     }
 }
 

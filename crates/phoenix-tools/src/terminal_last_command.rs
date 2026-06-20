@@ -13,6 +13,11 @@ pub struct TerminalLastCommandTool;
 
 #[async_trait]
 impl Tool for TerminalLastCommandTool {
+    // clearable: re-queryable read — see specs/stale-tool-results (REQ-STR-002).
+    fn clearable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "terminal_last_command"
     }

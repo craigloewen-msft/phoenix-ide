@@ -163,6 +163,20 @@ pub trait StateStore: Send + Sync {
         cwd: &str,
     ) -> Result<(), String>;
 
+    /// Read the conversation's clear watermark for stale tool-result clearing
+    /// (specs/stale-tool-results). Returns 0 when nothing has been cleared yet.
+    async fn get_clear_watermark(&self, conv_id: &str) -> Result<i64, String>;
+
+    /// Advance the conversation's clear watermark. The write is structurally
+    /// monotonic — a value below the persisted watermark is ignored, never
+    /// regressing it (specs/stale-tool-results, REQ-STR-007).
+    async fn set_clear_watermark(&self, conv_id: &str, watermark: i64) -> Result<(), String>;
+
+    /// The total prompt size of the most recent turn (input + cache-read +
+    /// cache-creation tokens), or `None` if the conversation has no turns yet.
+    /// The clearing pressure signal (specs/stale-tool-results, REQ-STR-001).
+    async fn get_last_turn_prompt_tokens(&self, conv_id: &str) -> Result<Option<i64>, String>;
+
     /// Record token usage for one LLM turn. Fire-and-forget; errors are logged
     /// by the caller and do not affect the conversation.
     async fn insert_turn_usage(
@@ -237,6 +251,14 @@ pub trait ToolExecutor: Send + Sync {
         _language: crate::llm_language::LlmLanguage,
     ) -> Vec<crate::llm::ToolDefinition> {
         self.definitions().await
+    }
+
+    /// Names of tools whose stale results may be cleared from the model-bound
+    /// history (specs/stale-tool-results). Default empty so a test double opts
+    /// out of clearing unless it overrides; the production registry executor
+    /// derives the set from `Tool::clearable()`.
+    fn clearable_tool_names(&self) -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
     }
 
     /// Replace the tool set (e.g., Explore -> Work mode transition).
@@ -410,6 +432,18 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
             .await
     }
 
+    async fn get_clear_watermark(&self, conv_id: &str) -> Result<i64, String> {
+        (**self).get_clear_watermark(conv_id).await
+    }
+
+    async fn set_clear_watermark(&self, conv_id: &str, watermark: i64) -> Result<(), String> {
+        (**self).set_clear_watermark(conv_id, watermark).await
+    }
+
+    async fn get_last_turn_prompt_tokens(&self, conv_id: &str) -> Result<Option<i64>, String> {
+        (**self).get_last_turn_prompt_tokens(conv_id).await
+    }
+
     async fn insert_turn_usage(
         &self,
         conversation_id: &str,
@@ -477,6 +511,10 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
 
     fn upgrade_to_work_mode(&self) {
         (**self).upgrade_to_work_mode();
+    }
+
+    fn clearable_tool_names(&self) -> std::collections::HashSet<String> {
+        (**self).clearable_tool_names()
     }
 }
 
@@ -693,6 +731,27 @@ impl StateStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
+    async fn get_clear_watermark(&self, conv_id: &str) -> Result<i64, String> {
+        self.db
+            .get_clear_watermark(conv_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn set_clear_watermark(&self, conv_id: &str, watermark: i64) -> Result<(), String> {
+        self.db
+            .update_clear_watermark(conv_id, watermark)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn get_last_turn_prompt_tokens(&self, conv_id: &str) -> Result<Option<i64>, String> {
+        self.db
+            .get_last_turn_prompt_tokens(conv_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     async fn insert_turn_usage(
         &self,
         conversation_id: &str,
@@ -862,6 +921,13 @@ impl ToolExecutor for ToolRegistryExecutor {
     async fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
         self.definitions_for_language(crate::llm_language::LlmLanguage::default())
             .await
+    }
+
+    fn clearable_tool_names(&self) -> std::collections::HashSet<String> {
+        self.registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clearable_tool_names()
     }
 
     async fn definitions_for_language(

@@ -44,6 +44,11 @@ fn resolve_and_validate(path: &str, working_dir: &std::path::Path) -> Result<Pat
 
 #[async_trait]
 impl Tool for ReadFileTool {
+    // clearable: re-queryable read — see specs/stale-tool-results (REQ-STR-002).
+    fn clearable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "read_file"
     }
