@@ -2540,6 +2540,73 @@ impl Database {
         Ok(())
     }
 
+    /// Return the display text of the earliest *opening* message in a
+    /// conversation, or `None` when there is none (REQ-CHN-010).
+    ///
+    /// An opening is a user-initiated message: a plain `user` message, or a
+    /// `skill` invocation (a user action whose original trigger text is the
+    /// opening intent — Phoenix persists a skill-invoking prompt as
+    /// `message_type = 'skill'`, not `'user'`). System-generated user messages
+    /// (task-approval seeds, `is_meta`) count too; agent/tool/continuation
+    /// messages do not.
+    ///
+    /// "Earliest" is by `sequence_id` (the messages table's append order).
+    /// Used by chain-name regeneration to summarize each member's opening
+    /// intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn first_opening_message_text(&self, conv_id: &str) -> DbResult<Option<String>> {
+        let row = sqlx::query(
+            "SELECT message_type, content FROM messages
+             WHERE conversation_id = ?1 AND message_type IN ('user', 'skill')
+             ORDER BY sequence_id ASC
+             LIMIT 1",
+        )
+        .bind(conv_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let message_type: String = row.try_get("message_type")?;
+        let content_str: String = row.try_get("content")?;
+        let value: serde_json::Value = serde_json::from_str(&content_str).unwrap_or_default();
+
+        // A row whose content fails to parse as its tagged type is corrupt;
+        // treat it as "no usable opening" rather than surfacing a parse error
+        // to the naming flow.
+        let text = match message_type.as_str() {
+            "user" => match MessageContent::from_stored_json(MessageType::User, value) {
+                Ok(MessageContent::User(user)) => user.text,
+                _ => return Ok(None),
+            },
+            // The trigger is the user's original text that invoked the skill —
+            // the opening intent. The expanded body is the wrong thing to name
+            // from. Fall back to the skill name if the trigger is empty.
+            "skill" => match MessageContent::from_stored_json(MessageType::Skill, value) {
+                Ok(MessageContent::Skill(skill)) => {
+                    if skill.trigger.trim().is_empty() {
+                        skill.name
+                    } else {
+                        skill.trigger
+                    }
+                }
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+
+        let text = text.trim();
+        if text.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(text.to_string()))
+        }
+    }
+
     /// Insert a freshly-submitted Q&A row in the `in_flight` state (REQ-CHN-005).
     ///
     /// `answer` and `completed_at` are NULL at insertion. The row is
@@ -7816,6 +7883,168 @@ mod tests {
         // Missing conversation surfaces as a typed error, not silent no-op.
         let err = db.set_chain_name("ghost", Some("x")).await.unwrap_err();
         matches!(err, DbError::ConversationNotFound(_));
+    }
+
+    /// REQ-CHN-010: `first_opening_message_text` returns the earliest opening
+    /// message — a `user` message OR a `skill` invocation (its trigger text) —
+    /// and skips agent/tool/continuation messages.
+    #[tokio::test]
+    async fn test_first_opening_message_text() {
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("fum", "slug-fum", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        // No opening yet → None.
+        assert_eq!(db.first_opening_message_text("fum").await.unwrap(), None);
+
+        // Add an agent message first (lower sequence) — must be skipped.
+        db.add_message(
+            "fum-agent",
+            "fum",
+            &MessageContent::agent(vec![ContentBlock::text("agent says hi")]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        // Still no opening.
+        assert_eq!(db.first_opening_message_text("fum").await.unwrap(), None);
+
+        // First user message.
+        db.add_message(
+            "fum-u1",
+            "fum",
+            &MessageContent::user("Refactor the auth module"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        // A later user message must not win.
+        db.add_message(
+            "fum-u2",
+            "fum",
+            &MessageContent::user("Now add tests"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.first_opening_message_text("fum").await.unwrap(),
+            Some("Refactor the auth module".to_string())
+        );
+
+        // Unknown conversation → None (no rows match), not an error.
+        assert_eq!(db.first_opening_message_text("ghost").await.unwrap(), None);
+
+        // A member whose opening is a SKILL invocation: the user's trigger text
+        // is the opening intent — not the expanded skill body.
+        db.create_conversation("skillconv", "slug-skill", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "skill-open",
+            "skillconv",
+            &MessageContent::Skill(phoenix_core::domain::db_schema::SkillContent {
+                name: "build".to_string(),
+                body: "EXPANDED SKILL BODY — must not be the chain name".to_string(),
+                trigger: "Ship the release build".to_string(),
+                files: vec![],
+            }),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.first_opening_message_text("skillconv").await.unwrap(),
+            Some("Ship the release build".to_string())
+        );
+    }
+
+    // ==================== rename_conversation Tests ====================
+
+    /// `rename_conversation` updates the slug and advances `updated_at`.
+    #[tokio::test]
+    async fn test_rename_conversation_success() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("rc", "slug-rc-old", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let before = db.get_conversation("rc").await.unwrap();
+        assert_eq!(before.slug.as_deref(), Some("slug-rc-old"));
+
+        // Ensure a measurable gap so updated_at strictly advances even on
+        // fast machines (timestamps are RFC3339, sub-millisecond granular).
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        db.rename_conversation("rc", "slug-rc-new").await.unwrap();
+
+        let after = db.get_conversation("rc").await.unwrap();
+        assert_eq!(after.slug.as_deref(), Some("slug-rc-new"));
+        assert!(
+            after.updated_at >= before.updated_at,
+            "updated_at must not regress on rename (before={:?}, after={:?})",
+            before.updated_at,
+            after.updated_at,
+        );
+    }
+
+    /// Renaming to a slug already used by another conversation returns
+    /// `DbError::SlugExists` and leaves the original row untouched.
+    #[tokio::test]
+    async fn test_rename_conversation_duplicate_slug() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("rc-a", "slug-taken", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("rc-b", "slug-b", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        match db.rename_conversation("rc-b", "slug-taken").await {
+            Err(DbError::SlugExists(slug)) => assert_eq!(slug, "slug-taken"),
+            other => panic!("expected SlugExists, got {other:?}"),
+        }
+
+        // rc-b's slug is unchanged after the rejected rename.
+        let b = db.get_conversation("rc-b").await.unwrap();
+        assert_eq!(b.slug.as_deref(), Some("slug-b"));
+    }
+
+    /// Renaming a conversation whose slug already equals the target is a
+    /// no-op success (the existence check excludes the row's own id), so a
+    /// caller re-applying the current slug is not spuriously rejected.
+    #[tokio::test]
+    async fn test_rename_conversation_same_slug_is_ok() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("rc-same", "slug-same", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        db.rename_conversation("rc-same", "slug-same")
+            .await
+            .unwrap();
+
+        let conv = db.get_conversation("rc-same").await.unwrap();
+        assert_eq!(conv.slug.as_deref(), Some("slug-same"));
+    }
+
+    /// Renaming a nonexistent conversation returns
+    /// `DbError::ConversationNotFound`, not a silent no-op.
+    #[tokio::test]
+    async fn test_rename_conversation_not_found() {
+        let db = Database::open_in_memory().await.unwrap();
+        match db.rename_conversation("ghost", "slug-anything").await {
+            Err(DbError::ConversationNotFound(id)) => assert_eq!(id, "ghost"),
+            other => panic!("expected ConversationNotFound, got {other:?}"),
+        }
     }
 
     // ==================== Fork Proposal Tests ====================

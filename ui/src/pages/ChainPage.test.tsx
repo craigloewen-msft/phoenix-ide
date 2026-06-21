@@ -56,6 +56,7 @@ vi.mock('../api', async () => {
       getChain: vi.fn(),
       submitChainQuestion: vi.fn(),
       setChainName: vi.fn(),
+      regenerateChainName: vi.fn(),
       // The work-scope dock resolves the active member's scope key via
       // getConversation, then polls getWorkScopeInventory. Defaults below are
       // overridden per-test where the dock behaviour is under test.
@@ -141,10 +142,10 @@ const makeChain = (overrides: Partial<ChainView> = {}): ChainView => ({
   ...overrides,
 });
 
-function renderAt(rootId: string) {
+function renderAt(rootId: string, search = '') {
   return render(
     <ChainProvider>
-      <MemoryRouter initialEntries={[`/chains/${rootId}`]}>
+      <MemoryRouter initialEntries={[`/chains/${rootId}${search}`]}>
         <Routes>
           <Route path="/chains/:rootConvId" element={<ChainPage />} />
           <Route path="/c/:slug" element={<div data-testid="conv-page">conv</div>} />
@@ -597,6 +598,132 @@ describe('ChainPage — inline name edit (REQ-CHN-007)', () => {
     await waitFor(() => {
       expect(api.setChainName).toHaveBeenCalledWith(ROOT_ID, null);
     });
+  });
+});
+
+describe('ChainPage — regenerate name (REQ-CHN-010)', () => {
+  it('clicking regenerate calls regenerateChainName and applies the returned name', async () => {
+    const { api } = await import('../api');
+    const initial = makeChain({ chain_name: 'old-name', display_name: 'old-name' });
+    const regenerated = makeChain({
+      chain_name: 'fresh-name',
+      display_name: 'fresh-name',
+    });
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(initial);
+    (api.regenerateChainName as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      regenerated,
+    );
+
+    renderAt(ROOT_ID);
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole('button', { name: /old-name/ }),
+      ).toBeInTheDocument();
+    });
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Regenerate name from chain content' }),
+    );
+
+    await waitFor(() => {
+      expect(api.regenerateChainName).toHaveBeenCalledWith(ROOT_ID);
+    });
+    await waitFor(() => {
+      expect(
+        screen.getByRole('button', { name: /fresh-name/ }),
+      ).toBeInTheDocument();
+    });
+    // Manual-only (REQ-CHN-010): exactly one call from the explicit click, no
+    // auto-trigger on mount.
+    expect(api.regenerateChainName).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the displayed name and surfaces an error toast when regeneration fails', async () => {
+    const { api } = await import('../api');
+    const initial = makeChain({ chain_name: 'keep-me', display_name: 'keep-me' });
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(initial);
+    (api.regenerateChainName as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('LLM unavailable'),
+    );
+
+    renderAt(ROOT_ID);
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole('button', { name: /keep-me/ }),
+      ).toBeInTheDocument();
+    });
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Regenerate name from chain content' }),
+    );
+
+    // The failure surfaces via the app toast mechanism.
+    await waitFor(() => {
+      expect(screen.getByText('LLM unavailable')).toBeInTheDocument();
+    });
+    // The displayed name is unchanged (server left it untouched on failure).
+    expect(
+      screen.getByRole('button', { name: /keep-me/ }),
+    ).toBeInTheDocument();
+  });
+
+  it('disables regenerate while the name editor is open (avoids the commit/regenerate race)', async () => {
+    const { api } = await import('../api');
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      makeChain({ chain_name: 'old-name', display_name: 'old-name' }),
+    );
+
+    renderAt(ROOT_ID);
+
+    const nameBtn = await screen.findByRole('button', { name: /old-name/ });
+    // Enabled before editing.
+    expect(
+      screen.getByRole('button', { name: 'Regenerate name from chain content' }),
+    ).toBeEnabled();
+
+    // Open the inline editor.
+    fireEvent.click(nameBtn);
+    await screen.findByRole('textbox', { name: 'Chain name' });
+
+    // Now disabled, so a click can't race the blur-commit PATCH.
+    expect(
+      screen.getByRole('button', { name: 'Regenerate name from chain content' }),
+    ).toBeDisabled();
+    expect(api.regenerateChainName).not.toHaveBeenCalled();
+  });
+});
+
+describe('ChainPage — rename intent from sidebar (REQ-CHN-007)', () => {
+  it('opens directly in name-edit mode when navigated with ?rename=1', async () => {
+    const { api } = await import('../api');
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      makeChain({ chain_name: 'old-name', display_name: 'old-name' }),
+    );
+
+    // The sidebar "Rename chain…" action lands here with ?rename=1; the editor
+    // must open without any further click (otherwise the menu item is a no-op).
+    renderAt(ROOT_ID, '?rename=1');
+
+    const input = await screen.findByRole('textbox', { name: 'Chain name' });
+    expect(input).toHaveValue('old-name');
+  });
+
+  it('does not open the editor on a normal visit (no ?rename)', async () => {
+    const { api } = await import('../api');
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      makeChain({ chain_name: 'old-name', display_name: 'old-name' }),
+    );
+
+    renderAt(ROOT_ID);
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /old-name/ })).toBeInTheDocument();
+    });
+    expect(
+      screen.queryByRole('textbox', { name: 'Chain name' }),
+    ).not.toBeInTheDocument();
   });
 });
 
