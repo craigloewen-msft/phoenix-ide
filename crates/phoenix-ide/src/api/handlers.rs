@@ -7556,6 +7556,7 @@ mod upgrade_model_state_guard_tests {
                 &ConvState::Error {
                     message: "overloaded".into(),
                     error_kind: crate::db::ErrorKind::ServerOverloaded,
+                    resets_at: None,
                 },
             )
             .await
