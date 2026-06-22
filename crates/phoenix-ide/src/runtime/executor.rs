@@ -36,7 +36,7 @@ use phoenix_llm::{
 };
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 /// Safety-net wall-clock timeout for sub-agents (REQ-SA-006).
@@ -1023,6 +1023,11 @@ where
     /// DB handle) keeps retirement serialized with approve/request-changes so a
     /// terminal transition can't tear down an in-flight resolve's worktree.
     fork_cmd_tx: Option<mpsc::Sender<super::fork_resolve::ForkCommand>>,
+    /// Watch sender that publishes the current `ConvState` on every transition.
+    /// The paired `watch::Receiver` lives in `ConversationHandle` so HTTP
+    /// handlers can read live runtime state without holding the `runtimes` lock.
+    /// `None` in tests that do not exercise the live-state authority path.
+    state_watcher: Option<watch::Sender<ConvState>>,
 }
 
 impl<S, L, T> ConversationRuntime<S, L, T>
@@ -1105,6 +1110,7 @@ where
             credential_helper: None,
             agent_catalog: Arc::from(Vec::new()),
             fork_cmd_tx: None,
+            state_watcher: None,
         }
     }
 
@@ -1117,6 +1123,14 @@ where
         tx: mpsc::Sender<super::fork_resolve::ForkCommand>,
     ) -> Self {
         self.fork_cmd_tx = Some(tx);
+        self
+    }
+
+    /// Attach a watch sender so the runtime publishes its current `ConvState`
+    /// on every transition. The paired receiver lives in `ConversationHandle`
+    /// and lets HTTP handlers read live state without consulting the DB.
+    pub fn with_state_watcher(mut self, tx: watch::Sender<ConvState>) -> Self {
+        self.state_watcher = Some(tx);
         self
     }
 
@@ -1829,6 +1843,22 @@ where
         // its prior value too — gating here keeps the in-memory stamp in sync.
         if self.state != old_state {
             self.state_updated_at = Utc::now();
+            // Publish early for most transitions so effective_conversation_state
+            // reflects the new state before long-running effects (e.g. ApproveTask
+            // git work) complete. Exception: suppress when entering Idle with
+            // queued steering messages — the inline drain will immediately advance
+            // the state to LlmRequesting, and exposing the transient Idle would let
+            // a concurrent POST /chat route a UserMessage before the drain finishes
+            // (FM-7 intermediate-Idle race). The end-of-function publish below
+            // covers that suppressed case once the drain completes.
+            let will_drain_from_idle = matches!(self.state, ConvState::Idle)
+                && !self.steering_queue.is_empty()
+                && !self.context.is_sub_agent;
+            if !will_drain_from_idle {
+                if let Some(tx) = &self.state_watcher {
+                    let _ = tx.send(self.state.clone());
+                }
+            }
         }
 
         // Retire any pending retry-backoff timer when the conversation leaves
@@ -1946,6 +1976,17 @@ where
             }
         }
 
+        // Publish the final state to any live-state observer after all effects
+        // (including any inline steering drain) have completed. Publishing here
+        // rather than at the state-set site above prevents the intermediate
+        // `Idle` from being visible to `effective_conversation_state` during
+        // the await inside `run_effects_with_inline_drain`, which would cause a
+        // concurrent `POST /chat` to route a `UserMessage` before the drain has
+        // advanced the state back to `LlmRequesting` (FM-7).
+        if let Some(tx) = &self.state_watcher {
+            let _ = tx.send(self.state.clone());
+        }
+
         Ok(generated_events)
     }
 
@@ -2009,6 +2050,12 @@ where
         // jump the elapsed counter (REQ-WPV-001).
         if self.state != drain_old_state {
             self.state_updated_at = Utc::now();
+            // Mirror apply_transition_result: publish the new state so live-state
+            // observers (e.g. effective_conversation_state) stay current after a
+            // steering drain transition (Idle → LlmRequesting is the common path).
+            if let Some(tx) = &self.state_watcher {
+                let _ = tx.send(self.state.clone());
+            }
         }
         for effect in drain_result.effects {
             if let Some(gen_event) = self.execute_effect(effect).await? {
@@ -4499,6 +4546,12 @@ where
                     plan: plan_backup,
                 };
                 self.state_updated_at = Utc::now();
+                // Publish the revert so live-state observers (effective_conversation_state)
+                // see AwaitingTaskApproval, not the LlmRequesting this approval briefly
+                // advanced to before the failure.
+                if let Some(tx) = &self.state_watcher {
+                    let _ = tx.send(self.state.clone());
+                }
 
                 // Broadcast an error so the UI knows, but don't propagate — the
                 // conversation stays in AwaitingTaskApproval for retry.
@@ -4564,6 +4617,10 @@ where
                     plan: plan_backup,
                 };
                 self.state_updated_at = Utc::now();
+                // Publish the revert so live-state observers stay consistent.
+                if let Some(tx) = &self.state_watcher {
+                    let _ = tx.send(self.state.clone());
+                }
                 let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
                     sequence_id: seq,
                     error: crate::runtime::user_facing_error::UserFacingError::retryable(
