@@ -6,7 +6,9 @@ import type { Conversation, Project } from '../api';
 const { apiMock } = vi.hoisted(() => ({
   apiMock: {
     codexLoginPreflight: vi.fn(),
+    deploymentInfo: vi.fn(),
     getProjects: vi.fn(),
+    getLocalServices: vi.fn(),
     archiveConversation: vi.fn(),
     archiveChain: vi.fn(),
     getChain: vi.fn(),
@@ -70,6 +72,8 @@ describe('Sidebar — active conversation project filter', () => {
       account_id: null,
       auth_path: null,
     });
+    apiMock.deploymentInfo.mockResolvedValue({ local_access: true });
+    apiMock.getLocalServices.mockResolvedValue({ services: [] });
     apiMock.getProjects.mockResolvedValue([
       makeProject('proj-1', '/home/user/one'),
       makeProject('proj-2', '/home/user/two'),
