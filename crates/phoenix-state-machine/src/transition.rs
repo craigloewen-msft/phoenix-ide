@@ -12,12 +12,14 @@
 //! REQ-BED-006: Error Recovery
 
 use super::effect::{compute_bash_display_data, CheckpointData};
-use super::event::{CoreEvent, ParentEvent, ParentOnlyEvent, SubAgentEvent, SubAgentOnlyEvent};
+use super::event::{
+    CancelCause, CoreEvent, ParentEvent, ParentOnlyEvent, SubAgentEvent, SubAgentOnlyEvent,
+};
 use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 use super::state::{
     AssistantMessage, ContextExhaustionBehavior, ContinuationSummaryRequest, CoreState, ModeKind,
-    ParentState, RecoveryKind, RecoveryResumeTarget, SubAgentResult, SubAgentState,
-    TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
+    ParentState, RecoveryKind, RecoveryResumeTarget, SubAgentOutcome, SubAgentResult,
+    SubAgentState, TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
@@ -1054,14 +1056,16 @@ fn handle_core_cancellation(
             CoreState::AwaitingSubAgents {
                 pending,
                 completed_results,
-                ..
+                spawn_tool_id,
             },
-            CoreEvent::UserCancel { .. },
+            CoreEvent::UserCancel { cause, .. },
         ) => {
             let ids: Vec<String> = pending.iter().map(|p| p.agent_id.clone()).collect();
             Ok(CoreTransitionResult::new(CoreState::CancellingSubAgents {
                 pending: pending.clone(),
                 completed_results: completed_results.clone(),
+                cause,
+                spawn_tool_id: spawn_tool_id.clone(),
             })
             .with_effect(Effect::CancelSubAgents { ids })
             .with_effect(Effect::PersistState))
@@ -1141,6 +1145,8 @@ fn handle_core_cancellation(
                 Ok(CoreTransitionResult::new(CoreState::CancellingSubAgents {
                     pending: pending_sub_agents.clone(),
                     completed_results: vec![],
+                    cause: CancelCause::UserRequested,
+                    spawn_tool_id: None,
                 })
                 .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                 .with_effect(Effect::PersistState))
@@ -1180,6 +1186,8 @@ fn handle_core_cancellation(
                 Ok(CoreTransitionResult::new(CoreState::CancellingSubAgents {
                     pending: pending_sub_agents.clone(),
                     completed_results: vec![],
+                    cause: CancelCause::UserRequested,
+                    spawn_tool_id: None,
                 })
                 .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                 .with_effect(Effect::PersistState))
@@ -1239,6 +1247,22 @@ fn build_cancellation_results(
         ));
     }
     all_results
+}
+
+/// Map a sub-agent's reported outcome to the outcome recorded when the parent
+/// is tearing the sub-agent down. A `Timeout` cause records `TimedOut` for ANY
+/// result — even a late `Success` — because the completion deadline is a hard
+/// contract; a `UserRequested` cancel keeps the reported outcome (e.g. a
+/// `Success`, or a `Failure { Cancelled }`).
+fn map_teardown_outcome(outcome: SubAgentOutcome, cause: CancelCause) -> SubAgentOutcome {
+    match cause {
+        // The completion deadline is a hard contract: any result (including a
+        // late Success) that arrives during a timeout teardown counts as timed out.
+        CancelCause::Timeout => SubAgentOutcome::TimedOut,
+        // A user-requested cancel keeps what the agent reported (Success, or
+        // Failure { Cancelled }).
+        CancelCause::UserRequested => outcome,
+    }
 }
 
 /// Handles `SubAgentResult` events in `AwaitingSubAgents` and `CancellingSubAgents` states.
@@ -1323,6 +1347,8 @@ fn handle_core_sub_agents(
             CoreState::CancellingSubAgents {
                 pending,
                 completed_results,
+                cause,
+                spawn_tool_id,
             },
             CoreEvent::SubAgentResult { agent_id, outcome },
         ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() > 1 => {
@@ -1336,28 +1362,75 @@ fn handle_core_sub_agents(
                 .filter(|p| p.agent_id != agent_id)
                 .cloned()
                 .collect();
+            let recorded = map_teardown_outcome(outcome, *cause);
             let mut new_results = completed_results.clone();
             new_results.push(SubAgentResult {
                 agent_id,
                 task,
-                outcome,
+                outcome: recorded,
             });
 
             Ok(CoreTransitionResult::new(CoreState::CancellingSubAgents {
                 pending: new_pending,
                 completed_results: new_results,
+                cause: *cause,
+                spawn_tool_id: spawn_tool_id.clone(),
             })
             .with_effect(Effect::PersistState))
         }
 
-        // CancellingSubAgents + SubAgentResult (last one) -> Idle
+        // CancellingSubAgents + SubAgentResult (last one)
+        // A completion timeout reports-and-continues (resume the parent's LLM
+        // turn); a user cancel reports-and-stops (settle to Idle).
         (
-            CoreState::CancellingSubAgents { pending, .. },
-            CoreEvent::SubAgentResult { agent_id, .. },
+            CoreState::CancellingSubAgents {
+                pending,
+                completed_results,
+                cause,
+                spawn_tool_id,
+            },
+            CoreEvent::SubAgentResult { agent_id, outcome },
         ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() == 1 => {
-            Ok(CoreTransitionResult::new(CoreState::Idle)
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_agent_done()))
+            let task = pending
+                .iter()
+                .find(|p| p.agent_id == agent_id)
+                .map(|p| p.task.clone())
+                .unwrap_or_default();
+            let recorded = map_teardown_outcome(outcome, *cause);
+            let mut new_results = completed_results.clone();
+            new_results.push(SubAgentResult {
+                agent_id,
+                task,
+                outcome: recorded,
+            });
+
+            // Always persist the drained results. The id is threaded through
+            // as-is: `Some` updates the originating spawn_agents tool message
+            // (AwaitingSubAgents-origin); `None` (CancellingTool-origin, or a
+            // multi-tool batch where spawn_agents wasn't last) persists a
+            // safe non-tool summary. The persist handler — not this gate —
+            // guarantees no orphaned tool_result is ever produced.
+            match cause {
+                CancelCause::Timeout => {
+                    Ok(
+                        CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
+                            .with_effect(Effect::PersistSubAgentResults {
+                                results: new_results,
+                                spawn_tool_id: spawn_tool_id.clone(),
+                            })
+                            .with_effect(Effect::PersistState)
+                            .with_effect(Effect::notify_state_change())
+                            .with_effect(Effect::RequestLlm),
+                    )
+                }
+                CancelCause::UserRequested => Ok(CoreTransitionResult::new(CoreState::Idle)
+                    .with_effect(Effect::PersistSubAgentResults {
+                        results: new_results,
+                        spawn_tool_id: spawn_tool_id.clone(),
+                    })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_agent_done())),
+            }
         }
 
         (state, event) => Err(TransitionError::InvalidTransition {
@@ -2531,7 +2604,7 @@ pub fn transition_sub_agent(
                 assistant_message,
                 pending_sub_agents,
             }),
-            SubAgentEvent::Core(CoreEvent::UserCancel { reason: _ }),
+            SubAgentEvent::Core(CoreEvent::UserCancel { reason: _, .. }),
         ) => Ok(
             SubAgentTransitionResult::new(SubAgentState::Core(CoreState::CancellingTool {
                 tool_use_id: current_tool.id.clone(),
@@ -2593,13 +2666,13 @@ pub fn transition_sub_agent(
         // ToolAborted/ToolComplete settles the round (arm above).
         (
             cancelling @ SubAgentState::Core(CoreState::CancellingTool { .. }),
-            SubAgentEvent::Core(CoreEvent::UserCancel { reason: _ }),
+            SubAgentEvent::Core(CoreEvent::UserCancel { reason: _, .. }),
         ) => Ok(SubAgentTransitionResult::new(cancelling.clone())),
 
         // ============================================================
         // Sub-agent UserCancel -> Failed (from any other non-terminal core state)
         // ============================================================
-        (SubAgentState::Core(_), SubAgentEvent::Core(CoreEvent::UserCancel { reason })) => {
+        (SubAgentState::Core(_), SubAgentEvent::Core(CoreEvent::UserCancel { reason, .. })) => {
             let error = reason
                 .clone()
                 .unwrap_or_else(|| "Cancelled by parent".to_string());
@@ -3511,8 +3584,15 @@ mod tests {
             attempt: 1,
         };
 
-        let err = transition(&state, &test_context(), Event::UserCancel { reason: None })
-            .expect_err("continuation generation is not user-cancellable");
+        let err = transition(
+            &state,
+            &test_context(),
+            Event::UserCancel {
+                reason: None,
+                cause: CancelCause::UserRequested,
+            },
+        )
+        .expect_err("continuation generation is not user-cancellable");
 
         assert!(matches!(
             err,
@@ -3742,7 +3822,10 @@ mod tests {
                 assistant_message,
             },
             &test_context(),
-            Event::UserCancel { reason: None },
+            Event::UserCancel {
+                reason: None,
+                cause: CancelCause::UserRequested,
+            },
         )
         .unwrap();
 
@@ -3971,7 +4054,10 @@ mod tests {
                 assistant_message,
             },
             &sub_agent_context(),
-            Event::UserCancel { reason: None },
+            Event::UserCancel {
+                reason: None,
+                cause: CancelCause::UserRequested,
+            },
         )
         .expect("sub-agent ToolExecuting + UserCancel must transition");
 
@@ -4017,6 +4103,7 @@ mod tests {
     /// goes to Idle to resume the user's turn — a sub-agent has no turn to
     /// resume, so it must end Failed instead.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_subagent_cancelling_tool_settles_to_failed_and_notifies_parent() {
         use crate::state::AssistantMessage;
         use phoenix_core::domain::llm_types::ContentBlock;
@@ -4115,6 +4202,7 @@ mod tests {
             &sub_agent_context(),
             Event::UserCancel {
                 reason: Some("second cancel".to_string()),
+                cause: CancelCause::UserRequested,
             },
         )
         .expect("sub-agent CancellingTool + UserCancel must be absorbed");
@@ -4140,7 +4228,10 @@ mod tests {
         let result = transition(
             &ConvState::LlmRequesting { attempt: 1 },
             &sub_agent_context(),
-            Event::UserCancel { reason: None },
+            Event::UserCancel {
+                reason: None,
+                cause: CancelCause::UserRequested,
+            },
         )
         .expect("sub-agent LlmRequesting + UserCancel must transition");
 
@@ -6135,5 +6226,436 @@ mod resolve_task_file_tests {
         std::os::unix::fs::symlink(outside.path(), tmp.path().join("escape")).unwrap();
         let err = resolve_task_file(tmp.path(), "tasks", "escape/plan.md").unwrap_err();
         assert!(err.contains("resolves outside"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    // ========================================================================
+    // task 61004 M1: forced sub-agent teardown via the cancel protocol.
+    //
+    // These pin the `CancellingSubAgents + SubAgentResult` drain arms and the
+    // `map_teardown_outcome` mapping. The completion deadline is a hard contract:
+    // a `Timeout`-caused teardown relabels EVERY outcome (including a late Success)
+    // `TimedOut`, and the last-one drain resumes the parent's turn
+    // (-> LlmRequesting + RequestLlm). A `UserRequested` teardown keeps the
+    // reported outcome verbatim and stops (-> Idle + AgentDone). The cause must
+    // also survive a multi-agent drain's self-transition unchanged.
+    // ========================================================================
+
+    use super::{transition, ConvState, Effect, Event};
+    use crate::event::CancelCause;
+    use crate::state::{PendingSubAgent, SubAgentMode, SubAgentOutcome};
+    use phoenix_core::domain::db_schema::ErrorKind;
+    use std::path::PathBuf;
+
+    fn test_context() -> super::ConvContext {
+        super::ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
+    }
+
+    fn pending(id: &str) -> PendingSubAgent {
+        PendingSubAgent {
+            agent_id: id.to_string(),
+            task: format!("task for {id}"),
+            mode: SubAgentMode::Work,
+        }
+    }
+
+    /// Extract the recorded outcome for `agent_id` from a `PersistSubAgentResults`
+    /// effect (emitted on the last-one -> Idle drain).
+    fn recorded_in_persist(effects: &[Effect], agent_id: &str) -> SubAgentOutcome {
+        for effect in effects {
+            if let Effect::PersistSubAgentResults { results, .. } = effect {
+                if let Some(r) = results.iter().find(|r| r.agent_id == agent_id) {
+                    return r.outcome.clone();
+                }
+            }
+        }
+        panic!("no PersistSubAgentResults effect carrying agent {agent_id}: {effects:?}");
+    }
+
+    /// Extract the recorded outcome for `agent_id` from the new state's
+    /// `completed_results` (the more-pending self-transition arm).
+    fn recorded_in_state(state: &ConvState, agent_id: &str) -> SubAgentOutcome {
+        let ConvState::CancellingSubAgents {
+            completed_results, ..
+        } = state
+        else {
+            panic!("expected CancellingSubAgents, got {}", state.variant_name());
+        };
+        completed_results
+            .iter()
+            .find(|r| r.agent_id == agent_id)
+            .map_or_else(
+                || panic!("agent {agent_id} not in completed_results"),
+                |r| r.outcome.clone(),
+            )
+    }
+
+    /// Test 1 (last-one arm): under a `Timeout`-caused teardown the deadline is a
+    /// hard contract — even a reported `Success` is recorded as `TimedOut`, and
+    /// the last result RESUMES the parent (-> `LlmRequesting` + `RequestLlm`) so
+    /// the model continues with the timeout report (matching the pre-rework timeout).
+    #[test]
+    fn timeout_relabels_even_success_and_resumes_last_arm() {
+        let state = ConvState::CancellingSubAgents {
+            pending: vec![pending("a")],
+            completed_results: vec![],
+            cause: CancelCause::Timeout,
+            spawn_tool_id: Some("spawn-1".to_string()),
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::SubAgentResult {
+                agent_id: "a".to_string(),
+                outcome: SubAgentOutcome::Success {
+                    result: "did the thing".to_string(),
+                },
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(result.new_state, ConvState::LlmRequesting { .. }),
+            "a Timeout teardown resumes the parent, got {:?}",
+            result.new_state
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "Timeout resume must re-call the model"
+        );
+        assert_eq!(
+            recorded_in_persist(&result.effects, "a"),
+            SubAgentOutcome::TimedOut,
+            "a late Success under a Timeout cause is recorded TimedOut (deadline contract)"
+        );
+    }
+
+    /// Test 1 (more-pending arm): same relabel, but with a second agent still
+    /// pending so the drain self-transitions `CancellingSubAgents -> CancellingSubAgents`.
+    #[test]
+    fn timeout_relabels_even_success_more_pending_arm() {
+        let state = ConvState::CancellingSubAgents {
+            pending: vec![pending("a"), pending("b")],
+            completed_results: vec![],
+            cause: CancelCause::Timeout,
+            spawn_tool_id: Some("spawn-1".to_string()),
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::SubAgentResult {
+                agent_id: "a".to_string(),
+                outcome: SubAgentOutcome::Success {
+                    result: "real".to_string(),
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            recorded_in_state(&result.new_state, "a"),
+            SubAgentOutcome::TimedOut,
+            "Timeout relabels even Success in the self-transition arm too"
+        );
+    }
+
+    /// Test 2: a non-success outcome under a `Timeout` cause is relabeled
+    /// `TimedOut` and the last result resumes the parent (-> `LlmRequesting`).
+    #[test]
+    fn timeout_cause_relabels_non_success_to_timed_out() {
+        let state = ConvState::CancellingSubAgents {
+            pending: vec![pending("a")],
+            completed_results: vec![],
+            cause: CancelCause::Timeout,
+            spawn_tool_id: Some("spawn-1".to_string()),
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::SubAgentResult {
+                agent_id: "a".to_string(),
+                outcome: SubAgentOutcome::Failure {
+                    error: "presumed terminated".to_string(),
+                    error_kind: ErrorKind::Cancelled,
+                },
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(result.new_state, ConvState::LlmRequesting { .. }),
+            "a Timeout teardown resumes the parent, got {:?}",
+            result.new_state
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "Timeout resume must re-call the model"
+        );
+        assert_eq!(
+            recorded_in_persist(&result.effects, "a"),
+            SubAgentOutcome::TimedOut,
+            "a Failure{{Cancelled}} under a Timeout cause must be relabeled TimedOut"
+        );
+    }
+
+    /// Test 3: a `UserRequested` cause keeps the reported outcome verbatim — no
+    /// relabel.
+    #[test]
+    fn user_requested_cause_keeps_reported_outcome() {
+        let state = ConvState::CancellingSubAgents {
+            pending: vec![pending("a")],
+            completed_results: vec![],
+            cause: CancelCause::UserRequested,
+            spawn_tool_id: Some("spawn-1".to_string()),
+        };
+        let reported = SubAgentOutcome::Failure {
+            error: "cancelled by user".to_string(),
+            error_kind: ErrorKind::Cancelled,
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::SubAgentResult {
+                agent_id: "a".to_string(),
+                outcome: reported.clone(),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(result.new_state, ConvState::Idle));
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "a user cancel stops the turn — it must NOT resume the model"
+        );
+        assert_eq!(
+            recorded_in_persist(&result.effects, "a"),
+            reported,
+            "a UserRequested teardown must keep the reported Failure{{Cancelled}} verbatim"
+        );
+    }
+
+    /// Test 6: the parent's `AwaitingSubAgents` completion timeout reroutes
+    /// through the cancel protocol. `AwaitingSubAgents + UserCancel{Timeout}`
+    /// lands in `CancellingSubAgents{cause: Timeout}` and emits the real
+    /// `Effect::CancelSubAgents` — it does NOT fabricate per-agent `TimedOut`
+    /// results directly (those drain later through `CancellingSubAgents`).
+    #[test]
+    fn timeout_user_cancel_reroutes_to_cancelling_subagents_with_cancel_effect() {
+        let state = ConvState::AwaitingSubAgents {
+            pending: vec![pending("a"), pending("b")],
+            completed_results: vec![],
+            spawn_tool_id: None,
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::UserCancel {
+                reason: None,
+                cause: CancelCause::Timeout,
+            },
+        )
+        .unwrap();
+
+        let ConvState::CancellingSubAgents { pending, cause, .. } = &result.new_state else {
+            panic!(
+                "expected CancellingSubAgents, got {}",
+                result.new_state.variant_name()
+            );
+        };
+        assert_eq!(
+            *cause,
+            CancelCause::Timeout,
+            "cause must be stamped Timeout"
+        );
+        assert_eq!(pending.len(), 2, "all agents stay pending until they drain");
+
+        let cancel = result
+            .effects
+            .iter()
+            .find_map(|e| {
+                if let Effect::CancelSubAgents { ids } = e {
+                    Some(ids.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("must emit Effect::CancelSubAgents");
+        assert_eq!(cancel.len(), 2, "cancel targets both pending agents");
+
+        // The reroute must NOT directly fabricate per-agent results.
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistSubAgentResults { .. })),
+            "the timeout reroute must not fabricate per-agent results directly"
+        );
+    }
+
+    /// Test 7: a multi-tool-spawn batch leaves `spawn_tool_id: None`
+    /// (`spawn_agents` wasn't the last tool). On a completion timeout the agents
+    /// drain through
+    /// `CancellingSubAgents`, and the LAST result must STILL persist its results
+    /// (with `spawn_tool_id: None`) and resume the parent — the absence of a spawn
+    /// id no longer suppresses persistence, so the resumed model sees the
+    /// timed-out results. Pins fix B/C.
+    #[test]
+    fn timeout_persists_results_even_with_no_spawn_id() {
+        // Drive the real reroute first so the CancellingSubAgents state is
+        // constructed exactly as production does, carrying spawn_tool_id: None.
+        let awaiting = ConvState::AwaitingSubAgents {
+            pending: vec![pending("a")],
+            completed_results: vec![],
+            spawn_tool_id: None,
+        };
+        let cancelling = transition(
+            &awaiting,
+            &test_context(),
+            Event::UserCancel {
+                reason: None,
+                cause: CancelCause::Timeout,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                cancelling.new_state,
+                ConvState::CancellingSubAgents {
+                    spawn_tool_id: None,
+                    ..
+                }
+            ),
+            "reroute must carry spawn_tool_id: None through to CancellingSubAgents"
+        );
+
+        // Drain the single (last) agent; it must persist AND resume.
+        let result = transition(
+            &cancelling.new_state,
+            &test_context(),
+            Event::SubAgentResult {
+                agent_id: "a".to_string(),
+                outcome: SubAgentOutcome::TimedOut,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(result.new_state, ConvState::LlmRequesting { .. }),
+            "Timeout teardown resumes the parent even with no spawn id, got {:?}",
+            result.new_state
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "Timeout resume must re-call the model"
+        );
+        let persist = result
+            .effects
+            .iter()
+            .find_map(|e| {
+                if let Effect::PersistSubAgentResults {
+                    results,
+                    spawn_tool_id,
+                } = e
+                {
+                    Some((results.clone(), spawn_tool_id.clone()))
+                } else {
+                    None
+                }
+            })
+            .expect("must persist results even when spawn_tool_id is None");
+        assert_eq!(
+            persist.1, None,
+            "the None spawn id is threaded through to the persist effect as-is"
+        );
+        assert_eq!(
+            persist
+                .0
+                .iter()
+                .find(|r| r.agent_id == "a")
+                .unwrap()
+                .outcome,
+            SubAgentOutcome::TimedOut,
+            "the timed-out result is carried in the persist effect"
+        );
+    }
+
+    /// Cause-on-self-transition probe: a multi-agent drain's more-pending arm
+    /// must carry `cause` through unchanged so later agents are still mapped
+    /// correctly. Drain agent "a" (non-success) under a Timeout cause; the
+    /// resulting `CancellingSubAgents` must still carry `cause: Timeout`, and a
+    /// second drain of "b" (non-success) must therefore still relabel `TimedOut`.
+    #[test]
+    fn cause_survives_multi_agent_self_transition() {
+        let state = ConvState::CancellingSubAgents {
+            pending: vec![pending("a"), pending("b")],
+            completed_results: vec![],
+            cause: CancelCause::Timeout,
+            spawn_tool_id: Some("spawn-1".to_string()),
+        };
+        let first = transition(
+            &state,
+            &test_context(),
+            Event::SubAgentResult {
+                agent_id: "a".to_string(),
+                outcome: SubAgentOutcome::Failure {
+                    error: "x".to_string(),
+                    error_kind: ErrorKind::Cancelled,
+                },
+            },
+        )
+        .unwrap();
+
+        let ConvState::CancellingSubAgents { cause, .. } = &first.new_state else {
+            panic!(
+                "expected CancellingSubAgents, got {}",
+                first.new_state.variant_name()
+            );
+        };
+        assert_eq!(
+            *cause,
+            CancelCause::Timeout,
+            "cause must survive the self-transition"
+        );
+        assert_eq!(
+            recorded_in_state(&first.new_state, "a"),
+            SubAgentOutcome::TimedOut
+        );
+
+        // Drain the last agent; the carried cause must still relabel.
+        let second = transition(
+            &first.new_state,
+            &test_context(),
+            Event::SubAgentResult {
+                agent_id: "b".to_string(),
+                outcome: SubAgentOutcome::Failure {
+                    error: "y".to_string(),
+                    error_kind: ErrorKind::Cancelled,
+                },
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(second.new_state, ConvState::LlmRequesting { .. }),
+            "Timeout teardown resumes the parent after the last agent drains"
+        );
+        assert_eq!(
+            recorded_in_persist(&second.effects, "b"),
+            SubAgentOutcome::TimedOut,
+            "the carried Timeout cause must relabel the last agent too"
+        );
     }
 }

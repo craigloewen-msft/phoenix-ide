@@ -50,6 +50,15 @@ const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_mins(20);
 /// pathological "task never returns" case.
 const CANCELLATION_DEADLINE: Duration = Duration::from_secs(3);
 
+/// Last-resort backstop forcing `CancellingSubAgents` to drain to `Idle` when a
+/// cancelled sub-agent never reports back. Set to 2× `CANCELLATION_DEADLINE` (6s
+/// = 2 × 3s) deliberately: `CancellingSubAgents` is parent-only, so this only
+/// applies to a parent waiting for its sub-agents to drain. Each sub-agent has
+/// its own 3s `CancellingTool` backstop, so giving the parent 6s guarantees a
+/// real cancelled result wins the race in the common case, leaving this 6s as a
+/// true last resort for a sub-agent runtime that has genuinely vanished.
+const CANCELLING_SUBAGENTS_DEADLINE: Duration = Duration::from_secs(6);
+
 /// Hard byte cap on the LLM-bound text of a single tool result.
 ///
 /// Per-tool caps are line-based (bash tail = 200 lines, `read_file` = 2000
@@ -728,6 +737,28 @@ fn render_messages(
         }
     }
     messages
+}
+
+/// Render a human-readable summary of sub-agent outcomes for the LLM.
+///
+/// Both `persist_sub_agent_results` carriers (the `spawn_agents` `tool_result`
+/// and the standalone assistant text message) feed the model this same text.
+fn render_sub_agent_summary(results: &[SubAgentResult]) -> String {
+    let body = results
+        .iter()
+        .map(|r| {
+            let outcome = match &r.outcome {
+                SubAgentOutcome::Success { result } => format!("Result: {result}"),
+                SubAgentOutcome::Failure { error, .. } => format!("Failed: {error}"),
+                SubAgentOutcome::TimedOut => {
+                    "Timed out: sub-agent exceeded its time limit".to_string()
+                }
+            };
+            format!("Task: \"{}\"\n{outcome}", r.task)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!("Sub-agent results ({} completed):\n\n{body}", results.len())
 }
 
 /// Decide whether `path` is inside the worktree rooted at `root`.
@@ -2130,7 +2161,9 @@ where
         let entering_llm_requesting_from_tool_round =
             matches!(
                 old_state,
-                ConvState::ToolExecuting { .. } | ConvState::AwaitingSubAgents { .. }
+                ConvState::ToolExecuting { .. }
+                    | ConvState::AwaitingSubAgents { .. }
+                    | ConvState::CancellingSubAgents { .. }
             ) && matches!(self.state, ConvState::LlmRequesting { .. });
 
         if !(entering_idle || entering_llm_requesting_from_tool_round)
@@ -2160,84 +2193,56 @@ where
         )
     }
 
-    /// Handle sub-agent timeout: cancel all pending agents and inject `TimedOut` results.
+    /// Handle the `AwaitingSubAgents` completion timeout (REQ-SA-006) by routing
+    /// it through the cancellation protocol rather than racing it.
     ///
     /// Dispatched by `handle_deadline_expiry` when the liveness deadline fires in
-    /// `AwaitingSubAgents` (REQ-SA-006). The deadline is already cleared by the
-    /// dispatcher.
+    /// `AwaitingSubAgents`; the deadline is already cleared by the dispatcher.
     ///
-    // TODO(task 61004): timeout should follow the cancellation protocol, not
-    // race it. Today this both (a) injects a synthetic `TimedOut` per pending
-    // agent — draining the parent out of `AwaitingSubAgents` — and (b) sends a
-    // real cancel. The cancel later produces a *real* `SubAgentResult` that
-    // arrives after the parent has already left `AwaitingSubAgents`, so it is
-    // buffered (`sub_agent_result_buffer`). That late result no longer leaks
-    // into a later round: the buffer-drain on entering `AwaitingSubAgents`
-    // keeps only results whose agent is pending in the entering round and
-    // discards completed-round results. The remaining concern is that a real
-    // success already in flight can be overwritten by the synthetic `TimedOut`.
-    // The correct shape is to inject a single `UserCancel` (→
-    // `CancellingSubAgents`, which emits `Effect::CancelSubAgents`) and let the
-    // real cancelled results drain through `CancellingSubAgents` to `Idle`,
-    // conserving fan-in. The backstop half of that rewrite now exists:
-    // `CancellingSubAgents` has its own liveness deadline
-    // (`handle_cancelling_sub_agents_timeout`), so a cancelled sub-agent that
-    // never reports back can no longer wedge the drain. The remaining work is
-    // routing the timeout through `UserCancel` while preserving the "timed out"
-    // vs "cancelled" semantic the LLM history renders.
+    /// Injecting a single `UserCancel { cause: Timeout }` drives the
+    /// `AwaitingSubAgents + UserCancel -> CancellingSubAgents` transition, which
+    /// emits `Effect::CancelSubAgents` (the real cancel) and stamps
+    /// `cause: Timeout` on the state. Real cancelled results then drain through
+    /// `CancellingSubAgents` — each sub-agent terminates and reports within its
+    /// own 3s `CancellingTool` backstop — and the drain arm labels non-success
+    /// outcomes `TimedOut` per the state's cause. The 6s `CancellingSubAgents`
+    /// last-resort backstop (`handle_cancelling_sub_agents_timeout`) presumes any
+    /// still-pending agent dead after that. This handler no longer sends a direct
+    /// cancel or fabricates per-agent results; the transition owns the cancel.
     async fn handle_sub_agent_timeout(&mut self) {
-        let pending_ids: Vec<(String, String)> =
-            if let ConvState::AwaitingSubAgents { pending, .. } = &self.state {
-                pending
-                    .iter()
-                    .map(|p| (p.agent_id.clone(), p.task.clone()))
-                    .collect()
-            } else {
-                // Deadline fired but state already moved on — nothing to do
-                return;
-            };
+        let pending_count = if let ConvState::AwaitingSubAgents { pending, .. } = &self.state {
+            pending.len()
+        } else {
+            // Deadline fired but state already moved on — nothing to do.
+            return;
+        };
 
         tracing::warn!(
-            count = pending_ids.len(),
-            "Sub-agent timeout reached, cancelling pending agents"
+            count = pending_count,
+            "Sub-agent completion timeout reached, cancelling pending agents via cancel protocol"
         );
 
-        // Cancel the actual sub-agent runtimes
-        if let Some(cancel_tx) = &self.cancel_tx {
-            let ids: Vec<String> = pending_ids.iter().map(|(id, _)| id.clone()).collect();
-            let request = SubAgentCancelRequest {
-                ids,
-                parent_conversation_id: self.context.conversation_id.clone(),
-                parent_event_tx: self.event_tx.clone(),
-            };
-            if let Err(e) = cancel_tx.send(request).await {
-                tracing::error!(error = %e, "Failed to send cancel request for timed-out agents");
-            }
-        }
-
-        // Inject TimedOut results for each pending agent — transitions state normally
-        for (agent_id, _task) in pending_ids {
-            let event = Event::SubAgentResult {
-                agent_id,
-                outcome: SubAgentOutcome::TimedOut,
-            };
-            if let Err(e) = self.process_event(event).await {
-                tracing::warn!(error = %e, "Failed to process timeout result for sub-agent");
-            }
+        let event = Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::Timeout,
+        };
+        if let Err(e) = self.process_event(event).await {
+            tracing::warn!(error = %e, "Failed to process sub-agent timeout cancel");
         }
     }
 
     /// The liveness-deadline duration for a state, or `None` if the state has no
     /// deadline. This is the single place that maps a waiting state to its
     /// backstop duration — `AwaitingSubAgents` gets the 20-minute completion
-    /// timeout (REQ-SA-006); `CancellingTool` and `CancellingSubAgents` get the
-    /// 3-second forced-teardown backstop (REQ-BED-005a).
+    /// timeout (REQ-SA-006); `CancellingTool` gets the 3-second forced-teardown
+    /// backstop (REQ-BED-005a); `CancellingSubAgents` gets a 6-second last-resort
+    /// backstop (2× the 3s sub-agent `CancellingTool` deadline) so real cancelled
+    /// results win the drain before the parent presumes a vanished runtime dead.
     fn deadline_for(state: &ConvState) -> Option<Duration> {
         match state {
             ConvState::AwaitingSubAgents { .. } => Some(DEFAULT_SUBAGENT_TIMEOUT),
-            ConvState::CancellingTool { .. } | ConvState::CancellingSubAgents { .. } => {
-                Some(CANCELLATION_DEADLINE)
-            }
+            ConvState::CancellingTool { .. } => Some(CANCELLATION_DEADLINE),
+            ConvState::CancellingSubAgents { .. } => Some(CANCELLING_SUBAGENTS_DEADLINE),
             _ => None,
         }
     }
@@ -2251,9 +2256,9 @@ where
     /// the prior two-field design: an `AwaitingSubAgents → AwaitingSubAgents`
     /// self-transition (a sub-agent resolving while others remain) keeps the
     /// original 20-minute window rather than restarting it, and a
-    /// `CancellingSubAgents → CancellingSubAgents` drain keeps its 3-second
+    /// `CancellingSubAgents → CancellingSubAgents` drain keeps its 6-second
     /// window. An `AwaitingSubAgents → CancellingSubAgents` cancel re-arms to the
-    /// 3-second backstop — the variant changed, so the cancellation window
+    /// 6-second backstop — the variant changed, so the cancellation window
     /// replaces the long completion window.
     fn manage_deadline(&mut self, old_state: &ConvState) {
         // Leaving CancellingTool ends the tool round; drop the retained handle so
@@ -2305,19 +2310,21 @@ where
         }
     }
 
-    /// Handle the cancellation backstop firing in `CancellingSubAgents`
-    /// (REQ-BED-005a `CancellingSubAgentsDeadlineFires`): a sub-agent that never
-    /// reported back after being cancelled has held the parent in
-    /// `CancellingSubAgents` past the bounded deadline. Force the drain to Idle
-    /// without waiting for stragglers by injecting a synthetic `TimedOut` result
-    /// per still-pending sub-agent — the same synthetic-injection approach
-    /// `handle_sub_agent_timeout` uses to drain `AwaitingSubAgents`. Draining the
-    /// last pending result reaches Idle via the
-    /// `CancellingSubAgents + SubAgentResult (last one) -> Idle` transition arm.
+    /// Handle the 6-second last-resort backstop firing in `CancellingSubAgents`
+    /// (REQ-BED-005a `CancellingSubAgentsDeadlineFires`). By the time this fires,
+    /// real cancelled results have had 3s+ (the sub-agent's own `CancellingTool`
+    /// backstop) to arrive, so any still-pending sub-agent is presumed gone —
+    /// its runtime has genuinely vanished. Inject a generic `Failure { Cancelled
+    /// }` per still-pending agent; the `CancellingSubAgents + SubAgentResult`
+    /// drain arm maps that by the state's recorded `cause` (a timeout-caused
+    /// teardown renders `TimedOut`, a user cancel renders `Failure { Cancelled
+    /// }`), so this handler does not hardcode the label. Releasing the one-writer
+    /// reservation as each result drains is safe because the agent is presumed
+    /// dead. The last pending result resolves `CancellingSubAgents -> Idle`.
     async fn handle_cancelling_sub_agents_timeout(&mut self) {
-        let pending_ids: Vec<String> =
-            if let ConvState::CancellingSubAgents { pending, .. } = &self.state {
-                pending.iter().map(|p| p.agent_id.clone()).collect()
+        let (pending_ids, cause): (Vec<String>, crate::state_machine::event::CancelCause) =
+            if let ConvState::CancellingSubAgents { pending, cause, .. } = &self.state {
+                (pending.iter().map(|p| p.agent_id.clone()).collect(), *cause)
             } else {
                 // Deadline fired but state already moved on — nothing to do.
                 return;
@@ -2326,17 +2333,25 @@ where
         tracing::warn!(
             conv_id = %self.context.conversation_id,
             count = pending_ids.len(),
-            deadline_secs = CANCELLATION_DEADLINE.as_secs(),
-            "Cancellation backstop fired — sub-agents did not report back within the \
-             deadline; forcing teardown to Idle without waiting for stragglers"
+            deadline_secs = CANCELLING_SUBAGENTS_DEADLINE.as_secs(),
+            "Cancellation last-resort backstop fired — sub-agents did not report back within the \
+             deadline; presuming them terminated and forcing teardown to Idle"
         );
 
-        // Inject a synthetic TimedOut per pending sub-agent so the parent drains
-        // to Idle. The last one resolves CancellingSubAgents -> Idle.
+        // Inject a generic Failure{Cancelled} per still-pending sub-agent so the
+        // parent drains out of CancellingSubAgents. The drain arm relabels by the
+        // state's `cause` (Timeout -> TimedOut, UserRequested -> Failure{Cancelled})
+        // and the last one resolves by cause: Timeout resumes to LlmRequesting,
+        // UserRequested settles to Idle.
         for agent_id in pending_ids {
             let event = Event::SubAgentResult {
                 agent_id,
-                outcome: SubAgentOutcome::TimedOut,
+                outcome: SubAgentOutcome::Failure {
+                    error: "sub-agent did not report within the cancellation deadline \
+                            (presumed terminated)"
+                        .to_string(),
+                    error_kind: crate::db::ErrorKind::Cancelled,
+                },
             };
             if let Err(e) = self.process_event(event).await {
                 tracing::warn!(error = %e, "Failed to process cancellation backstop SubAgentResult");
@@ -2348,7 +2363,13 @@ where
         // after the work it describes. History replays by `sequence_id`; a
         // lower sequence would make the notice appear before (or transiently
         // instead of) the cancelled tool/sub-agent rounds on reconnect/replay.
-        self.broadcast_cancellation_backstop_message().await;
+        //
+        // Only a user-requested cancel actually stops the conversation; a
+        // completion timeout drains and resumes the parent's LLM turn, so the
+        // "cancellation completed" notice would be wrong there.
+        if cause == crate::state_machine::event::CancelCause::UserRequested {
+            self.broadcast_cancellation_backstop_message().await;
+        }
     }
 
     /// Persist+broadcast the user-visible "cancellation completed" system
@@ -2549,6 +2570,7 @@ where
             .event_tx
             .send(Event::UserCancel {
                 reason: Some(format!("parent_tool_cycle_cap_exceeded ({cap})")),
+                cause: crate::state_machine::event::CancelCause::UserRequested,
             })
             .await;
     }
@@ -3976,8 +3998,10 @@ where
         Ok(None)
     }
 
-    /// Persist aggregated sub-agent results: update the `spawn_agents` message
-    /// content and `display_data`, or create a standalone summary message.
+    /// Persist aggregated sub-agent results. With a `spawn_tool_id`, update the
+    /// originating `spawn_agents` tool message's content and `display_data`.
+    /// Without one, persist a standalone meta-user summary — never a fabricated
+    /// `tool_result`, which would be an orphan with no matching `tool_use`.
     async fn persist_sub_agent_results(
         &mut self,
         results: Vec<SubAgentResult>,
@@ -3989,36 +4013,19 @@ where
             "results": results
         });
 
+        // Human-readable summary of sub-agent outcomes for the LLM. Both branches
+        // feed the model the same text; only the carrier differs (tool_result vs
+        // assistant text).
+        let llm_content = render_sub_agent_summary(&results);
+
         // If we have a spawn_tool_id, update its message's content (for LLM history)
         // and display_data (for UI).
         if let Some(tool_id) = spawn_tool_id {
             let message_id = tool_result_message_id(&tool_id);
 
-            // Build a human-readable summary of sub-agent outcomes for the LLM.
-            // This replaces the initial "Spawning N sub-agents..." acknowledgement so
-            // build_llm_messages_static feeds the actual results to the model.
-            let llm_content = results
-                .iter()
-                .map(|r| {
-                    let outcome = match &r.outcome {
-                        SubAgentOutcome::Success { result } => {
-                            format!("Result: {result}")
-                        }
-                        SubAgentOutcome::Failure { error, .. } => {
-                            format!("Failed: {error}")
-                        }
-                        SubAgentOutcome::TimedOut => {
-                            "Timed out: sub-agent exceeded its time limit".to_string()
-                        }
-                    };
-                    format!("Task: \"{}\"\n{outcome}", r.task)
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            let llm_content = format!(
-                "Sub-agent results ({} completed):\n\n{llm_content}",
-                results.len()
-            );
+            // This summary replaces the initial "Spawning N sub-agents..."
+            // acknowledgement so build_llm_messages_static feeds the actual
+            // results to the model.
 
             // Both writes must succeed before broadcasting. Otherwise the client
             // would see state the DB can't corroborate on reconnect (full resync
@@ -4058,14 +4065,16 @@ where
                 duration_ms: None,
             });
         } else {
-            // No spawn_tool_id - create a standalone summary message
-            // This happens when spawn_agents wasn't the last tool in a batch
-            let summary_text = format!("{} sub-agent(s) completed", results.len());
-            let content = crate::db::MessageContent::tool(
-                uuid::Uuid::new_v4().to_string(),
-                &summary_text,
-                false,
-            );
+            // No spawn_tool_id: spawn_agents wasn't the last tool in the batch, so
+            // there is no assistant tool_use to pair a tool_result against. Persist
+            // the summary as a META USER observation: it renders as user role
+            // (render_messages), so the model RESPONDS to the results instead of
+            // continuing them (an assistant-role message would leave the turn on
+            // the assistant side, to be extended rather than answered). It carries
+            // no tool id, so it can never be an orphan tool_result, and `is_meta`
+            // keeps the UI distinguishing it from real user input.
+            let content =
+                crate::db::MessageContent::User(crate::db::UserContent::meta(&llm_content));
             let msg_id = uuid::Uuid::new_v4().to_string();
             let seq = self.broadcast_tx.next_seq();
             let message = self
@@ -4080,7 +4089,7 @@ where
                 )
                 .await?;
 
-            // Broadcast the new message (tool message, no bash enrichment needed)
+            // Broadcast the new message (meta user observation, no bash enrichment needed)
             let _ = self.broadcast_tx.send_message(message);
         }
 
@@ -7341,6 +7350,52 @@ mod steer_drain_detector_tests {
         assert!(rt.steering_queue.is_empty());
     }
 
+    /// Fix B/C: `persist_sub_agent_results(_, None)` must persist a NON-tool
+    /// message. A fabricated `tool_result` (random id, no matching `tool_use`) is an
+    /// orphan the provider rejects; the `None` branch must instead emit an
+    /// assistant text summary that renders into LLM history. This pins that the
+    /// orphan branch is gone.
+    #[tokio::test]
+    async fn persist_sub_agent_results_none_emits_non_tool_message() {
+        use crate::db::MessageContent;
+
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-persist-none",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+
+        let results = vec![SubAgentResult {
+            agent_id: "a".to_string(),
+            task: "investigate".to_string(),
+            outcome: SubAgentOutcome::TimedOut,
+        }];
+        rt.persist_sub_agent_results(results, None)
+            .await
+            .expect("persist must succeed");
+
+        let msgs = storage.get_all_messages("conv-persist-none");
+        assert_eq!(msgs.len(), 1, "exactly one summary message persisted");
+        let MessageContent::User(user_content) = &msgs[0].content else {
+            panic!(
+                "expected a non-tool meta-User message, got {:?} (a tool_result here would be an orphan)",
+                msgs[0].content.message_type()
+            );
+        };
+        let rendered = render_messages(&msgs, &std::collections::HashSet::new());
+        assert_eq!(rendered.len(), 1, "the summary must reach LLM history");
+        assert_eq!(
+            rendered[0].role,
+            MessageRole::User,
+            "delivered as a user observation so the model RESPONDS to the results rather than continuing them"
+        );
+        let text = format!("{user_content:?}");
+        assert!(
+            text.contains("Timed out") && text.contains("investigate"),
+            "the summary must carry the per-result outcome, got: {text}"
+        );
+    }
+
     /// Regression (task 61005): a `SubAgentResult` buffered from an earlier
     /// batch in the same awaiting-round must survive a subsequent
     /// `spawn_agents` dispatch and be delivered when the parent enters
@@ -7548,6 +7603,196 @@ mod steer_drain_detector_tests {
         assert!(
             rt.sub_agent_result_buffer.is_empty(),
             "buffer empty after drain — stale entry discarded, current entry drained"
+        );
+    }
+
+    /// Build a `CancellingSubAgents` state pending on the given agent ids (all
+    /// Work mode) with the given cause.
+    fn mk_cancelling_sub_agents(
+        agent_ids: &[&str],
+        cause: crate::state_machine::event::CancelCause,
+    ) -> ConvState {
+        ConvState::CancellingSubAgents {
+            pending: agent_ids
+                .iter()
+                .map(|id| PendingSubAgent {
+                    agent_id: (*id).to_string(),
+                    task: format!("task {id}"),
+                    mode: SubAgentMode::Work,
+                })
+                .collect(),
+            completed_results: vec![],
+            cause,
+            // Default to a real spawn id so the last-one drain still persists
+            // results (exercising the common AwaitingSubAgents-origin path).
+            spawn_tool_id: Some("spawn-1".to_string()),
+        }
+    }
+
+    /// Test 4 (part A): the one-writer reservation is released ONLY when a
+    /// `SubAgentResult` for the in-flight Work agent is actually processed — not
+    /// merely because the parent is in `CancellingSubAgents`. Seed the counter at
+    /// 1 (a Work agent is in flight), process its result, confirm the counter
+    /// drops to 0.
+    #[tokio::test]
+    async fn one_writer_released_on_confirmed_stop() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-onewriter-release",
+            mk_cancelling_sub_agents(
+                &["w1"],
+                crate::state_machine::event::CancelCause::UserRequested,
+            ),
+            vec![],
+        );
+        rt.active_work_subagents = 1;
+
+        // Before the result drains, the reservation is still held.
+        assert_eq!(
+            rt.active_work_subagents, 1,
+            "reservation held until the Work agent's result is processed"
+        );
+
+        rt.process_event(Event::SubAgentResult {
+            agent_id: "w1".to_string(),
+            outcome: SubAgentOutcome::Failure {
+                error: "cancelled".to_string(),
+                error_kind: crate::db::ErrorKind::Cancelled,
+            },
+        })
+        .await
+        .expect("processing the Work agent's result must succeed");
+
+        assert_eq!(
+            rt.active_work_subagents, 0,
+            "reservation released exactly once when the Work result drained"
+        );
+        assert!(
+            matches!(rt.state, ConvState::Idle),
+            "the last drained result resolves CancellingSubAgents -> Idle, got {}",
+            rt.state.variant_name()
+        );
+    }
+
+    /// Test 4 (part B): after the 6s last-resort presumes a silent Work agent
+    /// dead and injects a synthetic result, the one-writer counter returns to 0
+    /// — no leak. Drives the backstop directly (no real 6s wait).
+    #[tokio::test]
+    async fn one_writer_released_by_last_resort_backstop() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-onewriter-backstop",
+            mk_cancelling_sub_agents(&["w1"], crate::state_machine::event::CancelCause::Timeout),
+            vec![],
+        );
+        rt.active_work_subagents = 1;
+
+        // Fire the last-resort backstop directly (the deadline arm would call
+        // this after 6s).
+        rt.handle_cancelling_sub_agents_timeout().await;
+
+        assert_eq!(
+            rt.active_work_subagents, 0,
+            "presumed-dead teardown must release the one-writer reservation — no leak"
+        );
+        assert!(
+            matches!(rt.state, ConvState::LlmRequesting { .. }),
+            "a Timeout teardown resumes the parent (LlmRequesting), got {}",
+            rt.state.variant_name()
+        );
+    }
+
+    /// Test 5 (mixed drain): two pending Work agents — one reports a real result,
+    /// the other is presumed dead by the last-resort backstop. Exactly one
+    /// decrement each (no double-release, no leak); the parent reaches Idle.
+    #[tokio::test]
+    async fn mixed_drain_real_result_then_backstop_no_double_release() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-mixed-drain",
+            mk_cancelling_sub_agents(
+                &["real", "silent"],
+                crate::state_machine::event::CancelCause::Timeout,
+            ),
+            vec![],
+        );
+        rt.active_work_subagents = 2;
+
+        // "real" reports a genuine Success — fidelity preserved, counter -> 1.
+        rt.process_event(Event::SubAgentResult {
+            agent_id: "real".to_string(),
+            outcome: SubAgentOutcome::Success {
+                result: "did real work".to_string(),
+            },
+        })
+        .await
+        .expect("processing the real result must succeed");
+
+        assert_eq!(
+            rt.active_work_subagents, 1,
+            "exactly one decrement for the real result"
+        );
+        assert!(
+            matches!(rt.state, ConvState::CancellingSubAgents { .. }),
+            "still draining the silent agent, got {}",
+            rt.state.variant_name()
+        );
+
+        // "silent" never reports; the backstop presumes it dead and drains it.
+        rt.handle_cancelling_sub_agents_timeout().await;
+
+        assert_eq!(
+            rt.active_work_subagents, 0,
+            "exactly one decrement for the presumed-dead agent — no double-release, no leak"
+        );
+        assert!(
+            matches!(rt.state, ConvState::LlmRequesting { .. }),
+            "Timeout teardown resumes the parent after both agents drain, got {}",
+            rt.state.variant_name()
+        );
+    }
+
+    /// Double-release / underflow probe: a real result drains a Work agent
+    /// (counter -> 0, agent removed from pending), then a LATE synthetic result
+    /// for the SAME agent arrives. The pending-membership guard means the second
+    /// is a harmless rejected transition that does NOT decrement again — the
+    /// `saturating_sub` floor is never even reached because the guard fires first.
+    #[tokio::test]
+    async fn late_duplicate_result_for_same_agent_does_not_double_release() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-dup-nounder",
+            mk_cancelling_sub_agents(
+                &["w1"],
+                crate::state_machine::event::CancelCause::UserRequested,
+            ),
+            vec![],
+        );
+        rt.active_work_subagents = 1;
+
+        rt.process_event(Event::SubAgentResult {
+            agent_id: "w1".to_string(),
+            outcome: SubAgentOutcome::Failure {
+                error: "cancelled".to_string(),
+                error_kind: crate::db::ErrorKind::Cancelled,
+            },
+        })
+        .await
+        .expect("first result must succeed");
+        assert_eq!(rt.active_work_subagents, 0);
+        assert!(matches!(rt.state, ConvState::Idle));
+
+        // A late duplicate for the same agent. The parent is now Idle, so this is
+        // buffered (Idle can't handle SubAgentResult) rather than re-decrementing.
+        rt.process_event(Event::SubAgentResult {
+            agent_id: "w1".to_string(),
+            outcome: SubAgentOutcome::Failure {
+                error: "late dup".to_string(),
+                error_kind: crate::db::ErrorKind::Cancelled,
+            },
+        })
+        .await
+        .expect("a late duplicate must not error");
+
+        assert_eq!(
+            rt.active_work_subagents, 0,
+            "a late duplicate for an already-drained agent must not decrement again"
         );
     }
 
@@ -8689,9 +8934,12 @@ mod retry_timer_epoch_tests {
         );
         let scheduled_gen = rt.retry_generation;
 
-        rt.process_event(Event::UserCancel { reason: None })
-            .await
-            .expect("cancel transitions");
+        rt.process_event(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .expect("cancel transitions");
         assert!(
             matches!(rt.state, ConvState::Idle),
             "cancel from LlmRequesting goes to Idle, got {:?}",
@@ -8722,9 +8970,12 @@ mod retry_timer_epoch_tests {
             .await
             .expect("retryable error transitions");
         let stale_gen = rt.retry_generation;
-        rt.process_event(Event::UserCancel { reason: None })
-            .await
-            .expect("cancel transitions");
+        rt.process_event(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .expect("cancel transitions");
         assert!(matches!(rt.state, ConvState::Idle));
 
         // The stale timer fires attempt 2 after the turn was cancelled. Its

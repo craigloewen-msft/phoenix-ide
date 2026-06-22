@@ -1,19 +1,24 @@
-The executor outcome plumbing validates outcomes by current state SHAPE only, not by identity/epoch/liveness. Three concrete bugs in this family; the durable fix is to epoch-tag outcomes and turn sender-drop into a typed failure outcome.
+The executor outcome plumbing validated outcomes by current state SHAPE only, not by identity/epoch/liveness. Four concrete bugs in this family; the durable fix is to epoch-tag outcomes, turn sender-drop into a typed failure outcome, and make forced sub-agent teardown follow the real cancellation protocol instead of racing it.
 
-## H2 — retry timers carry no epoch, never cancelled (HIGH, also a token-cost bug)
-Effect::ScheduleRetry spawns a detached sleep -> EffectOutcome::RetryTimeout { attempt } (executor.rs ~1632). Attempt numbers are reused across turns and the only guard is `attempt == retry_attempt`. Cancel-then-resend: stale timer from the old turn passes the guard and fires a second concurrent RequestLlm. dispatch_llm_request has no in-flight check and overwrites llm_task_handle -> two concurrent LLM requests (double token cost); if the duplicate wins the race the wrong response persists. Same hole on the AwaitingContinuation retry path.
-Fix: tag ScheduleRetry/RetryTimeout with a per-turn generation, or store an AbortHandle and cancel on any transition out of the scheduling state.
+All four are now resolved (the last, M1, in the same change that reworked sub-agent forced-teardown). Remaining adjacent gaps are tracked as their own follow-ups (08695, 08693).
 
-## M1 — sub-agent timeout double-delivers (MEDIUM)
-handle_sub_agent_timeout (executor.rs ~1115) injects synthetic TimedOut for each pending agent AND sends a cancel; the cancel produces a second real SubAgentResult that lingers in the buffer and can surface a spurious user-visible SseEvent::Error in a later round. A real success already in flight is overwritten by TimedOut.
-Fix: make timeout follow the cancellation protocol (enter CancellingSubAgents, let real/synthesized results drain) instead of racing.
+## H2 — retry timers carry no epoch, never cancelled — DONE
+`retry_generation` epoch + generation-tagged retry-outcome channel; stale timers are discarded by generation match (`ScheduleRetry`/`RetryTimeout`).
 
-## M2 — sub-agent UserCancel during ToolExecuting skips AbortTool (MEDIUM)
-transition.rs ~2507 matches SubAgentState::Core + UserCancel and goes straight to Failed + NotifyParent with no Effect::AbortTool. A Work-mode sub-agent bash/patch keeps mutating the shared worktree after the parent was told it stopped. Parent path correctly routes through CancellingTool/AbortTool.
-Fix: route sub-agent cancellation from ToolExecuting through the same CancellingTool/AbortTool sequence.
+## M3 — panicked/aborted tool task wedges the conversation forever — DONE
+`forward_tool_outcome`/`forward_llm_outcome` map a dropped oneshot sender to a typed `Failed`/`NetworkError` so a sender-drop can't be silently lost; REQ-BED-005a adds the bounded `CancellingTool` deadline backstop so the "user cancel waits forever" half can't happen. (Residual: a forwarder TASK dropped on runtime shutdown/eviction — not the sender — is tracked as 08693.)
 
-## M3 — panicked tool task wedges the conversation forever (MEDIUM)
-Outcome forwarders are `if let Ok(x) = rx.await` (executor.rs ~2388 tool, ~2186 LLM). If the spawned task panics the oneshot sender drops and nothing is delivered. For tools: ToolExecuting never gets ToolComplete; user cancel moves to CancellingTool which waits forever and rejects all input — unrecoverable until restart. No tool deadline exists.
-Fix: map Err(RecvError) -> ToolExecOutcome::Failed (resp. LlmOutcome::NetworkError) so sender-drop is structurally impossible to lose.
+## M2 — sub-agent UserCancel during ToolExecuting skips AbortTool — DONE
+`UserCancel` is a shared `CoreEvent`; the sub-agent `ToolExecuting + UserCancel -> CancellingTool + AbortTool` arm routes through `CancellingTool` and defers `NotifyParent` until the tool settles, so a Work-mode sub-agent no longer keeps mutating the shared worktree after the parent was told it stopped. No sub-agent-specific short-circuit to `Failed` remains.
+
+## M1 — forced sub-agent teardown races the real runtime — DONE
+Forced teardown (the `AwaitingSubAgents` completion timeout and the cancellation backstop) used to fabricate a synthetic `TimedOut` per pending agent and move on without waiting for the real runtime to stop — overwriting a real success and releasing the REQ-PROJ-008 one-writer reservation before the runtime stopped (the latter was briefly filed as a separate 08695, folded back in here).
+
+Now: forced teardown follows the real cancellation protocol. A typed `CancelCause { UserRequested, Timeout }` rides on `UserCancel` and is stamped onto `CancellingSubAgents`; the completion timeout injects `UserCancel { cause: Timeout }` (the transition emits the real `CancelSubAgents`) rather than fabricating results. Real results drain through `CancellingSubAgents` and finalize each agent — recording its outcome AND releasing its one-writer reservation — only on confirmed termination; the REQ-BED-005a `CancellingSubAgentsDeadlineFires` backstop presumes a never-reporting agent dead (release is then safe). Outcome + terminal are cause-aware: `Timeout` records `TimedOut` (the deadline is a hard contract — even a late success) and resumes the parent (`-> LlmRequesting`, report-and-continue); `UserRequested` keeps the reported outcome and stops (`-> Idle`). `spawn_tool_id` is threaded through `CancellingSubAgents` so results update the real `spawn_agents` tool message instead of minting an orphaned `tool_result`.
+
+## Follow-ups (separate tasks)
+- 08695 — a per-agent `spec.timeout` (distinct from the parent's `AwaitingSubAgents` deadline) is still tagged `UserRequested` at the per-agent timer, so it renders as "cancelled" rather than "timed out"; needs cause threaded through the sub-agent's own `CancellingTool`.
+- 08693 — forwarder task lost on runtime shutdown/eviction (M3 residual).
+- `persist_sub_agent_results`' `None` branch mints a `tool_result` with a random id — a latent orphan for the pre-existing "spawn_agents wasn't the last tool" case; could be hardened to never emit a tool_result without a tool_use.
 
 Found in spiritual-core audit 2026-06-10. Anchors verified by tracing code paths.
