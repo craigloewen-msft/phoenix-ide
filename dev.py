@@ -2568,6 +2568,16 @@ def cmd_qa_meta_viewer() -> None:
     )
 
 
+def cmd_qa_conversation_panel() -> None:
+    """Capture conversation side panel Ladle screenshots into ignored local artifacts."""
+    subprocess.run(
+        ["pnpm", "qa:conversation-panel"],
+        cwd=ROOT / "ui",
+        check=True,
+        env=node_env(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # TLS
 # ---------------------------------------------------------------------------
@@ -7182,6 +7192,7 @@ def main():
     qa_sub = qa_parser.add_subparsers(dest="qa_command", required=True)
     qa_sub.add_parser("grounding-panel", help="Capture grounding panel Ladle screenshots")
     qa_sub.add_parser("meta-viewer", help="Capture MetaViewer edge-state Ladle screenshots")
+    qa_sub.add_parser("conversation-panel", help="Capture conversation side panel Ladle screenshots")
 
     # tls
     tls_parser = sub.add_parser("tls", help="Manage Phoenix HTTPS certificates")
@@ -7273,6 +7284,8 @@ def main():
             cmd_qa_grounding_panel()
         elif args.qa_command == "meta-viewer":
             cmd_qa_meta_viewer()
+        elif args.qa_command == "conversation-panel":
+            cmd_qa_conversation_panel()
     elif args.command == "tls":
         if args.tls_command == "ca":
             cmd_tls_ca(args.dir)

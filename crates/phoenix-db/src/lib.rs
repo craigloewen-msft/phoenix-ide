@@ -437,6 +437,73 @@ impl Database {
 
     /// # Errors
     /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn primary_work_scope_pr_associations(
+        &self,
+        scopes: &[phoenix_core::work_scope::WorkScope],
+    ) -> DbResult<std::collections::HashMap<String, WorkScopePrAssociation>> {
+        if scopes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let mut keys = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for scope in scopes {
+            let (scope_type, scope_value) = work_scope_db_key(scope);
+            let stable_key = scope.stable_key();
+            if seen.insert(stable_key.clone()) {
+                keys.push((stable_key, scope_type.to_string(), scope_value.to_string()));
+            }
+        }
+        if keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT s.scope_type, s.scope_value,
+                    p.work_scope_id, p.repo_owner, p.repo_name, p.pr_number, p.title, p.url, p.state, p.draft,
+                    p.display_state, p.base, p.head, p.github_updated_at, p.first_seen_at, p.last_seen_at
+             FROM work_scopes s
+             JOIN work_scope_pr_associations p ON p.work_scope_id = s.id
+             WHERE (s.scope_type, s.scope_value) IN ",
+        );
+        query.push_tuples(keys.iter(), |mut tuple, (_, scope_type, scope_value)| {
+            tuple.push_bind(scope_type).push_bind(scope_value);
+        });
+
+        let rows = query.build().fetch_all(&self.pool).await?;
+        let mut grouped: std::collections::HashMap<String, Vec<WorkScopePrAssociation>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let scope_type: String = row.get("scope_type");
+            let scope_value: String = row.get("scope_value");
+            let stable_key = match scope_type.as_str() {
+                "Worktree" => {
+                    phoenix_core::work_scope::WorkScope::Worktree(scope_value).stable_key()
+                }
+                "Conversation" => {
+                    phoenix_core::work_scope::WorkScope::Conversation(scope_value).stable_key()
+                }
+                "Global" => phoenix_core::work_scope::WorkScope::Global.stable_key(),
+                _ => continue,
+            };
+            grouped
+                .entry(stable_key)
+                .or_default()
+                .push(row_to_work_scope_pr(&row)?);
+        }
+
+        let mut out = std::collections::HashMap::new();
+        for (stable_key, mut prs) in grouped {
+            sort_work_scope_pr_associations(&mut prs);
+            if let Some(primary) = prs.into_iter().next() {
+                out.insert(stable_key, primary);
+            }
+        }
+        Ok(out)
+    }
+
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn upsert_work_scope_pr_feedback_baseline(
         &self,
         scope: &phoenix_core::work_scope::WorkScope,
@@ -5551,6 +5618,23 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(primary.pr_number, 2);
+
+        let mut primary_by_scope = db
+            .primary_work_scope_pr_associations(&[
+                scope.clone(),
+                scope.clone(),
+                phoenix_core::work_scope::WorkScope::Conversation("missing".to_string()),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(primary_by_scope.len(), 1);
+        assert_eq!(
+            primary_by_scope
+                .remove(&scope.stable_key())
+                .unwrap()
+                .pr_number,
+            2
+        );
     }
 
     #[tokio::test]

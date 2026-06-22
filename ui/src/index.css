@@ -7350,6 +7350,14 @@ html * {
   text-transform: uppercase;
 }
 
+.sidebar-pr-badge {
+  margin-left: 6px;
+  font-size: 9px;
+  line-height: 1.4;
+  padding: 1px 5px;
+  vertical-align: middle;
+}
+
 .sidebar-list {
   flex: 1 1 auto;
   overflow: hidden auto;
@@ -13059,4 +13067,12 @@ button.keyword-search-filepath:hover {
   background:
     linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent-blue) 5%, transparent)),
     var(--bg-primary);
+}
+
+.conversation-panel-fixture-stage {
+  align-items: stretch;
+}
+
+.conversation-panel-fixture-sidebar {
+  height: 100vh;
 }

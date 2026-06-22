@@ -39,6 +39,58 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     expect(store.upsertSnapshot('alpha', conv)).toBe(false);
   });
 
+  it('updates only cached PR when same-timestamp snapshot changes cached PR', () => {
+    const store = new ConversationStore();
+    const base = makeConv('alpha', {
+      updated_at: '2024-06-01T00:00:00Z',
+      browser_session_active: true,
+    });
+    const withPrAndStaleLiveFlag = makeConv('alpha', {
+      updated_at: '2024-06-01T00:00:00Z',
+      browser_session_active: false,
+      cached_pr: {
+        number: 12,
+        title: 'Cached PR',
+        url: 'https://example.test/pr/12',
+        display_state: 'open',
+        base: 'main',
+        head: 'feature',
+      },
+    });
+
+    expect(store.upsertSnapshot('alpha', base)).toBe(true);
+    expect(store.upsertSnapshot('alpha', withPrAndStaleLiveFlag)).toBe(true);
+    const row = store.getSnapshot('alpha').conversation;
+    expect(row?.cached_pr?.number).toBe(12);
+    expect(row?.browser_session_active).toBe(true);
+  });
+
+  it('clears only cached PR when same-timestamp snapshot drops cached PR', () => {
+    const store = new ConversationStore();
+    const withPr = makeConv('alpha', {
+      updated_at: '2024-06-01T00:00:00Z',
+      browser_session_active: true,
+      cached_pr: {
+        number: 12,
+        title: 'Cached PR',
+        url: 'https://example.test/pr/12',
+        display_state: 'open',
+        base: 'main',
+        head: 'feature',
+      },
+    });
+    const withoutPrAndStaleLiveFlag = makeConv('alpha', {
+      updated_at: '2024-06-01T00:00:00Z',
+      browser_session_active: false,
+    });
+
+    expect(store.upsertSnapshot('alpha', withPr)).toBe(true);
+    expect(store.upsertSnapshot('alpha', withoutPrAndStaleLiveFlag)).toBe(true);
+    const row = store.getSnapshot('alpha').conversation;
+    expect(row?.cached_pr).toBeUndefined();
+    expect(row?.browser_session_active).toBe(true);
+  });
+
   it('updates conversation when updated_at advances', () => {
     const store = new ConversationStore();
     const v1 = makeConv('alpha', { updated_at: '2024-06-01T00:00:00Z' });
