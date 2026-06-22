@@ -10,6 +10,12 @@ interface TasksPanelProps {
   conversationId: string | undefined;
   currentTaskId?: string | undefined;
   onTaskClick?: ((task: TaskEntry) => void) | undefined;
+  expanded?: boolean;
+  onToggleExpanded?: (expanded: boolean) => void;
+  groupExpanded?: Record<string, boolean>;
+  onGroupExpandedChange?: (expanded: Record<string, boolean>) => void;
+  scrollTop?: number;
+  onScrollTopChange?: (scrollTop: number) => void;
 }
 
 const STATUS_ORDER: Record<string, number> = {
@@ -31,20 +37,36 @@ const PRIORITY_CLASS: Record<string, string> = {
 
 const TERMINAL_STATUSES = new Set(['done', 'wont-do']);
 
-export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: TasksPanelProps) {
+const DEFAULT_GROUP_EXPANDED: Record<string, boolean> = {
+  'in-progress': true,
+  ready: true,
+  blocked: true,
+  brainstorming: false,
+  done: false,
+  'wont-do': false,
+};
+
+export function TasksPanel({
+  conversationId,
+  currentTaskId,
+  onTaskClick,
+  expanded: controlledExpanded,
+  onToggleExpanded,
+  groupExpanded: controlledGroupExpanded,
+  onGroupExpandedChange,
+  scrollTop,
+  onScrollTopChange,
+}: TasksPanelProps) {
   const navigate = useNavigate();
-  const [expanded, setExpanded] = useState(false);
+  const [internalExpanded, setInternalExpanded] = useState(false);
+  const expanded = controlledExpanded ?? internalExpanded;
+  const setExpanded = onToggleExpanded ?? setInternalExpanded;
   const [tasks, setTasks] = useState<TaskEntry[]>([]);
   const [counts, setCounts] = useState<TaskCountResponse | null>(null);
   const [loading, setLoading] = useState(false);
-  const [groupExpanded, setGroupExpanded] = useState<Record<string, boolean>>({
-    'in-progress': true,
-    ready: true,
-    blocked: true,
-    brainstorming: false,
-    done: false,
-    'wont-do': false,
-  });
+  const [internalGroupExpanded, setInternalGroupExpanded] = useState(DEFAULT_GROUP_EXPANDED);
+  const groupExpanded = controlledGroupExpanded ?? internalGroupExpanded;
+  const setGroupExpanded = onGroupExpandedChange ?? setInternalGroupExpanded;
 
   // Clear both representations on conversation change so a stale count/list from
   // the prior conversation never bleeds across navigation (REQ-TASKS-UI-007).
@@ -99,12 +121,12 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
     ([a], [b]) => (STATUS_ORDER[a] ?? 99) - (STATUS_ORDER[b] ?? 99),
   );
 
+
   const toggleGroup = (status: string) => {
-    setGroupExpanded((prev) => ({ ...prev, [status]: !prev[status] }));
+    setGroupExpanded({ ...groupExpanded, [status]: !groupExpanded[status] });
   };
 
   // Once the full list is loaded (expanded), it is authoritative for the header;
-  // otherwise the lightweight counts drive it. Both carry the same shape and
   // render through the same `taskCountsLabel`, so collapsing/expanding never
   // changes the wording.
   const fullSummary = summarizeTasks(tasks, currentTaskId);
@@ -124,6 +146,8 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
       expanded={expanded}
       attention={(headerCounts?.current ?? false) || (headerCounts?.blocked ?? 0) > 0}
       onToggle={() => setExpanded(!expanded)}
+      scrollTop={scrollTop}
+      onScrollTopChange={onScrollTopChange}
     >
       <div className={`tasks-panel${expanded ? ' is-expanded' : ''}`}>
         {loading && <GroundingState tone="loading">Loading tasks…</GroundingState>}
@@ -201,3 +225,4 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
     </GroundingSection>
   );
 }
+  // otherwise the lightweight counts drive it. Both carry the same shape and

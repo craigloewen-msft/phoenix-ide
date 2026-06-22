@@ -10,16 +10,30 @@ interface SkillsPanelProps {
   onSkillClick?: (skill: SkillEntry) => void;
   expanded?: boolean;
   onToggleExpanded?: (expanded: boolean) => void;
+  expandedGroups?: Set<string> | null;
+  onExpandedGroupsChange?: (groups: Set<string>) => void;
+  scrollTop?: number;
+  onScrollTopChange?: (scrollTop: number) => void;
 }
 
-export function SkillsPanel({ conversationId, onSkillClick, expanded: controlledExpanded, onToggleExpanded }: SkillsPanelProps) {
+export function SkillsPanel({
+  conversationId,
+  onSkillClick,
+  expanded: controlledExpanded,
+  onToggleExpanded,
+  expandedGroups: controlledExpandedGroups,
+  onExpandedGroupsChange,
+  scrollTop,
+  onScrollTopChange,
+}: SkillsPanelProps) {
   const [skills, setSkills] = useState<SkillEntry[]>([]);
   const [internalExpanded, setInternalExpanded] = useState(false);
-  // Use controlled state if provided, otherwise internal
   const expanded = controlledExpanded ?? internalExpanded;
   const setExpanded = onToggleExpanded ?? setInternalExpanded;
-  /** Which groups are expanded (all by default once skills load) */
-  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  const [internalExpandedGroups, setInternalExpandedGroups] = useState<Set<string>>(new Set());
+  const expandedGroups = controlledExpandedGroups ?? internalExpandedGroups;
+  const setExpandedGroups = onExpandedGroupsChange ?? setInternalExpandedGroups;
+  const hasControlledGroups = controlledExpandedGroups !== undefined && controlledExpandedGroups !== null;
 
   useEffect(() => {
     if (!conversationId) {
@@ -34,20 +48,20 @@ export function SkillsPanel({ conversationId, onSkillClick, expanded: controlled
       .then(resp => {
         if (!cancelled) {
           setSkills(resp.skills);
-          // Initialize all groups as expanded
           const groups = groupSkills(resp.skills);
-          setExpandedGroups(new Set(groups.keys()));
+          if (!hasControlledGroups) setExpandedGroups(new Set(groups.keys()));
         }
       })
       .catch(() => {
         if (!cancelled) setSkills([]);
       });
 
-    return () => {
+
+  return () => {
       cancelled = true;
       controller.abort();
     };
-  }, [conversationId]);
+  }, [conversationId, hasControlledGroups, setExpandedGroups]);
 
   const grouped = useMemo(() => groupSkills(skills), [skills]);
 
@@ -58,15 +72,13 @@ export function SkillsPanel({ conversationId, onSkillClick, expanded: controlled
   };
 
   const toggleGroup = (group: string) => {
-    setExpandedGroups(prev => {
-      const next = new Set(prev);
-      if (next.has(group)) {
-        next.delete(group);
-      } else {
-        next.add(group);
-      }
-      return next;
-    });
+    const next = new Set(expandedGroups);
+    if (next.has(group)) {
+      next.delete(group);
+    } else {
+      next.add(group);
+    }
+    setExpandedGroups(next);
   };
 
   return (
@@ -77,6 +89,8 @@ export function SkillsPanel({ conversationId, onSkillClick, expanded: controlled
       count={skills.length}
       expanded={expanded}
       onToggle={() => setExpanded(!expanded)}
+      scrollTop={scrollTop}
+      onScrollTopChange={onScrollTopChange}
     >
       <div className={`skills-panel${expanded ? ' is-expanded' : ''}`}>
         {skills.length === 0 ? (
