@@ -219,24 +219,90 @@ const PATH_LIKE_EXTENSIONS: &[&str] = &[
 ];
 
 /// Determine whether a token after @ looks like an intentional file path reference.
-/// Returns true if the token contains `/` (path separator) or ends with a known
-/// file extension. Returns false for bare words like "username" or "param".
+/// Path references must have a path-token shape before slash/extension heuristics apply.
 fn looks_like_file_path(token: &str) -> bool {
-    // Bazel labels (@repo//pkg:target, @+canonical//...) and URL-ish strings
-    // (@https://...) contain "//". Real file paths do not. Exclude these before
-    // the single-slash check would otherwise match them.
-    if token.contains("//") {
+    if !has_path_token_shape(token) {
         return false;
     }
+
     if token.contains('/') {
         return true;
     }
+
     if let Some(ext) = token.rsplit('.').next() {
-        if ext != token && PATH_LIKE_EXTENSIONS.contains(&ext) {
-            return true;
+        if ext != token {
+            let ext = ext.to_ascii_lowercase();
+            return PATH_LIKE_EXTENSIONS.contains(&ext.as_str());
         }
     }
+
     false
+}
+
+fn has_path_token_shape(token: &str) -> bool {
+    if token.is_empty() || token.contains("//") {
+        return false;
+    }
+
+    if !token.chars().all(is_path_token_char) {
+        return false;
+    }
+
+    if token.ends_with('/')
+        || token.ends_with('.')
+        || token.ends_with(',')
+        || token.ends_with('\'')
+        || token.ends_with(':')
+        || token.ends_with('!')
+    {
+        return false;
+    }
+
+    if token.starts_with('/') {
+        return token
+            .split('/')
+            .skip(1)
+            .all(|component| !component.is_empty() && path_component_has_valid_groups(component));
+    }
+
+    token
+        .split('/')
+        .all(|component| !component.is_empty() && path_component_has_valid_groups(component))
+}
+
+fn path_component_has_valid_groups(component: &str) -> bool {
+    let mut stack = Vec::new();
+    let mut previous_open = None;
+
+    for c in component.chars() {
+        match c {
+            '(' | '[' => stack.push(c),
+            ')' => {
+                if stack.last() != Some(&'(') || previous_open == Some('(') {
+                    return false;
+                }
+                stack.pop();
+            }
+            ']' => {
+                if stack.last() != Some(&'[') || previous_open == Some('[') {
+                    return false;
+                }
+                stack.pop();
+            }
+            _ => {}
+        }
+        previous_open = matches!(c, '(' | '[').then_some(c);
+    }
+
+    stack.is_empty()
+}
+
+fn is_path_token_char(c: char) -> bool {
+    !c.is_control()
+        && !matches!(
+            c,
+            '"' | '`' | ';' | '<' | '>' | '{' | '}' | '\\' | '|' | '?'
+        )
 }
 
 /// Expand all inline references in `text` against `root`.
@@ -937,6 +1003,27 @@ mod tests {
     }
 
     #[test]
+    fn test_fastapi_decorator_passes_through() {
+        let tmp = make_tmp();
+        let input = r#"@app.get("/.well-known/api-catalog", include_in_schema=False)"#;
+        let result = expand(input, &root(tmp.path())).unwrap();
+        assert_eq!(result.llm_text, input);
+    }
+
+    #[test]
+    fn test_pasted_fastapi_route_snippet_passes_through() {
+        let tmp = make_tmp();
+        let input = r#"Can you review this route?
+
+@app.get("/.well-known/api-catalog", include_in_schema=False)
+def api_catalog():
+    return {"ok": True}
+"#;
+        let result = expand(input, &root(tmp.path())).unwrap();
+        assert_eq!(result.llm_text, input);
+    }
+
+    #[test]
     fn test_at_with_extension_treated_as_file_ref() {
         let tmp = make_tmp();
         // This has .md extension -- looks like a file, should try to resolve
@@ -962,15 +1049,82 @@ mod tests {
     }
 
     #[test]
+    fn test_framework_route_paths_expand() {
+        let tmp = make_tmp();
+        fs::create_dir_all(tmp.path().join("app/routes/[slug]")).unwrap();
+        fs::create_dir_all(tmp.path().join("app/routes/(auth)")).unwrap();
+        fs::create_dir_all(tmp.path().join("app/shop/[[...slug]]")).unwrap();
+        fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        fs::create_dir_all(tmp.path().join("data")).unwrap();
+        fs::write(tmp.path().join("app/routes/[slug].tsx"), "slug route").unwrap();
+        fs::write(tmp.path().join("app/routes/[slug]/$id.tsx"), "id route").unwrap();
+        fs::write(
+            tmp.path().join("app/routes/(auth)/login.tsx"),
+            "login route",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("app/shop/[[...slug]]/page.tsx"),
+            "shop route",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("fixtures")).unwrap();
+        fs::write(tmp.path().join("docs/café.md"), "unicode doc").unwrap();
+        fs::write(tmp.path().join("docs/what's-new.md"), "apostrophe doc").unwrap();
+        fs::write(tmp.path().join("docs/important!.md"), "important doc").unwrap();
+        fs::write(tmp.path().join("data/foo,bar.csv"), "comma data").unwrap();
+        fs::write(
+            tmp.path().join("fixtures/2026-06-23T12:00:00Z.json"),
+            "timestamp fixture",
+        )
+        .unwrap();
+
+        let result = expand(
+            "see @app/routes/[slug].tsx and @app/routes/[slug]/$id.tsx and @app/routes/(auth)/login.tsx and @app/shop/[[...slug]]/page.tsx and @docs/café.md and @docs/what's-new.md and @docs/important!.md and @data/foo,bar.csv and @fixtures/2026-06-23T12:00:00Z.json",
+            &root(tmp.path()),
+        )
+        .unwrap();
+
+        assert!(result.llm_text.contains("slug route"));
+        assert!(result.llm_text.contains("id route"));
+        assert!(result.llm_text.contains("login route"));
+        assert!(result.llm_text.contains("shop route"));
+        assert!(result.llm_text.contains("unicode doc"));
+        assert!(result.llm_text.contains("apostrophe doc"));
+        assert!(result.llm_text.contains("important doc"));
+        assert!(result.llm_text.contains("comma data"));
+        assert!(result.llm_text.contains("timestamp fixture"));
+    }
+
+    #[test]
     fn test_looks_like_file_path_function() {
         assert!(looks_like_file_path("src/main.rs"));
         assert!(looks_like_file_path("AGENTS.md"));
         assert!(looks_like_file_path("config.toml"));
         assert!(looks_like_file_path("test.txt"));
+        assert!(looks_like_file_path("foo/bar"));
+        assert!(looks_like_file_path("app/routes/[slug].tsx"));
+        assert!(looks_like_file_path("app/routes/(auth)/login.tsx"));
+        assert!(looks_like_file_path("app/routes/[slug]/$id.tsx"));
+        assert!(looks_like_file_path("app/shop/[[...slug]]/page.tsx"));
+        assert!(looks_like_file_path("docs/café.md"));
+        assert!(looks_like_file_path("docs/what's-new.md"));
+        assert!(looks_like_file_path("docs/important!.md"));
+        assert!(looks_like_file_path("data/foo,bar.csv"));
+        assert!(looks_like_file_path("fixtures/2026-06-23T12:00:00Z.json"));
         assert!(!looks_like_file_path("username"));
         assert!(!looks_like_file_path("param"));
         assert!(!looks_like_file_path("override"));
         assert!(!looks_like_file_path("TODO"));
+        assert!(!looks_like_file_path(
+            "app.get(\"/.well-known/api-catalog\","
+        ));
+        assert!(!looks_like_file_path("src/main.rs,"));
+        assert!(!looks_like_file_path("foo/bar)"));
+        assert!(!looks_like_file_path("notes.md:"));
+        assert!(!looks_like_file_path("app/shop/[[slug]/page.tsx"));
+        assert!(!looks_like_file_path("docs/what's-new.md'"));
+        assert!(!looks_like_file_path("docs/important.md!"));
     }
 
     #[test]

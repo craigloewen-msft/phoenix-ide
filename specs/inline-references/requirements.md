@@ -115,14 +115,18 @@ AND SHALL deliver the fully expanded content to the AI
 
 ### REQ-IR-007: Graceful Handling of Unresolvable Expansion References
 
-WHEN a message contains `@` followed by a token that looks like a file path
-(contains `/` or `.` with a recognized file extension)
+WHEN a message contains `@` followed by a token with a valid path-token shape
+(Unicode path characters, including punctuation inside filenames, balanced
+framework route groups, and no call/prose delimiters or trailing punctuation)
+and that token contains `/` or `.` with a recognized file extension
 AND the referenced file does not exist
 THE SYSTEM SHALL present the user with a clear error identifying the missing file
 AND SHALL NOT send the message until the reference is removed or corrected
 
-WHEN a message contains `@` followed by a token that does NOT look like a
-file path (bare word, email address, `@mention`-style text)
+WHEN a message contains `@` followed by a token that does NOT satisfy the full
+file-reference predicate (for example: bare word, email address,
+`@mention`-style text, code annotation, decorator, malformed route grouping,
+function-call-shaped token, or otherwise non-path-like token)
 THE SYSTEM SHALL treat the `@` as literal text
 AND SHALL send the message without expansion or error
 
@@ -132,9 +136,9 @@ THE SYSTEM SHALL treat the `/` as literal text (no error, no block)
 **Rationale:** `@` appears in email addresses, `@mention` conventions, code
 annotations (`@param`, `@override`), and casual text. Blocking send for
 these false positives is more disruptive than the original risk of silently
-broken references. The heuristic (path-like = intentional reference) catches
-real file references while letting casual `@` usage pass through. `/skill`
-already falls through silently when no skill matches (the token is ignored).
+broken references. The heuristic expands only valid path-token shapes, catching
+real file references while letting casual `@` usage and pasted code pass through.
+`/skill` already falls through silently when no skill matches (the token is ignored).
 `./path` references are not validated at send time (see REQ-IR-008).
 
 ---
