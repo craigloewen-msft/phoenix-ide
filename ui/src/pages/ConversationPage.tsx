@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState, useEffect, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react';
+import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type FileAttachment, type ImageData } from '../api';
 import { refreshModels } from '../modelsPoller';
@@ -221,6 +221,32 @@ function ConversationPageContent() {
     collapseThreshold: 280,
   });
 
+  // The viewer pane (`--viewer-pane-width`) and the terminal pane
+  // (`--terminal-pane-height`, read by `TerminalPanel`) are sized from CSS
+  // variables on `#app`. Each variable is owned imperatively (NOT via the React
+  // `style` prop) by exactly two writers that never run concurrently: a layout
+  // effect that syncs it to committed pane state, and the matching divider's
+  // live-drag channel. Driving them from the style prop instead would let an
+  // unrelated re-render mid-drag (streaming, heartbeat) clobber the live size
+  // and snap the pane back; an effect's deps are frozen during a drag, so it
+  // cannot fire until the drag commits on pointer-up. The live channel means a
+  // divider drag resizes its pane without re-rendering this page (and the
+  // conversation subtree below it) on every pointer move — React state catches
+  // up once, on pointer-up. See `useResizablePane`'s `onLiveResize`.
+  const appElementRef = useRef<HTMLDivElement | null>(null);
+  useLayoutEffect(() => {
+    appElementRef.current?.style.setProperty(
+      '--viewer-pane-width',
+      `${viewerPane.collapsed ? 0 : viewerPane.size}px`,
+    );
+  }, [viewerPane.collapsed, viewerPane.size]);
+  const handleViewerLiveResize = useCallback((size: number, collapsed: boolean) => {
+    appElementRef.current?.style.setProperty(
+      '--viewer-pane-width',
+      `${collapsed ? 0 : size}px`,
+    );
+  }, []);
+
   // Mobile-only file browser overlay. The prose reader itself reads its
   // open-file state from `fileExplorer.openFileState` (URL-driven), so
   // mobile and desktop share a single source of truth — opening or closing
@@ -317,6 +343,44 @@ function ConversationPageContent() {
     collapseThreshold: 60,
     defaultCollapsed: true,
   });
+
+  // Terminal-pane height live-drag channel — mirrors the viewer pane above.
+  // `TerminalPanel` reads `--terminal-pane-height` (falling back to its `height`
+  // prop); the layout effect syncs it to committed state and the divider's
+  // `onLiveResize` drives it during a drag, so resizing the terminal does not
+  // re-render this page. The xterm fit is driven by a ResizeObserver on the
+  // panel element, so it keeps tracking the live height without React.
+  useLayoutEffect(() => {
+    appElementRef.current?.style.setProperty(
+      '--terminal-pane-height',
+      `${terminalPane.collapsed ? TERMINAL_COLLAPSED_PX : terminalPane.size}px`,
+    );
+  }, [terminalPane.collapsed, terminalPane.size]);
+  const handleTerminalLiveResize = useCallback((size: number, collapsed: boolean) => {
+    appElementRef.current?.style.setProperty(
+      '--terminal-pane-height',
+      `${collapsed ? TERMINAL_COLLAPSED_PX : size}px`,
+    );
+  }, []);
+
+  // Callback ref for `#app`. The layout effects above only re-run on pane-state
+  // changes; the conversation-load path first paints a skeleton `#app` (without
+  // this ref) and mounts the real host later *without* a pane-state change, so
+  // those effects would never seed the variables on the real element. Syncing on
+  // attach (from the latest committed values, held in a ref to keep the callback
+  // stable) guarantees the host opens at the stored width, not the CSS fallback.
+  const paneVarsRef = useRef({ viewerWidth: '', terminalHeight: '' });
+  paneVarsRef.current = {
+    viewerWidth: `${viewerPane.collapsed ? 0 : viewerPane.size}px`,
+    terminalHeight: `${terminalPane.collapsed ? TERMINAL_COLLAPSED_PX : terminalPane.size}px`,
+  };
+  const setAppElement = useCallback((el: HTMLDivElement | null) => {
+    appElementRef.current = el;
+    if (el) {
+      el.style.setProperty('--viewer-pane-width', paneVarsRef.current.viewerWidth);
+      el.style.setProperty('--terminal-pane-height', paneVarsRef.current.terminalHeight);
+    }
+  }, []);
 
   // Credential helper auto-open — shared hook consolidates the pattern.
   const { showAuthPanel, setShowAuthPanel } = useAutoAuth(credentialStatus);
@@ -1163,12 +1227,8 @@ function ConversationPageContent() {
     >
     <div
       id="app"
+      ref={setAppElement}
       className={showSplitPaneViewer ? 'app-split-pane' : undefined}
-      style={
-        showSplitPaneViewer
-          ? ({ ['--viewer-pane-width' as string]: `${viewerPane.collapsed ? 0 : viewerPane.size}px` } as React.CSSProperties)
-          : undefined
-      }
     >
       <div className="conversation-column">
       {seedBreadcrumb}
@@ -1508,7 +1568,7 @@ function ConversationPageContent() {
           <PaneDivider
             orientation="horizontal"
             title="Drag to resize • Double-click to collapse/expand"
-            onPointerDown={(e) => terminalPane.startDrag(e, 'y', true)}
+            onPointerDown={(e) => terminalPane.startDrag(e, 'y', true, handleTerminalLiveResize)}
             onDoubleClick={() => {
               if (terminalPane.collapsed) {
                 terminalPane.expandFromCollapsed();
@@ -1645,7 +1705,7 @@ function ConversationPageContent() {
             aria-valuemax={VIEWER_PANE_MAX}
             aria-valuenow={viewerPane.collapsed ? 0 : viewerPane.size}
             tabIndex={0}
-            onPointerDown={(e) => viewerPane.startDrag(e, 'x', true)}
+            onPointerDown={(e) => viewerPane.startDrag(e, 'x', true, handleViewerLiveResize)}
             onDoubleClick={() => viewerPane.setCollapsed(!viewerPane.collapsed)}
             onKeyDown={(e) => {
               // Keyboard resize for the WAI-ARIA `separator` pattern.
