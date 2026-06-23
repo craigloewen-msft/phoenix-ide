@@ -12,9 +12,10 @@ interface McpStatusPanelProps {
    *  can tell at a glance that something went wrong, vs the green
    *  status path. REQ-NOTIF-002 (specs/notifications/). */
   showError: (message: string, duration?: number) => void;
+  readOnly?: boolean;
 }
 
-export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
+export function McpStatusPanel({ showToast, showError, readOnly = false }: McpStatusPanelProps) {
   const [servers, setServers] = useState<McpServerStatus[]>([]);
   const [expanded, setExpanded] = useState(false);
   const [expandedServers, setExpandedServers] = useState<Set<string>>(new Set());
@@ -88,7 +89,7 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
 
   const handleReload = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (reloading) return;
+    if (readOnly || reloading) return;
     setReloading(true);
     // Open the retry-polling window (bounded by the backend connect timeout)
     // and mark the awaited set unknown until the reload request returns it.
@@ -142,7 +143,7 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
       reloadUntilRef.current = 0;
       awaitingRef.current = null;
     }
-  }, [reloading, fetchStatus, showToast, showError]);
+  }, [readOnly, reloading, fetchStatus, showToast, showError]);
 
   // Clear `reloading` once new content arrives, with a 5s safety timeout to
   // avoid a stuck spinner if the backend connection never emits anything.
@@ -157,6 +158,7 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
   }, [reloading, servers.length]);
 
   const handleToggleEnabled = useCallback(async (serverName: string, currentlyEnabled: boolean) => {
+    if (readOnly) return;
     setTogglingServers(prev => new Set(prev).add(serverName));
     try {
       if (currentlyEnabled) {
@@ -175,7 +177,7 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
         return next;
       });
     }
-  }, [fetchStatus, showToast, showError]);
+  }, [readOnly, fetchStatus, showToast, showError]);
 
   const toggleServer = useCallback((name: string) => {
     setExpandedServers(prev => {
@@ -202,7 +204,7 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
       expanded={expanded}
       attention={summary.attention}
       onToggle={() => setExpanded(!expanded)}
-      action={(servers.length > 0 || pendingOAuth.length > 0) ? (
+      action={!readOnly && (servers.length > 0 || pendingOAuth.length > 0) ? (
         <button
           type="button"
           className={`mcp-panel-reload ${reloading ? 'reloading' : ''}`}
@@ -220,14 +222,18 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
             <div className="mcp-banner-head">
               <span className="mcp-oauth-label">Auth required</span>
               <span className="mcp-banner-name">{s.name}</span>
-              <a
-                href={s.pending_oauth_url}
-                target="_blank"
-                rel="noreferrer"
-                className="mcp-oauth-link"
-              >
-                Sign in &rarr;
-              </a>
+              {readOnly ? (
+                <span className="mcp-oauth-link">Sign-in required</span>
+              ) : (
+                <a
+                  href={s.pending_oauth_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="mcp-oauth-link"
+                >
+                  Sign in &rarr;
+                </a>
+              )}
             </div>
             {s.auth_redirect_warning && (
               <div className="mcp-oauth-warning">
@@ -265,17 +271,17 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
                   </span>
                   <span
                     className={`mcp-server-toggle ${server.enabled ? 'on' : 'off'} ${togglingServers.has(server.name) ? 'toggling' : ''}`}
-                    role="button"
-                    tabIndex={0}
-                    title={server.enabled ? 'Disable server' : 'Enable server'}
+                    role={readOnly ? undefined : 'button'}
+                    tabIndex={readOnly ? undefined : 0}
+                    title={readOnly ? (server.enabled ? 'Enabled' : 'Disabled') : (server.enabled ? 'Disable server' : 'Enable server')}
                     onClick={(e) => {
                       e.stopPropagation();
-                      if (!togglingServers.has(server.name)) {
+                      if (!readOnly && !togglingServers.has(server.name)) {
                         handleToggleEnabled(server.name, server.enabled);
                       }
                     }}
                     onKeyDown={(e) => {
-                      if ((e.key === 'Enter' || e.key === ' ') && !togglingServers.has(server.name)) {
+                      if (!readOnly && (e.key === 'Enter' || e.key === ' ') && !togglingServers.has(server.name)) {
                         e.stopPropagation();
                         handleToggleEnabled(server.name, server.enabled);
                       }

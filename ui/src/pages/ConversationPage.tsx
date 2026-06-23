@@ -71,6 +71,7 @@ const ProcessInspectorPanel = lazy(() =>
 
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useViewerSlot } from '../contexts/ViewerSlotContext';
+import { useConversationReadiness } from '../contexts/useConversationReadiness';
 import {
   ForkProposalsProvider,
   useForkProposals,
@@ -118,8 +119,25 @@ export function ConversationPage() {
   );
 }
 
+function RecoveryBanner({ message, recoveryKind }: { message: string; recoveryKind: string }) {
+  return (
+    <div className="error-input-area">
+      <div className="error-body">
+        <div className="error-body-content">
+          <div className="error-body-title">Recovery required — {recoveryKind}</div>
+          <div className="error-body-details">{message}</div>
+        </div>
+      </div>
+      <div className="error-action-bar">
+        <span className="error-action-hint">This archived conversation is read-only.</span>
+      </div>
+    </div>
+  );
+}
+
 function ConversationPageContent() {
   const { slug } = useParams<{ slug: string }>();
+  const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
   const createConversationWithStore = useCreateConversationWithStore();
 
@@ -134,11 +152,29 @@ function ConversationPageContent() {
   // Derived from atom
   const conversationId = atom.conversationId ?? undefined;
   const conversation = atom.conversation;
+  const [archiveStatusConfirmedConversationId, setArchiveStatusConfirmedConversationId] = useState<string | null>(null);
+  const archiveStatusConfirmed =
+    conversationId !== undefined && archiveStatusConfirmedConversationId === conversationId;
+  const serverArchived = conversation?.archived === true;
+  const cachedIsSafeOffline =
+    !navigator.onLine && conversation?.archived !== true && !archiveStatusConfirmed;
+  const isArchived = serverArchived || (!archiveStatusConfirmed && !cachedIsSafeOffline);
+  const confirmedLive = !!conversationId && (archiveStatusConfirmed || cachedIsSafeOffline) && !serverArchived;
   const prStatusHandle = useConversationPrStatus({
-    conversationId,
+    conversationId: confirmedLive ? conversationId : undefined,
     convModeLabel: conversation?.conv_mode_label,
     branchName: conversation?.branch_name,
   });
+
+  useEffect(() => {
+    setConversationReadiness({
+      conversationId: conversationId ?? null,
+      confirmedLive,
+    });
+    return () => {
+      setConversationReadiness({ conversationId: null, confirmedLive: false });
+    };
+  }, [setConversationReadiness, conversationId, confirmedLive]);
 
   // Page-level state — not conversation data
   const [error, setError] = useState<string | null>(null);
@@ -152,7 +188,8 @@ function ConversationPageContent() {
   // No coordinating effects: the type system enforces the single slot.
   const viewerSlot = useViewerSlot();
   const slotKind = viewerSlot.slot.kind;
-  const diffPresentation = viewerSlot.slot.kind === 'diff' ? viewerSlot.slot.presentation : null;
+  const rawDiffPresentation = viewerSlot.slot.kind === 'diff' ? viewerSlot.slot.presentation : null;
+  const diffPresentation = isArchived ? null : rawDiffPresentation;
   const fullscreenDiffOpen = diffPresentation === 'fullscreen';
   const paneDiffOpen = diffPresentation === 'pane';
   const browserOpen = slotKind === 'browser';
@@ -209,7 +246,7 @@ function ConversationPageContent() {
   }, []);
 
   // App state for offline support
-  const { isOnline, queueOperation } = useAppMachine();
+  const { isOnline, queueOperation, removePendingOperations } = useAppMachine();
 
   // Toast for question panel feedback
   const { toasts, dismissToast, showInfo, showError } = useToast();
@@ -325,29 +362,27 @@ function ConversationPageContent() {
     }
 
     setError(null);
-
-    // Returning navigation: atom already has conversationId — just reconnect SSE.
-    // Reading via ref to avoid adding `atom` to deps (would re-run on every SSE event).
-    if (atomRef.current.conversationId) {
-      return;
-    }
+    setArchiveStatusConfirmedConversationId(null);
+    const hadAtomData = !!atomRef.current.conversationId;
 
     let cancelled = false;
 
     const loadConversation = async () => {
       try {
-        // Step 1: Show cached data immediately
-        const cached = await cacheDB.getConversationBySlug(slug);
-        if (cached && !cancelled) {
-          const cachedMessages = await cacheDB.getMessages(cached.id);
-          dispatch({
-            type: 'set_initial_data',
-            conversationId: cached.id,
-            conversation: cached,
-            messages: cachedMessages,
-            phase: cached.state ? parseConversationState(cached.state) : { type: 'idle' },
-            contextWindow: { used: 0 },
-          });
+        let cached = atomRef.current.conversation;
+        if (!hadAtomData) {
+          cached = await cacheDB.getConversationBySlug(slug);
+          if (cached && !cancelled) {
+            const cachedMessages = await cacheDB.getMessages(cached.id);
+            dispatch({
+              type: 'set_initial_data',
+              conversationId: cached.id,
+              conversation: cached,
+              messages: cachedMessages,
+              phase: cached.state ? parseConversationState(cached.state) : { type: 'idle' },
+              contextWindow: { used: 0 },
+            });
+          }
         }
 
         // Step 2: Fetch authoritative data from network
@@ -369,6 +404,7 @@ function ConversationPageContent() {
                   used: result.context_window_size || 0,
                 },
               });
+              setArchiveStatusConfirmedConversationId(result.conversation.id);
               await cacheDB.putConversation(result.conversation);
               await cacheDB.putMessages(result.messages);
             }
@@ -398,6 +434,42 @@ function ConversationPageContent() {
       cancelled = true;
     };
   }, [slug, navigate, dispatch]);
+
+  useEffect(() => {
+    if (!slug || !conversationId || archiveStatusConfirmed || !isConnected) return;
+    let cancelled = false;
+
+    const confirmArchiveStatus = async () => {
+      try {
+        const result = await api.getConversationBySlug(slug);
+        if (cancelled) return;
+        dispatch({
+          type: 'set_initial_data',
+          conversationId: result.conversation.id,
+          conversation: result.conversation,
+          messages: result.messages,
+          phase: result.conversation.state
+            ? parseConversationState(result.conversation.state)
+            : result.presentation_mode === 'working'
+              ? { type: 'awaiting_llm' }
+              : { type: 'idle' },
+          contextWindow: {
+            used: result.context_window_size || 0,
+          },
+        });
+        setArchiveStatusConfirmedConversationId(result.conversation.id);
+        await cacheDB.putConversation(result.conversation);
+        await cacheDB.putMessages(result.messages);
+      } catch (err) {
+        if (!cancelled) console.warn('Failed to confirm archive status:', err);
+      }
+    };
+
+    void confirmArchiveStatus();
+    return () => {
+      cancelled = true;
+    };
+  }, [slug, conversationId, archiveStatusConfirmed, isConnected, dispatch]);
 
   // Fetch system prompt once when conversationId is known
   useEffect(() => {
@@ -439,12 +511,12 @@ function ConversationPageContent() {
 
   // Auto-open/close task approval overlay on state transitions
   useEffect(() => {
-    if (atom.phase.type === 'awaiting_task_approval') {
+    if (atom.phase.type === 'awaiting_task_approval' && !isArchived) {
       setShowTaskApproval(true);
     } else {
       setShowTaskApproval(false);
     }
-  }, [atom.phase.type]);
+  }, [atom.phase.type, isArchived]);
 
   // Ctrl+` toggles the terminal collapse state. Only blocked when focus is
   // inside the xterm itself — in every other input (chat textarea, etc.)
@@ -504,6 +576,7 @@ function ConversationPageContent() {
       files: FileAttachment[] = []
     ) => {
       if (!conversationId) return;
+      if (isArchived) return;
 
       sendingMessagesRef.current.add(localId);
 
@@ -539,7 +612,7 @@ function ConversationPageContent() {
           // during the offline window. (task 02676)
           await queueOperation({
             type: 'send_message',
-            conversationId,
+              conversationId,
             payload: { text, images: imgs, files, localId },
             createdAt: new Date(),
             retryCount: 0,
@@ -562,11 +635,23 @@ function ConversationPageContent() {
         sendingMessagesRef.current.delete(localId);
       }
     },
-    [conversationId, isOnline, queueOperation, dispatch, markSteeringQueued]
+    [conversationId, isArchived, isOnline, queueOperation, dispatch, markSteeringQueued]
   );
 
   const sendMessageRef = useRef(sendMessage);
   useEffect(() => { sendMessageRef.current = sendMessage; }, [sendMessage]);
+
+  useEffect(() => {
+    if (!serverArchived) return;
+    for (const msg of pendingMessages) {
+      dismiss(msg.localId);
+    }
+    if (conversationId) {
+      void removePendingOperations(conversationId, 'send_message').catch((err) => {
+        console.error('Failed to drop archived pending operations:', err);
+      });
+    }
+  }, [serverArchived, conversationId, pendingMessages, dismiss, removePendingOperations]);
 
   // Send queued messages when connection is restored. Iterate the derived
   // `pendingMessages` (NOT raw `queuedMessages`) so we don't re-POST entries
@@ -574,17 +659,17 @@ function ConversationPageContent() {
   // Skip `steering_queued` messages — they are already held server-side and
   // will be delivered automatically when the conversation reaches Idle.
   useEffect(() => {
-    if (!isConnected || !conversationId) return;
+    if (!isConnected || !conversationId || isArchived) return;
 
     for (const msg of pendingMessages) {
       if (msg.status === 'steering_queued') continue;
       if (sendingMessagesRef.current.has(msg.localId)) continue;
       sendMessageRef.current(msg.localId, msg.text, msg.images, msg.files ?? []);
     }
-  }, [isConnected, conversationId, pendingMessages]);
+  }, [isConnected, conversationId, isArchived, pendingMessages]);
 
   const handleSend = useCallback(async (text: string, attachedImages: ImageData[], attachedFiles: FileAttachment[] = []) => {
-    if (!conversationId) return;
+    if (!conversationId || isArchived) return;
 
     const msg = enqueue(text, attachedImages, attachedFiles);
 
@@ -592,7 +677,7 @@ function ConversationPageContent() {
       // Await so expansion errors propagate back to InputArea (REQ-IR-007)
       await sendMessage(msg.localId, text, attachedImages, attachedFiles);
     }
-  }, [conversationId, enqueue, isConnected, sendMessage]);
+  }, [conversationId, isArchived, enqueue, isConnected, sendMessage]);
 
   const handleRetry = useCallback((localId: string) => {
     const msg = queuedMessages.find((m) => m.localId === localId);
@@ -660,17 +745,17 @@ function ConversationPageContent() {
   );
 
   const handleTriggerContinuation = useCallback(async () => {
-    if (!conversationId) return;
+    if (!conversationId || isArchived) return;
 
     try {
       await api.triggerContinuation(conversationId);
     } catch (err) {
       console.error('Failed to trigger continuation:', err);
     }
-  }, [conversationId]);
+  }, [conversationId, isArchived]);
 
   const handleUpgradeModel = useCallback(async (newModelId: string) => {
-    if (!conversationId || !canChangeModelInState(atom.phase)) return;
+    if (!conversationId || isArchived || !canChangeModelInState(atom.phase)) return;
 
     try {
       await api.upgradeModel(conversationId, newModelId);
@@ -679,7 +764,7 @@ function ConversationPageContent() {
     } catch (err) {
       console.error('Failed to upgrade model:', err);
     }
-  }, [conversationId, atom.phase, showInfo, dispatch]);
+  }, [conversationId, isArchived, atom.phase, showInfo, dispatch]);
 
   // REQ-TERM-020 / REQ-SEED-001: "Let Phoenix set this up for me" handler.
   // TerminalPanel builds the prompt text and hands it off; this owns the API
@@ -722,7 +807,7 @@ function ConversationPageContent() {
   );
 
   const handleApproveTask = async () => {
-    if (!conversationId) return;
+    if (!conversationId || isArchived) return;
     try {
       const result = await api.approveTask(conversationId);
       if (result.first_task) {
@@ -734,7 +819,7 @@ function ConversationPageContent() {
   };
 
   const handleRejectTask = async () => {
-    if (!conversationId) return;
+    if (!conversationId || isArchived) return;
     try {
       await api.rejectTask(conversationId);
     } catch (err) {
@@ -743,7 +828,7 @@ function ConversationPageContent() {
   };
 
   const handleTaskFeedback = async (annotations: string) => {
-    if (!conversationId) return;
+    if (!conversationId || isArchived) return;
     try {
       await api.sendTaskFeedback(conversationId, annotations);
     } catch (err) {
@@ -876,12 +961,21 @@ function ConversationPageContent() {
 
   const convStateForChildren = atom.phase;
   const handleSendTextOnly = useCallback((text: string) => handleSend(text, []), [handleSend]);
-  const handleOpenFiles = useCallback(() => setShowFileBrowser(true), []);
+  const fileRootPath = isArchived || !conversation ? null : (conversation.worktree_path ?? conversation.cwd);
+  const handleOpenFiles = useCallback(() => {
+    if (fileRootPath) setShowFileBrowser(true);
+  }, [fileRootPath]);
+  useEffect(() => {
+    if (!fileRootPath) setShowFileBrowser(false);
+  }, [fileRootPath]);
+  const openFileState = fileRootPath ? fileExplorer.openFileState : null;
+  const browserViewerOpen = !isArchived && browserOpen;
+  const inspectViewerOpen = !isArchived && inspectOpen;
   const stateBarContinuation = useMemo(
-    () => convStateForChildren.type === 'idle'
+    () => !isArchived && convStateForChildren.type === 'idle'
       ? { phase: 'idle' as const, onTrigger: handleTriggerContinuation }
       : { phase: 'unavailable' as const },
-    [convStateForChildren.type, handleTriggerContinuation],
+    [isArchived, convStateForChildren.type, handleTriggerContinuation],
   );
 
   if (error) {
@@ -923,8 +1017,8 @@ function ConversationPageContent() {
   // Wide desktop (≥1280px) renders it as a split-pane sibling inside
   // the main return below (task 08654).
   if (isDesktop && !isWideDesktop) {
-    if (fileExplorer.openFileState) {
-      const prs = fileExplorer.openFileState;
+    if (openFileState) {
+      const prs = openFileState;
       return (
         <div id="app">
           <Suspense fallback={null}>
@@ -955,7 +1049,7 @@ function ConversationPageContent() {
         </div>
       );
     }
-    if (browserOpen && conversationId) {
+    if (browserViewerOpen && conversationId) {
       return (
         <div id="app">
           <Suspense fallback={null}>
@@ -968,7 +1062,7 @@ function ConversationPageContent() {
         </div>
       );
     }
-    if (inspectSlot) {
+    if (inspectViewerOpen && inspectSlot) {
       return (
         <div id="app">
           <Suspense fallback={null}>
@@ -991,7 +1085,7 @@ function ConversationPageContent() {
   // disable with a tooltip. Deliberately no onSendMessage — a stuck
   // conversation exposes only terminal cleanup, never a message-posting action
   // that would reopen the error. One definition, shared by both stuck branches.
-  const stuckCleanupBar = conversationId && (
+  const stuckCleanupBar = conversationId && !isArchived && (
     <WorkControlBar
       conversationId={conversationId}
       convModeLabel={conversation.conv_mode_label}
@@ -1003,6 +1097,7 @@ function ConversationPageContent() {
   );
   const showTerminal =
     !!conversationId &&
+    !isArchived &&
     convStateForChildren.type !== 'terminal' &&
     convStateForChildren.type !== 'handed_off' &&
     convStateForChildren.type !== 'context_exhausted';
@@ -1053,16 +1148,16 @@ function ConversationPageContent() {
   // .conversation-column when wide-desktop and a viewer (file OR diff)
   // is open. CSS in .app-split-pane (index.css) flexes children
   // horizontally.
-  const splitPanePrs = fileExplorer.openFileState;
+  const splitPanePrs = openFileState;
   const showSplitPaneViewer =
     isDesktop
     && isWideDesktop
-    && (splitPanePrs !== null || paneDiffOpen || browserOpen || inspectOpen);
+    && (splitPanePrs !== null || paneDiffOpen || browserViewerOpen || inspectViewerOpen);
 
   return (
     <ForkProposalsProvider
       conversationId={conversationId}
-      originTerminal={isTerminalConversationState(convStateForChildren)}
+      originTerminal={isArchived || isTerminalConversationState(convStateForChildren)}
       onOutcome={handleForkOutcome}
       onError={showError}
     >
@@ -1078,7 +1173,7 @@ function ConversationPageContent() {
       <div className="conversation-column">
       {seedBreadcrumb}
       {parentConvBreadcrumb}
-      {viewerSlot.browserSessionActive && !browserOpen && (
+      {viewerSlot.browserSessionActive && !isArchived && !browserOpen && (
         <div className="browser-view-launcher">
           <button
             type="button"
@@ -1097,10 +1192,10 @@ function ConversationPageContent() {
         pendingMessages={pendingMessages}
         convState={convStateForChildren}
         onRetry={handleRetry}
-        onCancelSteering={handleCancelSteering}
-        onOpenFile={handleOpenFileFromPatch}
+        onCancelSteering={isArchived ? undefined : handleCancelSteering}
+        onOpenFile={isArchived ? undefined : handleOpenFileFromPatch}
         filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
-        workScopeKey={conversation.work_scope_key}
+        workScopeKey={isArchived ? undefined : conversation.work_scope_key}
         conversationId={conversationId}
         slug={slug}
         systemPrompt={atom.systemPrompt ?? undefined}
@@ -1137,7 +1232,7 @@ function ConversationPageContent() {
           </button>
           <div className="context-exhausted-summary">
             <div className="context-exhausted-actions">
-              {conversation.continued_in_conv_id ? (
+              {!isArchived && (conversation.continued_in_conv_id ? (
                 // REQ-BED-030 single-continuation policy: once a parent has a
                 // continuation, the Continue button is replaced with a link to
                 // that continuation. Clicking re-hits the idempotent
@@ -1196,7 +1291,7 @@ function ConversationPageContent() {
                 >
                   Continue in new conversation
                 </button>
-              )}
+              ))}
               <button
                 type="button"
                 className="context-exhausted-copy"
@@ -1243,7 +1338,9 @@ function ConversationPageContent() {
           </button>
         </div>
       )}
-      {convStateForChildren.type === 'awaiting_recovery' ? (
+      {convStateForChildren.type === 'awaiting_recovery' && isArchived ? (
+        <RecoveryBanner message={convStateForChildren.message} recoveryKind={convStateForChildren.recovery_kind} />
+      ) : convStateForChildren.type === 'awaiting_recovery' ? (
         <>
         {credentialStatus && (
           <Suspense fallback={null}>
@@ -1281,8 +1378,8 @@ function ConversationPageContent() {
         <ErrorBanner
           message={convStateForChildren.message}
           error={convStateForChildren.error}
-          onRetry={() => handleSend('continue', [])}
-          onDismiss={() => {
+          onRetry={isArchived ? undefined : () => handleSend('continue', [])}
+          onDismiss={isArchived ? undefined : () => {
             // No optimistic idle: `dismissError` resolves on enqueue, not on
             // persist, so faking idle could diverge if the executor races/
             // rejects. The server-broadcast state_change SSE drives idle.
@@ -1296,7 +1393,7 @@ function ConversationPageContent() {
             banner's quick "retry/continue" so the user is not forced into the
             canned "continue" turn. Gated on can_user_resume to match the
             banner: a non-resumable error stays a dead end. */}
-        {(convStateForChildren.error?.can_user_resume ?? false) && (
+        {(convStateForChildren.error?.can_user_resume ?? false) && !isArchived && (
           <RenderProfiler id="InputArea">
           <ConnectedInputArea
             ref={inputRef}
@@ -1325,10 +1422,11 @@ function ConversationPageContent() {
           questions={convStateForChildren.questions}
           conversationId={conversation.id}
           showToast={showInfo}
+          readOnly={isArchived}
           onAnswered={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}
           onDismissed={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id })}
         />
-      ) : convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'handed_off' && convStateForChildren.type !== 'terminal' ? (
+      ) : !isArchived && convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'handed_off' && convStateForChildren.type !== 'terminal' ? (
         <>
         {conversationId && (
           <WorkControlBar
@@ -1397,7 +1495,7 @@ function ConversationPageContent() {
         phaseStateUpdatedAt={atom.phaseStateUpdatedAt}
         firstByteRequestId={atom.firstByteRequestId}
         turnRetryContext={atom.turnRetryContext}
-        onOpenFiles={isDesktop ? undefined : handleOpenFiles}
+        onOpenFiles={isDesktop || !fileRootPath ? undefined : handleOpenFiles}
         prStatusState={prStatusHandle.state}
       />
       </RenderProfiler>
@@ -1438,7 +1536,7 @@ function ConversationPageContent() {
       )}
 
       {/* Task approval overlay — browser back navigates away; SSE restores state on return. */}
-      {showTaskApproval && atom.phase.type === 'awaiting_task_approval' && (
+      {showTaskApproval && !isArchived && atom.phase.type === 'awaiting_task_approval' && (
         <Suspense fallback={null}>
           <TaskApprovalReader
             title={atom.phase.title}
@@ -1465,26 +1563,28 @@ function ConversationPageContent() {
 
 
       {/* Mobile file browser overlay */}
-      <FileBrowserOverlay
-        isOpen={showFileBrowser}
-        rootPath={conversation.worktree_path ?? conversation.cwd}
-        conversationId={conversation.id}
-        onClose={() => setShowFileBrowser(false)}
-        onFileSelect={handleFileSelect}
-      />
+      {fileRootPath && (
+        <FileBrowserOverlay
+          isOpen={showFileBrowser}
+          rootPath={fileRootPath}
+          conversationId={conversation.id}
+          onClose={() => setShowFileBrowser(false)}
+          onFileSelect={handleFileSelect}
+        />
+      )}
 
       {/* Mobile prose reader overlay — reads URL-driven state from
           FileExplorerProvider so cold reload (e.g. iOS PWA return) restores
           the exact file the user was viewing. */}
-      {!isDesktop && fileExplorer.openFileState && (
+      {!isDesktop && openFileState && (
         <Suspense fallback={null}>
           <FileViewer
-            filePath={fileExplorer.openFileState.path}
-            rootDir={fileExplorer.openFileState.rootDir}
+            filePath={openFileState.path}
+            rootDir={openFileState.rootDir}
             onClose={handleCloseFileViewer}
             onSendNotes={handleSendNotes}
-            patchContext={fileExplorer.openFileState.patchContext ?? undefined}
-            focusLine={fileExplorer.openFileState.focusLine}
+            patchContext={openFileState.patchContext ?? undefined}
+            focusLine={openFileState.focusLine}
           />
         </Suspense>
       )}
@@ -1512,7 +1612,7 @@ function ConversationPageContent() {
       {/* Browser view overlay: same fallback role as the diff overlay above
           — mobile, narrow desktop, or any case where the split pane is
           unavailable. REQ-BT-018. */}
-      {browserOpen && !showSplitPaneViewer && conversationId && (
+      {browserViewerOpen && !showSplitPaneViewer && conversationId && (
         <Suspense fallback={null}>
           <div className="browser-view-overlay">
             <BrowserViewPanel
@@ -1524,7 +1624,7 @@ function ConversationPageContent() {
       )}
       {/* Process inspector overlay: mobile, narrow desktop, or any case where
           the split pane is unavailable (REQ-PINSP-007). */}
-      {inspectSlot && !showSplitPaneViewer && (
+      {inspectViewerOpen && inspectSlot && !showSplitPaneViewer && (
         <Suspense fallback={null}>
           <ProcessInspectorPanel
             scopeKey={inspectSlot.scopeKey}
@@ -1590,13 +1690,13 @@ function ConversationPageContent() {
                   focusLine={splitPanePrs.focusLine}
                   inline
                 />
-              ) : browserOpen && conversationId ? (
+              ) : browserViewerOpen && conversationId ? (
                 <BrowserViewPanel
                   conversationId={conversationId}
                   onClose={handleCloseBrowserView}
                   inline
                 />
-              ) : inspectSlot ? (
+              ) : inspectViewerOpen && inspectSlot ? (
                 <ProcessInspectorPanel
                   scopeKey={inspectSlot.scopeKey}
                   handleId={inspectSlot.handleId}
