@@ -42,6 +42,15 @@ function matchCloseFence(line: string, char: string, minLength: number): boolean
   return re.test(line);
 }
 
+function lineBare(line: string): string {
+  return line.endsWith('\n') ? line.slice(0, -1) : line;
+}
+
+function isMarkdownFenceLang(lang: string): boolean {
+  const normalized = lang.toLowerCase();
+  return normalized === 'markdown' || normalized === 'md' || normalized === 'mdx';
+}
+
 /**
  * Parse a streaming buffer into typed blocks.
  *
@@ -100,6 +109,10 @@ export function parseStreamingBlocks(buffer: string): StreamingBlock[] {
   let fenceChar = '';
   let fenceLength = 0;
   let fenceLang = '';
+  let nestedFenceChar = '';
+  let nestedFenceLength = 0;
+  let nestedContentLineCount = 0;
+  let lastNestedCloseCompletedEmpty = false;
 
   // Accumulators
   let mdAccum = '';
@@ -119,16 +132,48 @@ export function parseStreamingBlocks(buffer: string): StreamingBlock[] {
     fenceChar = '';
     fenceLength = 0;
     fenceLang = '';
+    nestedFenceChar = '';
+    nestedFenceLength = 0;
+    nestedContentLineCount = 0;
+    lastNestedCloseCompletedEmpty = false;
   }
 
-  for (const line of lines) {
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    const line = lines[lineIndex]!;
     // For fence matching, use the line without its trailing newline.
-    const bare = line.endsWith('\n') ? line.slice(0, -1) : line;
+    const bare = lineBare(line);
 
     if (insideFence) {
-      if (matchCloseFence(bare, fenceChar, fenceLength)) {
+      const nestedMarkdownFence = isMarkdownFenceLang(fenceLang) && nestedFenceChar !== '';
+      const nestedOpener = isMarkdownFenceLang(fenceLang) ? matchOpenFence(bare) : null;
+
+      if (nestedMarkdownFence) {
+        codeAccum += line;
+        if (matchCloseFence(bare, nestedFenceChar, nestedFenceLength)) {
+          lastNestedCloseCompletedEmpty = nestedContentLineCount === 0;
+          nestedFenceChar = '';
+          nestedFenceLength = 0;
+          nestedContentLineCount = 0;
+        } else {
+          nestedContentLineCount += 1;
+          lastNestedCloseCompletedEmpty = false;
+        }
+      } else if (nestedOpener) {
+        const shouldStartNested = !matchCloseFence(bare, fenceChar, fenceLength);
+
+        if (shouldStartNested) {
+          nestedFenceChar = nestedOpener.char;
+          nestedFenceLength = nestedOpener.length;
+          nestedContentLineCount = 0;
+          lastNestedCloseCompletedEmpty = false;
+          codeAccum += line;
+        } else {
+          flushCode(true);
+        }
+      } else if (matchCloseFence(bare, fenceChar, fenceLength)) {
         flushCode(true);
       } else {
+        lastNestedCloseCompletedEmpty = false;
         codeAccum += line;
       }
     } else {
@@ -148,7 +193,18 @@ export function parseStreamingBlocks(buffer: string): StreamingBlock[] {
 
   // Emit any open code fence as incomplete
   if (insideFence) {
-    flushCode(false);
+    const trailingBare = lines.length > 0 ? lineBare(lines[lines.length - 1]!) : '';
+    if (
+      isMarkdownFenceLang(fenceLang) &&
+      nestedFenceChar === '' &&
+      lastNestedCloseCompletedEmpty &&
+      matchCloseFence(trailingBare, fenceChar, fenceLength)
+    ) {
+      codeAccum = codeAccum.replace(new RegExp(`\\n?${fenceChar}{${fenceLength},}\\s*$`), '');
+      flushCode(true);
+    } else {
+      flushCode(false);
+    }
   }
 
   // Emit any trailing markdown
