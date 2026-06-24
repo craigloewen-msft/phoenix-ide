@@ -1,6 +1,6 @@
 // Utility functions
 
-import type { ConversationState, RecoveryResumeTarget, ToolCall, PendingSubAgent, SubAgentResult, UserQuestion } from './api';
+import type { CommissionReviewApprovalScope, ConversationState, RecoveryResumeTarget, ToolCall, PendingSubAgent, SubAgentResult, UserQuestion } from './api';
 import { getErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
 
@@ -55,7 +55,7 @@ export function formatShortDateTime(isoStr: string): string {
 export function isAgentWorking(state: ConversationState): boolean {
   switch (state.type) {
     case 'idle': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted':
-    case 'awaiting_task_approval': case 'awaiting_user_response':
+    case 'awaiting_task_approval': case 'awaiting_user_response': case 'awaiting_commission_review_approval':
       return false;
     case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
@@ -69,7 +69,7 @@ export function isAgentWorking(state: ConversationState): boolean {
 export function canCancelConversationState(state: ConversationState): boolean {
   switch (state.type) {
     case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
-    case 'awaiting_sub_agents': case 'awaiting_task_approval': case 'awaiting_recovery':
+    case 'awaiting_sub_agents': case 'awaiting_task_approval': case 'awaiting_commission_review_approval': case 'awaiting_recovery':
       return true;
     case 'idle': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted':
     case 'awaiting_llm': case 'awaiting_continuation': case 'awaiting_user_response':
@@ -84,7 +84,7 @@ export function isCancellingState(state: ConversationState): boolean {
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
       return true;
     case 'idle': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted':
-    case 'awaiting_task_approval': case 'awaiting_user_response':
+    case 'awaiting_task_approval': case 'awaiting_user_response': case 'awaiting_commission_review_approval':
     case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
     case 'awaiting_recovery':
@@ -139,6 +139,7 @@ export function getStateDescription(state: ConversationState): string {
     case 'handed_off':
       return 'handed off';
     case 'awaiting_task_approval':
+    case 'awaiting_commission_review_approval':
       return 'awaiting approval';
     case 'awaiting_user_response':
       // Disambiguated from `llm_requesting`'s "awaiting LLM response":
@@ -172,6 +173,43 @@ function serverError(message: string): ConversationState {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function parseCommissionReviewScope(raw: unknown): CommissionReviewApprovalScope | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return undefined;
+  }
+  const obj = raw as Record<string, unknown>;
+  const kind = obj['kind'];
+  const repoRoot = obj['repo_root'];
+  const base = obj['base'];
+  const head = obj['head'];
+  const dirty = obj['dirty'];
+  const changedFiles = obj['changed_files'];
+  const insertions = obj['insertions'];
+  const deletions = obj['deletions'];
+  if (
+    typeof kind !== 'string' ||
+    typeof repoRoot !== 'string' ||
+    typeof base !== 'string' ||
+    typeof head !== 'string' ||
+    typeof dirty !== 'boolean' ||
+    typeof changedFiles !== 'number' ||
+    typeof insertions !== 'number' ||
+    typeof deletions !== 'number'
+  ) {
+    return undefined;
+  }
+  return {
+    kind,
+    repo_root: repoRoot,
+    base,
+    head,
+    dirty,
+    changed_files: changedFiles,
+    insertions,
+    deletions,
+  };
 }
 
 function parseRecoveryResumeTarget(raw: Record<string, unknown>): RecoveryResumeTarget {
@@ -235,6 +273,32 @@ export function parseConversationState(raw: unknown): ConversationState {
         priority: (obj['priority'] as string) ?? '',
         plan: (obj['plan'] as string) ?? '',
       };
+    case 'awaiting_commission_review_approval': {
+      const request = obj['request'];
+      if (!request || typeof request !== 'object' || Array.isArray(request)) {
+        return invalidRequestError('Invalid commission review approval state: missing request');
+      }
+      const requestObj = request as Record<string, unknown>;
+      const brief = requestObj['brief'];
+      const focus = requestObj['focus'];
+      const allowDirty = requestObj['allow_dirty_working_tree'];
+      if (typeof brief !== 'string' || brief.trim() === '') {
+        return invalidRequestError('Invalid commission review approval state: missing brief');
+      }
+      if (focus !== undefined && focus !== null && typeof focus !== 'string') {
+        return invalidRequestError('Invalid commission review approval state: invalid focus');
+      }
+      if (typeof allowDirty !== 'boolean') {
+        return invalidRequestError('Invalid commission review approval state: invalid dirty-worktree flag');
+      }
+      return {
+        type: 'awaiting_commission_review_approval',
+        brief,
+        focus: focus ?? null,
+        allow_dirty_working_tree: allowDirty,
+        scope: parseCommissionReviewScope(obj['scope']),
+      };
+    }
     case 'awaiting_user_response':
       return {
         type: 'awaiting_user_response',

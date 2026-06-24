@@ -336,6 +336,17 @@ export type RecoveryResumeTarget =
   | { type: 'conversation_turn' }
   | { type: 'continuation_summary'; request: ContinuationSummaryRequest };
 
+export interface CommissionReviewApprovalScope {
+  kind: string;
+  repo_root: string;
+  base: string;
+  head: string;
+  dirty: boolean;
+  changed_files: number;
+  insertions: number;
+  deletions: number;
+}
+
 export type ConversationState =
   | { type: 'idle' }
   | { type: 'awaiting_llm' }
@@ -348,6 +359,13 @@ export type ConversationState =
   | { type: 'cancelling_tool'; current_tool: ToolCall }
   | { type: 'cancelling_sub_agents'; pending: PendingSubAgent[] }
   | { type: 'awaiting_task_approval'; title: string; priority: string; plan: string }
+  | {
+      type: 'awaiting_commission_review_approval';
+      brief: string;
+      focus?: string | null;
+      allow_dirty_working_tree: boolean;
+      scope: CommissionReviewApprovalScope | undefined;
+    }
   | { type: 'awaiting_user_response'; questions: UserQuestion[] }
   | { type: 'context_exhausted'; summary: string }
   | { type: 'handed_off'; successor_conv_id: string }
@@ -383,6 +401,7 @@ export function isTerminalConversationState(state: ConversationState): boolean {
     case 'cancelling_tool':
     case 'cancelling_sub_agents':
     case 'awaiting_task_approval':
+    case 'awaiting_commission_review_approval':
     case 'awaiting_user_response':
     case 'error':
     case 'awaiting_recovery':
@@ -403,6 +422,7 @@ function getDisplayState(stateType: string | undefined): 'idle' | 'working' | 'e
     case 'error': return 'error';
     case 'context_exhausted': return 'idle';
     case 'awaiting_task_approval': return 'awaiting-approval';
+    case 'awaiting_commission_review_approval': return 'awaiting-approval';
     case 'awaiting_user_response': return 'awaiting-approval';
     default: return stateType ? 'working' : 'idle';
   }
@@ -1539,6 +1559,18 @@ export const api = {
   async rejectTask(convId: string): Promise<{ success: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/reject-task`, { method: 'POST' });
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to reject task'); }
+    return resp.json();
+  },
+
+  async approveCommissionReview(convId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/approve-commission-review`, { method: 'POST' });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to approve commission review'); }
+    return resp.json();
+  },
+
+  async rejectCommissionReview(convId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/reject-commission-review`, { method: 'POST' });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to reject commission review'); }
     return resp.json();
   },
 

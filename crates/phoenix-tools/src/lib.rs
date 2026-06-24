@@ -6,6 +6,7 @@ mod ask_user_question;
 pub mod bash;
 pub mod bash_check;
 pub mod browser;
+mod commission_review;
 mod keyword_search;
 pub mod mcp;
 pub mod patch;
@@ -33,6 +34,7 @@ pub use browser::{
     BrowserResizeTool, BrowserSessionManager, BrowserTakeScreenshotTool, BrowserTypeTool,
     BrowserWaitForSelectorTool,
 };
+pub use commission_review::CommissionReviewTool;
 pub use keyword_search::KeywordSearchTool;
 pub use patch::PatchTool;
 pub use propose_task::ProposeTaskTool;
@@ -95,6 +97,12 @@ pub struct ToolImage {
     pub data: String, // base64-encoded
 }
 
+#[derive(Debug, Clone)]
+pub struct ToolLlmUsage {
+    pub model: String,
+    pub usage: phoenix_core::domain::llm_types::Usage,
+}
+
 /// Result from tool execution.
 ///
 /// An enum, not a `struct { success: bool, output: String, .. }`: those two
@@ -118,11 +126,13 @@ pub enum ToolOutput {
         /// not text).
         images: Vec<ToolImage>,
         display_data: Option<Value>,
+        llm_usage: Option<Box<ToolLlmUsage>>,
     },
     Error {
         output: String,
         images: Vec<ToolImage>,
         display_data: Option<Value>,
+        llm_usage: Option<Box<ToolLlmUsage>>,
     },
 }
 
@@ -132,6 +142,7 @@ impl ToolOutput {
             output: output.into(),
             images: vec![],
             display_data: None,
+            llm_usage: None,
         }
     }
 
@@ -140,6 +151,7 @@ impl ToolOutput {
             output: message.into(),
             images: vec![],
             display_data: None,
+            llm_usage: None,
         }
     }
 
@@ -153,7 +165,25 @@ impl ToolOutput {
         self
     }
 
-    /// Attach typed images for LLM consumption.
+    /// Attach tool-spent LLM usage for runtime accounting.
+    #[must_use]
+    pub fn with_llm_usage(mut self, usage: ToolLlmUsage) -> Self {
+        match &mut self {
+            Self::Success { llm_usage, .. } | Self::Error { llm_usage, .. } => {
+                *llm_usage = Some(Box::new(usage));
+            }
+        }
+        self
+    }
+
+    pub fn take_llm_usage(&mut self) -> Option<ToolLlmUsage> {
+        match self {
+            Self::Success { llm_usage, .. } | Self::Error { llm_usage, .. } => {
+                llm_usage.take().map(|usage| *usage)
+            }
+        }
+    }
+
     #[must_use]
     pub fn with_images(mut self, imgs: Vec<ToolImage>) -> Self {
         match &mut self {
@@ -604,6 +634,14 @@ impl ToolRegistry {
         self
     }
 
+    /// Add `commission_review` where Phoenix can infer a git-backed review target
+    /// and gate execution through parent approval.
+    #[must_use]
+    pub fn with_commission_review(mut self) -> Self {
+        self.tools.push(Arc::new(CommissionReviewTool));
+        self
+    }
+
     /// Tool registry for Explore-mode sub-agents (REQ-PROJ-008).
     /// Read-only tools + `submit_result`/`submit_error`. No bash, no tmux, no
     /// patch, no spawn, no `ask_user`, no skill, no `propose_task`.
@@ -883,6 +921,7 @@ mod tests {
         assert!(direct.contains("patch"));
         assert!(direct.contains("tmux_run"));
         assert!(direct.contains("tmux"));
+        assert!(!direct.contains("commission_review"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(direct.contains(*tool), "Direct missing {tool}");
         }
@@ -896,8 +935,13 @@ mod tests {
         // always, Direct-in-a-git-repo conditionally — REQ-PROJ-036). Adds
         // propose_task on top of the full suite; the base `direct()` stays
         // propose_task-free above.
-        let direct_fork = names(&ToolRegistry::direct(Vec::new()).with_propose_task());
+        let direct_fork = names(
+            &ToolRegistry::direct(Vec::new())
+                .with_propose_task()
+                .with_commission_review(),
+        );
         assert!(direct_fork.contains("propose_task"));
+        assert!(direct_fork.contains("commission_review"));
         assert!(direct_fork.contains("bash"));
         assert!(direct_fork.contains("patch"));
 
@@ -908,6 +952,7 @@ mod tests {
         assert!(work.contains("tmux_run"));
         assert!(work.contains("tmux"));
         assert!(work.contains("propose_task"));
+        assert!(!work.contains("commission_review"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(work.contains(*tool), "Work missing {tool}");
         }
@@ -923,6 +968,7 @@ mod tests {
         assert!(!explore.contains("bash"));
         assert!(!explore.contains("tmux_run"));
         assert!(!explore.contains("tmux"));
+        assert!(!explore.contains("commission_review"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(
                 !explore.contains(*tool),
@@ -953,6 +999,7 @@ mod tests {
         assert!(!sub_explore.contains("spawn_agents"));
         assert!(!sub_explore.contains("ask_user_question"));
         assert!(!sub_explore.contains("propose_task"));
+        assert!(!sub_explore.contains("commission_review"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(
                 !sub_explore.contains(*tool),
@@ -975,6 +1022,7 @@ mod tests {
         assert!(sub_work.contains("submit_result"));
         assert!(!sub_work.contains("spawn_agents"));
         assert!(!sub_work.contains("propose_task"));
+        assert!(!sub_work.contains("commission_review"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(
                 !sub_work.contains(*tool),
