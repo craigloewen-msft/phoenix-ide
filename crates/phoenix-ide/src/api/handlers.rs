@@ -453,6 +453,7 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
             conv.conv_mode.worktree_path().map(std::path::Path::new),
         )
         .stable_key(),
+        cached_pr: None,
         inner: conv.clone(),
     }
 }
@@ -466,8 +467,12 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
 async fn enrich_conversation_with_seed(
     state: &AppState,
     conv: &crate::db::Conversation,
-) -> crate::runtime::EnrichedConversation {
+    include_cached_pr: bool,
+) -> Result<crate::runtime::EnrichedConversation, AppError> {
     let mut enriched = enrich_conversation_with_runtime(state, conv);
+    if include_cached_pr {
+        enriched.cached_pr = cached_pr_summary_for_conversation(state, conv).await?;
+    }
     if let Some(parent_id) = conv.seed_parent_id.as_deref() {
         if let Ok(parent) = state.runtime.db().get_conversation(parent_id).await {
             enriched.seed_parent_slug = parent.slug;
@@ -496,7 +501,7 @@ async fn enrich_conversation_with_seed(
         .browser_sessions()
         .is_active(&work_scope)
         .await;
-    enriched
+    Ok(enriched)
 }
 
 /// Build an `EnrichedConversation` and apply runtime-derived fields that are
@@ -547,21 +552,37 @@ fn conversation_work_scope(conv: &crate::db::Conversation) -> crate::work_scope:
     )
 }
 
-fn sidebar_cached_pr_summary(pr: &crate::db::WorkScopePrAssociation) -> Value {
-    serde_json::json!({
-        "number": pr.pr_number,
-        "title": pr.title,
-        "url": pr.url,
-        "display_state": pr.display_state,
-        "base": pr.base,
-        "head": pr.head,
-    })
+fn sidebar_cached_pr_summary(
+    pr: &crate::db::WorkScopePrAssociation,
+) -> crate::runtime::CachedPrSummary {
+    crate::runtime::CachedPrSummary {
+        number: pr.pr_number,
+        title: pr.title.clone(),
+        url: pr.url.clone(),
+        display_state: pr.display_state.clone(),
+        base: pr.base.clone(),
+        head: pr.head.clone(),
+    }
+}
+
+async fn cached_pr_summary_for_conversation(
+    state: &AppState,
+    conv: &crate::db::Conversation,
+) -> Result<Option<crate::runtime::CachedPrSummary>, AppError> {
+    let scope = conversation_work_scope(conv);
+    Ok(state
+        .runtime
+        .db()
+        .primary_work_scope_pr_association(&scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .map(|pr| sidebar_cached_pr_summary(&pr)))
 }
 
 async fn cached_pr_summaries_for_conversations(
     state: &AppState,
     conversations: &[crate::db::Conversation],
-) -> Result<HashMap<String, Value>, AppError> {
+) -> Result<HashMap<String, crate::runtime::CachedPrSummary>, AppError> {
     let scopes: Vec<_> = conversations.iter().map(conversation_work_scope).collect();
     let associations = state
         .runtime
@@ -585,7 +606,7 @@ async fn cached_pr_summaries_for_conversations(
 fn conversation_to_json(
     state: &AppState,
     conv: &crate::db::Conversation,
-    cached_pr: Option<&Value>,
+    cached_pr: Option<&crate::runtime::CachedPrSummary>,
 ) -> Value {
     let mut val =
         serde_json::to_value(enrich_conversation_with_runtime(state, conv)).unwrap_or(Value::Null);
@@ -599,7 +620,10 @@ fn conversation_to_json(
             Value::Bool(conv_requires_action(conv)),
         );
         if let Some(pr) = cached_pr {
-            map.insert("cached_pr".to_string(), pr.clone());
+            map.insert(
+                "cached_pr".to_string(),
+                serde_json::to_value(pr).unwrap_or(Value::Null),
+            );
         }
     }
     val
@@ -609,9 +633,13 @@ fn conversation_to_json(
 /// database so the frontend can render the seed breadcrumb (REQ-SEED-003).
 /// Prefer this on single-conversation endpoints; the list endpoints stay
 /// synchronous because they don't render breadcrumbs.
-async fn conversation_to_json_with_seed(state: &AppState, conv: &crate::db::Conversation) -> Value {
-    let enriched = enrich_conversation_with_seed(state, conv).await;
-    let mut val = serde_json::to_value(enriched).unwrap_or(Value::Null);
+async fn conversation_to_json_with_seed(
+    state: &AppState,
+    conv: &crate::db::Conversation,
+    include_cached_pr: bool,
+) -> Result<Value, AppError> {
+    let enriched = enrich_conversation_with_seed(state, conv, include_cached_pr).await?;
+    let mut val = serde_json::to_value(&enriched).unwrap_or(Value::Null);
     if let Value::Object(ref mut map) = val {
         map.insert(
             "presentation_mode".to_string(),
@@ -621,8 +649,14 @@ async fn conversation_to_json_with_seed(state: &AppState, conv: &crate::db::Conv
             "requires_action".to_string(),
             Value::Bool(conv_requires_action(conv)),
         );
+        if let Some(pr) = enriched.cached_pr.clone() {
+            map.insert(
+                "cached_pr".to_string(),
+                serde_json::to_value(pr).unwrap_or(Value::Null),
+            );
+        }
     }
-    val
+    Ok(val)
 }
 
 fn conv_requires_action(conv: &crate::db::Conversation) -> bool {
@@ -1911,7 +1945,7 @@ async fn get_conversation(
         .map_or(0, crate::db::UsageData::context_window_used);
 
     Ok(Json(ConversationWithMessagesResponse {
-        conversation: conversation_to_json_with_seed(&state, &conversation).await,
+        conversation: conversation_to_json_with_seed(&state, &conversation, true).await?,
         messages: enriched_msgs,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
@@ -2143,7 +2177,7 @@ async fn stream_conversation(
     // Create init event with typed data -- serialization deferred to SSE layer
     let init_event = SseEvent::Init {
         sequence_id: init_seq,
-        conversation: Box::new(enrich_conversation_with_seed(&state, &conversation).await),
+        conversation: Box::new(enrich_conversation_with_seed(&state, &conversation, true).await?),
         messages,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
@@ -3547,7 +3581,7 @@ async fn get_by_slug(
         .map_or(0, crate::db::UsageData::context_window_used);
 
     Ok(Json(ConversationWithMessagesResponse {
-        conversation: conversation_to_json_with_seed(&state, &conversation).await,
+        conversation: conversation_to_json_with_seed(&state, &conversation, true).await?,
         messages: enriched_msgs,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
@@ -5189,7 +5223,7 @@ async fn get_shared_conversation(
         .map_or(0, crate::db::UsageData::context_window_used);
 
     Ok(Json(ConversationWithMessagesResponse {
-        conversation: conversation_to_json_with_seed(&state, &conversation).await,
+        conversation: conversation_to_json_with_seed(&state, &conversation, false).await?,
         messages: enriched_msgs,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
@@ -5283,7 +5317,7 @@ async fn shared_sse_stream(
 
     let init_event = SseEvent::Init {
         sequence_id: init_seq,
-        conversation: Box::new(enrich_conversation_with_seed(&state, &conversation).await),
+        conversation: Box::new(enrich_conversation_with_seed(&state, &conversation, false).await?),
         messages,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
@@ -5538,6 +5572,110 @@ pub(crate) mod hard_delete_cascade_tests {
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn single_conversation_response_includes_cached_pr_for_primary_work_scope_association() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().join("repo");
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        let state = make_test_state().await;
+        let mode = crate::db::ConvMode::Work {
+            branch_name: crate::db::NonEmptyString::new("task-36002".to_string()).unwrap(),
+            worktree_path: crate::db::NonEmptyString::new(worktree.to_string_lossy().to_string())
+                .unwrap(),
+            base_branch: crate::db::NonEmptyString::new("main".to_string()).unwrap(),
+            task_id: crate::db::NonEmptyString::new("36002".to_string()).unwrap(),
+            task_title: crate::db::NonEmptyString::new("Seed PR badge".to_string()).unwrap(),
+        };
+        state
+            .db
+            .create_conversation_with_project(
+                "c-cached-pr",
+                "cached-pr",
+                cwd.to_str().unwrap(),
+                true,
+                None,
+                None,
+                None,
+                &mode,
+                None,
+                None,
+                None,
+                crate::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("create conversation");
+        state
+            .db
+            .upsert_work_scope_pr_observations(
+                &crate::work_scope::WorkScope::resolve(
+                    "c-cached-pr",
+                    Some(std::path::Path::new(worktree.to_str().unwrap())),
+                ),
+                &[crate::db::WorkScopePrObservation {
+                    repo_owner: "example".to_string(),
+                    repo_name: "repo".to_string(),
+                    pr_number: 44,
+                    title: "Cached PR".to_string(),
+                    url: "https://github.com/example/repo/pull/44".to_string(),
+                    state: "OPEN".to_string(),
+                    draft: false,
+                    display_state: phoenix_core::domain::pr_display_state::PrDisplayState::Open,
+                    base: "main".to_string(),
+                    head: "task-36002".to_string(),
+                    github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+                }],
+            )
+            .await
+            .expect("upsert pr association");
+
+        let conv = state
+            .db
+            .get_conversation("c-cached-pr")
+            .await
+            .expect("conversation");
+        let enriched = enrich_conversation_with_seed(&state, &conv, true)
+            .await
+            .expect("enriched conversation");
+        let init_cached_pr = enriched.cached_pr.expect("init cached_pr");
+        assert_eq!(init_cached_pr.number, 44);
+
+        let token = state
+            .db
+            .create_share_token("c-cached-pr")
+            .await
+            .expect("share token");
+        let Json(shared_response) = get_shared_conversation(State(state.clone()), Path(token))
+            .await
+            .expect("shared conversation");
+        assert!(
+            shared_response.conversation.get("cached_pr").is_none(),
+            "share payload must not expose private PR metadata"
+        );
+
+        let Json(response) = get_conversation(
+            State(state),
+            Path("c-cached-pr".to_string()),
+            Query(GetConversationQuery {
+                after_sequence: None,
+            }),
+        )
+        .await
+        .expect("get conversation");
+
+        let cached_pr = response.conversation.get("cached_pr").expect("cached_pr");
+        assert_eq!(cached_pr["number"], serde_json::json!(44));
+        assert_eq!(cached_pr["title"], serde_json::json!("Cached PR"));
+        assert_eq!(
+            cached_pr["url"],
+            serde_json::json!("https://github.com/example/repo/pull/44")
+        );
+        assert_eq!(cached_pr["display_state"], serde_json::json!("open"));
+        assert_eq!(cached_pr["base"], serde_json::json!("main"));
+        assert_eq!(cached_pr["head"], serde_json::json!("task-36002"));
     }
 
     #[tokio::test]

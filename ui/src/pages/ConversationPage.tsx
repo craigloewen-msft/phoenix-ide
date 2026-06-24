@@ -164,6 +164,7 @@ function ConversationPageContent() {
     conversationId: confirmedLive ? conversationId : undefined,
     convModeLabel: conversation?.conv_mode_label,
     branchName: conversation?.branch_name,
+    cachedPr: conversation?.cached_pr,
   });
 
   useEffect(() => {
