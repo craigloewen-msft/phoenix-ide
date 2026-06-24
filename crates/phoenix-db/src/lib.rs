@@ -4056,13 +4056,15 @@ impl Database {
         root_conversation_id: &str,
         model: &str,
         usage: &phoenix_core::domain::llm_types::Usage,
+        first_byte_at: Option<DateTime<Utc>>,
     ) -> DbResult<()> {
         let now_str = Utc::now().to_rfc3339();
+        let first_byte_str = first_byte_at.map(|t| t.to_rfc3339());
         sqlx::query(
             "INSERT INTO turn_usage \
              (conversation_id, root_conversation_id, model, \
-              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, created_at, first_byte_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
         .bind(conversation_id)
         .bind(root_conversation_id)
@@ -4072,6 +4074,7 @@ impl Database {
         .bind(usage.cache_creation_tokens.cast_signed())
         .bind(usage.cache_read_tokens.cast_signed())
         .bind(&now_str)
+        .bind(first_byte_str)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -4283,8 +4286,8 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn usage_conversation_turns(&self, root_id: &str) -> DbResult<Vec<UsageTurnRow>> {
         let rows = sqlx::query(
-            "SELECT model, created_at, input_tokens, output_tokens, \
-             cache_creation_tokens, cache_read_tokens \
+            "SELECT id, conversation_id, root_conversation_id, model, created_at, first_byte_at, \
+             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens \
              FROM turn_usage WHERE root_conversation_id = ?1 ORDER BY created_at ASC",
         )
         .bind(root_id)
@@ -4294,12 +4297,76 @@ impl Database {
         rows.into_iter()
             .map(|r| {
                 Ok(UsageTurnRow {
+                    id: r.try_get("id")?,
+                    conversation_id: r.try_get("conversation_id")?,
+                    root_conversation_id: r.try_get("root_conversation_id")?,
                     model: r.try_get("model")?,
                     created_at: r.try_get("created_at")?,
+                    first_byte_at: r.try_get("first_byte_at")?,
                     input_tokens: r.try_get("input_tokens")?,
                     output_tokens: r.try_get("output_tokens")?,
                     cache_creation_tokens: r.try_get("cache_creation_tokens")?,
                     cache_read_tokens: r.try_get("cache_read_tokens")?,
+                })
+            })
+            .collect()
+    }
+    /// Conversation ids that belong to one analytics session/root conversation.
+    /// Includes the root id even when it has no token rows yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn analytics_conversation_ids_for_root(
+        &self,
+        root_id: &str,
+    ) -> DbResult<Vec<String>> {
+        let mut ids: Vec<String> = sqlx::query_scalar(
+            "WITH RECURSIVE session_conversations(id) AS (\
+                 SELECT ?1 \
+                 UNION \
+                 SELECT c.id FROM conversations c \
+                 JOIN session_conversations sc ON c.parent_conversation_id = sc.id \
+             ) \
+             SELECT id FROM session_conversations ORDER BY id ASC",
+        )
+        .bind(root_id)
+        .fetch_all(&self.pool)
+        .await?;
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// Timestamp-only non-agent message anchors for conversations in one root
+    /// session. Avoids hydrating message content/attachments for usage latency.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn usage_anchor_messages(&self, root_id: &str) -> DbResult<Vec<UsageAnchorRow>> {
+        let rows = sqlx::query(
+            "WITH RECURSIVE session_conversations(id) AS (\
+                 SELECT ?1 \
+                 UNION \
+                 SELECT c.id FROM conversations c \
+                 JOIN session_conversations sc ON c.parent_conversation_id = sc.id \
+             ) \
+             SELECT m.conversation_id, m.created_at \
+             FROM messages m \
+             JOIN session_conversations sc ON sc.id = m.conversation_id \
+             WHERE m.message_type != 'agent' \
+             ORDER BY m.conversation_id ASC, m.created_at ASC, m.sequence_id ASC",
+        )
+        .bind(root_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(UsageAnchorRow {
+                    conversation_id: r.try_get("conversation_id")?,
+                    created_at: r.try_get("created_at")?,
                 })
             })
             .collect()
@@ -5637,6 +5704,123 @@ mod tests {
                 .pr_number,
             2
         );
+    }
+
+    #[tokio::test]
+    async fn turn_usage_first_byte_at_is_nullable_and_roundtrips() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-fb", "slug-fb", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let usage = phoenix_core::domain::llm_types::Usage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 5,
+        };
+        db.insert_turn_usage("conv-fb", "conv-fb", "mock", &usage, None)
+            .await
+            .unwrap();
+        let observed = Utc::now();
+        db.insert_turn_usage("conv-fb", "conv-fb", "mock", &usage, Some(observed))
+            .await
+            .unwrap();
+
+        let rows = db.usage_conversation_turns("conv-fb").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].first_byte_at, None);
+        assert_eq!(
+            rows[1].first_byte_at.as_deref(),
+            Some(observed.to_rfc3339().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn analytics_conversation_ids_include_root_without_usage() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-root-only", "slug-root-only", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation(
+            "conv-child-no-usage",
+            "slug-child-no-usage",
+            "/tmp",
+            false,
+            Some("conv-root-only"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ids = db
+            .analytics_conversation_ids_for_root("conv-root-only")
+            .await
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec![
+                "conv-child-no-usage".to_string(),
+                "conv-root-only".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_anchor_messages_returns_non_agent_timestamps_without_content() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("root-anchor", "root-anchor", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation(
+            "sub-anchor",
+            "sub-anchor",
+            "/tmp",
+            false,
+            Some("root-anchor"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        db.add_message(
+            "root-user",
+            "root-anchor",
+            &MessageContent::user("root"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.add_message(
+            "root-agent",
+            "root-anchor",
+            &MessageContent::agent(vec![phoenix_core::domain::llm_types::ContentBlock::Text {
+                text: "agent".to_string(),
+            }]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.add_message(
+            "sub-tool",
+            "sub-anchor",
+            &MessageContent::tool("tu", "ok", false),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let usage = phoenix_core::domain::llm_types::Usage::default();
+        db.insert_turn_usage("sub-anchor", "root-anchor", "mock", &usage, None)
+            .await
+            .unwrap();
+
+        let anchors = db.usage_anchor_messages("root-anchor").await.unwrap();
+        let ids: Vec<_> = anchors.iter().map(|a| a.conversation_id.as_str()).collect();
+        assert_eq!(ids, vec!["root-anchor", "sub-anchor"]);
     }
 
     #[tokio::test]

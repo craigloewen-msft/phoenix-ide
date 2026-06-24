@@ -1504,12 +1504,24 @@ pub struct UsageConversationModelRow {
 /// per-conversation drill-down timeseries.
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageTurnRow {
+    pub id: i64,
+    pub conversation_id: String,
+    pub root_conversation_id: String,
     pub model: String,
     pub created_at: String,
+    pub first_byte_at: Option<String>,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_creation_tokens: i64,
     pub cache_read_tokens: i64,
+}
+
+/// Timestamp-only message anchor used to derive turn latency without hydrating
+/// full message content or attachments.
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageAnchorRow {
+    pub conversation_id: String,
+    pub created_at: String,
 }
 
 #[cfg(test)]

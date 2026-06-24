@@ -170,7 +170,7 @@ fn model_pricing(model: &str) -> Option<ModelPricing> {
     }
 }
 
-fn calculate_turn_cost(
+pub(crate) fn calculate_turn_cost(
     model: &str,
     input: i64,
     output: i64,
@@ -309,6 +309,8 @@ pub struct UsageOverview {
 pub struct TurnPoint {
     pub index: f64,
     pub created_at: String,
+    pub first_byte_at: Option<String>,
+    pub first_byte_latency_ms: Option<f64>,
     pub model: String,
     pub input_tokens: f64,
     pub output_tokens: f64,
@@ -569,47 +571,43 @@ pub async fn usage_conversation_detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let rows = match state.db.usage_conversation_turns(&id).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(error = %e, conv_id = %id, "usage_conversation_turns failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response();
-        }
-    };
+    let turns_projection =
+        match crate::analytics::project_usage_turns_for_root(&state.db, &id).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = %e, conv_id = %id, "usage analytics projection failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response();
+            }
+        };
 
     let mut totals = Totals::default();
-    let turns: Vec<TurnPoint> = rows
+    let turns: Vec<TurnPoint> = turns_projection
         .iter()
         .enumerate()
         .map(|(idx, r)| {
-            let cost = calculate_turn_cost(
-                &r.model,
-                r.input_tokens,
-                r.output_tokens,
-                r.cache_creation_tokens,
-                r.cache_read_tokens,
-            );
             totals.add(
-                r.input_tokens,
-                r.output_tokens,
-                r.cache_creation_tokens,
-                r.cache_read_tokens,
+                r.tokens.input_tokens,
+                r.tokens.output_tokens,
+                r.tokens.cache_creation_tokens,
+                r.tokens.cache_read_tokens,
                 1,
-                cost,
+                r.cost,
             );
             TurnPoint {
                 index: idx as f64,
-                created_at: r.created_at.clone(),
+                created_at: r.created_at.to_rfc3339(),
+                first_byte_at: r.first_byte_at.map(|t| t.to_rfc3339()),
+                first_byte_latency_ms: r.first_byte_latency_ms.map(|ms| ms as f64),
                 model: r.model.clone(),
-                input_tokens: r.input_tokens as f64,
-                output_tokens: r.output_tokens as f64,
-                cache_write_tokens: r.cache_creation_tokens as f64,
-                cache_read_tokens: r.cache_read_tokens as f64,
-                total_tokens: (r.input_tokens
-                    + r.output_tokens
-                    + r.cache_creation_tokens
-                    + r.cache_read_tokens) as f64,
-                cost,
+                input_tokens: r.tokens.input_tokens as f64,
+                output_tokens: r.tokens.output_tokens as f64,
+                cache_write_tokens: r.tokens.cache_creation_tokens as f64,
+                cache_read_tokens: r.tokens.cache_read_tokens as f64,
+                total_tokens: (r.tokens.input_tokens
+                    + r.tokens.output_tokens
+                    + r.tokens.cache_creation_tokens
+                    + r.tokens.cache_read_tokens) as f64,
+                cost: r.cost,
             }
         })
         .collect();
