@@ -15,13 +15,32 @@ enum MatchOutcome {
     Duplicate(DuplicateMatchDiagnostics),
 }
 
+/// Find every non-overlapping exact occurrence of `old_text` in `content`.
+///
+/// Used by `replace` with `replace_all`: the fuzzy cascade is deliberately not
+/// consulted, because "single best candidate" has no meaning across many sites.
+/// An empty `old_text` yields no matches (rather than one per byte boundary).
+#[must_use]
+pub(super) fn find_all_exact(content: &str, old_text: &str) -> Vec<EditSpec> {
+    if old_text.is_empty() {
+        return Vec::new();
+    }
+    content
+        .match_indices(old_text)
+        .map(|(offset, _)| EditSpec {
+            offset,
+            length: old_text.len(),
+        })
+        .collect()
+}
+
 /// Find a unique match for `old_text` in `content`
 ///
 /// Tries in order:
 /// 1. Exact match
 /// 2. Dedent matching (different indentation levels)
 /// 3. Trimmed line matching (first/last line variations)
-/// 4. NFKC-normalised match (handles Unicode lookalike characters)
+/// 4. Unicode confusable-skeleton match (handles lookalike characters)
 pub fn find_unique_match(content: &str, old_text: &str) -> Result<EditSpec, PatchError> {
     let mut duplicate: Option<DuplicateMatchDiagnostics> = None;
 
@@ -282,7 +301,14 @@ fn find_trimmed_match(content: &str, old_text: &str) -> Option<MatchOutcome> {
 fn find_normalised_match(content: &str, old_text: &str) -> Option<MatchOutcome> {
     let skel_old: String = skeleton(old_text).collect();
 
-    if skel_old == old_text {
+    // Fast path: when old_text carries no confusable AND the file is pure ASCII,
+    // skeletonising cannot surface anything the exact/dedent/trim strategies
+    // didn't already see, so skip the allocation-heavy skeleton map entirely.
+    // This keeps a typo in a large ASCII file cheap. We do NOT bail merely on
+    // `skel_old == old_text`: the confusable may live in the FILE (e.g. the file
+    // uses `…` while old_text is the ASCII `...`) — a non-ASCII file still runs
+    // the full pass so that recovery works.
+    if skel_old == old_text && content.is_ascii() {
         return None;
     }
 
@@ -302,32 +328,38 @@ fn find_normalised_match(content: &str, old_text: &str) -> Option<MatchOutcome> 
     }
     skel_to_orig.push(content.len());
 
-    let mut matches = skel_content.match_indices(&skel_old);
-    let (first_offset, _) = matches.next()?;
-    let first_range =
-        original_range_from_skeleton(&skel_to_orig, first_offset, skel_old.len(), content.len());
-    let Some((second_offset, _)) = matches.next() else {
+    // Keep only matches aligned to whole original characters: the mapped
+    // original slice must itself skeletonise back to skel_old. A needle landing
+    // *inside* a single character's multi-char skeleton expansion (e.g. ".."
+    // inside the "..." skeleton of one "…") maps to a misaligned or empty range
+    // and would corrupt the file, so it is rejected here rather than matched.
+    let aligned: Vec<(usize, usize)> = skel_content
+        .match_indices(&skel_old)
+        .map(|(offset, _)| {
+            original_range_from_skeleton(&skel_to_orig, offset, skel_old.len(), content.len())
+        })
+        .filter(|&(start, len)| {
+            content
+                .get(start..start + len)
+                .is_some_and(|slice| skeleton(slice).collect::<String>() == skel_old)
+        })
+        .collect();
+
+    let mut ranges = aligned.into_iter();
+    let first_range = ranges.next()?;
+    let Some(second_range) = ranges.next() else {
         return Some(MatchOutcome::Unique(EditSpec {
             offset: first_range.0,
             length: first_range.1,
         }));
     };
-    let second_range =
-        original_range_from_skeleton(&skel_to_orig, second_offset, skel_old.len(), content.len());
 
     Some(MatchOutcome::Duplicate(
         duplicate_match_diagnostics_from_ranges(
             content,
             std::iter::once(first_range)
                 .chain(std::iter::once(second_range))
-                .chain(matches.map(|(offset, _)| {
-                    original_range_from_skeleton(
-                        &skel_to_orig,
-                        offset,
-                        skel_old.len(),
-                        content.len(),
-                    )
-                })),
+                .chain(ranges),
         ),
     ))
 }
@@ -414,6 +446,21 @@ mod tests {
     }
 
     #[test]
+    fn test_find_all_exact() {
+        let specs = find_all_exact("foo bar foo baz foo", "foo");
+        assert_eq!(specs.len(), 3);
+        assert_eq!(specs[0].offset, 0);
+        assert_eq!(specs[1].offset, 8);
+        assert_eq!(specs[2].offset, 16);
+        assert!(specs.iter().all(|s| s.length == 3));
+    }
+
+    #[test]
+    fn test_find_all_exact_empty_needle_yields_nothing() {
+        assert!(find_all_exact("anything", "").is_empty());
+    }
+
+    #[test]
     fn test_no_match() {
         let content = "hello world";
         let err = find_unique_match(content, "foo").unwrap_err();
@@ -438,6 +485,9 @@ mod tests {
             | PatchError::ClipboardNotFound(_)
             | PatchError::OldTextNotFound
             | PatchError::EditOutOfBounds
+            | PatchError::OverlappingEdits
+            | PatchError::ReplaceAllInexact
+            | PatchError::ReplaceAllRequiresReplace
             | PatchError::ReindentPrefixMismatch { .. }
             | PatchError::NoPatches) => panic!("unexpected error: {other:?}"),
         }
@@ -507,6 +557,9 @@ mod tests {
             | PatchError::ClipboardNotFound(_)
             | PatchError::OldTextNotFound
             | PatchError::EditOutOfBounds
+            | PatchError::OverlappingEdits
+            | PatchError::ReplaceAllInexact
+            | PatchError::ReplaceAllRequiresReplace
             | PatchError::ReindentPrefixMismatch { .. }
             | PatchError::NoPatches) => {
                 panic!("expected fuzzy duplicate diagnostics, got {other:?}")
@@ -531,6 +584,9 @@ mod tests {
             | PatchError::ClipboardNotFound(_)
             | PatchError::OldTextNotFound
             | PatchError::EditOutOfBounds
+            | PatchError::OverlappingEdits
+            | PatchError::ReplaceAllInexact
+            | PatchError::ReplaceAllRequiresReplace
             | PatchError::ReindentPrefixMismatch { .. }
             | PatchError::NoPatches) => {
                 panic!("expected normalised duplicate diagnostics, got {other:?}")
@@ -613,6 +669,28 @@ mod tests {
         #[allow(clippy::string_slice)]
         let matched = &content[spec.offset..spec.offset + spec.length];
         assert_eq!(matched, "\u{201C}target\u{201D}");
+    }
+
+    #[test]
+    fn test_normalised_match_ascii_oldtext_unicode_file() {
+        // The confusable is in the FILE (ellipsis char), old_text is plain ASCII
+        // dots whose skeleton is unchanged. Skeleton matching must still find it.
+        let content = "wait\u{2026} done";
+        let old_text = "wait... done";
+        let spec = find_unique_match(content, old_text).unwrap();
+        #[allow(clippy::string_slice)]
+        let matched = &content[spec.offset..spec.offset + spec.length];
+        assert_eq!(matched, "wait\u{2026} done");
+    }
+
+    #[test]
+    fn test_normalised_rejects_partial_skeleton_match() {
+        // ".." must not match *inside* a single "…" (skeleton "..."): that maps to
+        // a misaligned/empty range. It is treated as not found, never a length-0
+        // edit that would insert before the ellipsis.
+        let content = "x\u{2026}y";
+        let err = find_unique_match(content, "..").unwrap_err();
+        assert_eq!(err, PatchError::OldTextNotFound);
     }
 
     #[test]
