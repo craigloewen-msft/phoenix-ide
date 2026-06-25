@@ -18,7 +18,7 @@ Supported Options:
     - "We want people to be able to use Codex, and their ChatGPT subscription,
       wherever they like!" - [from OpenAI themselves](https://x.com/romainhuet/status/2038699202834841962)
     - Browser and device code supported.
-- LLM gateway / custom endpoint -> `LLM_GATEWAY`, or `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`
+- Custom provider-compatible endpoint -> `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`
 
 See the env var section for more details (or point your preferred coding agent
 at the repo)
@@ -54,7 +54,7 @@ at the repo)
 Rust backend serves the API and, in production, embeds the React frontend via `rust-embed`.
 SQLite persists conversations and messages. A bedrock state machine drives the conversation
 lifecycle (Idle → Processing → ToolExecuting → …). Tools are modular and LLM-invokable.
-Multi-provider LLM support: the Anthropic and OpenAI APIs, a ChatGPT/Codex bridge, or an LLM gateway.
+Multi-provider LLM support: the Anthropic and OpenAI APIs, a ChatGPT/Codex bridge, or provider-compatible base URLs.
 
 ## Philosophy
 
@@ -154,7 +154,7 @@ https://github.com/scottopell/phoenix-ide/releases/latest/download/phoenix_ide-x
 
 Everything Phoenix reads. The server reads its config from the environment at
 startup; `./dev.py` and the production deploy paths populate most of these for
-you (dev mode auto-detects an LLM gateway; prod reads `.phoenix-ide.env` from the repo root of the checkout you deploy from).
+you (prod reads `.phoenix-ide.env` from the repo root of the checkout you deploy from).
 
 ### Core server
 
@@ -166,16 +166,16 @@ you (dev mode auto-detects an LLM gateway; prod reads `.phoenix-ide.env` from th
 | `RUST_LOG` | `tracing` filter (`info`, `debug`, `phoenix_ide=debug`, …) | env-default filter |
 | `HOME` / `USERPROFILE` | Home dir — used for the default DB path, built-in-skill extraction, working-dir resolution, tmux sockets | OS home; `/tmp` fallback |
 
-### LLM providers and gateway
+### LLM providers and backend-compatible endpoints
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `LLM_GATEWAY` | LLM gateway base URL (e.g. exe.dev gateway) | — |
 | `ANTHROPIC_API_KEY` | Direct Anthropic API key | — |
 | `ANTHROPIC_BASE_URL` | Override the Anthropic API base URL | — |
 | `OPENAI_API_KEY` | Direct OpenAI API key | — |
 | `OPENAI_BASE_URL` | Override the OpenAI API base URL | — |
 | `DEFAULT_MODEL` | Preferred default model ID (used only if it actually registers) | first registered model |
+| `PHOENIX_LLM_MODELS` | Inline JSON array of additional model specs to add to the built-in registry | — |
 | `LLM_API_KEY_HELPER` | Command that prints a fresh API key/token on stdout (e.g. `claude` OAuth helper) | — |
 | `LLM_API_KEY_HELPER_TTL_MS` | How long a helper-produced credential is cached | `7200000` (2 h) |
 | `LLM_CUSTOM_HEADERS` | Extra request headers — newline-separated `Key: value` (literal `\n` accepted); a `provider` header is auto-injected | — |
@@ -185,9 +185,44 @@ you (dev mode auto-detects an LLM gateway; prod reads `.phoenix-ide.env` from th
 | `CODEX_HOME` | Where the Codex CLI keeps `auth.json` (read when the ChatGPT bridge is active) | `$HOME/.codex` |
 | `PHOENIX_ENABLE_MOCK_MODEL` | `1` → register the deterministic mock provider (testing only) | off |
 
-If none of `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `LLM_GATEWAY`, or
-`LLM_API_KEY_HELPER` (and no ChatGPT/Codex credential) is present, the server
-starts with no models and logs a warning.
+If none of `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `LLM_API_KEY_HELPER`,
+or a ChatGPT/Codex credential is present, the server starts with no models and
+logs a warning.
+
+`PHOENIX_LLM_MODELS` is additive. It does not override built-in model IDs; a
+configured duplicate ID is ignored and Phoenix logs a warning while keeping the
+built-in definition. The value is parsed at startup, and invalid JSON or invalid
+fields are logged and ignored without removing built-in models. Each configured
+model object has this shape:
+
+```json
+[
+  {
+    "id": "provider-compatible/model-id",
+    "api_name": "optional-wire-model-name",
+    "backend": "anthropic",
+    "description": "Human-readable picker text",
+    "context_window": 200000,
+    "recommended": false,
+    "supports_tool_search": false
+  }
+]
+```
+
+`api_name` may be omitted; when absent Phoenix sends `id` as the wire model
+name. `backend` selects both route/auth family and wire protocol. Supported
+values are `anthropic` (Anthropic Messages-compatible) and `openai_responses`
+(OpenAI Responses-compatible).
+
+Example Anthropic-compatible provider POC:
+
+```env
+ANTHROPIC_API_KEY=provider-api-key
+ANTHROPIC_BASE_URL=https://provider.example/v1/messages
+LLM_CUSTOM_HEADERS=source: my-provider-poc
+DEFAULT_MODEL=example/provider-model
+PHOENIX_LLM_MODELS=[{"id":"example/provider-model","backend":"anthropic","description":"Example Anthropic-compatible POC","context_window":200000,"recommended":false,"supports_tool_search":false}]
+```
 
 ### TLS
 

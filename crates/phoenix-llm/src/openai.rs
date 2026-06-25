@@ -1,11 +1,12 @@
 //! `OpenAI` and `OpenAI`-compatible provider implementation
 
+use super::headers::apply_source_header;
 use super::models::ModelSpec;
 use super::rate_limit::{
     parse_active_limit, parse_credits_snapshot, parse_promo_message, parse_rate_limit_for_limit,
     QuotaDetails,
 };
-use super::types::{ContentBlock, LlmRequest, LlmResponse, MessageRole, Usage, LLM_SOURCE_HEADER};
+use super::types::{ContentBlock, LlmRequest, LlmResponse, MessageRole, Usage};
 use super::LlmError;
 use chrono::{DateTime, Utc};
 use reqwest::header::HeaderMap;
@@ -19,16 +20,12 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 
 /// Determine the full endpoint URL.
-/// Priority: `base_url_override` (used as-is) > `gateway` > provider default.
-fn resolve_endpoint(gateway: Option<&str>, base_url_override: Option<&str>) -> String {
-    if let Some(url) = base_url_override {
-        return url.to_string();
-    }
-
-    match gateway {
-        Some(gw) => format!("{}/openai/v1/responses", gw.trim_end_matches('/')),
-        None => "https://api.openai.com/v1/responses".to_string(),
-    }
+/// Priority: `base_url_override` (used as-is) > provider default.
+fn resolve_endpoint(base_url_override: Option<&str>) -> String {
+    base_url_override.map_or_else(
+        || "https://api.openai.com/v1/responses".to_string(),
+        std::string::ToString::to_string,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -40,7 +37,6 @@ fn resolve_endpoint(gateway: Option<&str>, base_url_override: Option<&str>) -> S
 pub async fn complete(
     spec: &ModelSpec,
     api_key: &str,
-    gateway: Option<&str>,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
     request_tags: &BTreeMap<String, String>,
@@ -52,7 +48,6 @@ pub async fn complete(
         return complete_streaming(
             spec,
             api_key,
-            gateway,
             base_url_override,
             custom_headers,
             request_tags,
@@ -63,7 +58,7 @@ pub async fn complete(
         .await;
     }
 
-    let url = resolve_endpoint(gateway, base_url_override);
+    let url = resolve_endpoint(base_url_override);
     let mut responses_request =
         translate_to_responses_request(&spec.api_name, request, use_codex_backend);
     if !request_tags.is_empty() {
@@ -78,11 +73,8 @@ pub async fn complete(
     let mut builder = client
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .header("source", LLM_SOURCE_HEADER);
-    for (k, v) in custom_headers {
-        builder = builder.header(k.as_str(), v.as_str());
-    }
+        .header("Content-Type", "application/json");
+    builder = apply_source_header(builder, custom_headers);
     let response = builder.json(&responses_request).send().await.map_err(|e| {
         if e.is_timeout() {
             LlmError::network(format!("Request timeout: {e}"))
@@ -452,7 +444,6 @@ impl ResponsesStreamAccumulator {
 pub async fn complete_streaming(
     spec: &ModelSpec,
     api_key: &str,
-    gateway: Option<&str>,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
     request_tags: &BTreeMap<String, String>,
@@ -462,7 +453,7 @@ pub async fn complete_streaming(
 ) -> Result<LlmResponse, LlmError> {
     use futures::StreamExt;
 
-    let url = resolve_endpoint(gateway, base_url_override);
+    let url = resolve_endpoint(base_url_override);
     let mut responses_request =
         translate_to_responses_request(&spec.api_name, request, use_codex_backend);
     responses_request.stream = Some(true);
@@ -478,11 +469,8 @@ pub async fn complete_streaming(
     let mut builder = client
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .header("source", LLM_SOURCE_HEADER);
-    for (k, v) in custom_headers {
-        builder = builder.header(k.as_str(), v.as_str());
-    }
+        .header("Content-Type", "application/json");
+    builder = apply_source_header(builder, custom_headers);
     let response = builder.json(&responses_request).send().await.map_err(|e| {
         if e.is_timeout() {
             LlmError::network(format!("Request timeout: {e}"))
@@ -1122,6 +1110,7 @@ pub(crate) struct ResponsesApiUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::headers::has_custom_source_header;
     use crate::types::{LlmRequest, PromptCacheKey};
 
     fn empty_request() -> LlmRequest {
@@ -1132,6 +1121,22 @@ mod tests {
             max_tokens: None,
             cache_key: PromptCacheKey::stable("test"),
         }
+    }
+
+    #[test]
+    fn custom_source_header_suppresses_default_source_header() {
+        assert!(has_custom_source_header(&[(
+            "source".to_string(),
+            "custom-poc".to_string(),
+        )]));
+        assert!(has_custom_source_header(&[(
+            "Source".to_string(),
+            "custom-poc".to_string(),
+        )]));
+        assert!(!has_custom_source_header(&[(
+            "x-source".to_string(),
+            "custom-poc".to_string(),
+        )]));
     }
 
     /// A tool result carrying an image (e.g. `read_image`) serialises its

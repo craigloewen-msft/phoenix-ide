@@ -1,24 +1,14 @@
 //! Model registry for managing available LLM providers
 
 use super::{
-    all_models, codex_credential, discover_models, probe_gateway, CodexCredential, DiscoveryConfig,
-    LlmService, LlmServiceImpl, LoggingService, ModelInfo, Provider,
+    all_models, codex_credential, discover_models, merge_model_specs, parse_external_models,
+    CodexCredential, DiscoveredModels, DiscoveryConfig, LlmService, LlmServiceImpl, LoggingService,
+    ModelBackend, ModelInfo, ModelSource,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Gateway reachability status determined at startup
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GatewayStatus {
-    /// No gateway configured; direct API key mode
-    NotConfigured,
-    /// Gateway configured and responded successfully during startup probe
-    Healthy,
-    /// Gateway configured but unreachable or returned an error during startup probe
-    Unreachable,
-}
 
 /// A credential source that produces a string on demand.
 /// Implementations range from static strings to cached command execution.
@@ -77,7 +67,7 @@ impl CredentialSource for StaticCredential {
 /// How an LLM credential should be sent in HTTP headers.
 #[derive(Debug, Clone, Copy)]
 pub enum AuthStyle {
-    /// `x-api-key: <credential>` (standard API keys and gateway implicit auth)
+    /// `x-api-key: <credential>` (standard API keys)
     ApiKey,
     /// `Authorization: Bearer <credential>`.
     /// Used for service-to-service auth (e.g. Datadog AI Gateway with ddtool JWT).
@@ -157,23 +147,21 @@ pub struct ResolvedAuth {
 pub struct LlmConfig {
     pub anthropic_api_key: Option<String>,
     pub openai_api_key: Option<String>,
-    /// exe.dev gateway URL (e.g., `http://127.0.0.1:8462`)
-    pub gateway: Option<String>,
     /// Default model ID
     pub default_model: Option<String>,
     /// Interactive credential helper. Implements `CredentialSource` for LLM auth
     /// and streams interactive output (OIDC flows) to the UI panel.
     pub credential_helper: Option<Arc<crate::CredentialHelper>>,
-    /// Direct URL override for the Anthropic endpoint (overrides gateway routing).
+    /// Direct URL override for the Anthropic endpoint.
     pub anthropic_base_url: Option<String>,
-    /// Direct URL override for the `OpenAI` endpoint (overrides gateway routing).
+    /// Direct URL override for the `OpenAI` endpoint.
     pub openai_base_url: Option<String>,
     /// Extra headers to inject on every LLM request (newline-separated "key: value").
     /// Parsed from `LLM_CUSTOM_HEADERS` env var. A `provider` header is auto-injected
     /// based on which provider is being called.
     pub custom_headers: Vec<(String, String)>,
     /// Free-form metadata pairs forwarded as a top-level `tags` object on
-    /// every outbound LLM request (gateway-routed only). Parsed from
+    /// every outbound LLM request routed through a base URL override. Parsed from
     /// `LLM_REQUEST_TAGS` env var as comma-separated `key=value` pairs.
     /// Phoenix doesn't interpret these — they're a pass-through channel for
     /// whatever proxy sits in front of the model.
@@ -181,6 +169,10 @@ pub struct LlmConfig {
     /// How credential helper output should be sent in HTTP headers.
     /// Parsed from `LLM_AUTH_HEADER` env var at startup.
     pub auth_style: AuthStyle,
+    /// Additional model specs loaded from `PHOENIX_LLM_MODELS` inline JSON.
+    /// These are additive only; duplicate IDs are ignored when merged with
+    /// built-ins.
+    pub external_models: Vec<super::ModelSpec>,
     /// User has signalled intent to use the `ChatGPT` bridge. True when
     /// Phoenix's own login file (`~/.phoenix-ide/codex-auth.json`) exists at
     /// startup OR when `OPENAI_USE_CODEX_AUTH=1` is set (piggyback mode).
@@ -219,7 +211,6 @@ impl std::fmt::Debug for LlmConfig {
                 "openai_api_key",
                 &self.openai_api_key.as_ref().map(|_| "[redacted]"),
             )
-            .field("gateway", &self.gateway)
             .field("default_model", &self.default_model)
             .field("credential_helper", &self.credential_helper.is_some())
             .field("anthropic_base_url", &self.anthropic_base_url)
@@ -227,6 +218,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("custom_headers", &self.custom_headers)
             .field("request_tags", &self.request_tags)
             .field("auth_style", &self.auth_style)
+            .field("external_models", &self.external_models.len())
             .field("use_codex_auth", &self.use_codex_auth)
             .field("codex_credential", &self.codex_credential.is_some())
             .field("codex_credential_path", &self.codex_credential_path)
@@ -240,7 +232,6 @@ impl Clone for LlmConfig {
         Self {
             anthropic_api_key: self.anthropic_api_key.clone(),
             openai_api_key: self.openai_api_key.clone(),
-            gateway: self.gateway.clone(),
             default_model: self.default_model.clone(),
             credential_helper: self.credential_helper.as_ref().map(Arc::clone),
             anthropic_base_url: self.anthropic_base_url.clone(),
@@ -248,6 +239,7 @@ impl Clone for LlmConfig {
             custom_headers: self.custom_headers.clone(),
             request_tags: self.request_tags.clone(),
             auth_style: self.auth_style,
+            external_models: self.external_models.clone(),
             use_codex_auth: self.use_codex_auth,
             codex_credential: self.codex_credential.as_ref().map(Arc::clone),
             codex_credential_path: self.codex_credential_path.clone(),
@@ -261,7 +253,6 @@ impl Default for LlmConfig {
         Self {
             anthropic_api_key: None,
             openai_api_key: None,
-            gateway: None,
             default_model: None,
             credential_helper: None,
             anthropic_base_url: None,
@@ -269,6 +260,7 @@ impl Default for LlmConfig {
             custom_headers: Vec::new(),
             request_tags: std::collections::BTreeMap::new(),
             auth_style: AuthStyle::ApiKey,
+            external_models: Vec::new(),
             use_codex_auth: false,
             codex_credential: None,
             codex_credential_path: None,
@@ -278,6 +270,7 @@ impl Default for LlmConfig {
 }
 
 impl LlmConfig {
+    #[allow(clippy::too_many_lines)]
     pub fn from_env(runtime_env: Arc<PhoenixRuntimeEnvironment>) -> Self {
         let credential_helper = std::env::var("LLM_API_KEY_HELPER")
             .ok()
@@ -293,10 +286,16 @@ impl LlmConfig {
         let anthropic_base_url = std::env::var("ANTHROPIC_BASE_URL")
             .ok()
             .filter(|s| !s.is_empty());
+        if let Some(url) = anthropic_base_url.as_deref() {
+            warn_if_endpoint_url_has_no_path("ANTHROPIC_BASE_URL", url);
+        }
 
         let openai_base_url = std::env::var("OPENAI_BASE_URL")
             .ok()
             .filter(|s| !s.is_empty());
+        if let Some(url) = openai_base_url.as_deref() {
+            warn_if_endpoint_url_has_no_path("OPENAI_BASE_URL", url);
+        }
 
         // Parse newline-separated "key: value" pairs (supports real newlines and literal \n)
         let custom_headers = std::env::var("LLM_CUSTOM_HEADERS")
@@ -317,6 +316,24 @@ impl LlmConfig {
             .ok()
             .as_deref()
             .map(parse_request_tags)
+            .unwrap_or_default();
+
+        let external_models = std::env::var("PHOENIX_LLM_MODELS")
+            .ok()
+            .filter(|raw| !raw.trim().is_empty())
+            .map(|raw| match parse_external_models(&raw) {
+                Ok(models) => {
+                    tracing::info!(count = models.len(), "loaded PHOENIX_LLM_MODELS additions");
+                    models
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "invalid PHOENIX_LLM_MODELS; ignoring externally configured LLM models"
+                    );
+                    Vec::new()
+                }
+            })
             .unwrap_or_default();
 
         // Resolve which file (if any) holds ChatGPT credentials at startup.
@@ -355,7 +372,6 @@ impl LlmConfig {
         Self {
             anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
             openai_api_key: std::env::var("OPENAI_API_KEY").ok(),
-            gateway: std::env::var("LLM_GATEWAY").ok(),
             default_model: std::env::var("DEFAULT_MODEL").ok(),
             credential_helper,
             anthropic_base_url,
@@ -370,11 +386,51 @@ impl LlmConfig {
             } else {
                 AuthStyle::ApiKey
             },
+            external_models,
             use_codex_auth,
             codex_credential,
             codex_credential_path,
             runtime_env,
         }
+    }
+}
+
+fn discovery_auth_headers(
+    backend: ModelBackend,
+    helper_token: Option<&str>,
+    static_key: Option<&str>,
+    auth_style: AuthStyle,
+) -> Option<Vec<(String, String)>> {
+    let helper_token = helper_token.filter(|value| !value.is_empty());
+    let static_key = static_key.filter(|value| !value.is_empty());
+    let (credential, _from_helper) = helper_token
+        .map(|token| (token, true))
+        .or_else(|| static_key.map(|key| (key, false)))?;
+    let headers = match backend {
+        ModelBackend::Anthropic => match auth_style {
+            AuthStyle::ApiKey => vec![("x-api-key".to_string(), credential.to_string())],
+            AuthStyle::PlainBearer => {
+                vec![("Authorization".to_string(), format!("Bearer {credential}"))]
+            }
+        },
+        ModelBackend::OpenAIResponses => {
+            vec![("Authorization".to_string(), format!("Bearer {credential}"))]
+        }
+        ModelBackend::Mock => return None,
+    };
+    Some(headers)
+}
+
+fn warn_if_endpoint_url_has_no_path(name: &str, url: &str) {
+    let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let has_path = without_scheme
+        .split_once('/')
+        .is_some_and(|(_, path)| !path.trim_matches('/').is_empty());
+    if !has_path {
+        tracing::warn!(
+            env_var = name,
+            "LLM base URL override has no path; Phoenix uses endpoint URLs as-is and will not append a provider path"
+        );
     }
 }
 
@@ -399,12 +455,25 @@ fn parse_request_tags(raw: &str) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
+fn infer_provider_display_from_model_id(model_id: &str) -> String {
+    if model_id.starts_with("claude-") {
+        "Anthropic".to_string()
+    } else if model_id.starts_with("gpt-") {
+        "OpenAI".to_string()
+    } else {
+        "Unknown".to_string()
+    }
+}
+
 /// Derive a `/v1/models` URL from a base URL like `/v1/messages` or `/v1/responses`.
 /// Replaces the last path segment with `"models"`, stripping any query string first.
 fn derive_models_url(base_url: &str) -> Option<String> {
-    // Strip query string if present (e.g. "https://host/v1/messages?foo=bar")
     let path = base_url.split('?').next().unwrap_or(base_url);
+    let scheme_end = path.find("://").map_or(0, |idx| idx + 3);
     let last_slash = path.rfind('/')?;
+    if last_slash < scheme_end {
+        return None;
+    }
     // Safety: `last_slash` is from `rfind('/')` on `path`
     #[allow(clippy::string_slice)]
     Some(format!("{}models", &path[..=last_slash]))
@@ -422,8 +491,6 @@ pub struct ModelRegistry {
     services: std::sync::RwLock<HashMap<String, Arc<dyn LlmService>>>,
     specs: std::sync::RwLock<HashMap<String, super::ModelSpec>>,
     default_model: String,
-    /// Reachability status of the configured gateway, determined at startup
-    pub gateway_status: GatewayStatus,
     /// Whether the Codex/ChatGPT credential was loaded into the registry at
     /// process startup. **Frozen** at construction time and **not updated**
     /// when [`Self::reload_codex_credential`] runs — this is "was the bridge
@@ -452,7 +519,6 @@ impl ModelRegistry {
             services: std::sync::RwLock::new(HashMap::new()),
             specs: std::sync::RwLock::new(HashMap::new()),
             default_model: "test-model".to_string(),
-            gateway_status: GatewayStatus::NotConfigured,
             codex_bridge_loaded_at_startup: false,
             current_codex_loaded_path: std::sync::RwLock::new(None),
             config: Arc::new(LlmConfig::default()),
@@ -464,8 +530,8 @@ impl ModelRegistry {
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
 
-        // Try to create each model from the centralized definitions
-        for spec in all_models() {
+        // Try to create each model from the centralized definitions plus valid external additions.
+        for spec in Self::model_specs(config) {
             if let Some(service) = Self::try_create_model(&spec, config) {
                 services.insert(spec.id.clone(), service);
                 specs.insert(spec.id.clone(), spec);
@@ -478,18 +544,10 @@ impl ModelRegistry {
             services: std::sync::RwLock::new(services),
             specs: std::sync::RwLock::new(specs),
             default_model,
-            gateway_status: GatewayStatus::NotConfigured,
             codex_bridge_loaded_at_startup: config.codex_credential.is_some(),
             current_codex_loaded_path: std::sync::RwLock::new(config.codex_credential_path.clone()),
             config: Arc::new(config.clone()),
         }
-    }
-
-    /// Create a registry with a specific gateway status, using hardcoded models only.
-    fn new_with_status(config: &LlmConfig, status: GatewayStatus) -> Self {
-        let mut reg = Self::new(config);
-        reg.gateway_status = status;
-        reg
     }
 
     /// Pick the default model from available services.
@@ -528,89 +586,61 @@ impl ModelRegistry {
             .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
     }
 
-    /// Create registry with model discovery from gateway or `credential_helper`.
+    /// Create registry with model discovery using credential-helper auth and base URL overrides.
     ///
-    /// Discovery validates which hardcoded models are available on the gateway.
-    /// Unknown/dynamic models from the gateway are silently ignored.
-    /// Falls back to hardcoded models if discovery fails.
+    /// Discovery validates which configured models are available at direct model-listing
+    /// endpoints derived from `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`. Falls back
+    /// to the configured model list if discovery is unavailable or unhelpful.
     pub async fn new_with_discovery(config: &LlmConfig) -> Self {
-        // Build discovery config from available settings
-        let Some((discovery, is_gateway_mode)) = Self::build_discovery_config(config).await else {
+        let Some(discovery) = Self::build_discovery_config(config).await else {
             return Self::new(config);
         };
 
-        // Gateway mode: probe reachability first
-        if let (true, Some(ref gw)) = (is_gateway_mode, &config.gateway) {
-            tracing::info!("Discovering models from gateway: {}", gw);
-
-            let reachable = probe_gateway(
-                gw,
-                discovery.auth_token.as_deref(),
-                &discovery.custom_headers,
-            )
-            .await;
-
-            if !reachable {
-                tracing::warn!(
-                    gateway = %gw,
-                    "Gateway unreachable during startup probe; falling back to hardcoded models"
-                );
-                return Self::new_with_status(config, GatewayStatus::Unreachable);
-            }
-        } else {
-            tracing::info!("Discovering models via credential_helper auth");
-        }
-
-        // Try to discover models
+        tracing::info!("Discovering models from configured base URL endpoints");
         let discovered = discover_models(&discovery).await;
 
-        // If discovery returned no models but we're in gateway mode and the probe succeeded,
-        // the gateway is reachable but doesn't expose a model-listing endpoint (e.g. exe.dev
-        // gateway only proxies inference). Fall back to hardcoded models with Healthy status.
-        if discovered.is_empty() {
-            if is_gateway_mode {
-                tracing::warn!(
-                    "Gateway model discovery returned no models (gateway may not support listing); \
-                     using hardcoded model list with Healthy status"
-                );
-                return Self::new_with_status(config, GatewayStatus::Healthy);
-            }
-            tracing::warn!("Model discovery returned no models, falling back to hardcoded list");
-            return Self::new_with_status(config, GatewayStatus::Unreachable);
+        if !discovered.any_listed() {
+            tracing::warn!(
+                "Model discovery returned no models, falling back to configured model list"
+            );
+            return Self::new(config);
         }
 
-        tracing::info!("Discovered {} models from gateway", discovered.len());
+        tracing::info!("Discovered {} models", discovered.len());
 
-        // Register hardcoded models that were confirmed by discovery.
-        // The AI gateway returns provider-prefixed IDs (e.g. "anthropic/claude-sonnet-4-6"),
-        // so also check for "{provider}/{id}" and "{provider}/{api_name}".
+        let configured_specs = Self::model_specs(config);
+        let fallback_backends = Self::discovery_fallback_backends(&configured_specs, &discovered);
+
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
 
-        for spec in all_models() {
-            let prefixed_id = format!("{}/{}", spec.provider.header_value(), spec.id);
-            let prefixed_api = format!("{}/{}", spec.provider.header_value(), spec.api_name);
-            if discovered.contains(&spec.id)
-                || discovered.contains(&spec.api_name)
-                || discovered.contains(&prefixed_id)
-                || discovered.contains(&prefixed_api)
-            {
-                if let Some(service) = Self::try_create_model(&spec, config) {
-                    services.insert(spec.id.clone(), service);
-                    specs.insert(spec.id.clone(), spec);
-                }
+        for spec in configured_specs {
+            let uses_codex_bridge = config.use_codex_auth
+                && spec.backend == ModelBackend::OpenAIResponses
+                && spec.source == ModelSource::BuiltIn;
+            let listed_backend_match = discovered.was_listed(spec.backend)
+                && Self::spec_matches_discovered_model(&spec, &discovered);
+            let should_filter = !uses_codex_bridge
+                && discovered.was_listed(spec.backend)
+                && !fallback_backends.contains(&spec.backend);
+            if should_filter && !listed_backend_match {
+                continue;
+            }
+            if let Some(service) = Self::try_create_model(&spec, config) {
+                services.insert(spec.id.clone(), service);
+                specs.insert(spec.id.clone(), spec);
             }
         }
 
         if services.is_empty() {
             tracing::warn!(
                 discovered = discovered.len(),
-                "No known models found in gateway discovery; falling back to hardcoded list"
+                "No configured known models found in discovery; falling back to configured model list"
             );
-            return Self::new_with_status(config, GatewayStatus::Unreachable);
+            return Self::new(config);
         }
 
-        tracing::info!("Registered {} models (hardcoded only)", services.len());
+        tracing::info!("Registered {} discovered configured models", services.len());
 
         let default_model = Self::pick_default_model(&services, config);
 
@@ -618,55 +648,100 @@ impl ModelRegistry {
             services: std::sync::RwLock::new(services),
             specs: std::sync::RwLock::new(specs),
             default_model,
-            gateway_status: GatewayStatus::Healthy,
             codex_bridge_loaded_at_startup: config.codex_credential.is_some(),
             current_codex_loaded_path: std::sync::RwLock::new(config.codex_credential_path.clone()),
             config: Arc::new(config.clone()),
         }
     }
 
-    /// Build a `DiscoveryConfig` from the available LLM config settings.
-    ///
-    /// Returns `Some((config, is_gateway_mode))` when discovery is possible,
-    /// or `None` when no gateway or `credential_helper` is configured.
-    async fn build_discovery_config(config: &LlmConfig) -> Option<(DiscoveryConfig, bool)> {
-        if let Some(ref gw) = config.gateway {
-            // Legacy gateway mode — construct URLs from gateway base
-            let base = gw.trim_end_matches('/');
-            Some((
-                DiscoveryConfig {
-                    anthropic_models_url: Some(format!("{base}/anthropic/v1/models")),
-                    openai_models_url: Some(format!("{base}/openai/v1/models")),
-                    auth_token: None, // Gateway handles auth
-                    custom_headers: vec![],
-                },
-                true,
-            ))
-        } else if let Some(ref helper) = config.credential_helper {
-            // Direct auth mode — derive models URLs from base URL overrides
-            let auth_token = helper.get().await;
-            // Helper not yet authenticated — skip discovery, fall back to hardcoded models
-            auth_token.as_ref()?;
-            let headers = config.custom_headers.clone();
+    /// Return built-in model specs plus valid external additions from config.
+    fn model_specs(config: &LlmConfig) -> Vec<super::ModelSpec> {
+        merge_model_specs(all_models(), &config.external_models)
+    }
 
-            Some((
-                DiscoveryConfig {
-                    anthropic_models_url: config
-                        .anthropic_base_url
-                        .as_deref()
-                        .and_then(derive_models_url),
-                    openai_models_url: config
-                        .openai_base_url
-                        .as_deref()
-                        .and_then(derive_models_url),
-                    auth_token,
-                    custom_headers: headers,
-                },
-                false,
-            ))
+    fn discovery_fallback_backends(
+        specs: &[super::ModelSpec],
+        discovered: &DiscoveredModels,
+    ) -> HashSet<ModelBackend> {
+        [ModelBackend::Anthropic, ModelBackend::OpenAIResponses]
+            .into_iter()
+            .filter(|backend| {
+                discovered.was_listed(*backend)
+                    && !specs.iter().any(|spec| {
+                        spec.backend == *backend
+                            && Self::spec_matches_discovered_model(spec, discovered)
+                    })
+            })
+            .collect()
+    }
+
+    fn spec_matches_discovered_model(
+        spec: &super::ModelSpec,
+        discovered: &DiscoveredModels,
+    ) -> bool {
+        let ids = discovered.ids_for_backend(spec.backend);
+        let prefixed_id = format!("{}/{}", spec.backend.header_value(), spec.id);
+        let prefixed_api = format!("{}/{}", spec.backend.header_value(), spec.api_name);
+        ids.contains(&spec.id)
+            || ids.contains(&spec.api_name)
+            || ids.contains(&prefixed_id)
+            || ids.contains(&prefixed_api)
+    }
+
+    /// Build a `DiscoveryConfig` from credential-helper auth and base URL overrides.
+    ///
+    /// Returns `None` when no model-listing URL can be derived or no helper
+    /// credential is already cached. It never starts or waits for the helper;
+    /// interactive auth must happen after the server is serving the auth UI.
+    async fn build_discovery_config(config: &LlmConfig) -> Option<DiscoveryConfig> {
+        let anthropic_models_url = config
+            .anthropic_base_url
+            .as_deref()
+            .and_then(derive_models_url);
+        let openai_models_url = config
+            .openai_base_url
+            .as_deref()
+            .and_then(derive_models_url);
+        if anthropic_models_url.is_none() && openai_models_url.is_none() {
+            return None;
+        }
+
+        let helper_token = match config.credential_helper.as_ref() {
+            Some(helper) => helper.cached_credential().await,
+            None => None,
+        };
+        let auth_style = config.auth_style;
+        let anthropic_auth_headers = if anthropic_models_url.is_some() {
+            discovery_auth_headers(
+                ModelBackend::Anthropic,
+                helper_token.as_deref(),
+                config.anthropic_api_key.as_deref(),
+                auth_style,
+            )
         } else {
             None
+        };
+        let openai_auth_headers = if openai_models_url.is_some() {
+            discovery_auth_headers(
+                ModelBackend::OpenAIResponses,
+                helper_token.as_deref(),
+                config.openai_api_key.as_deref(),
+                auth_style,
+            )
+        } else {
+            None
+        };
+        if anthropic_auth_headers.is_none() && openai_auth_headers.is_none() {
+            return None;
         }
+
+        Some(DiscoveryConfig {
+            anthropic_models_url: anthropic_auth_headers.as_ref().and(anthropic_models_url),
+            openai_models_url: openai_auth_headers.as_ref().and(openai_models_url),
+            anthropic_auth_headers: anthropic_auth_headers.unwrap_or_default(),
+            openai_auth_headers: openai_auth_headers.unwrap_or_default(),
+            custom_headers: config.custom_headers.clone(),
+        })
     }
 
     /// Try to create a model service, validating prerequisites
@@ -675,7 +750,7 @@ impl ModelRegistry {
         config: &LlmConfig,
     ) -> Option<Arc<dyn LlmService>> {
         // Mock provider: opt-in only via PHOENIX_ENABLE_MOCK_MODEL=1
-        if spec.provider == Provider::Mock {
+        if spec.backend == ModelBackend::Mock {
             let enabled = std::env::var("PHOENIX_ENABLE_MOCK_MODEL")
                 .map(|v| v == "1")
                 .unwrap_or(false);
@@ -694,7 +769,10 @@ impl ModelRegistry {
         // but the credential failed to load, OpenAI models are unavailable
         // rather than silently falling through to OPENAI_API_KEY (which
         // would bill the wrong account).
-        if config.use_codex_auth && spec.provider == Provider::OpenAI {
+        if config.use_codex_auth
+            && spec.backend == ModelBackend::OpenAIResponses
+            && spec.source == ModelSource::BuiltIn
+        {
             let cred = config.codex_credential.as_ref()?;
             let auth = LlmAuth::new(
                 Arc::clone(cred) as Arc<dyn CredentialSource>,
@@ -722,34 +800,32 @@ impl ModelRegistry {
                 Arc::clone(helper) as Arc<dyn CredentialSource>,
                 config.auth_style,
             )
-        } else if config.gateway.is_some() {
-            // Gateway mode: sentinel value; gateway handles real authentication
-            LlmAuth::new(
-                Arc::new(StaticCredential::new("implicit")),
-                AuthStyle::ApiKey,
-            )
         } else {
-            // Direct mode: require real credentials per provider
-            match spec.provider {
-                Provider::Anthropic => {
+            // Direct mode: require real credentials per backend
+            match spec.backend {
+                ModelBackend::Anthropic => {
                     let key = config
                         .anthropic_api_key
                         .as_deref()
                         .filter(|k| !k.is_empty())?;
-                    LlmAuth::new(Arc::new(StaticCredential::new(key)), AuthStyle::ApiKey)
+                    let style = if config.anthropic_base_url.is_some() {
+                        config.auth_style
+                    } else {
+                        AuthStyle::ApiKey
+                    };
+                    LlmAuth::new(Arc::new(StaticCredential::new(key)), style)
                 }
-                Provider::OpenAI => {
+                ModelBackend::OpenAIResponses => {
                     let key = config.openai_api_key.as_deref().filter(|k| !k.is_empty())?;
                     LlmAuth::new(Arc::new(StaticCredential::new(key)), AuthStyle::ApiKey)
                 }
-                Provider::Mock => unreachable!("handled above"),
+                ModelBackend::Mock => unreachable!("handled above"),
             }
         };
 
         let service = Arc::new(LlmServiceImpl::new(
             spec.clone(),
             auth,
-            config.gateway.clone(),
             config.anthropic_base_url.clone(),
             config.openai_base_url.clone(),
             config.custom_headers.clone(),
@@ -815,7 +891,7 @@ impl ModelRegistry {
             if let Some(service) = services.get(model_id) {
                 model_infos.push(ModelInfo {
                     id: spec.id.clone(),
-                    provider: spec.provider.display_name().to_string(),
+                    provider: spec.backend.display_name().to_string(),
                     description: spec.description.clone(),
                     context_window: spec.context_window_for(service.as_ref()),
                     recommended: spec.recommended,
@@ -823,6 +899,32 @@ impl ModelRegistry {
             }
         }
         model_infos
+    }
+
+    /// Resolve a registered model id to a provider display name.
+    ///
+    /// Returns `"Unknown"` when the model is not currently registered.
+    ///
+    /// # Panics
+    /// Panics if the internal specs lock is poisoned.
+    pub fn provider_display_name(&self, model_id: &str) -> String {
+        if let Some(spec) = self
+            .specs
+            .read()
+            .expect("specs lock poisoned")
+            .get(model_id)
+            .cloned()
+        {
+            return spec.backend.display_name().to_string();
+        }
+
+        Self::model_specs(&self.config)
+            .into_iter()
+            .find(|spec| spec.id == model_id)
+            .map_or_else(
+                || infer_provider_display_from_model_id(model_id),
+                |spec| spec.backend.display_name().to_string(),
+            )
     }
 
     /// Check if any models are available
@@ -857,7 +959,6 @@ impl ModelRegistry {
             services: std::sync::RwLock::new(services),
             specs: std::sync::RwLock::new(HashMap::new()),
             default_model: "claude-sonnet-4-6".to_string(),
-            gateway_status: GatewayStatus::NotConfigured,
             codex_bridge_loaded_at_startup: false,
             current_codex_loaded_path: std::sync::RwLock::new(None),
             config: Arc::new(LlmConfig::default()),
@@ -905,18 +1006,23 @@ impl ModelRegistry {
     /// # Panics
     /// Panics if the internal specs or services lock is poisoned.
     pub fn cheap_model_id_for_provider(&self, parent_model_id: &str) -> String {
-        use crate::models::Provider;
-
-        let parent_provider = {
+        let parent = {
             let specs = self.specs.read().expect("specs lock poisoned");
-            specs.get(parent_model_id).map(|s| s.provider)
+            specs.get(parent_model_id).map(|s| (s.backend, s.source))
         };
 
-        let candidates: &[&str] = match parent_provider {
-            Some(Provider::Anthropic) => &["claude-haiku-4-5"],
-            Some(Provider::OpenAI) => &["gpt-5.4-mini"],
-            Some(Provider::Mock) => return "mock".to_string(),
-            None => return parent_model_id.to_string(),
+        let Some((parent_backend, parent_source)) = parent else {
+            return parent_model_id.to_string();
+        };
+
+        if parent_source == ModelSource::External {
+            return parent_model_id.to_string();
+        }
+
+        let candidates: &[&str] = match parent_backend {
+            ModelBackend::Anthropic => &["claude-haiku-4-5"],
+            ModelBackend::OpenAIResponses => &["gpt-5.4-mini"],
+            ModelBackend::Mock => return "mock".to_string(),
         };
 
         let services = self.services.read().expect("services lock poisoned");
@@ -968,7 +1074,6 @@ impl ModelRegistry {
         &self,
         new_path: Option<std::path::PathBuf>,
     ) -> CodexReloadOutcome {
-        use crate::models::Provider;
         let cred_with_account = match new_path.as_ref() {
             Some(path) => match CodexCredential::load(path.clone()) {
                 Ok((cred, account_id)) => Some((cred, account_id)),
@@ -1003,8 +1108,10 @@ impl ModelRegistry {
         let mut new_codex_services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         let mut new_codex_specs: HashMap<String, super::ModelSpec> = HashMap::new();
         if let Some((cred, _)) = cred_with_account.as_ref() {
-            for spec in all_models() {
-                if spec.provider != Provider::OpenAI {
+            for spec in Self::model_specs(&self.config) {
+                if spec.backend != ModelBackend::OpenAIResponses
+                    || spec.source != ModelSource::BuiltIn
+                {
                     continue;
                 }
                 let auth = LlmAuth::new(
@@ -1036,9 +1143,11 @@ impl ModelRegistry {
             // Remove existing OpenAI entries before inserting the new ones,
             // so deregister-on-logout (cred=None) and switch-account both
             // converge on the right state.
-            let openai_ids: Vec<String> = all_models()
+            let openai_ids: Vec<String> = Self::model_specs(&self.config)
                 .iter()
-                .filter(|s| s.provider == Provider::OpenAI)
+                .filter(|s| {
+                    s.backend == ModelBackend::OpenAIResponses && s.source == ModelSource::BuiltIn
+                })
                 .map(|s| s.id.clone())
                 .collect();
             for id in &openai_ids {
@@ -1118,6 +1227,7 @@ pub struct CodexReloadOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn test_no_api_keys_no_models() {
@@ -1185,33 +1295,139 @@ mod tests {
         assert_eq!(tags.get("query"), Some(&"a=b=c".to_string()));
     }
 
-    #[test]
-    fn test_gateway_enables_all_models() {
-        // With gateway, all models become available (gateway handles auth)
-        let config = LlmConfig {
-            gateway: Some("https://example.com".to_string()),
-            ..Default::default()
-        };
-        let registry = ModelRegistry::new(&config);
-        // All models should be available since gateway mode uses "implicit" API key
-        assert!(!registry.available_models().is_empty());
-        // Should have models from multiple providers
-        assert!(registry.get("claude-sonnet-4-6").is_some());
-        assert!(registry.get("gpt-5.5").is_some());
+    fn external_baseten_model() -> super::super::ModelSpec {
+        parse_external_models(
+            r#"[{"id":"baseten/moonshotai/Kimi-K2.6","backend":"anthropic","description":"Baseten Kimi K2.6 open-weight POC","context_window":262000,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
     }
 
     #[test]
-    fn test_gateway_with_anthropic_key() {
+    fn configured_anthropic_model_registers_and_can_be_default() {
+        let model = external_baseten_model();
         let config = LlmConfig {
-            gateway: Some("https://example.com".to_string()),
             anthropic_api_key: Some("test-key".to_string()),
+            default_model: Some(model.id.clone()),
+            external_models: vec![model],
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
 
-        let models = registry.available_models();
-        assert!(!models.is_empty());
-        assert!(models.contains(&"claude-opus-4-6".to_string()));
+        assert!(registry.get("baseten/moonshotai/Kimi-K2.6").is_some());
+        assert_eq!(registry.default_model_id(), "baseten/moonshotai/Kimi-K2.6");
+        assert_eq!(
+            registry.context_window("baseten/moonshotai/Kimi-K2.6"),
+            262_000
+        );
+    }
+
+    #[test]
+    fn configured_model_appears_in_model_info() {
+        let config = LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            external_models: vec![external_baseten_model()],
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        let info = registry
+            .available_model_info()
+            .into_iter()
+            .find(|model| model.id == "baseten/moonshotai/Kimi-K2.6")
+            .expect("external model should be included in /api/models data");
+
+        assert_eq!(info.provider, "Anthropic");
+        assert_eq!(info.context_window, 262_000);
+        assert!(!info.recommended);
+    }
+
+    #[test]
+    fn discovery_matcher_allows_configured_model_id_and_backend_prefix() {
+        let model = external_baseten_model();
+        let discovered = DiscoveredModels {
+            anthropic_listed: true,
+            anthropic: HashSet::from(["anthropic/baseten/moonshotai/Kimi-K2.6".to_string()]),
+            openai_responses_listed: false,
+            openai_responses: HashSet::new(),
+        };
+
+        assert!(ModelRegistry::spec_matches_discovered_model(
+            &model,
+            &discovered
+        ));
+    }
+
+    #[test]
+    fn discovery_matcher_does_not_cross_backend_boundaries() {
+        let model = external_baseten_model();
+        let discovered = DiscoveredModels {
+            anthropic_listed: true,
+            anthropic: HashSet::new(),
+            openai_responses_listed: true,
+            openai_responses: HashSet::from(["baseten/moonshotai/Kimi-K2.6".to_string()]),
+        };
+
+        assert!(!ModelRegistry::spec_matches_discovered_model(
+            &model,
+            &discovered
+        ));
+    }
+
+    #[test]
+    fn discovery_fallback_is_backend_specific() {
+        let specs = vec![external_baseten_model(), external_openai_model()];
+        let discovered = DiscoveredModels {
+            anthropic_listed: true,
+            anthropic: HashSet::from(["unmatched-anthropic".to_string()]),
+            openai_responses_listed: true,
+            openai_responses: HashSet::from(["openai-compatible/custom".to_string()]),
+        };
+
+        let fallback = ModelRegistry::discovery_fallback_backends(&specs, &discovered);
+
+        assert!(fallback.contains(&ModelBackend::Anthropic));
+        assert!(!fallback.contains(&ModelBackend::OpenAIResponses));
+    }
+
+    #[test]
+    fn provider_display_name_uses_external_model_metadata_even_when_unregistered() {
+        let registry = ModelRegistry::new(&LlmConfig {
+            external_models: vec![external_baseten_model()],
+            ..Default::default()
+        });
+
+        assert_eq!(
+            registry.provider_display_name("baseten/moonshotai/Kimi-K2.6"),
+            "Anthropic"
+        );
+        assert_eq!(registry.provider_display_name("unknown-model"), "Unknown");
+        assert_eq!(
+            registry.provider_display_name("claude-retired-1"),
+            "Anthropic"
+        );
+        assert_eq!(registry.provider_display_name("gpt-retired-1"), "OpenAI");
+    }
+
+    #[test]
+    fn duplicate_configured_model_does_not_override_builtin_registration() {
+        let duplicate = parse_external_models(
+            r#"[{"id":"claude-sonnet-4-6","api_name":"other-wire-name","backend":"anthropic","description":"Override attempt","context_window":123,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+        let config = LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            external_models: vec![duplicate],
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        assert_eq!(registry.context_window("claude-sonnet-4-6"), 1_000_000);
     }
 
     #[test]
@@ -1244,6 +1460,166 @@ mod tests {
         assert_eq!(cred.get().await, Some("test-key".to_string()));
     }
 
+    #[tokio::test]
+    async fn discovery_config_does_not_start_idle_credential_helper() {
+        let helper =
+            crate::CredentialHelper::new("echo test-token".to_string(), Duration::from_hours(1));
+        let config = LlmConfig {
+            credential_helper: Some(helper.clone()),
+            anthropic_base_url: Some("https://proxy.example/v1/messages".to_string()),
+            ..Default::default()
+        };
+
+        assert!(ModelRegistry::build_discovery_config(&config)
+            .await
+            .is_none());
+        assert_eq!(
+            helper.credential_status().await,
+            crate::CredentialStatus::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_config_uses_cached_credential_helper_token() {
+        let helper =
+            crate::CredentialHelper::new("echo test-token".to_string(), Duration::from_hours(1));
+        assert!(helper.get().await.is_none());
+        helper.wait_for_settlement().await;
+        let config = LlmConfig {
+            credential_helper: Some(helper),
+            anthropic_base_url: Some("https://proxy.example/v1/messages".to_string()),
+            ..Default::default()
+        };
+
+        let discovery = ModelRegistry::build_discovery_config(&config)
+            .await
+            .expect("cached helper token should produce discovery config");
+
+        assert_eq!(
+            discovery.anthropic_auth_headers,
+            vec![("x-api-key".to_string(), "test-token".to_string())]
+        );
+        assert_eq!(
+            discovery.anthropic_models_url.as_deref(),
+            Some("https://proxy.example/v1/models")
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_config_uses_static_provider_keys() {
+        let config = LlmConfig {
+            anthropic_api_key: Some("anthropic-key".to_string()),
+            openai_api_key: Some("openai-key".to_string()),
+            anthropic_base_url: Some("https://proxy.example/v1/messages".to_string()),
+            openai_base_url: Some("https://proxy.example/v1/responses".to_string()),
+            ..Default::default()
+        };
+
+        let discovery = ModelRegistry::build_discovery_config(&config)
+            .await
+            .expect("static keys should produce discovery config");
+
+        assert_eq!(
+            discovery.anthropic_auth_headers,
+            vec![("x-api-key".to_string(), "anthropic-key".to_string())]
+        );
+        assert_eq!(
+            discovery.openai_auth_headers,
+            vec![("Authorization".to_string(), "Bearer openai-key".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_config_keeps_backend_with_available_credentials() {
+        let config = LlmConfig {
+            anthropic_base_url: Some("https://stale.example/v1/messages".to_string()),
+            openai_api_key: Some("openai-key".to_string()),
+            openai_base_url: Some("https://proxy.example/v1/responses".to_string()),
+            ..Default::default()
+        };
+
+        let discovery = ModelRegistry::build_discovery_config(&config)
+            .await
+            .expect("OpenAI credentials should keep OpenAI discovery enabled");
+
+        assert!(discovery.anthropic_models_url.is_none());
+        assert_eq!(
+            discovery.openai_models_url.as_deref(),
+            Some("https://proxy.example/v1/models")
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_config_prefers_cached_helper_over_static_key() {
+        let helper =
+            crate::CredentialHelper::new("echo helper-token".to_string(), Duration::from_hours(1));
+        assert!(helper.get().await.is_none());
+        helper.wait_for_settlement().await;
+        let config = LlmConfig {
+            credential_helper: Some(helper),
+            anthropic_api_key: Some("static-key".to_string()),
+            anthropic_base_url: Some("https://proxy.example/v1/messages".to_string()),
+            ..Default::default()
+        };
+
+        let discovery = ModelRegistry::build_discovery_config(&config)
+            .await
+            .expect("cached helper token should produce discovery config");
+
+        assert_eq!(
+            discovery.anthropic_auth_headers,
+            vec![("x-api-key".to_string(), "helper-token".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_config_preserves_bearer_for_cached_helper_token() {
+        let helper =
+            crate::CredentialHelper::new("echo bearer-token".to_string(), Duration::from_hours(1));
+        assert!(helper.get().await.is_none());
+        helper.wait_for_settlement().await;
+        let config = LlmConfig {
+            credential_helper: Some(helper),
+            auth_style: AuthStyle::PlainBearer,
+            anthropic_base_url: Some("https://proxy.example/v1/messages".to_string()),
+            ..Default::default()
+        };
+
+        let discovery = ModelRegistry::build_discovery_config(&config)
+            .await
+            .expect("cached helper token should produce discovery config");
+
+        assert_eq!(
+            discovery.anthropic_auth_headers,
+            vec![(
+                "Authorization".to_string(),
+                "Bearer bearer-token".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_config_preserves_bearer_for_static_anthropic_key() {
+        let config = LlmConfig {
+            anthropic_api_key: Some("bearer-token".to_string()),
+            auth_style: AuthStyle::PlainBearer,
+            anthropic_base_url: Some("https://proxy.example/v1/messages".to_string()),
+            ..Default::default()
+        };
+
+        let discovery = ModelRegistry::build_discovery_config(&config)
+            .await
+            .expect("static bearer key should produce discovery config");
+
+        assert_eq!(
+            discovery.anthropic_auth_headers,
+            vec![(
+                "Authorization".to_string(),
+                "Bearer bearer-token".to_string()
+            )]
+        );
+    }
+
     #[test]
     fn test_credential_helper_enables_all_models() {
         // When credential_helper is set, all models become available
@@ -1272,7 +1648,61 @@ mod tests {
         crate::CodexCredential::load(path).unwrap().0
     }
 
-    /// With Codex auth enabled and a valid credential, `OpenAI` models register
+    fn external_openai_model() -> super::super::ModelSpec {
+        parse_external_models(
+            r#"[{"id":"openai-compatible/custom","backend":"openai_responses","description":"OpenAI-compatible POC","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+    }
+
+    #[test]
+    fn external_openai_model_bypasses_codex_bridge_when_direct_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LlmConfig {
+            openai_api_key: Some("test-openai-key".to_string()),
+            openai_base_url: Some("https://example.test/v1/responses".to_string()),
+            use_codex_auth: true,
+            codex_credential: Some(fake_codex_credential(&dir)),
+            external_models: vec![external_openai_model()],
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        assert!(
+            registry
+                .get("gpt-5.5")
+                .expect("built-in OpenAI model should still use Codex")
+                .uses_codex_bridge(),
+            "built-in OpenAI models keep existing Codex routing"
+        );
+        assert!(
+            !registry
+                .get("openai-compatible/custom")
+                .expect("external OpenAI-compatible model should register")
+                .uses_codex_bridge(),
+            "external OpenAI-compatible models must use explicit endpoint/auth config"
+        );
+    }
+
+    #[test]
+    fn cheap_model_for_external_parent_stays_on_external_model() {
+        let config = LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            external_models: vec![external_baseten_model()],
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        assert_eq!(
+            registry.cheap_model_id_for_provider("baseten/moonshotai/Kimi-K2.6"),
+            "baseten/moonshotai/Kimi-K2.6"
+        );
+    }
+
+    /// With Codex auth enabled and a valid credential, built-in `OpenAI` models register
     /// via the codex branch (no need for `OPENAI_API_KEY`) and are distinct from
     /// Anthropic registration.
     #[test]
@@ -1569,8 +1999,13 @@ mod tests {
     }
 
     #[test]
+    fn test_derive_models_url_no_path_component() {
+        assert_eq!(derive_models_url("https://host"), None);
+        assert_eq!(derive_models_url("https://host?foo=bar"), None);
+    }
+
+    #[test]
     fn test_derive_models_url_no_slash() {
-        // A URL with no slash at all returns None
         assert_eq!(derive_models_url("noslash"), None);
     }
 

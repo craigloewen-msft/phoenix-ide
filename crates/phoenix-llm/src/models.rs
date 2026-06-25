@@ -1,7 +1,6 @@
 //! Centralized model definitions for all LLM providers
 //!
-//! This module contains all model definitions in a single location,
-//! making it easier to add new models and providers.
+use std::collections::HashSet;
 
 /// Per-model metadata surfaced to API consumers (the `/api/models` response and
 /// the model picker). Built by [`super::ModelRegistry::available_model_info`]
@@ -15,43 +14,89 @@ pub struct ModelInfo {
     pub recommended: bool,
 }
 
-/// LLM provider enumeration
+/// Backend route + wire protocol used for a model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Provider {
+pub enum ModelBackend {
+    /// Anthropic Messages-compatible backend.
     Anthropic,
-    OpenAI,
+    /// `OpenAI` Responses-compatible backend.
+    OpenAIResponses,
+    /// In-process deterministic mock backend.
     Mock,
 }
 
-impl Provider {
-    /// Get the display name for this provider
+impl ModelBackend {
+    /// Display name surfaced in `/api/models` and usage reports.
     #[must_use]
     pub fn display_name(self) -> &'static str {
         match self {
-            Provider::Anthropic => "Anthropic",
-            Provider::OpenAI => "OpenAI",
-            Provider::Mock => "Mock",
+            ModelBackend::Anthropic => "Anthropic",
+            ModelBackend::OpenAIResponses => "OpenAI",
+            ModelBackend::Mock => "Mock",
         }
     }
 
-    /// Lowercase provider name for gateway `provider` header (e.g. "anthropic", "openai").
+    /// Lowercase backend name for compatibility headers.
     #[must_use]
     pub fn header_value(self) -> &'static str {
         match self {
-            Provider::Anthropic => "anthropic",
-            Provider::OpenAI => "openai",
-            Provider::Mock => "mock",
+            ModelBackend::Anthropic => "anthropic",
+            ModelBackend::OpenAIResponses => "openai",
+            ModelBackend::Mock => "mock",
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn api_format(self) -> ApiFormat {
+        match self {
+            ModelBackend::Anthropic | ModelBackend::Mock => ApiFormat::Anthropic,
+            ModelBackend::OpenAIResponses => ApiFormat::OpenAIResponses,
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExternalBackend {
+    #[serde(rename = "anthropic", alias = "anthropic_messages")]
+    Anthropic,
+    #[serde(rename = "openai_responses")]
+    OpenAIResponses,
+}
+
+impl From<ExternalBackend> for ModelBackend {
+    fn from(value: ExternalBackend) -> Self {
+        match value {
+            ExternalBackend::Anthropic => ModelBackend::Anthropic,
+            ExternalBackend::OpenAIResponses => ModelBackend::OpenAIResponses,
         }
     }
 }
 
 /// API format / wire protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApiFormat {
+pub(crate) enum ApiFormat {
     /// Anthropic Messages API
     Anthropic,
     /// `OpenAI` Responses API
     OpenAIResponses,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ExternalModelSpec {
+    id: String,
+    api_name: Option<String>,
+    backend: ExternalBackend,
+    description: String,
+    context_window: usize,
+    recommended: bool,
+    supports_tool_search: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSource {
+    BuiltIn,
+    External,
 }
 
 /// Model specification with metadata
@@ -61,10 +106,8 @@ pub struct ModelSpec {
     pub id: String,
     /// API name used by the provider (e.g., "claude-haiku-4-5-20251001")
     pub api_name: String,
-    /// Provider for this model
-    pub provider: Provider,
-    /// API format / wire protocol
-    pub api_format: ApiFormat,
+    /// Backend route + wire protocol for this model.
+    pub backend: ModelBackend,
     /// Human-readable description
     pub description: String,
     /// Platform-API context window ceiling. **Not** route-aware — the codex
@@ -78,6 +121,10 @@ pub struct ModelSpec {
     pub recommended: bool,
     /// Whether this model supports Anthropic's tool search feature
     pub supports_tool_search: bool,
+    /// Where this model definition came from. External `OpenAI`-compatible
+    /// specs bypass the Codex bridge because their endpoint is operator-configured,
+    /// not `ChatGPT`'s backend.
+    pub source: ModelSource,
 }
 
 impl ModelSpec {
@@ -96,6 +143,86 @@ impl ModelSpec {
     }
 }
 
+/// Parse additional model specs from the `PHOENIX_LLM_MODELS` inline JSON format.
+///
+/// `api_name` defaults to `id`, so compatible backend aliases can be trialled
+/// without duplicating the same identifier in config.
+///
+/// # Errors
+/// Returns valid model specs. Invalid entries are logged and skipped so one bad
+/// item does not suppress the rest of the configured external models.
+pub fn parse_external_models(raw: &str) -> Result<Vec<ModelSpec>, String> {
+    let specs: Vec<serde_json::Value> =
+        serde_json::from_str(raw).map_err(|_| "invalid JSON for PHOENIX_LLM_MODELS".to_string())?;
+
+    let mut parsed = Vec::new();
+    for (index, value) in specs.into_iter().enumerate() {
+        match serde_json::from_value::<ExternalModelSpec>(value)
+            .map_err(|_| format!("model at index {index} has invalid shape"))
+            .and_then(|spec| external_model_spec_from_config(index, spec))
+        {
+            Ok(spec) => parsed.push(spec),
+            Err(error) => {
+                tracing::warn!(error = %error, "ignoring invalid PHOENIX_LLM_MODELS entry");
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+fn external_model_spec_from_config(
+    index: usize,
+    spec: ExternalModelSpec,
+) -> Result<ModelSpec, String> {
+    let id = spec.id.trim().to_string();
+    if id.is_empty() {
+        return Err(format!("model at index {index} has an empty id"));
+    }
+    let api_name = spec
+        .api_name
+        .map_or_else(|| id.clone(), |name| name.trim().to_string());
+    if api_name.is_empty() {
+        return Err(format!("model '{id}' has an empty api_name"));
+    }
+    let description = spec.description.trim().to_string();
+    if description.is_empty() {
+        return Err(format!("model '{id}' has an empty description"));
+    }
+    if spec.context_window == 0 {
+        return Err(format!("model '{id}' has invalid context_window 0"));
+    }
+    Ok(ModelSpec {
+        id,
+        api_name,
+        backend: spec.backend.into(),
+        description,
+        context_window: spec.context_window,
+        recommended: spec.recommended,
+        supports_tool_search: spec.supports_tool_search,
+        source: ModelSource::External,
+    })
+}
+
+/// Merge built-in models with externally configured additions.
+///
+/// Duplicate IDs are rejected: the first definition wins, which preserves the
+/// built-in model contract and prevents silent overrides from config.
+#[must_use]
+pub fn merge_model_specs(mut builtins: Vec<ModelSpec>, external: &[ModelSpec]) -> Vec<ModelSpec> {
+    let mut ids: HashSet<String> = builtins.iter().map(|spec| spec.id.clone()).collect();
+    for spec in external {
+        if !ids.insert(spec.id.clone()) {
+            tracing::warn!(
+                model_id = %spec.id,
+                "PHOENIX_LLM_MODELS duplicate model id ignored; built-in or earlier configured model kept"
+            );
+            continue;
+        }
+        builtins.push(spec.clone());
+    }
+    builtins
+}
+
 /// Get all available model specifications
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -110,110 +237,188 @@ pub fn all_models() -> Vec<ModelSpec> {
         ModelSpec {
             id: "claude-opus-4-8".into(),
             api_name: "claude-opus-4-8".into(),
-            provider: Provider::Anthropic,
-            api_format: ApiFormat::Anthropic,
+            backend: ModelBackend::Anthropic,
             description: "Claude Opus 4.8 (most capable, slower)".into(),
             context_window: 1_000_000,
             recommended: true,
             supports_tool_search: true,
+            source: ModelSource::BuiltIn,
         },
         ModelSpec {
             id: "claude-opus-4-7".into(),
             api_name: "claude-opus-4-7".into(),
-            provider: Provider::Anthropic,
-            api_format: ApiFormat::Anthropic,
+            backend: ModelBackend::Anthropic,
             description: "Claude Opus 4.7 (legacy)".into(),
             context_window: 1_000_000,
             recommended: false,
             supports_tool_search: true,
+            source: ModelSource::BuiltIn,
         },
         ModelSpec {
             id: "claude-opus-4-6".into(),
             api_name: "claude-opus-4-6".into(),
-            provider: Provider::Anthropic,
-            api_format: ApiFormat::Anthropic,
+            backend: ModelBackend::Anthropic,
             description: "Claude Opus 4.6 (legacy)".into(),
             context_window: 1_000_000,
             recommended: false,
             supports_tool_search: true,
+            source: ModelSource::BuiltIn,
         },
         ModelSpec {
             id: "claude-sonnet-4-6".into(),
             api_name: "claude-sonnet-4-6".into(),
-            provider: Provider::Anthropic,
-            api_format: ApiFormat::Anthropic,
+            backend: ModelBackend::Anthropic,
             description: "Claude Sonnet 4.6 (balanced performance)".into(),
             context_window: 1_000_000,
             recommended: true,
             supports_tool_search: true,
+            source: ModelSource::BuiltIn,
         },
         ModelSpec {
             id: "claude-haiku-4-5".into(),
             api_name: "claude-haiku-4-5-20251001".into(),
-            provider: Provider::Anthropic,
-            api_format: ApiFormat::Anthropic,
+            backend: ModelBackend::Anthropic,
             description: "Claude Haiku 4.5 (fast, efficient)".into(),
             context_window: 200_000,
             recommended: true,
             supports_tool_search: false,
+            source: ModelSource::BuiltIn,
         },
         // OpenAI models
-        // Context windows here are the platform-API ceilings (what gateway/
-        // direct-API callers can actually use). The codex bridge caps every
-        // model at 272K regardless — that override is applied at registration
-        // time in `registry.rs` when the bridge path is selected, so this
-        // spec's value reaches the runtime only for gateway/direct routes.
+        // Context windows here are the platform-API ceilings. The codex bridge
+        // caps every built-in OpenAI Responses model at 272K regardless — that
+        // override is applied at registration time in `registry.rs` when the
+        // bridge path is selected, so this spec's value reaches the runtime
+        // only for direct/provider-compatible routes.
         ModelSpec {
             id: "gpt-5.5".into(),
             api_name: "gpt-5.5".into(),
-            provider: Provider::OpenAI,
-            api_format: ApiFormat::OpenAIResponses,
+            backend: ModelBackend::OpenAIResponses,
             description: "GPT-5.5 (frontier, 1M context)".into(),
             context_window: 1_000_000,
             recommended: true,
             supports_tool_search: false,
+            source: ModelSource::BuiltIn,
         },
         ModelSpec {
             id: "gpt-5.4".into(),
             api_name: "gpt-5.4".into(),
-            provider: Provider::OpenAI,
-            api_format: ApiFormat::OpenAIResponses,
+            backend: ModelBackend::OpenAIResponses,
             description: "GPT-5.4 (frontier, native computer use)".into(),
             context_window: 400_000,
             recommended: false,
             supports_tool_search: false,
+            source: ModelSource::BuiltIn,
         },
         ModelSpec {
             id: "gpt-5.4-mini".into(),
             api_name: "gpt-5.4-mini".into(),
-            provider: Provider::OpenAI,
-            api_format: ApiFormat::OpenAIResponses,
+            backend: ModelBackend::OpenAIResponses,
             description: "GPT-5.4 Mini (fast, efficient)".into(),
             context_window: 400_000,
             recommended: true,
             supports_tool_search: false,
+            source: ModelSource::BuiltIn,
         },
         // GPT-5 Codex models (responses API)
         ModelSpec {
             id: "gpt-5.3-codex".into(),
             api_name: "gpt-5.3-codex".into(),
-            provider: Provider::OpenAI,
-            api_format: ApiFormat::OpenAIResponses,
+            backend: ModelBackend::OpenAIResponses,
             description: "GPT-5.3 Codex (latest code model)".into(),
             context_window: 200_000,
             recommended: true,
             supports_tool_search: false,
+            source: ModelSource::BuiltIn,
         },
         // Mock model for frontend development without API keys
         ModelSpec {
             id: "mock".into(),
             api_name: "mock".into(),
-            provider: Provider::Mock,
-            api_format: ApiFormat::Anthropic, // unused by mock, but needed for the struct
+            backend: ModelBackend::Mock,
             description: "Mock (lorem ipsum for UI dev)".into(),
             context_window: 200_000,
             recommended: false,
             supports_tool_search: false,
+            source: ModelSource::BuiltIn,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_external_model_with_api_name_defaulting_to_id() {
+        let models = parse_external_models(
+            r#"[{"id":"baseten/moonshotai/Kimi-K2.6","backend":"anthropic","description":"Baseten Kimi K2.6 open-weight POC","context_window":262000,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .expect("external model config should parse");
+
+        assert_eq!(models.len(), 1);
+        let model = &models[0];
+        assert_eq!(model.id, "baseten/moonshotai/Kimi-K2.6");
+        assert_eq!(model.api_name, model.id);
+        assert_eq!(model.backend, ModelBackend::Anthropic);
+        assert_eq!(model.backend.api_format(), ApiFormat::Anthropic);
+        assert_eq!(model.context_window, 262_000);
+        assert!(!model.supports_tool_search);
+    }
+
+    #[test]
+    fn parses_documented_openai_external_names() {
+        let models = parse_external_models(
+            r#"[{"id":"openai-compatible/model","backend":"openai_responses","description":"OpenAI-compatible POC","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .expect("documented OpenAI config values should parse");
+
+        assert_eq!(models[0].backend, ModelBackend::OpenAIResponses);
+        assert_eq!(models[0].backend.api_format(), ApiFormat::OpenAIResponses);
+    }
+
+    #[test]
+    fn skips_unknown_external_backend_entry() {
+        let models = parse_external_models(
+            r#"[{"id":"bad-openai","backend":"not-a-backend","description":"Bad backend","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .expect("array syntax should parse even when an entry is invalid");
+
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn skips_invalid_external_context_window_entry() {
+        let models = parse_external_models(
+            r#"[{"id":"bad","backend":"anthropic","description":"Bad","context_window":0,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .expect("array syntax should parse even when an entry is invalid");
+
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn bad_external_models_json_is_rejected() {
+        let err = parse_external_models("not json")
+            .expect_err("top-level invalid JSON should still reject the config");
+
+        assert_eq!(err, "invalid JSON for PHOENIX_LLM_MODELS");
+    }
+
+    #[test]
+    fn duplicate_external_ids_do_not_override_builtins() {
+        let external = parse_external_models(
+            r#"[{"id":"claude-sonnet-4-6","api_name":"other-wire-name","backend":"anthropic","description":"Override attempt","context_window":123,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .unwrap();
+
+        let merged = merge_model_specs(all_models(), &external);
+        let sonnet = merged
+            .iter()
+            .find(|spec| spec.id == "claude-sonnet-4-6")
+            .unwrap();
+
+        assert_ne!(sonnet.api_name, "other-wire-name");
+        assert_ne!(sonnet.context_window, 123);
+    }
 }

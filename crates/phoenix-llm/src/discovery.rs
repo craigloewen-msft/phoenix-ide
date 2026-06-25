@@ -1,10 +1,12 @@
-//! Dynamic model discovery from LLM gateway
+//! Dynamic model discovery from provider-compatible model listing endpoints.
 //!
-//! Queries gateway endpoints to discover available models at runtime,
-//! validating which hardcoded models are available.
+//! Queries `/v1/models` endpoints derived from configured base URLs to validate
+//! which configured models are available.
 
+use crate::ModelBackend;
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 /// Configuration for model discovery
 pub struct DiscoveryConfig {
@@ -12,8 +14,10 @@ pub struct DiscoveryConfig {
     pub anthropic_models_url: Option<String>,
     /// URL for `OpenAI` models endpoint
     pub openai_models_url: Option<String>,
-    /// Auth token to send as Authorization: Bearer (if any)
-    pub auth_token: Option<String>,
+    /// Auth headers to send to the Anthropic models endpoint.
+    pub anthropic_auth_headers: Vec<(String, String)>,
+    /// Auth headers to send to the `OpenAI` models endpoint.
+    pub openai_auth_headers: Vec<(String, String)>,
     /// Custom headers to inject on discovery requests
     pub custom_headers: Vec<(String, String)>,
 }
@@ -29,56 +33,74 @@ struct ModelData {
     id: String,
 }
 
-/// Probe gateway reachability with a lightweight HEAD/GET request.
-///
-/// Returns `true` if the gateway responds with any HTTP status (even an error),
-/// meaning the host is up and listening. Returns `false` on network/timeout errors.
-pub async fn probe_gateway(
-    gateway_url: &str,
-    auth_token: Option<&str>,
-    custom_headers: &[(String, String)],
-) -> bool {
-    let url = format!("{}/_proxy/status", gateway_url.trim_end_matches('/'));
-    let client = reqwest::Client::new();
-    let mut request = client.get(&url).timeout(std::time::Duration::from_secs(3));
+#[derive(Debug, Default)]
+pub struct DiscoveredModels {
+    pub anthropic_listed: bool,
+    pub anthropic: HashSet<String>,
+    pub openai_responses_listed: bool,
+    pub openai_responses: HashSet<String>,
+}
 
-    if let Some(token) = auth_token {
-        request = request.header("Authorization", format!("Bearer {token}"));
-    }
-    for (key, value) in custom_headers {
-        request = request.header(key.as_str(), value.as_str());
+fn empty_ids() -> &'static HashSet<String> {
+    static EMPTY: OnceLock<HashSet<String>> = OnceLock::new();
+    EMPTY.get_or_init(HashSet::new)
+}
+
+impl DiscoveredModels {
+    #[must_use]
+    pub fn any_listed(&self) -> bool {
+        self.anthropic_listed || self.openai_responses_listed
     }
 
-    match request.send().await {
-        Ok(_) => {
-            tracing::debug!(url = %url, "Gateway probe succeeded");
-            true
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.anthropic.is_empty() && self.openai_responses.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.anthropic.len() + self.openai_responses.len()
+    }
+
+    #[must_use]
+    pub fn was_listed(&self, backend: ModelBackend) -> bool {
+        match backend {
+            ModelBackend::Anthropic => self.anthropic_listed,
+            ModelBackend::OpenAIResponses => self.openai_responses_listed,
+            ModelBackend::Mock => false,
         }
-        Err(err) => {
-            tracing::debug!(url = %url, error = %err, "Gateway probe failed");
-            false
+    }
+
+    #[must_use]
+    pub fn ids_for_backend(&self, backend: ModelBackend) -> &HashSet<String> {
+        match backend {
+            ModelBackend::Anthropic => &self.anthropic,
+            ModelBackend::OpenAIResponses => &self.openai_responses,
+            ModelBackend::Mock => empty_ids(),
         }
     }
 }
 
-/// Discover available model IDs from the LLM gateway.
+/// Discover available model IDs from configured model-listing endpoints.
 ///
-/// Returns a set of model IDs that the gateway reports as available.
-/// Used to validate which hardcoded models are actually reachable.
-pub async fn discover_models(config: &DiscoveryConfig) -> HashSet<String> {
-    let mut models = HashSet::new();
+/// Returns backend-scoped model IDs that the endpoints report as available.
+pub async fn discover_models(config: &DiscoveryConfig) -> DiscoveredModels {
+    let mut models = DiscoveredModels::default();
 
     if let Some(ref url) = config.anthropic_models_url {
         match discover_provider(
             url,
             "anthropic",
-            config.auth_token.as_deref(),
+            config.anthropic_auth_headers.as_slice(),
             &config.custom_headers,
             &[("anthropic-version", "2023-06-01")],
         )
         .await
         {
-            Ok(m) => models.extend(m),
+            Ok(m) => {
+                models.anthropic_listed = true;
+                models.anthropic.extend(m);
+            }
             Err(e) => tracing::warn!(provider = "anthropic", error = %e, "Discovery failed"),
         }
     }
@@ -87,13 +109,16 @@ pub async fn discover_models(config: &DiscoveryConfig) -> HashSet<String> {
         match discover_provider(
             url,
             "openai",
-            config.auth_token.as_deref(),
+            config.openai_auth_headers.as_slice(),
             &config.custom_headers,
             &[],
         )
         .await
         {
-            Ok(m) => models.extend(m),
+            Ok(m) => {
+                models.openai_responses_listed = true;
+                models.openai_responses.extend(m);
+            }
             Err(e) => tracing::warn!(provider = "openai", error = %e, "Discovery failed"),
         }
     }
@@ -105,7 +130,7 @@ pub async fn discover_models(config: &DiscoveryConfig) -> HashSet<String> {
 async fn discover_provider(
     url: &str,
     provider_name: &str,
-    auth_token: Option<&str>,
+    auth_headers: &[(String, String)],
     custom_headers: &[(String, String)],
     extra_headers: &[(&str, &str)],
 ) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
@@ -118,8 +143,8 @@ async fn discover_provider(
     for &(key, value) in extra_headers {
         request = request.header(key, value);
     }
-    if let Some(token) = auth_token {
-        request = request.header("Authorization", format!("Bearer {token}"));
+    for (key, value) in auth_headers {
+        request = request.header(key.as_str(), value.as_str());
     }
     for (key, value) in custom_headers {
         request = request.header(key.as_str(), value.as_str());
@@ -138,10 +163,6 @@ async fn discover_provider(
     let models_response: ModelsResponse = response.json().await?;
     let ids: HashSet<String> = models_response.data.into_iter().map(|m| m.id).collect();
 
-    tracing::info!(
-        "Discovered {} {} models from gateway",
-        ids.len(),
-        provider_name
-    );
+    tracing::info!("Discovered {} {} models", ids.len(), provider_name);
     Ok(ids)
 }
