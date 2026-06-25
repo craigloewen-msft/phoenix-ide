@@ -111,10 +111,33 @@ struct ReviewTargetSummary {
     allow_dirty_working_tree: bool,
 }
 
+/// Why a changed file was excluded from the review entirely. Distinct from a
+/// `ReviewWarning`: an unreviewed file is a coverage gap the requester must see,
+/// not advisory noise, so it is surfaced as a top-level result rather than
+/// buried in the warnings stream.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OversizedReason {
+    /// The file's own diff exceeded `MAX_FILE_BYTES`.
+    PerFileCap,
+    /// The cumulative review body would exceed `MAX_REVIEW_BYTES`, so this file
+    /// was dropped even though it fit the per-file cap.
+    TotalReviewCap,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UnreviewedFile {
+    file: String,
+    reason: OversizedReason,
+}
+
 #[derive(Debug, Serialize)]
 struct ReviewOutput {
     status: ReviewStatus,
     summary: ReviewSummary,
+    /// Files changed by the diff that were NOT sent to the reviewer because they
+    /// exceeded a size cap. Non-empty means the review did not cover everything.
+    unreviewed: Vec<UnreviewedFile>,
     findings: Vec<ReviewFinding>,
     warnings: Vec<ReviewWarning>,
 }
@@ -143,6 +166,7 @@ struct DiffCollection {
     deletions: u64,
     body: String,
     warnings: Vec<ReviewWarning>,
+    unreviewed: Vec<UnreviewedFile>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,6 +229,7 @@ impl Tool for CommissionReviewTool {
                     "kind": "commission_review",
                     "status": &out.status,
                     "summary": &out.summary,
+                    "unreviewed": &out.unreviewed,
                     "findings": &out.findings,
                     "warnings": &out.warnings,
                 });
@@ -262,8 +287,26 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
     }
 
     if collection.files_reviewed == 0 {
+        // Nothing was reviewed, but distinguish "no reviewable text diff" from
+        // "every changed file was excluded by a size cap". The latter is a
+        // coverage gap, not a clean no-op, so it must not read as an ordinary
+        // Skipped run with no findings.
+        let (status, reviewer_summary) = if collection.unreviewed.is_empty() {
+            (
+                ReviewStatus::Skipped,
+                "No reviewable text diff was found".to_string(),
+            )
+        } else {
+            (
+                ReviewStatus::CompletedWithWarnings,
+                format!(
+                    "No files were reviewed: all {} changed file(s) exceeded a size cap",
+                    collection.unreviewed.len()
+                ),
+            )
+        };
         return Ok(ReviewOutput {
-            status: ReviewStatus::Skipped,
+            status,
             summary: ReviewSummary {
                 target: target.summary,
                 files_changed: collection.files_changed,
@@ -275,8 +318,9 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                 usage: phoenix_core::domain::llm_types::Usage::default(),
                 input_tokens: None,
                 output_tokens: None,
-                reviewer_summary: Some("No reviewable text diff was found".to_string()),
+                reviewer_summary: Some(reviewer_summary),
             },
+            unreviewed: collection.unreviewed,
             findings: Vec::new(),
             warnings: collection.warnings,
         });
@@ -377,7 +421,10 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
 
     normalize_findings(&mut findings, &mut warnings);
     warnings.extend(collection.warnings);
-    let status = if warnings.is_empty() {
+    let unreviewed = collection.unreviewed;
+    // Unreviewed files are a coverage gap, not advisory noise: a clean run that
+    // nonetheless skipped files must not report Success and read as full coverage.
+    let status = if warnings.is_empty() && unreviewed.is_empty() {
         ReviewStatus::Success
     } else {
         ReviewStatus::CompletedWithWarnings
@@ -407,6 +454,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                 Some(reviewer_summaries.join("\n\n"))
             },
         },
+        unreviewed,
         findings,
         warnings,
     })
@@ -447,6 +495,7 @@ fn failed_review_output(
             output_tokens: Some(output_tokens),
             reviewer_summary: Some(reason.to_string()),
         },
+        unreviewed: collection.unreviewed.clone(),
         findings,
         warnings,
     }
@@ -489,6 +538,22 @@ fn assert_approved_paths_match(
     Ok(())
 }
 
+/// Prefer the remote-tracking ref `origin/<base>` over the bare local branch,
+/// falling back to the local ref when no remote-tracking ref exists. See
+/// `specs/commission-review/design.md` (REQ-CR-004..006) for why the remote ref
+/// is the correct comparator.
+async fn effective_base_ref(repo: &Path, base_branch: &str) -> String {
+    let remote = format!("origin/{base_branch}");
+    if git_capture(repo, &["rev-parse", "--verify", "--quiet", &remote])
+        .await
+        .is_ok()
+    {
+        remote
+    } else {
+        base_branch.to_string()
+    }
+}
+
 async fn resolve_target(
     ctx: &ToolContext,
     input: &CommissionReviewInput,
@@ -506,7 +571,7 @@ async fn resolve_target(
         if dirty && !input.allow_dirty_working_tree {
             return Err("commission_review refused dirty worktree review. Commit/stash changes, or set allow_dirty_working_tree=true to include uncommitted changes.".to_string());
         }
-        let base = runtime_base_branch.unwrap_or("main").to_string();
+        let base = effective_base_ref(&repo, runtime_base_branch.unwrap_or("main")).await;
         Ok(ReviewTarget {
             summary: ReviewTargetSummary {
                 kind: ReviewTargetKind::WorktreeDiff,
@@ -541,6 +606,7 @@ async fn resolve_target(
 async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCollection, String> {
     let repo = Path::new(&target.summary.repo_root);
     let mut warnings = Vec::new();
+    let mut unreviewed = Vec::new();
     let effective_range_base = match &target.diff_spec {
         DiffSpec::Range { base, head, .. } => {
             Some(git_capture_cancel(repo, &["merge-base", base, head], &ctx.cancel).await?)
@@ -700,11 +766,10 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
                     }
                 };
                 if truncated {
-                    warnings.push(warning(
-                        "file_too_large",
-                        "file diff exceeded per-file review cap",
-                        Some(file),
-                    ));
+                    unreviewed.push(UnreviewedFile {
+                        file: file.clone(),
+                        reason: OversizedReason::PerFileCap,
+                    });
                     continue;
                 }
                 diff_output
@@ -729,30 +794,27 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
                     }
                 };
                 if truncated {
-                    warnings.push(warning(
-                        "file_too_large",
-                        "file diff exceeded per-file review cap",
-                        Some(file),
-                    ));
+                    unreviewed.push(UnreviewedFile {
+                        file: file.clone(),
+                        reason: OversizedReason::PerFileCap,
+                    });
                     continue;
                 }
                 diff_output
             }
         };
         if diff.len() > MAX_FILE_BYTES {
-            warnings.push(warning(
-                "file_too_large",
-                "file diff exceeded per-file review cap",
-                Some(file),
-            ));
+            unreviewed.push(UnreviewedFile {
+                file: file.clone(),
+                reason: OversizedReason::PerFileCap,
+            });
             continue;
         }
         if body.len() + diff.len() > MAX_REVIEW_BYTES {
-            warnings.push(warning(
-                "review_truncated",
-                "file diff skipped because total review cap was already reached",
-                Some(file),
-            ));
+            unreviewed.push(UnreviewedFile {
+                file: file.clone(),
+                reason: OversizedReason::TotalReviewCap,
+            });
             continue;
         }
         if !diff.trim().is_empty() {
@@ -768,6 +830,7 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
         deletions,
         body,
         warnings,
+        unreviewed,
     })
 }
 
@@ -1091,29 +1154,44 @@ async fn git_capture_limited(
         .spawn()
         .map_err(|e| format!("failed to run git {}: {e}", args.join(" ")))?;
 
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| format!("failed to capture git {} stdout", args.join(" ")))?;
-    let mut buf = vec![0_u8; max_bytes.saturating_add(1)];
-    let n = stdout
-        .read(&mut buf)
+
+    // Drain stdout by looping to EOF, bounded at `max_bytes + 1` bytes. A single
+    // `read()` returns only what currently sits in the OS pipe buffer (a few KB
+    // to ~64KB), never the whole diff. Reading once and then waiting for the
+    // child deadlocks the instant the diff exceeds the pipe buffer: git blocks
+    // writing the remainder into a pipe nobody drains, so it never exits and the
+    // wait never returns. Draining to EOF keeps the pipe moving; the bound caps
+    // memory and lets us detect an over-cap diff.
+    let read_cap = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut buf = Vec::new();
+    let bytes_read = stdout
+        .take(read_cap)
+        .read_to_end(&mut buf)
         .await
         .map_err(|e| format!("failed reading git {} stdout: {e}", args.join(" ")))?;
-    let truncated = n > max_bytes;
-    if truncated {
+
+    if bytes_read > max_bytes {
+        // Over the cap. We hold the read end and stop draining, so git would
+        // wedge on its next write — SIGKILL reaps it regardless of pipe state,
+        // which cannot deadlock (unlike waiting for a normal exit).
         let _ = child.kill().await;
         return Ok((String::new(), true));
     }
+
+    // EOF under the cap means git closed stdout and is exiting, so this wait
+    // completes promptly and yields the exit status plus any stderr.
     let output = child
         .wait_with_output()
         .await
         .map_err(|e| format!("failed waiting for git {}: {e}", args.join(" ")))?;
     if output.status.success() {
-        Ok((
-            String::from_utf8_lossy(&buf[..n]).trim_end().to_string(),
-            false,
-        ))
+        Ok((String::from_utf8_lossy(&buf).trim_end().to_string(), false))
     } else {
         Err(format!(
             "git {} failed: {}",
@@ -1130,6 +1208,215 @@ fn pretty_json<T: Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run `git` in `cwd`, asserting success. Test helper for repo setup.
+    async fn git_ok(cwd: &Path, args: &[&str]) {
+        let out = git_command()
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .await
+            .expect("git spawn");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A committed file whose diff far exceeds the OS pipe buffer must return
+    /// promptly as truncated, not deadlock. Regression: a single `read()` then
+    /// `wait_with_output()` on the taken stdout wedged git on its next write
+    /// once the diff outgrew the pipe buffer, parking the tool indefinitely.
+    #[tokio::test]
+    async fn large_diff_returns_truncated_without_deadlock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git_ok(repo, &["init", "-q"]).await;
+        git_ok(repo, &["config", "user.email", "t@t.t"]).await;
+        git_ok(repo, &["config", "user.name", "t"]).await;
+        // ~1MB single-line-free blob: orders of magnitude past any pipe buffer.
+        let big = "x\n".repeat(512 * 1024);
+        std::fs::write(repo.join("big.txt"), &big).expect("write");
+        git_ok(repo, &["add", "."]).await;
+        git_ok(repo, &["commit", "-qm", "add big"]).await;
+
+        // Diff of the whole file against the empty tree, capped at 64KB.
+        let empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+        let args = [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            empty_tree,
+            "--",
+            "big.txt",
+        ];
+        let fut = git_capture_limited(repo, &args, 64 * 1024);
+        let (body, truncated) = tokio::time::timeout(std::time::Duration::from_secs(20), fut)
+            .await
+            .expect("git_capture_limited must not hang on a large diff")
+            .expect("git diff should succeed");
+        assert!(truncated, "a >cap diff must be reported truncated");
+        assert!(body.is_empty(), "truncated diffs return an empty body");
+    }
+
+    /// A diff comfortably under the cap is returned whole — the bounded drain
+    /// must not silently truncate output that arrives across multiple reads.
+    #[tokio::test]
+    async fn small_diff_is_captured_whole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git_ok(repo, &["init", "-q"]).await;
+        git_ok(repo, &["config", "user.email", "t@t.t"]).await;
+        git_ok(repo, &["config", "user.name", "t"]).await;
+        let body_text = "line\n".repeat(2000); // ~10KB, well under the 64KB cap
+        std::fs::write(repo.join("small.txt"), &body_text).expect("write");
+        git_ok(repo, &["add", "."]).await;
+        git_ok(repo, &["commit", "-qm", "add small"]).await;
+
+        let empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+        let (body, truncated) = git_capture_limited(
+            repo,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                empty_tree,
+                "--",
+                "small.txt",
+            ],
+            64 * 1024,
+        )
+        .await
+        .expect("git diff should succeed");
+        assert!(!truncated, "an under-cap diff must not be truncated");
+        assert!(
+            body.matches("+line").count() >= 2000,
+            "every added line must survive the capture, got {} lines",
+            body.matches("+line").count()
+        );
+    }
+
+    /// The review comparator must prefer origin/<base> over the (often stale)
+    /// local base ref, and fall back to the local ref only when no
+    /// remote-tracking ref exists. Diffing against a stale local base is what
+    /// inflated a 3-commit PR into a 118-commit review in production.
+    #[tokio::test]
+    async fn effective_base_ref_prefers_remote_tracking_ref() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git_ok(repo, &["init", "-q"]).await;
+        git_ok(repo, &["config", "user.email", "t@t.t"]).await;
+        git_ok(repo, &["config", "user.name", "t"]).await;
+        std::fs::write(repo.join("f.txt"), "x").expect("write");
+        git_ok(repo, &["add", "."]).await;
+        git_ok(repo, &["commit", "-qm", "c1"]).await;
+        let head = git_capture(repo, &["rev-parse", "HEAD"])
+            .await
+            .expect("head");
+
+        // No remote-tracking ref yet: fall back to the bare local branch.
+        assert_eq!(effective_base_ref(repo, "main").await, "main");
+
+        // Once origin/main exists, it must win.
+        git_ok(repo, &["update-ref", "refs/remotes/origin/main", &head]).await;
+        assert_eq!(effective_base_ref(repo, "main").await, "origin/main");
+    }
+
+    /// A diff whose only changed files all exceed the per-file cap reviews
+    /// nothing, but must report the coverage gap (`completed_with_warnings` +
+    /// unreviewed list), not look like an ordinary empty-diff skip.
+    #[tokio::test]
+    async fn all_files_over_cap_reports_coverage_gap_not_skip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git_ok(repo, &["init", "-q"]).await;
+        git_ok(repo, &["config", "user.email", "t@t.t"]).await;
+        git_ok(repo, &["config", "user.name", "t"]).await;
+        git_ok(repo, &["commit", "-qm", "base", "--allow-empty"]).await;
+        let base = git_capture(repo, &["rev-parse", "HEAD"])
+            .await
+            .expect("base");
+        git_ok(repo, &["update-ref", "refs/remotes/origin/main", &base]).await;
+        // One changed file, far over MAX_FILE_BYTES, on a committed branch.
+        let big = "let x = 0;\n".repeat(MAX_FILE_BYTES / 5);
+        std::fs::write(repo.join("big.rs"), &big).expect("write");
+        git_ok(repo, &["add", "."]).await;
+        git_ok(repo, &["commit", "-qm", "huge"]).await;
+
+        let ctx = ToolContext::new(
+            CancellationToken::new(),
+            "test-conv".to_string(),
+            repo.to_path_buf(),
+            std::sync::Arc::new(crate::BrowserSessionManager::default()),
+            std::sync::Arc::new(crate::BashHandleRegistry::new()),
+            std::sync::Arc::new(crate::NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            std::sync::Arc::new(crate::TmuxRegistry::new()),
+            Some(repo.to_path_buf()),
+        );
+        let target = resolve_target(
+            &ctx,
+            &CommissionReviewInput {
+                brief: "ready".to_string(),
+                focus: None,
+                allow_dirty_working_tree: false,
+            },
+            Some("main"),
+        )
+        .await
+        .expect("resolve");
+        let collection = collect_diff(&target, &ctx).await.expect("collect");
+
+        assert_eq!(collection.files_reviewed, 0, "the only file is over-cap");
+        assert!(
+            !collection.unreviewed.is_empty(),
+            "over-cap file must be recorded as unreviewed"
+        );
+    }
+
+    #[test]
+    fn unreviewed_files_serialize_as_top_level_snake_case() {
+        let out = ReviewOutput {
+            status: ReviewStatus::CompletedWithWarnings,
+            summary: ReviewSummary {
+                target: ReviewTargetSummary {
+                    kind: ReviewTargetKind::WorktreeDiff,
+                    repo_root: "/r".to_string(),
+                    base: "main".to_string(),
+                    head: "HEAD".to_string(),
+                    dirty: false,
+                    allow_dirty_working_tree: false,
+                },
+                files_changed: 2,
+                files_reviewed: 0,
+                insertions: 0,
+                deletions: 0,
+                findings_count: 0,
+                elapsed_ms: 0,
+                usage: phoenix_core::domain::llm_types::Usage::default(),
+                input_tokens: None,
+                output_tokens: None,
+                reviewer_summary: None,
+            },
+            unreviewed: vec![
+                UnreviewedFile {
+                    file: "big.rs".to_string(),
+                    reason: OversizedReason::PerFileCap,
+                },
+                UnreviewedFile {
+                    file: "also_big.rs".to_string(),
+                    reason: OversizedReason::TotalReviewCap,
+                },
+            ],
+            findings: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let v = serde_json::to_value(&out).expect("serialize");
+        assert_eq!(v["unreviewed"][0]["file"], "big.rs");
+        assert_eq!(v["unreviewed"][0]["reason"], "per_file_cap");
+        assert_eq!(v["unreviewed"][1]["reason"], "total_review_cap");
+    }
 
     #[test]
     fn parse_json_findings() {
