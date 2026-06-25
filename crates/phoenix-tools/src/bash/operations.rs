@@ -29,6 +29,7 @@ use super::handle::{
 };
 use super::registry::{BashHandleError, LiveHandleSummary, WorkScopeHandles};
 use super::ring::{RingLine, WindowView};
+use super::sandbox::ExploreSandboxLauncher;
 use super::types::{BashOp, BashToolInput};
 use crate::{ToolContext, ToolOutput};
 use phoenix_core::domain::tool_wire::{
@@ -147,7 +148,7 @@ pub enum BashError {
         message: String,
         conflicting_args: Vec<&'static str>,
         recommended_action: String,
-        extra: Option<Value>,
+        extra: Option<Box<Value>>,
     },
 }
 
@@ -215,9 +216,11 @@ impl BashError {
                 // model these — see the `MutuallyExclusiveModes` doc on
                 // `BashErrorResponse`).
                 let mut value = serde_json::to_value(&typed_err).unwrap_or(Value::Null);
-                if let (Value::Object(obj), Some(Value::Object(extras))) = (&mut value, extra) {
-                    for (k, v) in extras {
-                        obj.insert(k, v);
+                if let (Value::Object(obj), Some(extra)) = (&mut value, extra) {
+                    if let Value::Object(extras) = *extra {
+                        for (k, v) in extras {
+                            obj.insert(k, v);
+                        }
                     }
                 }
                 let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
@@ -408,8 +411,26 @@ fn resolve_wait_seconds(raw: Option<i64>) -> Result<u64, BashError> {
 // Top-level dispatch
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy)]
+pub enum BashSpawnMode {
+    Direct,
+    ExploreReadOnly,
+}
+
 /// Run a bash request end-to-end and produce the `ToolOutput`.
 pub async fn dispatch(input: Value, ctx: ToolContext) -> ToolOutput {
+    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::Direct).await
+}
+
+pub async fn dispatch_sandboxed(input: Value, ctx: ToolContext) -> ToolOutput {
+    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::ExploreReadOnly).await
+}
+
+async fn dispatch_with_spawn_mode(
+    input: Value,
+    ctx: ToolContext,
+    spawn_mode: BashSpawnMode,
+) -> ToolOutput {
     let request = match parse_request(input) {
         Ok(r) => r,
         Err(e) => return e.into_tool_output(),
@@ -421,7 +442,7 @@ pub async fn dispatch(input: Value, ctx: ToolContext) -> ToolOutput {
             label,
             wait_seconds,
             read_args,
-        } => run_run(&cmd, label, wait_seconds, read_args, &ctx).await,
+        } => run_run(&cmd, label, wait_seconds, read_args, &ctx, spawn_mode).await,
         BashRequest::Peek {
             handle_id,
             read_args,
@@ -447,6 +468,7 @@ async fn run_run(
     wait_seconds: u64,
     read_args: ReadArgs,
     ctx: &ToolContext,
+    spawn_mode: BashSpawnMode,
 ) -> ToolOutput {
     // REQ-BASH-011: command safety is enforced upstream by the permission seam
     // (specs/permissions, the deterministic deny layer) before this tool runs,
@@ -479,8 +501,15 @@ async fn run_run(
         // from the spawned child. We hold the write lock across the spawn
         // so no other run can race the cap check, then insert below.
         // Spawn is fast (a fork+exec) so this lock-hold is bounded.
-        match spawn_child(cmd, label, ctx, handle_id.clone(), ring_bytes_cap) {
-            Ok((handle, child)) => {
+        match spawn_child(
+            cmd,
+            label,
+            ctx,
+            handle_id.clone(),
+            ring_bytes_cap,
+            spawn_mode,
+        ) {
+            Ok((handle, child, sandbox_scratch_dir)) => {
                 let inserted = handles.insert(handle.clone());
                 drop(handles);
                 // Spawn edge: a new bash handle exists for this scope. Emit a
@@ -488,7 +517,12 @@ async fn run_run(
                 // detached waiter started below carries the sink so it can
                 // emit the terminal edge off-thread.
                 registry.emit_lifecycle(&ctx.work_scope);
-                start_io_tasks(&inserted, child, registry.lifecycle_sink());
+                start_io_tasks(
+                    &inserted,
+                    child,
+                    registry.lifecycle_sink(),
+                    sandbox_scratch_dir,
+                );
                 race_run_response(inserted, cmd, wait_seconds, read_args, ctx).await
             }
             Err(e) => {
@@ -511,7 +545,15 @@ fn spawn_child(
     ctx: &ToolContext,
     handle_id: HandleId,
     ring_bytes_cap: usize,
-) -> Result<(Arc<Handle>, tokio::process::Child), String> {
+    spawn_mode: BashSpawnMode,
+) -> Result<
+    (
+        Arc<Handle>,
+        tokio::process::Child,
+        Option<std::path::PathBuf>,
+    ),
+    String,
+> {
     // Per bash.allium @guidance on HandleSpawned:
     //   "Spawn child via Command::new(\"bash\").args([\"-c\", cmd]) with
     //    pre_exec(setpgid(0,0))"
@@ -529,11 +571,20 @@ fn spawn_child(
     // itself is what gets signaled — same outcome as exec'd bash. The
     // load-bearing piece is the process-group leader bit (setpgid below)
     // so that `kill(-pgid, sig)` reaches the user's processes.
-    let mut command = Command::new("bash");
+    let mut sandbox_scratch_dir = None;
+    let mut command = match spawn_mode {
+        BashSpawnMode::Direct => {
+            let mut command = Command::new("bash");
+            command.arg("-c").arg(cmd).current_dir(&ctx.working_dir);
+            command
+        }
+        BashSpawnMode::ExploreReadOnly => {
+            let sandbox_command = ExploreSandboxLauncher::command(cmd, &ctx.working_dir)?;
+            sandbox_scratch_dir = Some(sandbox_command.scratch_dir);
+            Command::from(sandbox_command.command)
+        }
+    };
     command
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(&ctx.working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -552,9 +603,15 @@ fn spawn_child(
         });
     }
 
-    let child = command
-        .spawn()
-        .map_err(|e| format!("failed to spawn bash child: {e}"))?;
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            if let Some(dir) = &sandbox_scratch_dir {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            return Err(format!("failed to spawn bash child: {e}"));
+        }
+    };
 
     let pid = child
         .id()
@@ -571,13 +628,14 @@ fn spawn_child(
         pid,
         ring_bytes_cap,
     );
-    Ok((handle, child))
+    Ok((handle, child, sandbox_scratch_dir))
 }
 
 fn start_io_tasks(
     handle: &Arc<Handle>,
     mut child: tokio::process::Child,
     lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
+    sandbox_scratch_dir: Option<std::path::PathBuf>,
 ) {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -604,7 +662,15 @@ fn start_io_tasks(
     // Waiter task: call wait(), drain readers, then demote the handle.
     let h = handle.clone();
     tokio::spawn(async move {
-        run_waiter(h, child, stdout_join, stderr_join, lifecycle_sink).await;
+        run_waiter(
+            h,
+            child,
+            stdout_join,
+            stderr_join,
+            lifecycle_sink,
+            sandbox_scratch_dir,
+        )
+        .await;
     });
 }
 
@@ -677,6 +743,7 @@ async fn run_waiter(
     stdout_join: Option<tokio::task::JoinHandle<()>>,
     stderr_join: Option<tokio::task::JoinHandle<()>>,
     lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
+    sandbox_scratch_dir: Option<std::path::PathBuf>,
 ) {
     let panic_guard = ExitWatchPanicGuard::new(handle.clone());
     let started_at = Instant::now();
@@ -727,6 +794,11 @@ async fn run_waiter(
             }
         }
     }
+    if let Some(dir) = sandbox_scratch_dir {
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            tracing::debug!(path = %dir.display(), error = %e, "failed to remove explore bash scratch directory");
+        }
+    }
     panic_guard.disarm();
 }
 
@@ -750,7 +822,7 @@ fn exit_status_to_cause(status: std::process::ExitStatus) -> FinalCause {
             signal_number: Some(sig),
         }
     } else if let Some(code) = status.code() {
-        if (128..192).contains(&code) {
+        if (129..192).contains(&code) {
             FinalCause::Killed {
                 exit_code: Some(code),
                 signal_number: Some(code - 128),
@@ -1425,6 +1497,37 @@ mod tests {
             1234,
             RING_BUFFER_BYTES,
         )
+    }
+
+    #[test]
+    fn exit_code_128_is_not_signal_zero() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 128")
+            .status()
+            .expect("spawn shell");
+        assert!(matches!(
+            exit_status_to_cause(status),
+            FinalCause::Exited {
+                exit_code: Some(128)
+            }
+        ));
+    }
+
+    #[test]
+    fn exit_code_137_maps_to_signal_nine() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 137")
+            .status()
+            .expect("spawn shell");
+        assert!(matches!(
+            exit_status_to_cause(status),
+            FinalCause::Killed {
+                exit_code: Some(137),
+                signal_number: Some(9)
+            }
+        ));
     }
 
     #[test]

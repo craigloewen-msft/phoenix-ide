@@ -15,6 +15,7 @@
 //! (`app_settings.default_llm_language`). Chain continuations and sub-agent
 //! conversations inherit their parent's language.
 
+use crate::domain::sm_state::ExploreBashCapability;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -93,7 +94,11 @@ impl LlmLanguage {
             description: self.description().to_string(),
             prompts: LlmLanguagePromptCatalog {
                 base_prompt: base_prompt(self).to_string(),
-                explore_mode_block_template: mode_explore(self, TASKS_DIR),
+                explore_mode_block_template: mode_explore(
+                    self,
+                    TASKS_DIR,
+                    ExploreBashCapability::Unavailable,
+                ),
                 work_mode_block_template: mode_work(self, BRANCH_NAME, BASE_BRANCH, WORKTREE_PATH),
                 direct_mode_block: mode_direct(self).to_string(),
                 branch_mode_block_template: mode_branch(
@@ -164,7 +169,23 @@ pub fn sub_agent_suffix(lang: LlmLanguage) -> &'static str {
 // version uses so language is a pure swap.
 
 #[must_use]
-pub fn mode_explore(lang: LlmLanguage, tasks_dir_name: &str) -> String {
+pub fn mode_explore(
+    lang: LlmLanguage,
+    tasks_dir_name: &str,
+    bash: ExploreBashCapability,
+) -> String {
+    let bash_guidance = match (lang, bash) {
+        (LlmLanguage::PhoenixNative, ExploreBashCapability::Sandboxed) => {
+            "`bash` is available for read-only local investigation under an OS sandbox: it can read local files broadly like other Explore read tools, but source/Git metadata/task writes and network access are blocked. Use `patch` for task proposal drafts; bash may write only to scratch, synthetic home, and platform temp."
+        }
+        (LlmLanguage::PhoenixNative, ExploreBashCapability::Unavailable) => {
+            "`bash` is unavailable because this host cannot enforce the Explore sandbox; use read-only tools instead."
+        }
+        (LlmLanguage::Caveman, ExploreBashCapability::Sandboxed) => {
+            "Bash can look wide but no write code and no network."
+        }
+        (LlmLanguage::Caveman, ExploreBashCapability::Unavailable) => "No bash here.",
+    };
     match lang {
         LlmLanguage::PhoenixNative => format!(
             "\n\nYou are in Explore mode. This conversation is read-only \
@@ -196,15 +217,16 @@ pub fn mode_explore(lang: LlmLanguage, tasks_dir_name: &str) -> String {
                 reject. On approval, an isolated worktree is created and \
                 you gain full write access.\n\n\
              The `patch` tool is restricted to `{tasks_dir_name}/` in this \
-             mode. `bash` is unavailable. If the user asks you to change \
-             code directly, explain that you must propose a task first."
+             mode. {bash_guidance} If the user asks \
+             you to change code directly, explain that you must propose a task \
+             first."
         ),
         LlmLanguage::Caveman => format!(
             "\n\nYou in look-only cave. Look at code. No change code. \
              To do work: write plan in `{tasks_dir_name}/` (file like \
              `12345-p2-ready--slug.md`), then call propose_task with that file. \
              Big caveman say yes? You get new cave with write power. \
-             No bash here. patch only in `{tasks_dir_name}/`."
+             {bash_guidance} patch only in `{tasks_dir_name}/`."
         ),
     }
 }

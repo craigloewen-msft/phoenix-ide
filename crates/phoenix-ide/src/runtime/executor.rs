@@ -3383,6 +3383,7 @@ where
         let mode_context = self.context.mode_context.clone();
         let llm_language = self.context.llm_language;
         let persona = self.context.persona.clone();
+        let explore_bash = self.context.explore_bash;
 
         // Token streaming channel (REQ-BED-025).
         //
@@ -3491,6 +3492,16 @@ where
             )
             .await;
 
+            // Build tool definitions before the mode prompt so Explore prose can
+            // describe the same tool surface the model receives.
+            let tools = tool_executor.definitions_for_language(llm_language).await;
+            let explore_bash_capability =
+                if matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. })) {
+                    explore_bash
+                } else {
+                    phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
+                };
+
             // Build system prompt with AGENTS.md content + mode context
             // TODO(task 61006): snapshot system prompt per conversation to stop mid-session cache busts
             let system_prompt = build_system_prompt(
@@ -3500,12 +3511,10 @@ where
                 mode_context.as_ref(),
                 llm_language,
                 persona.as_deref(),
+                explore_bash_capability,
             );
 
             // Build request — normalize messages against current tool set
-            // to remove tool_use/tool_result blocks for tools no longer
-            // available (e.g., propose_task after Explore→Work transition).
-            let tools = tool_executor.definitions_for_language(llm_language).await;
             let tool_names: std::collections::HashSet<&str> =
                 tools.iter().map(|t| t.name.as_str()).collect();
             let messages = strip_unavailable_tool_blocks(messages, &tool_names);
@@ -3709,7 +3718,15 @@ where
     async fn dispatch_tool_execution(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
         // Special handling for spawn_agents tool
         if tool.name() == "spawn_agents" {
-            return self.handle_spawn_agents_tool(tool).await;
+            let advertised = self
+                .tool_executor
+                .definitions()
+                .await
+                .iter()
+                .any(|definition| definition.name == "spawn_agents");
+            if advertised {
+                return self.handle_spawn_agents_tool(tool).await;
+            }
         }
 
         // REQ-WPV-002: stamp the per-tool start time into the parent

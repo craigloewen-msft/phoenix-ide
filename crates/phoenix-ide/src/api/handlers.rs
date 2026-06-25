@@ -2099,6 +2099,15 @@ async fn get_system_prompt(
     // Mirror the mode context the live request uses (worktree boundaries,
     // Explore guidance) so the inspected prompt matches what the model sees.
     let mode_context = crate::runtime::conv_mode_to_context(&conversation.conv_mode);
+    let explore_bash = if matches!(
+        mode_context,
+        crate::system_prompt::ModeContext::Explore { .. }
+    ) && state.platform.has_sandbox()
+    {
+        phoenix_core::domain::sm_state::ExploreBashCapability::Sandboxed
+    } else {
+        phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
+    };
     let system_prompt = crate::system_prompt::build_system_prompt(
         &cwd,
         &tasks_dir_name,
@@ -2106,6 +2115,7 @@ async fn get_system_prompt(
         Some(&mode_context),
         conversation.llm_language,
         persona.as_deref(),
+        explore_bash,
     );
 
     Ok(Json(SystemPromptResponse { system_prompt }))
@@ -5553,12 +5563,14 @@ pub(crate) mod hard_delete_cascade_tests {
     pub(crate) async fn make_test_state() -> AppState {
         let db = Database::open_in_memory().await.expect("open db");
         let llm_registry = Arc::new(ModelRegistry::new_empty());
-        let platform = PlatformCapability::None;
+        let platform = PlatformCapability::None {
+            details: "test".into(),
+        };
         let mcp_manager = Arc::new(McpClientManager::new());
         let runtime = Arc::new(RuntimeManager::new(
             db.clone(),
             llm_registry.clone(),
-            platform,
+            platform.clone(),
             mcp_manager.clone(),
             None,
         ));
@@ -7798,12 +7810,14 @@ mod upgrade_model_state_guard_tests {
     async fn make_test_state() -> AppState {
         let db = Database::open_in_memory().await.expect("open db");
         let llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(StubLlm)));
-        let platform = PlatformCapability::None;
+        let platform = PlatformCapability::None {
+            details: "test".into(),
+        };
         let mcp_manager = Arc::new(McpClientManager::new());
         let runtime = Arc::new(RuntimeManager::new(
             db.clone(),
             llm_registry.clone(),
-            platform,
+            platform.clone(),
             mcp_manager.clone(),
             None,
         ));
@@ -8069,12 +8083,14 @@ mod file_read_tests {
         .await
         .expect("seed conversation");
         let llm_registry = Arc::new(ModelRegistry::new_empty());
-        let platform = PlatformCapability::None;
+        let platform = PlatformCapability::None {
+            details: "test".into(),
+        };
         let mcp_manager = Arc::new(McpClientManager::new());
         let runtime = Arc::new(RuntimeManager::new(
             db.clone(),
             llm_registry.clone(),
-            platform,
+            platform.clone(),
             mcp_manager.clone(),
             None,
         ));
@@ -8637,12 +8653,14 @@ mod chat_authority_tests {
     async fn make_state() -> AppState {
         let db = Database::open_in_memory().await.expect("open db");
         let llm_registry = Arc::new(ModelRegistry::new_empty());
-        let platform = PlatformCapability::None;
+        let platform = PlatformCapability::None {
+            details: "test".to_string(),
+        };
         let mcp_manager = Arc::new(McpClientManager::new());
         let runtime = Arc::new(RuntimeManager::new(
             db.clone(),
             llm_registry.clone(),
-            platform,
+            platform.clone(),
             mcp_manager.clone(),
             None,
         ));

@@ -839,19 +839,45 @@ checking. Error messages suggest alternatives:
 - `permission denied: git push --force is not allowed. Use --force-with-lease for safer force pushes, or push without force`
 - `permission denied: this rm command could delete critical data (.git, home directory, or root). Specify the full path explicitly (no wildcards, ~, or $HOME)`
 
-## Landlock Enforcement (REQ-BASH-012, REQ-BASH-013)
+## Explore Read-Only Sandbox (REQ-BASH-012, REQ-BASH-013)
 
-Unchanged from the prior revision. Explore-mode conversations spawn child
-processes with Landlock restrictions applied via the `landlock` crate at
-`pre_exec` time. Work-mode conversations spawn without restrictions. The
-detection of Landlock availability runs once at startup and is cached on
-the registry. On unsupported kernels or non-Linux OSes, Explore-mode
-read-only enforcement degrades to advisory tool-level checks; Work mode
-operates normally.
+Top-level Explore conversations use a separate `SandboxedBashTool` instance
+with the same schema, parser, handle registry, peek/wait/kill operations, ring
+buffer, and response shaping as writable `BashTool`. The only divergent path is
+`op="run"`: Phoenix spawns a short-lived Phoenix child process, that child
+applies `nono::Sandbox::apply()` to itself, and then it execs `/bin/bash -c
+<cmd>`. The server process never applies the sandbox to itself.
 
-The handle model does not change Landlock semantics. A handle's process
-inherits the sandbox policy from its spawn-time mode; the policy is fixed
-for the process's lifetime regardless of subsequent peek/wait/kill calls.
+The Explore policy grants broad filesystem read access, Phoenix-owned scratch
+read-write, a synthetic sandbox home under scratch, and platform-compatible
+temporary directory writes. Task proposal directories are read-only to bash;
+task drafts go through scoped non-bash proposal tools. If the platform temp root
+would cover the worktree, resolved Git metadata, or Phoenix-owned runtime state,
+the temp capability falls back to a Phoenix-owned scratch child so the temp grant
+cannot cover protected state. The scratch root itself is rejected when it overlaps
+protected repo/Git/Phoenix paths. `PHOENIX_SANDBOX_SCRATCH` names scratch,
+`PHOENIX_SANDBOX_HOME` and `HOME` name the synthetic home, and `TMPDIR` names
+the platform temp directory. Network access is blocked and the child
+environment is rebuilt from a small allowlist that preserves `PATH` while
+stripping ambient credential variables.
+
+The waiter removes Phoenix-owned per-command scratch/home directories when the
+sandboxed command reaches a terminal state. Platform temp is intentionally left
+to the platform.
+
+Broad read is deliberate: Explore already exposes read-only tools that can read
+arbitrary user-selected paths, and sandboxed bash follows that product contract.
+The sandbox is the write/network/ambient-credential boundary. Sensitive readable
+paths are part of the same broad-read risk model as `read_file` and `search`; read
+confidentiality is a separate feature with its own threat model.
+
+Platform detection is `nono::Sandbox::support_info()` at startup. When `nono`
+reports no enforceable backend, top-level Explore registries omit bash. Direct,
+Work, and Branch registries keep the ordinary writable bash behavior.
+
+The handle model does not change sandbox semantics. A handle's process inherits
+the sandbox policy from its spawn-time tool; the policy is fixed for the
+process's lifetime regardless of subsequent peek/wait/kill calls.
 
 ## Testing Strategy
 
@@ -868,6 +894,12 @@ for the process's lifetime regardless of subsequent peek/wait/kill calls.
 - Error envelope shapes for each stable error id.
 
 ### Integration tests
+- Top-level Explore bash on a supported host: `git log`, `git status`,
+  `git blame`, `rg`, and `cat` can read the worktree and other readable local
+  files; source writes fail with kernel permission errors; task proposal writes
+  fail; scratch, synthetic-home, and platform-temp writes succeed; network commands
+  fail; configured ambient credential variables are absent; Phoenix-owned
+  scratch/home directories are reaped after terminal state.
 - Spawn → exits within wait_seconds → `status: "exited"` with exit code.
 - Spawn → wait_seconds elapses → `status: "still_running"` with handle.
 - Repeated `wait` on same handle returns same handle id on each re-timeout.
