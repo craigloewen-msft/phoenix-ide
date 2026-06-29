@@ -696,13 +696,29 @@ function QueuedUserMessageImpl({
 // Compact-density helpers
 // ============================================================================
 
+const COMPACT_TEXT_PREVIEW_LIMIT = 140;
+
 /** First non-empty line of a text block, collapsed to single-line whitespace
- *  and ellipsized — the faded one-liner shown for insignificant prose in
- *  compact mode. */
-function firstLineSummary(text: string, maxLen = 140): string {
+ *  and ellipsized — the faded one-liner shown for compact prose that hides
+ *  content. */
+function firstLineSummary(text: string, maxLen = COMPACT_TEXT_PREVIEW_LIMIT): string {
   const firstLine = text.split('\n').find((l) => l.trim()) ?? text;
   const flat = firstLine.replace(/\s+/g, ' ').trim();
   return flat.length > maxLen ? `${flat.slice(0, maxLen - 1)}…` : flat;
+}
+
+function shouldCollapseCompactText(text: string): boolean {
+  if (containsMermaidFence(text)) return false;
+  if (isSignificantText(text)) return false;
+
+  const nonEmptyLines = text.split('\n').filter((line) => line.trim());
+  const firstLineFlat = (nonEmptyLines[0] ?? '').replace(/\s+/g, ' ').trim();
+  const fullFlat = text.replace(/\s+/g, ' ').trim();
+
+  const hidesAdditionalLines = nonEmptyLines.length > 1 && firstLineFlat !== fullFlat;
+  const truncatesFirstLine = firstLineFlat.length > COMPACT_TEXT_PREVIEW_LIMIT;
+
+  return hidesAdditionalLines || truncatesFirstLine;
 }
 
 /**
@@ -733,8 +749,8 @@ const AgentTextBlock = memo(function AgentTextBlock({
 });
 
 /**
- * An assistant text block that, in compact mode, is below the significance
- * threshold. Renders as a faded clickable one-liner that expands to the full
+ * An assistant text block that, in compact mode, has content hidden by its
+ * preview. Renders as a faded clickable one-liner that expands to the full
  * markdown on click — never destructive, the full text is always one click
  * away (and the title attr carries the first line for hover).
  */
@@ -1022,9 +1038,9 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
                 return null;
               }
               const remarkPlugins = usesGfmSyntax(block.text) ? REMARK_PLUGINS : NO_REMARK_PLUGINS;
-              // Compact: short prose folds to a faded expandable one-liner.
+              // Compact: only previews that hide content fold to an expandable one-liner.
               // Substantial prose (>= threshold) always renders full.
-              if (compact && !isSignificantText(block.text) && !containsMermaidFence(block.text)) {
+              if (compact && shouldCollapseCompactText(block.text)) {
                 return (
                   <CollapsibleText
                     key={i}
