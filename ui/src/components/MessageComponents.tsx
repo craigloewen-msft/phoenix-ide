@@ -852,6 +852,7 @@ interface AgentMessageProps {
   onOpenFile?: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
   filePathRootDir?: string | undefined;
   workScopeKey?: string | undefined;
+  activeToolUseId?: string | undefined;
   /**
    * When false, suppresses the "Phoenix HH:MM" header row. Used by the list
    * to collapse repeated headers across a run of consecutive agent messages
@@ -863,7 +864,7 @@ interface AgentMessageProps {
 
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, workScopeKey, isFirstInTurn = true }: AgentMessageProps) {
+function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, workScopeKey, activeToolUseId, isFirstInTurn = true }: AgentMessageProps) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const timestamp = message.created_at;
   const { theme } = useTheme();
@@ -1086,9 +1087,13 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
               const toolStartsMap = (message.display_data as Record<string, unknown> | undefined)?.[
                 'tool_starts'
               ] as Record<string, number> | undefined;
+              const toolUseId = block.id;
               const toolStartedAtMs =
-                block.id && toolStartsMap && typeof toolStartsMap[block.id] === 'number'
-                  ? (toolStartsMap[block.id] as number)
+                toolUseId !== undefined &&
+                  toolUseId === activeToolUseId &&
+                  toolStartsMap &&
+                  typeof toolStartsMap[toolUseId] === 'number'
+                  ? (toolStartsMap[toolUseId] as number)
                   : undefined;
               return (
                 <ToolUseBlock
