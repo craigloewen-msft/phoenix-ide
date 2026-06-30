@@ -1,2 +1,2 @@
-export { MobileConversationListFixture } from './renderFixture';
-export { mobileConversationListScenarios } from './scenarios';
+export { MobileConversationListFixture, MobileConversationListFixtureBody } from './renderFixture';
+export { getMobileConversationListScenario, mobileConversationListScenarios } from './scenarios';
