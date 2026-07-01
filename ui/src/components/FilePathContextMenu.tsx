@@ -3,6 +3,7 @@ import { copyToClipboard } from '../utils/clipboard';
 import {
   FILE_PATH_CONTEXT_MENU_OPEN_EVENT,
   MESSAGE_CONTEXT_MENU_OPEN_EVENT,
+  FILE_TREE_CONTEXT_MENU_OPEN_EVENT,
 } from './contextMenuEvents';
 import './MessageContextMenu.css';
 
@@ -45,7 +46,11 @@ export function FilePathContextMenu() {
   useEffect(() => {
     const closeMenu = () => setMenu(null);
     window.addEventListener(MESSAGE_CONTEXT_MENU_OPEN_EVENT, closeMenu);
-    return () => window.removeEventListener(MESSAGE_CONTEXT_MENU_OPEN_EVENT, closeMenu);
+    window.addEventListener(FILE_TREE_CONTEXT_MENU_OPEN_EVENT, closeMenu);
+    return () => {
+      window.removeEventListener(MESSAGE_CONTEXT_MENU_OPEN_EVENT, closeMenu);
+      window.removeEventListener(FILE_TREE_CONTEXT_MENU_OPEN_EVENT, closeMenu);
+    };
   }, []);
 
   useEffect(() => {
