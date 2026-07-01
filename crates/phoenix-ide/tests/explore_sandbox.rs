@@ -19,12 +19,13 @@ fn explore_sandbox_enforces_read_only_policy() {
     let repo = fixture_root.join("repo");
     let tasks = repo.join("tasks");
     let scratch = fixture_root.join("scratch");
-    let sandbox_home = scratch.join("home");
+    let home = fixture_root.join("real-home");
     let platform_temp = std::env::temp_dir();
     let outside = fixture_root.join("outside.txt");
     let sensitive = fixture_root.join("sensitive");
     std::fs::create_dir_all(&tasks).expect("tasks dir");
-    std::fs::create_dir_all(&sandbox_home).expect("sandbox home");
+    std::fs::create_dir_all(&scratch).expect("scratch dir");
+    std::fs::create_dir_all(&home).expect("home dir");
     std::fs::create_dir_all(&sensitive).expect("sensitive dir");
     std::fs::write(tasks.join("_TEMPLATE.md"), "# Template\n").expect("template");
     std::fs::write(repo.join("file.txt"), "hello\n").expect("source file");
@@ -45,7 +46,7 @@ fn explore_sandbox_enforces_read_only_policy() {
         &SandboxFixture {
             repo: &repo,
             scratch: &scratch,
-            sandbox_home: &sandbox_home,
+            home: &home,
             platform_temp: &platform_temp,
             sensitive: &sensitive,
         },
@@ -61,7 +62,7 @@ fn explore_sandbox_enforces_read_only_policy() {
         &SandboxFixture {
             repo: &repo,
             scratch: &scratch,
-            sandbox_home: &sandbox_home,
+            home: &home,
             platform_temp: &platform_temp,
             sensitive: &sensitive,
         },
@@ -78,7 +79,7 @@ fn explore_sandbox_enforces_read_only_policy() {
         &SandboxFixture {
             repo: &repo,
             scratch: &scratch,
-            sandbox_home: &sandbox_home,
+            home: &home,
             platform_temp: &platform_temp,
             sensitive: &sensitive,
         },
@@ -98,7 +99,7 @@ fn explore_sandbox_enforces_read_only_policy() {
         &SandboxFixture {
             repo: &repo,
             scratch: &scratch,
-            sandbox_home: &sandbox_home,
+            home: &home,
             platform_temp: &platform_temp,
             sensitive: &sensitive,
         },
@@ -114,7 +115,7 @@ fn explore_sandbox_enforces_read_only_policy() {
         &SandboxFixture {
             repo: &repo,
             scratch: &scratch,
-            sandbox_home: &sandbox_home,
+            home: &home,
             platform_temp: &platform_temp,
             sensitive: &sensitive,
         },
@@ -131,7 +132,7 @@ fn explore_sandbox_enforces_read_only_policy() {
         &SandboxFixture {
             repo: &repo,
             scratch: &scratch,
-            sandbox_home: &sandbox_home,
+            home: &home,
             platform_temp: &platform_temp,
             sensitive: &sensitive,
         },
@@ -147,11 +148,11 @@ fn explore_sandbox_enforces_read_only_policy() {
         &SandboxFixture {
             repo: &repo,
             scratch: &scratch,
-            sandbox_home: &sandbox_home,
+            home: &home,
             platform_temp: &platform_temp,
             sensitive: &sensitive,
         },
-        "printf 'home=%s\npsh=%s\nscratch=%s\ntmp=%s\ngh=%s\n' \"$HOME\" \"$PHOENIX_SANDBOX_HOME\" \"$PHOENIX_SANDBOX_SCRATCH\" \"$TMPDIR\" \"${GH_TOKEN-unset}\"",
+        "printf 'home=%s\nscratch=%s\ntmp=%s\ngh=%s\n' \"$HOME\" \"$PHOENIX_SANDBOX_SCRATCH\" \"$TMPDIR\" \"${GH_TOKEN-unset}\"",
     );
     assert!(
         env_probe.status.success(),
@@ -159,10 +160,7 @@ fn explore_sandbox_enforces_read_only_policy() {
     );
     assert!(env_probe
         .stdout
-        .contains(&format!("home={}", sandbox_home.display())));
-    assert!(env_probe
-        .stdout
-        .contains(&format!("psh={}", sandbox_home.display())));
+        .contains(&format!("home={}", home.display())));
     assert!(env_probe
         .stdout
         .contains(&format!("scratch={}", scratch.display())));
@@ -171,12 +169,35 @@ fn explore_sandbox_enforces_read_only_policy() {
         .contains(&format!("tmp={}", platform_temp.display())));
     assert!(env_probe.stdout.contains("gh=unset"));
 
+    // HOME is the user's real home, passed through unchanged. The nono
+    // sandbox must block writes to it — only scratch and platform-temp are
+    // read-write. This is the core security invariant of not remapping HOME.
+    let home_write_denied = sandbox_run(
+        bin,
+        &SandboxFixture {
+            repo: &repo,
+            scratch: &scratch,
+            home: &home,
+            platform_temp: &platform_temp,
+            sensitive: &sensitive,
+        },
+        "echo bad > \"$HOME/.phoenix-sandbox-test-write\"",
+    );
+    assert!(
+        !home_write_denied.status.success(),
+        "HOME write unexpectedly succeeded: {home_write_denied:?}"
+    );
+    assert!(
+        !home.join(".phoenix-sandbox-test-write").exists(),
+        "HOME write should have been blocked by the sandbox"
+    );
+
     let sensitive_read = sandbox_run(
         bin,
         &SandboxFixture {
             repo: &repo,
             scratch: &scratch,
-            sandbox_home: &sandbox_home,
+            home: &home,
             platform_temp: &platform_temp,
             sensitive: &sensitive,
         },
@@ -193,7 +214,7 @@ fn explore_sandbox_enforces_read_only_policy() {
         &SandboxFixture {
             repo: &repo,
             scratch: &scratch,
-            sandbox_home: &sandbox_home,
+            home: &home,
             platform_temp: &platform_temp,
             sensitive: &sensitive,
         },
@@ -229,7 +250,7 @@ struct SandboxOutput {
 struct SandboxFixture<'a> {
     repo: &'a std::path::Path,
     scratch: &'a std::path::Path,
-    sandbox_home: &'a std::path::Path,
+    home: &'a std::path::Path,
     platform_temp: &'a std::path::Path,
     sensitive: &'a std::path::Path,
 }
@@ -239,7 +260,7 @@ fn sandbox_run(bin: &str, fixture: &SandboxFixture<'_>, cmd: &str) -> SandboxOut
         .args(["--sandbox-exec", "--", cmd])
         .env("PHOENIX_SANDBOX_REPO_ROOT", fixture.repo)
         .env("PHOENIX_SANDBOX_SCRATCH", fixture.scratch)
-        .env("PHOENIX_SANDBOX_HOME", fixture.sandbox_home)
+        .env("HOME", fixture.home)
         .env("PHOENIX_SANDBOX_PLATFORM_TEMP", fixture.platform_temp)
         .env("PHOENIX_SANDBOX_SENSITIVE_DIRS", fixture.sensitive)
         .env("GH_TOKEN", "should-not-leak")
