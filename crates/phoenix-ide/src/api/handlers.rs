@@ -43,7 +43,7 @@ use crate::state_machine::{check_user_message_acceptable, ConvState, Event, Tran
 use super::browser_view::browser_view_ws_handler;
 
 use axum::{
-    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
+    extract::{DefaultBodyLimit, MatchedPath, Multipart, Path, Query, State},
     http::StatusCode,
     middleware,
     response::{Html, IntoResponse, Redirect, Response},
@@ -61,6 +61,7 @@ use std::fs;
 use std::path::{Path as FsPath, PathBuf};
 use std::time::{Duration, SystemTime};
 use tokio::io::AsyncWriteExt;
+use tower_http::trace::TraceLayer;
 
 async fn trajectory_export_handler(
     State(state): State<AppState>,
@@ -401,6 +402,91 @@ pub fn create_router(state: AppState) -> Router {
             state.clone(),
             super::auth::auth_middleware,
         ))
+        // HTTP access log + Datadog tracing: applied via `route_layer` so it
+        // runs AFTER routing, making axum's `MatchedPath` (the route template,
+        // e.g. `/api/conversations/:id/stream`) available in `make_span_with`.
+        //
+        // The `otel.kind = "server"` field is read by the tracing-opentelemetry
+        // bridge to set SpanKind::Server, which the datadog-opentelemetry
+        // exporter maps to type=web. The `http.request.method` and `http.route`
+        // fields are mapped to OTel HTTP semantic conventions, which the
+        // exporter uses to set the operation name to "http.server.request" and
+        // the resource to "METHOD /template". The `http.response.status_code`
+        // field is declared as Empty in the span and recorded in on_response so
+        // it appears as meta.http.status_code. For 5xx responses, the OTel span
+        // status is set to ERROR so Datadog counts them in error-rate metrics.
+        //
+        // The raw `path` field is intentionally omitted from the span to avoid
+        // exporting sensitive URL segments (share tokens, file paths) to
+        // Datadog. The `http.route` template is sufficient for endpoint
+        // grouping; the `method` field is retained for local log output. For
+        // unmatched/fallback routes where MatchedPath is not available,
+        // `http.route` is set to "unmatched" to avoid leaking raw paths.
+        //
+        // Health check endpoint (/version) uses Span::none() to suppress it
+        // from both logging and OTel export entirely. The on_response callback
+        // checks for Span::none() via id().is_none() before emitting the access
+        // log event.
+        .route_layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    let path = request.uri().path();
+                    if path == "/version" {
+                        // Suppress health-check spans entirely — no log output,
+                        // no OTel export.
+                        tracing::Span::none()
+                    } else {
+                        // MatchedPath is the route template (e.g.
+                        // /api/conversations/:id/stream), available because
+                        // route_layer runs after routing. For unmatched/fallback
+                        // routes where MatchedPath is not available, use
+                        // "unmatched" to avoid leaking raw paths that may
+                        // contain tokens or file paths.
+                        let route = request
+                            .extensions()
+                            .get::<MatchedPath>()
+                            .map_or_else(|| "unmatched".to_string(), |m| m.as_str().to_string());
+                        tracing::info_span!(
+                            "http",
+                            otel.kind = "server",
+                            method = %request.method(),
+                            "http.request.method" = %request.method(),
+                            "http.route" = %route,
+                            "http.response.status_code" = tracing::field::Empty,
+                            "otel.status_code" = tracing::field::Empty,
+                        )
+                    }
+                })
+                .on_response(
+                    |response: &axum::http::Response<_>,
+                     latency: std::time::Duration,
+                     span: &tracing::Span| {
+                        // Skip access-log event for suppressed spans (e.g.
+                        // /version health checks that use Span::none()).
+                        if span.id().is_none() {
+                            return;
+                        }
+                        let status = response.status().as_u16();
+                        // Record status code as a span attribute so the Datadog
+                        // exporter maps it to meta.http.status_code.
+                        span.record("http.response.status_code", status);
+                        // Mark 5xx responses as errors so Datadog counts them
+                        // in APM error-rate metrics.
+                        if status >= 500 {
+                            span.record("otel.status_code", "ERROR");
+                        }
+                        tracing::info!(
+                            parent: span,
+                            status = status,
+                            latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
+                        );
+                    },
+                )
+                .on_request(tower_http::trace::DefaultOnRequest::new().level(tracing::Level::DEBUG))
+                .on_failure(
+                    tower_http::trace::DefaultOnFailure::new().level(tracing::Level::ERROR),
+                ),
+        )
         .with_state(state)
 }
 

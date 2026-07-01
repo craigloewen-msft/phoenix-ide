@@ -70,7 +70,6 @@ use std::sync::Arc;
 use tower_http::{
     compression::CompressionLayer,
     cors::{Any, CorsLayer},
-    trace::TraceLayer,
 };
 mod hot_restart;
 mod logging;
@@ -552,10 +551,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Initialize logging from the configured sinks (PHOENIX_LOG_STDOUT /
-    // PHOENIX_LOG_FILE). The guard must outlive the program so the file
-    // appender's worker flushes on shutdown; held until `main` returns.
+    // PHOENIX_LOG_FILE) and the Datadog tracer provider (DD_* env vars). The
+    // handles must outlive the program so the file appender worker and the
+    // tracer provider flush on shutdown; held until `main` returns.
     let log_config = logging::LogConfig::from_env();
-    let _log_guard = logging::init(&log_config)?;
+    let tracing_handles = logging::init(&log_config)?;
 
     // Install a rustls crypto provider explicitly. rustls 0.23 refuses
     // to auto-pick when both `ring` and `aws-lc-rs` end up in the dep
@@ -906,41 +906,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let compression = CompressionLayer::new().gzip(true).br(true);
 
-    // HTTP access log: one line per request with method, path, status, latency.
-    // Health check endpoint (/version) is suppressed from normal INFO logging.
-    let trace_layer = TraceLayer::new_for_http()
-        .make_span_with(|request: &axum::http::Request<_>| {
-            // Create a span at INFO level; health checks get a separate disabled span
-            // to suppress them from normal log output.
-            let path = request.uri().path();
-            if path == "/version" {
-                tracing::debug_span!(
-                    "http",
-                    method = %request.method(),
-                    path = %path,
-                )
-            } else {
-                tracing::info_span!(
-                    "http",
-                    method = %request.method(),
-                    path = %path,
-                )
-            }
-        })
-        .on_response(
-            |response: &axum::http::Response<_>,
-             latency: std::time::Duration,
-             span: &tracing::Span| {
-                tracing::info!(
-                    parent: span,
-                    status = response.status().as_u16(),
-                    latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
-                );
-            },
-        )
-        .on_request(tower_http::trace::DefaultOnRequest::new().level(tracing::Level::DEBUG))
-        .on_failure(tower_http::trace::DefaultOnFailure::new().level(tracing::Level::ERROR));
-
     // Clear-to-ready sweep: once a usage-limit window elapses, return the
     // errored conversation to Idle so it is usable again without a manual
     // dismiss. Detached for the process lifetime; the first tick fires
@@ -953,10 +918,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // pass (REQ-BASH-007) can reach it after `state` moves into the router.
     let bash_handles_for_shutdown = state.runtime.bash_handles().clone();
 
-    let app = create_router(state)
-        .layer(trace_layer)
-        .layer(cors)
-        .layer(compression);
+    let app = create_router(state).layer(cors).layer(compression);
 
     // The listener was bound earlier so the deployment report could record the
     // real bind address (see above).
@@ -1012,6 +974,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
+    // Flush in-flight Datadog spans to the agent before we kill child
+    // processes and exit. Bounded by a 1s timeout inside shutdown_tracer.
+    tracing_handles.shutdown_tracer();
 
     // REQ-BASH-007: after the server stops accepting requests, walk the
     // live bash handle table and SIGKILL every process group as a final
