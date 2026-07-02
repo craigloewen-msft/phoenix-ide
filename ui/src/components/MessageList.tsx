@@ -16,7 +16,8 @@ import { MessageContextMenu } from './MessageContextMenu';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { useStreamingRequestId } from '../conversation/useConversationAtom';
 import {
-  buildRenderUnits,
+  buildHistoricalUnits,
+  buildTailUnits,
   type HistoricalUnit,
   type TailUnit,
   type RenderUnit,
@@ -77,6 +78,21 @@ export interface MessageListHandle {
 
 
 const PIN_TO_BOTTOM_THRESHOLD = 100;
+
+// How long after the last upward user scroll the auto-follow re-snap stays
+// suppressed. Rolling: touch momentum keeps refreshing it on every upward
+// scroll event, so the window only has to outlive the gap between momentum
+// scroll events, not the whole momentum animation.
+const USER_SCROLL_SUPPRESS_MS = 400;
+
+// Settle watch: how long after a conversation's first measurement the list
+// keeps verifying it is pinned to the bottom, and how often. Mount-time
+// stranding can be silent — virtuoso's placement churn does not always end
+// with a height delta or scroll event to hook — so event-driven rescue
+// alone can leave the viewport stranded until an unrelated late
+// measurement. The watch is stopped early by any user engagement.
+const SETTLE_WATCH_MS = 3000;
+const SETTLE_WATCH_INTERVAL_MS = 150;
 
 function formatAttachmentBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -310,9 +326,18 @@ function MessageListImpl({
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const scrollerRef = useRef<HTMLElement | null>(null);
   // Most recent `totalListHeightChanged` value virtuoso has reported. Used
-  // to detect "user was pinned to the previous bottom" — see the
-  // handleTotalListHeightChanged comment.
+  // only to classify a height delta as growth vs shrink (model units
+  // compared against model units) — see handleTotalListHeightChanged.
   const prevTotalHeightRef = useRef(0);
+  // Previous DOM scrollHeight of the scroller. The pin-distance check must
+  // compare scrollTop (DOM units) against the pre-growth bottom in the SAME
+  // units: virtuoso's totalListHeight is an estimate-corrected model value
+  // that can disagree with the DOM scrollHeight by more than the pin
+  // threshold on long conversations (hundreds of not-yet-measured rows'
+  // estimate error), which misclassifies a genuinely pinned user as
+  // scrolled-up and silently kills auto-follow. Synced at every height
+  // callback, so at callback time it still holds the pre-growth DOM height.
+  const prevScrollHeightRef = useRef(0);
   // Previous viewport (scroller) clientHeight. Used to detect viewport
   // shrinks (resize, panel expansion, composer growth) so a pinned user
   // stays pinned — see the viewport-shrink handling in
@@ -340,14 +365,19 @@ function MessageListImpl({
     [streamingRequestId],
   );
 
-  const { historicalUnits, tailUnits } = useMemo(
-    () => buildRenderUnits({
-      messages,
-      pendingMessages,
-      convState,
-      streamingHandle,
-    }),
-    [messages, pendingMessages, convState, streamingHandle],
+  // Split memos at the transform's natural boundary: historical units must
+  // NOT rebuild on conversation state ticks. A rebuild gives every unit a
+  // fresh object and toolResultsByUseId Map identity, which defeats
+  // AgentMessage's memo() and re-renders every mounted row on every state
+  // transition (sending → streaming → tool_executing → …) for zero visual
+  // change.
+  const { historicalUnits, endsInAgentRun } = useMemo(
+    () => buildHistoricalUnits({ messages, pendingMessages }),
+    [messages, pendingMessages],
+  );
+  const tailUnits = useMemo(
+    () => buildTailUnits({ convState, streamingHandle, endsInAgentRun }),
+    [convState, streamingHandle, endsInAgentRun],
   );
 
   const allUnits = useMemo<RenderUnit[]>(
@@ -379,7 +409,96 @@ function MessageListImpl({
     if (atBottom) setHasUnreadTailContent(false);
   }, []);
 
+  // User-gesture tracking for handleTotalListHeightChanged: an active touch
+  // drag, or any upward scroll within USER_SCROLL_SUPPRESS_MS (wheel notch,
+  // scrollbar drag, touch momentum after finger lift), marks the viewport as
+  // user-owned so the auto-follow re-snap never fights the gesture. Downward
+  // movement never suppresses — our own programmatic snaps scroll down, and a
+  // user scrolling down is heading to the bottom anyway.
+  const touchActiveRef = useRef(false);
+  const lastUpwardScrollAtRef = useRef(0);
+  const lastScrollTopRef = useRef(0);
+  const detachGestureListenersRef = useRef<(() => void) | null>(null);
+  // False until the user first interacts with this conversation's scroller
+  // (touch, wheel, pointer) or triggers a nav jump. While false, the list is
+  // still settling from mount and every height delta re-snaps to the bottom
+  // regardless of measured distance: virtuoso's initial `LAST` placement can
+  // be stranded far from the bottom when a large estimate correction lands
+  // right after mount, and a distance-based pin check would classify that
+  // stranding as "user scrolled up" and never recover. The mount contract is
+  // "open pinned to the newest message"; only a user action releases it.
+  const hasUserEngagedRef = useRef(false);
+  // Pending settle-snap frame (see scheduleSettleSnap). One in flight at a
+  // time; coalesces the burst of height deltas virtuoso emits while
+  // measuring a freshly-mounted conversation.
+  const settleSnapRafRef = useRef(0);
+
+  // Pre-engagement settle snap. Deliberately NOT virtuoso's
+  // `scrollToIndex('LAST')`: that navigates to the *model's* offset for the
+  // last item via an internal seek loop that measurement churn can abort
+  // mid-flight, leaving the viewport stranded once height deltas stop. A
+  // direct DOM assignment cannot be aborted and needs no model: each snap
+  // lands at the current DOM bottom, the tail rows mount and measure, any
+  // correction fires another height delta, and the loop converges exactly
+  // when the list is measured and the viewport is at the bottom. Deferred
+  // one frame so virtuoso's compensatory scrollTop adjustment for the
+  // triggering delta has already been applied (writing before it would be
+  // immediately shifted off-bottom by the compensation).
+  const scheduleSettleSnap = useCallback(() => {
+    if (settleSnapRafRef.current !== 0) return;
+    settleSnapRafRef.current = requestAnimationFrame(() => {
+      settleSnapRafRef.current = 0;
+      if (hasUserEngagedRef.current) return;
+      const s = scrollerRef.current;
+      if (!s) return;
+      s.scrollTop = s.scrollHeight;
+    });
+  }, []);
+
+  // Bounded settle watch (see SETTLE_WATCH_MS). Restarting extends the
+  // deadline; the interval instance is shared.
+  const settleWatchTimerRef = useRef(0);
+  const settleWatchDeadlineRef = useRef(0);
+
+  const stopSettleWatch = useCallback(() => {
+    if (settleWatchTimerRef.current !== 0) {
+      clearInterval(settleWatchTimerRef.current);
+      settleWatchTimerRef.current = 0;
+    }
+  }, []);
+
+  const startSettleWatch = useCallback(() => {
+    settleWatchDeadlineRef.current = Date.now() + SETTLE_WATCH_MS;
+    scheduleSettleSnap();
+    if (settleWatchTimerRef.current !== 0) return;
+    settleWatchTimerRef.current = window.setInterval(() => {
+      if (
+        hasUserEngagedRef.current ||
+        Date.now() > settleWatchDeadlineRef.current
+      ) {
+        stopSettleWatch();
+        return;
+      }
+      const s = scrollerRef.current;
+      if (!s) return;
+      if (s.scrollHeight - s.scrollTop - s.clientHeight > 1) {
+        s.scrollTop = s.scrollHeight;
+      }
+    }, SETTLE_WATCH_INTERVAL_MS);
+  }, [scheduleSettleSnap, stopSettleWatch]);
+
+  useEffect(() => {
+    return () => {
+      if (settleSnapRafRef.current !== 0) {
+        cancelAnimationFrame(settleSnapRafRef.current);
+      }
+      stopSettleWatch();
+    };
+  }, [stopSettleWatch]);
+
   const handleScrollerRef = useCallback((ref: HTMLElement | Window | null) => {
+    detachGestureListenersRef.current?.();
+    detachGestureListenersRef.current = null;
     scrollerRef.current = ref instanceof HTMLElement ? ref : null;
     // Preserve the `#messages` selector that <MessageContextMenu> binds
     // its `contextmenu` listener to. Before the virtuoso migration the
@@ -388,8 +507,67 @@ function MessageListImpl({
     // working without restructuring the menu component.
     if (ref instanceof HTMLElement) {
       ref.id = 'messages';
+      touchActiveRef.current = false;
+      lastUpwardScrollAtRef.current = 0;
+      lastScrollTopRef.current = ref.scrollTop;
+      hasUserEngagedRef.current = false;
+      const onPointerDown = () => {
+        hasUserEngagedRef.current = true;
+      };
+      const onTouchStart = () => {
+        hasUserEngagedRef.current = true;
+        touchActiveRef.current = true;
+      };
+      const onTouchEnd = (e: TouchEvent) => {
+        if (e.touches.length === 0) touchActiveRef.current = false;
+      };
+      // Wheel is tracked in addition to scroll direction so an upward intent
+      // registers even when the wheel event and the height delta land before
+      // the resulting scroll event does.
+      const onWheel = (e: WheelEvent) => {
+        hasUserEngagedRef.current = true;
+        if (e.deltaY < 0) lastUpwardScrollAtRef.current = Date.now();
+      };
+      const onScroll = () => {
+        const top = ref.scrollTop;
+        if (top < lastScrollTopRef.current) {
+          lastUpwardScrollAtRef.current = Date.now();
+        }
+        lastScrollTopRef.current = top;
+        // Pre-engagement and within the settle window, any movement that
+        // leaves the viewport off the bottom is settling churn (virtuoso
+        // initial placement and its compensations move scrollTop without a
+        // height delta, so the height-callback rescue alone cannot see
+        // every stranding). Our own settle snap lands at the bottom and
+        // won't re-trigger. Window-bounded because scroll-only user inputs
+        // (keyboard, find-in-page) never mark engagement and must not be
+        // fought once the mount has settled.
+        if (
+          !hasUserEngagedRef.current &&
+          Date.now() <= settleWatchDeadlineRef.current
+        ) {
+          if (ref.scrollHeight - top - ref.clientHeight > 1) {
+            scheduleSettleSnap();
+          }
+        }
+      };
+      ref.addEventListener('pointerdown', onPointerDown, { passive: true });
+      ref.addEventListener('touchstart', onTouchStart, { passive: true });
+      ref.addEventListener('touchend', onTouchEnd, { passive: true });
+      ref.addEventListener('touchcancel', onTouchEnd, { passive: true });
+      ref.addEventListener('wheel', onWheel, { passive: true });
+      ref.addEventListener('scroll', onScroll, { passive: true });
+      detachGestureListenersRef.current = () => {
+        ref.removeEventListener('pointerdown', onPointerDown);
+        ref.removeEventListener('touchstart', onTouchStart);
+        ref.removeEventListener('touchend', onTouchEnd);
+        ref.removeEventListener('touchcancel', onTouchEnd);
+        ref.removeEventListener('wheel', onWheel);
+        ref.removeEventListener('scroll', onScroll);
+        touchActiveRef.current = false;
+      };
     }
-  }, []);
+  }, [scheduleSettleSnap]);
 
   // Read latest length without re-binding the callback per render.
   // `data.length === 0` is reachable when systemPrompt is present but no
@@ -521,12 +699,19 @@ function MessageListImpl({
       // scrolled-up.
       const s = scrollerRef.current;
       prevClientHeightRef.current = s ? s.clientHeight : 0;
+      prevScrollHeightRef.current = s ? s.scrollHeight : 0;
       // Seed from allUnitsLengthRef: if the new conversation already has
       // messages, initialTopMostItemIndex handled placement and we must
       // NOT force a snap on the next height delta. Only an empty→non-empty
       // transition (conversation was empty at switch time, content arrived
       // later) should trigger the forced snap.
       hasSeenContentRef.current = allUnitsLengthRef.current > 0;
+      // Settle from the first measurement onwards rather than waiting for
+      // a later stray height delta: when initialTopMostItemIndex strands
+      // the mount (see hasUserEngagedRef), the stranding can be silent and
+      // the next delta a second away — a visible flash of the wrong
+      // position, or a permanent stranding if no delta ever comes.
+      if (hasSeenContentRef.current) startSettleWatch();
       return;
     }
     const prevHeight = prevTotalHeightRef.current;
@@ -545,11 +730,15 @@ function MessageListImpl({
     if (!hasSeenContentRef.current) {
       hasSeenContentRef.current = true;
       prevClientHeightRef.current = s.clientHeight;
+      prevScrollHeightRef.current = s.scrollHeight;
       virtuosoRef.current?.scrollToIndex({
         index: 'LAST',
         align: 'end',
         behavior: 'auto',
       });
+      // Content arriving after an empty mount goes through the same
+      // measurement churn as a conversation switch — watch it settle.
+      startSettleWatch();
       return;
     }
     // virtuoso calls this synchronously when its internal height model
@@ -566,31 +755,76 @@ function MessageListImpl({
       s.clientHeight < prevClientHeightRef.current
         ? prevClientHeightRef.current
         : s.clientHeight;
-    const oldFromBottom = prevHeight - s.scrollTop - clientHeightForPinCheck;
+    // Pin distance in DOM units: previous scrollHeight vs current scrollTop.
+    // Not `prevHeight` (virtuoso's model total), whose estimate error on a
+    // long conversation can exceed PIN_TO_BOTTOM_THRESHOLD and misclassify
+    // a pinned user as scrolled-up — see prevScrollHeightRef.
+    const oldFromBottom =
+      prevScrollHeightRef.current - s.scrollTop - clientHeightForPinCheck;
     prevClientHeightRef.current = s.clientHeight;
+    prevScrollHeightRef.current = s.scrollHeight;
+    // Pre-engagement settling: see hasUserEngagedRef. Distance is
+    // meaningless while virtuoso may have stranded the initial placement,
+    // so keep re-snapping until the user takes over. Bounded by the settle
+    // window: stranding is a mount-churn phenomenon, and scroll-only user
+    // inputs (keyboard scrolling on a focused row, browser find-in-page)
+    // emit no touch/wheel/pointer event to mark engagement — enforcing
+    // beyond the window would fight them. After the window the normal pin
+    // logic below applies, whose upward-scroll suppression covers
+    // scroll-only inputs.
+    if (
+      !hasUserEngagedRef.current &&
+      Date.now() <= settleWatchDeadlineRef.current
+    ) {
+      scheduleSettleSnap();
+      return;
+    }
+    // Genuine tail-activity signal for the unread paths below. Only
+    // height growth with server-driven activity at the tail counts;
+    // unrelated growth — header toggle, image load in an older message,
+    // late syntax-highlighter mount — must not raise "↓ New messages".
+    // Two coarse signals indicate genuine tail activity:
+    //   - active stream (token text growing inside the tail unit)
+    //   - awaiting_sub_agents phase (persist_sub_agent_results updates
+    //     the existing spawn_agents message via MessageUpdated;
+    //     same-length but the rendered tail grows)
+    // Length-grew append cases are covered by the separate
+    // useEffect on messages.length / pending.
+    const grewWithTailActivity =
+      newHeight > prevHeight &&
+      (streamingRequestIdRef.current !== null ||
+        convStateRef.current.type === 'awaiting_sub_agents');
     if (oldFromBottom <= PIN_TO_BOTTOM_THRESHOLD) {
-      virtuosoRef.current?.scrollToIndex({
-        index: 'LAST',
-        align: 'end',
-        behavior: 'auto',
-      });
+      // An in-progress user gesture owns the viewport. Height deltas fire
+      // continuously while rows mount and measure during the user's own
+      // scroll-up (overscan rows above the viewport, late images, syntax
+      // highlighters); re-snapping on those clobbers the gesture — on touch
+      // devices it made the first ~100px of every scroll-up yank back to
+      // the bottom, trapping the user there. The suppression covers the
+      // finger-down drag (touchActiveRef) and the momentum/wheel phase
+      // (rolling upward-scroll window). A genuinely pinned user is
+      // unaffected: their scroll events are all downward or absent.
+      const userOwnsViewport =
+        touchActiveRef.current ||
+        Date.now() - lastUpwardScrollAtRef.current < USER_SCROLL_SUPPRESS_MS;
+      if (!userOwnsViewport) {
+        virtuosoRef.current?.scrollToIndex({
+          index: 'LAST',
+          align: 'end',
+          behavior: 'auto',
+        });
+      } else if (grewWithTailActivity) {
+        // The suppressed snap must not swallow the unread signal: the user
+        // is departing the bottom while the tail genuinely grows, and this
+        // delta may be the LAST growth event (stream ends as they leave).
+        // Without marking here, they'd end up scrolled up above unseen
+        // content with no "↓ New messages" affordance. Harmless while they
+        // remain at bottom — the button renders only when !isAtBottom, and
+        // returning to bottom clears the flag.
+        setHasUnreadTailContent(true);
+      }
     } else if (newHeight > prevHeight) {
-      // Only treat height growth as "unread tail content" when there's
-      // genuine server-driven activity at the tail. Otherwise unrelated
-      // growth — header toggle, image load in older message, late
-      // syntax-highlighter mount on scrolled-past code block — would
-      // spuriously raise the "↓ New messages" button.
-      //
-      // Two coarse signals indicate genuine tail activity:
-      //   - active stream (token text growing inside the tail unit)
-      //   - awaiting_sub_agents phase (persist_sub_agent_results updates
-      //     the existing spawn_agents message via MessageUpdated;
-      //     same-length but the rendered tail grows)
-      // Length-grew append cases are covered by the separate
-      // useEffect on messages.length / pending.
-      const streamingActive = streamingRequestIdRef.current !== null;
-      const subAgentsActive = convStateRef.current.type === 'awaiting_sub_agents';
-      if (streamingActive || subAgentsActive) {
+      if (grewWithTailActivity) {
         setHasUnreadTailContent(true);
       } else if (import.meta.env.DEV) {
         // Height grew, user is past the pin threshold, but no genuine tail
@@ -602,7 +836,7 @@ function MessageListImpl({
         });
       }
     }
-  }, [conversationId]);
+  }, [conversationId, scheduleSettleSnap, startSettleWatch]);
 
   const scrollToNewest = useCallback(() => {
     if (allUnitsLengthRef.current === 0) return;
@@ -680,6 +914,10 @@ function MessageListImpl({
   const scrollToUnitIndex = useCallback((unitIndex: number) => {
     const unit = historicalUnits[unitIndex];
     if (!unit) return;
+    // A nav jump is user engagement even though it never touches the
+    // scroller: without this, a pre-engagement height delta would snap the
+    // viewport back to the bottom and clobber the jump.
+    hasUserEngagedRef.current = true;
     clearJumpRetryTimers();
     activeJumpKeyRef.current = unit.key;
     pendingPulseKeyRef.current = unit.key;

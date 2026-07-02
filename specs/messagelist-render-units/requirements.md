@@ -342,10 +342,36 @@ appended
 to the last item when the user's pre-growth distance from the bottom is
 within the pin threshold)
 
+THE SYSTEM SHALL compute the pre-growth distance from the bottom in DOM
+scroller units — the previously observed `scrollHeight` against the
+current `scrollTop` and viewport height — not against the virtualizer's
+reported total list height. The virtualizer's total is an
+estimate-corrected model value whose divergence from the DOM
+`scrollHeight` grows with the number of not-yet-measured rows; on long
+conversations that divergence exceeds the pin threshold, and a
+model-based check misclassifies a genuinely pinned user as scrolled-up,
+silently disabling auto-follow.
+
 WHEN a new render unit appears and the user is NOT pinned to the bottom
 (scrolled up)
 THE SYSTEM SHALL show the "jump-to-newest" button
 AND SHALL NOT auto-scroll the viewport
+
+WHEN the total list height changes while a user scroll gesture is in
+progress — an active touch drag (finger down), or an upward scroll
+(wheel, scrollbar, keyboard, or touch momentum) within a short rolling
+suppression window
+THE SYSTEM SHALL NOT auto-scroll the viewport, even if the pre-change
+scroll position is within the pin threshold
+SO THAT measurement-driven height deltas (rows mounting and being
+measured during the user's own scroll-up, late image loads, syntax
+highlighters) cannot clobber the gesture and trap the user at the
+bottom — a departing user's first pin-threshold's worth of travel is
+otherwise re-snapped on every height delta.
+The suppression window is refreshed by each upward scroll event, so it
+only needs to outlive the gap between momentum scroll events; downward
+scrolls never suppress (the auto-follow snap itself scrolls downward,
+and a user scrolling down is heading to the bottom).
 
 THE SYSTEM SHALL NOT force-scroll the viewport for any message type.
 No "force" override exists for system messages, approval prompts, or
@@ -367,6 +393,36 @@ the user back to the bottom. The manual `totalListHeightChanged`
 callback uses the pre-growth scroll position to distinguish "user was
 near the bottom" from "user scrolled up," which is correct during
 streaming where Virtuoso's built-in handler is not.
+
+WHILE the user has not yet interacted with the conversation's scroller
+(no touch, wheel, or pointer input, and no conversation-nav jump)
+AND the bounded settling window following the conversation's first
+measurement (or first content after an empty mount) has not elapsed
+THE SYSTEM SHALL keep the viewport pinned to the bottom regardless of
+the measured distance from it — correcting on every total-list-height
+change, on every scroll movement that leaves the viewport off the
+bottom, and by periodic verification (stranding can be silent: the
+virtualizer's placement churn does not always end with a height delta
+or scroll event to react to).
+The enforcement is bounded by the settling window, not merely the
+periodic check: stranding is a mount-churn phenomenon, and scroll-only
+user inputs — keyboard scrolling on a focused row, browser
+find-in-page — emit no touch/wheel/pointer event to mark engagement,
+so enforcement past the window would fight them. After the window the
+distance-based pin logic applies, whose upward-scroll suppression
+covers scroll-only inputs.
+SO THAT a stranded initial placement self-heals: the virtualizer's
+initial bottom placement is computed against pre-measurement estimates,
+and a large estimate correction landing right after mount can leave the
+viewport far from the bottom (even at the top of the conversation).
+Distance-based pinning cannot recover from stranding — it classifies
+the stranded viewport as a scrolled-up user. The mount contract is
+"open pinned to the newest message"; only a user interaction releases
+the viewport from it. The pre-engagement correction is a direct DOM
+scroll assignment, not a virtualizer scroll-to-index: the index seek
+navigates to the model's estimated offset via a seek loop that
+measurement churn can abort, while a DOM assignment to the current
+bottom cannot be aborted and converges as the tail measures.
 
 WHEN the Virtuoso instance mounts with empty data and the first
 messages arrive later (fresh conversation, or cached metadata before
