@@ -759,6 +759,7 @@ body {
 
 /* Message Styles */
 .message {
+  position: relative;
   padding: 8px;
   border-radius: 6px;
   max-width: 100%;
@@ -805,6 +806,25 @@ body {
   letter-spacing: normal;
   color: var(--text-muted);
   opacity: 0.7;
+}
+
+.message-mobile-copy-row {
+  display: none;
+  justify-content: flex-end;
+  margin-bottom: 4px;
+}
+
+.message-mobile-copy-row:empty {
+  display: none;
+}
+
+.message-mobile-copy.copy-btn {
+  display: none;
+  width: 44px;
+  height: 44px;
+  margin-left: auto;
+  border: 1px solid var(--border-color);
+  background: var(--bg-secondary);
 }
 
 .message-content {
@@ -1634,6 +1654,20 @@ pre:hover .copy-btn {
 .copy-btn:hover:not(:disabled) {
   background: var(--bg-tertiary);
   color: var(--text-primary);
+}
+
+@media (hover: none), (width <= 768px) {
+  .message-mobile-copy-row {
+    display: flex;
+  }
+
+  .message-mobile-copy-row:empty {
+    display: none;
+  }
+
+  .message-mobile-copy.copy-btn {
+    display: inline-flex;
+  }
 }
 
 /* Legacy styles kept for backward compatibility */
