@@ -29,7 +29,6 @@ import {
   Send,
   ChevronDown,
   Check,
-  XCircle,
   Loader2,
 } from 'lucide-react';
 
@@ -42,10 +41,30 @@ interface ReviewNote {
   timestamp: number;
 }
 
+const formatTaskApprovalContextPercent = (used: number, max: number): string => {
+  if (max <= 0) return '0%';
+  const percent = Math.min(Math.max((used / max) * 100, 0), 100);
+  return `${Math.round(percent)}%`;
+};
+
+type TaskApprovalContextRecommendation = 'start-here' | 'new-chat' | 'either';
+
+function getTaskApprovalContextRecommendation(percent: number): {
+  kind: TaskApprovalContextRecommendation;
+  label: string;
+} {
+  if (percent < 60) return { kind: 'start-here', label: 'Start here recommended' };
+  if (percent < 82) return { kind: 'either', label: 'Either path is fine' };
+  if (percent < 94) return { kind: 'new-chat', label: 'New chat recommended' };
+  return { kind: 'new-chat', label: 'New chat strongly recommended' };
+}
+
 export interface TaskApprovalReaderProps {
   title: string;
   priority: string;
   plan: string;
+  contextWindowUsed?: number | undefined;
+  modelContextWindow?: number | undefined;
   onApprove: (handoff: TaskApprovalHandoff) => void;
   onReject: () => void;
   onSendFeedback: (annotations: string) => void;
@@ -185,6 +204,8 @@ export function TaskApprovalReader({
   title,
   priority,
   plan,
+  contextWindowUsed,
+  modelContextWindow,
   onApprove,
   onReject,
   onSendFeedback,
@@ -203,6 +224,17 @@ export function TaskApprovalReader({
   const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false);
   const hasUnsentNotes = notes.length > 0;
   const noteCountLabel = `${notes.length} note${notes.length !== 1 ? 's' : ''}`;
+
+  const contextUsage =
+    contextWindowUsed !== undefined && modelContextWindow !== undefined && modelContextWindow > 0
+      ? Math.min(Math.max((contextWindowUsed / modelContextWindow) * 100, 0), 100)
+      : null;
+  const contextUsagePercent = contextUsage !== null
+    ? formatTaskApprovalContextPercent(contextWindowUsed ?? 0, modelContextWindow ?? 0)
+    : null;
+  const contextRecommendation = contextUsage !== null
+    ? getTaskApprovalContextRecommendation(contextUsage)
+    : null;
 
   const noteInputRef = useRef<HTMLTextAreaElement>(null);
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
@@ -436,6 +468,14 @@ export function TaskApprovalReader({
               </button>
             </>
           )}
+          <button
+            className="task-approval-header-discard"
+            onClick={handleDiscard}
+            aria-label="Discard task"
+            title="Discard task"
+          >
+            <X size={18} />
+          </button>
         </div>
       </div>
 
@@ -451,15 +491,21 @@ export function TaskApprovalReader({
         </div>
       )}
 
+      {contextUsagePercent && contextRecommendation && (
+        <div className={`task-approval-context-cue task-approval-context-cue--${contextRecommendation.kind}`}>
+          <span className="task-approval-context-cue__label">Context</span>
+          <span className="task-approval-context-cue__value">{contextUsagePercent} used</span>
+          <span className="task-approval-context-cue__recommendation">
+            {contextRecommendation.label}
+          </span>
+          <span className="task-approval-context-cue__hint">
+            Start here keeps this discussion; New chat starts a summarized continuation.
+          </span>
+        </div>
+      )}
+
       {/* Action toolbar */}
       <div className="task-approval-actions">
-        <button
-          className="task-approval-btn task-approval-btn--discard"
-          onClick={handleDiscard}
-        >
-          <XCircle size={18} />
-          Discard
-        </button>
         <button
           className={[
             'task-approval-btn',
@@ -470,6 +516,7 @@ export function TaskApprovalReader({
             .join(' ')}
           onClick={handleSendFeedback}
           disabled={!hasUnsentNotes}
+          aria-label={`Request changes (${notes.length})`}
           title={
             !hasUnsentNotes
               ? 'Add annotations to the plan before sending feedback'
@@ -477,18 +524,21 @@ export function TaskApprovalReader({
           }
         >
           <Send size={18} />
-          Send Feedback ({notes.length})
+          <span className="task-approval-btn-label-full">Request changes ({notes.length})</span>
+          <span className="task-approval-btn-label-compact">Revise</span>
         </button>
         <button
           className={[
             'task-approval-btn',
             'task-approval-btn--approve',
             hasUnsentNotes && 'task-approval-btn--subdued',
+            !hasUnsentNotes && contextRecommendation?.kind === 'start-here' && 'task-approval-btn--recommended-decision',
           ]
             .filter(Boolean)
             .join(' ')}
           disabled={approvingHandoff !== null}
           onClick={() => handleApprove('continue_in_current_conversation')}
+          aria-label="Approve and start here"
         >
           {approvingHandoff === 'continue_in_current_conversation' ? (
             <>
@@ -498,7 +548,8 @@ export function TaskApprovalReader({
           ) : (
             <>
               <Check size={18} />
-              Continue here
+              <span className="task-approval-btn-label-full">Start here</span>
+              <span className="task-approval-btn-label-compact">Start here</span>
             </>
           )}
         </button>
@@ -507,11 +558,13 @@ export function TaskApprovalReader({
             'task-approval-btn',
             'task-approval-btn--approve',
             hasUnsentNotes && 'task-approval-btn--subdued',
+            !hasUnsentNotes && contextRecommendation?.kind === 'new-chat' && 'task-approval-btn--recommended-decision',
           ]
             .filter(Boolean)
             .join(' ')}
           disabled={approvingHandoff !== null}
           onClick={() => handleApprove('start_fresh_work_conversation')}
+          aria-label="Approve and start a new continuation conversation"
         >
           {approvingHandoff === 'start_fresh_work_conversation' ? (
             <>
@@ -521,7 +574,8 @@ export function TaskApprovalReader({
           ) : (
             <>
               <Check size={18} />
-              Start fresh conversation
+              <span className="task-approval-btn-label-full">New chat</span>
+              <span className="task-approval-btn-label-compact">New chat</span>
             </>
           )}
         </button>

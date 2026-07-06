@@ -8718,6 +8718,26 @@ html * {
   flex-shrink: 0;
 }
 
+.task-approval-header-discard {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+
+.task-approval-header-discard:hover {
+  color: var(--accent-red);
+  border-color: color-mix(in srgb, var(--accent-red) 35%, transparent);
+  background: color-mix(in srgb, var(--accent-red) 10%, transparent);
+}
+
 .task-approval-content {
   flex: 1;
   overflow-y: auto;
@@ -8731,6 +8751,49 @@ html * {
   background: color-mix(in srgb, var(--accent-blue) 10%, var(--bg-secondary));
   color: var(--text-secondary);
   font-size: 13px;
+}
+
+.task-approval-context-cue {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.task-approval-context-cue__label {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+}
+
+.task-approval-context-cue__value {
+  flex-shrink: 0;
+  color: var(--text-primary);
+  font-weight: 700;
+}
+
+.task-approval-context-cue__recommendation {
+  flex-shrink: 0;
+  color: var(--text-primary);
+  font-weight: 700;
+}
+
+.task-approval-context-cue--start-here .task-approval-context-cue__recommendation {
+  color: var(--accent-green);
+}
+
+.task-approval-context-cue--new-chat .task-approval-context-cue__recommendation {
+  color: var(--accent-yellow);
+}
+
+.task-approval-context-cue__hint {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .task-approval-actions {
@@ -8754,6 +8817,10 @@ html * {
   font-weight: 500;
   cursor: pointer;
   transition: opacity 0.15s, background 0.15s;
+}
+
+.task-approval-btn-label-compact {
+  display: none;
 }
 
 .task-approval-btn:disabled {
@@ -8794,6 +8861,11 @@ html * {
   font-weight: 700;
 }
 
+.task-approval-btn--recommended-decision {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-green) 35%, transparent);
+  font-weight: 700;
+}
+
 .task-approval-btn--approve.task-approval-btn--subdued {
   background: transparent;
   color: var(--text-secondary);
@@ -8803,6 +8875,51 @@ html * {
 .task-approval-btn--approve.task-approval-btn--subdued:hover {
   background: var(--bg-tertiary);
   opacity: 1;
+}
+
+@media (width <= 640px) {
+  .task-approval-actions {
+    justify-content: stretch;
+    gap: 8px;
+    padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+  }
+
+  .task-approval-btn {
+    flex: 1 1 0;
+    justify-content: center;
+    min-width: 0;
+    min-height: 44px;
+    padding: 8px 10px;
+    text-align: center;
+    line-height: 1.2;
+    overflow-wrap: anywhere;
+    white-space: normal;
+  }
+
+  .task-approval-btn-label-full {
+    display: none;
+  }
+
+  .task-approval-btn-label-compact {
+    display: inline;
+  }
+
+  .task-approval-context-cue {
+    padding: 8px 12px;
+  }
+
+  .task-approval-context-cue__hint {
+    display: none;
+  }
+
+  .task-approval-context-cue__recommendation {
+    flex-shrink: 1;
+    min-width: 0;
+    margin-left: auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 }
 
 /* --- First Task Welcome modal --- */
