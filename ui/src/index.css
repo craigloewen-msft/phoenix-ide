@@ -5954,6 +5954,15 @@ html * {
   opacity: 0.9;
 }
 
+.workflow-card--disabled {
+  cursor: default;
+  opacity: 0.62;
+}
+
+.workflow-card--disabled:hover {
+  opacity: 0.62;
+}
+
 .workflow-card--active {
   border-color: var(--accent-blue);
   background: color-mix(in srgb, var(--accent-blue) 8%, transparent);
@@ -6075,6 +6084,12 @@ html * {
   display: grid;
   gap: 4px;
   padding-left: 10px;
+}
+
+.task-start-search {
+  width: 100%;
+  min-height: 28px;
+  font-size: 11px;
 }
 
 .task-start-item {

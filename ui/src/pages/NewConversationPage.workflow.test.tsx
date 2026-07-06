@@ -45,6 +45,7 @@ vi.mock('../api', () => {
       validateCwd: vi.fn(),
       listDirectory: vi.fn(),
       listGitBranches: vi.fn(),
+      getProjectTaskAvailability: vi.fn(),
       listProjectTasks: vi.fn(),
       createConversation: vi.fn(),
       listConversations: vi.fn().mockResolvedValue([]),
@@ -69,6 +70,12 @@ function renderPage() {
       </ConversationProvider>
     </MemoryRouter>,
   );
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(r => { resolve = r; });
+  return { promise, resolve };
 }
 
 async function settleValidation() {
@@ -121,6 +128,7 @@ describe('/new workflow modes', () => {
     vi.mocked(api.validateCwd).mockResolvedValue({ valid: true, is_git: true });
     vi.mocked(api.listDirectory).mockResolvedValue({ entries: [] });
     vi.mocked(api.listGitBranches).mockResolvedValue({ branches, current: 'feature/demo', default_branch: 'main' });
+    vi.mocked(api.getProjectTaskAvailability).mockResolvedValue({ available: true });
     vi.mocked(api.listProjectTasks).mockResolvedValue({ tasks: [task] });
     vi.mocked(api.createConversation).mockResolvedValue({
       id: 'c1',
@@ -442,17 +450,64 @@ describe('/new workflow modes', () => {
     );
   });
 
-  it('omits task workflow when taskmd discovery finds no active tasks', async () => {
-    vi.mocked(api.listProjectTasks).mockResolvedValue({ tasks: [] });
+  it('shows task workflow loading before availability settles without fetching the full list', async () => {
+    vi.mocked(api.getProjectTaskAvailability).mockImplementation(() => new Promise(() => {}));
+    renderPage();
+
+    await settleValidation();
+    await screen.findAllByText('Loading tasks...');
+    expect(screen.getAllByText('Start from a task').length).toBeGreaterThan(0);
+    expect(api.listProjectTasks).not.toHaveBeenCalled();
+  });
+
+  it('omits task workflow when task availability is absent', async () => {
+    vi.mocked(api.getProjectTaskAvailability).mockResolvedValue({ available: false });
     renderPage();
 
     await settleValidation();
     await screen.findAllByText('Chat in a fresh worktree');
-    await waitFor(() => expect(api.listProjectTasks).toHaveBeenCalledWith('/repo'));
+    await waitFor(() => expect(api.getProjectTaskAvailability).toHaveBeenCalledWith('/repo'));
 
     expect(screen.queryAllByText('Start from a task')).toHaveLength(0);
+    expect(api.listProjectTasks).not.toHaveBeenCalled();
     expect(screen.getAllByText('Chat in a specific branch').length).toBeGreaterThan(0);
     expect(screen.getAllByText('Work in this folder').length).toBeGreaterThan(0);
+  });
+
+  it('lazy-loads tasks and does not expose task base branch controls', async () => {
+    renderPage();
+
+    await settleValidation();
+    await screen.findAllByText('Start from a task');
+    expect(api.listProjectTasks).not.toHaveBeenCalled();
+    fireEvent.click(screen.getAllByText('Start from a task')[0]!);
+
+    await waitFor(() => expect(api.listProjectTasks).toHaveBeenCalledWith('/repo'));
+    expect(screen.queryByText('Base branch for planning')).not.toBeInTheDocument();
+    await screen.findAllByText('27108 · refine-new-workflows');
+  });
+
+  it('filters tasks by number or slug before pagination', async () => {
+    const taskList = Array.from({ length: 10 }, (_, index) => ({
+      ...task,
+      id: String(10000 + index),
+      slug: `filler-${index}`,
+      path: `/repo/tasks/${10000 + index}-p2-ready--filler-${index}.md`,
+    })).concat({
+      ...task,
+      id: '07004',
+      slug: 'merged-target-task',
+      path: '/repo/tasks/07004-p1-ready--merged-target-task.md',
+    });
+    vi.mocked(api.listProjectTasks).mockResolvedValue({ tasks: taskList });
+    renderPage();
+
+    await settleValidation();
+    fireEvent.click(screen.getAllByText('Start from a task')[0]!);
+    await screen.findAllByPlaceholderText('Search tasks by number or name...');
+    fireEvent.change(screen.getAllByPlaceholderText('Search tasks by number or name...')[0]!, { target: { value: '07004' } });
+
+    expect((await screen.findAllByText('07004 · merged-target-task')).length).toBeGreaterThan(0);
   });
 
   it('does not let task workflow submit notes without a selected task', async () => {
@@ -461,25 +516,65 @@ describe('/new workflow modes', () => {
     renderPage();
 
     await settleValidation();
-    await screen.findAllByText('Chat in a fresh worktree');
-    expect(screen.queryAllByText('Start from a task')).toHaveLength(0);
+    fireEvent.click(screen.getAllByText('Start from a task')[0]!);
+    await screen.findAllByText('No active tasks found.');
+    fireEvent.change(screen.getAllByPlaceholderText('Optional notes for this task…')[0]!, { target: { value: 'notes only' } });
+    expect(screen.getAllByRole('button', { name: 'Send' })[0]).toBeDisabled();
+  });
+
+  it('ignores a stale lazy task response after cwd changes', async () => {
+    const repoOneTasks = deferred<{ tasks: typeof task[] }>();
+    const repoTwoTask = {
+      ...task,
+      id: '07004',
+      slug: 'repo-two-task',
+      path: '/repo-two/tasks/07004-p1-ready--repo-two-task.md',
+    };
+    vi.mocked(api.listProjectTasks).mockImplementation((cwd: string) => {
+      if (cwd === '/repo') return repoOneTasks.promise;
+      return Promise.resolve({ tasks: [repoTwoTask] });
+    });
+    renderPage();
+
+    await settleValidation();
+    fireEvent.click(screen.getAllByText('Start from a task')[0]!);
+    await waitFor(() => expect(api.listProjectTasks).toHaveBeenCalledWith('/repo'));
+
+    fireEvent.change(screen.getAllByDisplayValue('/repo')[0]!, { target: { value: '/repo-two' } });
+    await settleValidation();
+    await waitFor(() => expect(api.getProjectTaskAvailability).toHaveBeenCalledWith('/repo-two'));
+
+    await act(async () => {
+      repoOneTasks.resolve({ tasks: [task] });
+      await Promise.resolve();
+    });
+    expect(screen.queryByText('27108 · refine-new-workflows')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByText('Start from a task')[0]!);
+    await waitFor(() => expect(api.listProjectTasks).toHaveBeenCalledWith('/repo-two'));
+    expect((await screen.findAllByText('07004 · repo-two-task')).length).toBeGreaterThan(0);
   });
 
   it('submits task workflow with propose-task prompt and managed mode', async () => {
+    vi.mocked(api.listProjectTasks).mockResolvedValue({
+      tasks: [{ ...task, source_ref: 'origin/main', content: '# Remote task body\n' }],
+    });
     renderPage();
 
     await settleValidation();
     await screen.findAllByText('Start from a task');
-    await waitFor(() => expect(api.listProjectTasks).toHaveBeenCalledWith('/repo'));
     fireEvent.click(screen.getAllByText('Start from a task')[0]!);
+    await waitFor(() => expect(api.listProjectTasks).toHaveBeenCalledWith('/repo'));
     fireEvent.click(screen.getAllByText('27108 · refine-new-workflows')[0]!);
+    expect((await screen.findAllByText('Remote task body')).length).toBeGreaterThan(0);
     fireEvent.change(screen.getAllByPlaceholderText('Optional notes for this task…')[0]!, { target: { value: 'extra notes' } });
     fireEvent.click(screen.getAllByRole('button', { name: 'Send' })[0]!);
 
     await waitFor(() => expect(api.createConversation).toHaveBeenCalled());
-    const [, text,,,, mode, baseBranch] = vi.mocked(api.createConversation).mock.calls[0]!;
+    const [, text,,,, mode, baseBranch,,,, checkoutRef] = vi.mocked(api.createConversation).mock.calls[0]!;
     expect(mode).toBe('managed');
     expect(baseBranch).toBe('main');
+    expect(checkoutRef).toBe('origin/main');
     expect(text).toContain('Call the propose_task tool');
     expect(text).toContain('tasks/27108-p1-ready--refine-new-workflows.md');
     expect(text).toContain('extra notes');

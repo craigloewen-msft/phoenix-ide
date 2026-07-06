@@ -27,8 +27,8 @@ use super::types::{
     FileViewerKind, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
     NotificationSettingsRequest, ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery,
     ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse, SuggestRequest,
-    SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse, TaskEntry,
-    TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
+    SuggestResponse, SystemPromptResponse, TaskAvailabilityResponse, TaskCountQuery,
+    TaskCountResponse, TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -308,6 +308,10 @@ pub fn create_router(state: AppState) -> Router {
             post(create_pr_auto_fix_context),
         )
         // Project task files available before a conversation exists
+        .route(
+            "/api/tasks/availability",
+            get(get_project_task_availability),
+        )
         .route("/api/tasks", get(list_project_tasks))
         // Git utilities
         .route("/api/git/branches", get(list_git_branches))
@@ -1679,14 +1683,17 @@ async fn create_conversation_with_id(
                 )
             })?;
         validate_user_ref(base_branch)?;
+        let checkout_ref = req.checkout_ref.as_deref().unwrap_or(base_branch);
+        validate_user_ref(checkout_ref)?;
         managed_base_branch = Some(base_branch.to_string());
 
         let conv_id = id.clone();
         let branch = base_branch.to_string();
+        let checkout = checkout_ref.to_string();
         let repo = repo_root.clone();
 
         let result = tokio::task::spawn_blocking(move || {
-            create_managed_explore_worktree_blocking(&repo, &conv_id, &branch)
+            create_managed_explore_worktree_blocking(&repo, &conv_id, &branch, &checkout)
         })
         .await
         .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
@@ -2012,15 +2019,23 @@ fn create_managed_explore_worktree_blocking(
     repo_root: &str,
     conv_id: &str,
     base_branch: &str,
+    checkout_ref: &str,
 ) -> Result<String, ManagedWorktreeError> {
     let cwd = std::path::Path::new(repo_root);
 
-    materialize_branch(cwd, base_branch).map_err(|e| match e {
-        GitOpError::BranchNotFound(b) => ManagedWorktreeError::BadRequest(format!(
-            "Branch '{b}' not found locally or at origin",
-        )),
-        other => ManagedWorktreeError::Git(other.to_string()),
-    })?;
+    let checkout_is_explicit_ref =
+        checkout_ref.starts_with("origin/") || checkout_ref.starts_with("refs/");
+    if checkout_is_explicit_ref {
+        run_git(cwd, &["rev-parse", "--verify", checkout_ref])
+            .map_err(ManagedWorktreeError::Git)?;
+    } else {
+        materialize_branch(cwd, checkout_ref).map_err(|e| match e {
+            GitOpError::BranchNotFound(b) => ManagedWorktreeError::BadRequest(format!(
+                "Branch '{b}' not found locally or at origin",
+            )),
+            other => ManagedWorktreeError::Git(other.to_string()),
+        })?;
+    }
 
     let id_prefix: String = conv_id.chars().take(8).collect();
     let temp_branch = format!("task-pending-{id_prefix}");
@@ -2029,18 +2044,19 @@ fn create_managed_explore_worktree_blocking(
         cwd,
         conv_id,
         &temp_branch,
-        Some(base_branch),
+        Some(checkout_ref),
         PhoenixIgnoreStrategy::StageGitignore,
     )
     .map_err(|e| {
         ManagedWorktreeError::Git(format!(
-            "Failed to create early worktree from '{base_branch}': {e}",
+            "Failed to create early worktree from '{checkout_ref}': {e}",
         ))
     })?;
 
     tracing::info!(
         conv_id = %conv_id,
         base_branch = %base_branch,
+        checkout_ref = %checkout_ref,
         temp_branch = %temp_branch,
         worktree = %worktree_path_str,
         "Created early Managed-mode worktree (REQ-PROJ-028)"
@@ -4756,12 +4772,10 @@ fn skill_entries_from_dir(
 // Tasks
 // ============================================================
 
-async fn task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -> Vec<TaskEntry> {
-    let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
-        .to_string_lossy()
-        .into_owned();
-    let tasks_dir = cwd.join(&tasks_dir_name);
-
+async fn task_conversation_slug_map(
+    state: &AppState,
+    cwd: &std::path::Path,
+) -> std::collections::HashMap<String, String> {
     let all_convs = state
         .runtime
         .db()
@@ -4777,7 +4791,7 @@ async fn task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -> Vec<Ta
         .into_iter()
         .find(|p| std::path::Path::new(&p.canonical_path) == cwd)
         .map(|p| p.id);
-    let task_to_slug: std::collections::HashMap<String, String> = all_convs
+    all_convs
         .iter()
         .filter(|c| match target_project_id.as_deref() {
             Some(project_id) => c.project_id.as_deref() == Some(project_id),
@@ -4788,22 +4802,238 @@ async fn task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -> Vec<Ta
             let slug = c.slug.as_deref()?;
             Some((task_id.to_string(), slug.to_string()))
         })
-        .collect();
+        .collect()
+}
+
+async fn task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -> Vec<TaskEntry> {
+    let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
+        .to_string_lossy()
+        .into_owned();
+    let tasks_dir = cwd.join(&tasks_dir_name);
+    let task_to_slug = task_conversation_slug_map(state, cwd).await;
 
     taskmd_core::tasks::list_tasks(&tasks_dir)
         .into_iter()
         .map(|t| {
             let conversation_slug = task_to_slug.get(&t.id).cloned();
-            TaskEntry {
-                id: t.id,
-                priority: t.priority.to_string(),
-                status: t.status.to_string(),
-                slug: t.slug,
-                path: t.path.to_string_lossy().into_owned(),
+            task_entry_with_conversation(
+                TaskEntryParts {
+                    id: t.id,
+                    priority: t.priority.to_string(),
+                    status: t.status.to_string(),
+                    slug: t.slug,
+                    path: t.path.to_string_lossy().into_owned(),
+                    source_ref: None,
+                    content: None,
+                },
                 conversation_slug,
-            }
+            )
         })
         .collect()
+}
+
+struct TaskEntryParts {
+    id: String,
+    priority: String,
+    status: String,
+    slug: String,
+    path: String,
+    source_ref: Option<String>,
+    content: Option<String>,
+}
+
+fn task_entry_with_conversation(
+    parts: TaskEntryParts,
+    conversation_slug: Option<String>,
+) -> TaskEntry {
+    TaskEntry {
+        id: parts.id,
+        priority: parts.priority,
+        status: parts.status,
+        slug: parts.slug,
+        path: parts.path,
+        source_ref: parts.source_ref,
+        content: parts.content,
+        conversation_slug,
+    }
+}
+
+fn local_task_entry_parts(cwd: &std::path::Path, tasks_dir_name: &str) -> Vec<TaskEntryParts> {
+    taskmd_core::tasks::list_tasks(&cwd.join(tasks_dir_name))
+        .into_iter()
+        .map(|t| TaskEntryParts {
+            id: t.id,
+            priority: t.priority.to_string(),
+            status: t.status.to_string(),
+            slug: t.slug,
+            path: t.path.to_string_lossy().into_owned(),
+            source_ref: None,
+            content: None,
+        })
+        .collect()
+}
+
+fn fetch_origin_for_project_tasks(cwd: &std::path::Path) {
+    let _ = run_git(cwd, &["fetch", "origin"])
+        .inspect_err(|e| tracing::debug!(error = %e, "project task refresh fetch failed"));
+    let _ = run_git(cwd, &["remote", "set-head", "origin", "--auto"]).inspect_err(
+        |e| tracing::debug!(error = %e, "project task refresh origin HEAD update failed"),
+    );
+}
+
+fn refreshed_default_task_ref(cwd: &std::path::Path) -> Option<String> {
+    fetch_origin_for_project_tasks(cwd);
+    let default_branch = run_git(cwd, &["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .ok()
+        .and_then(|s| {
+            s.trim()
+                .strip_prefix("refs/remotes/origin/")
+                .map(String::from)
+        })?;
+    let remote_ref = format!("origin/{default_branch}");
+    if run_git(cwd, &["rev-parse", "--verify", &remote_ref]).is_ok() {
+        Some(remote_ref)
+    } else if run_git(cwd, &["rev-parse", "--verify", &default_branch]).is_ok() {
+        Some(default_branch)
+    } else {
+        None
+    }
+}
+
+fn discover_task_dir_from_git_ref(cwd: &std::path::Path, ref_name: &str) -> String {
+    let output = run_git(cwd, &["ls-tree", "-r", "--name-only", ref_name]).unwrap_or_default();
+    let mut candidates: Vec<String> = output
+        .lines()
+        .filter_map(|path| {
+            let mut parts = path.split('/');
+            let dir = parts.next()?;
+            let file = parts.next()?;
+            if parts.next().is_none() && file == taskmd_core::constants::TEMPLATE_FILENAME {
+                Some(dir.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    candidates.sort();
+    if candidates
+        .iter()
+        .any(|name| name == taskmd_core::constants::DEFAULT_TASKS_DIR_NAME)
+    {
+        taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string()
+    } else {
+        candidates.into_iter().next().unwrap_or_else(|| {
+            taskmd_core::discover::discover_or_default(cwd)
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+}
+
+fn task_entries_from_git_ref(
+    cwd: &std::path::Path,
+    ref_name: &str,
+    tasks_dir_name: &str,
+) -> Vec<TaskEntryParts> {
+    task_entries_from_git_ref_with_limit(cwd, ref_name, tasks_dir_name, None)
+}
+
+fn task_entries_from_git_ref_with_limit(
+    cwd: &std::path::Path,
+    ref_name: &str,
+    tasks_dir_name: &str,
+    limit: Option<usize>,
+) -> Vec<TaskEntryParts> {
+    let tasks_prefix = format!("{}/", tasks_dir_name.trim_end_matches('/'));
+    let output = run_git(
+        cwd,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            ref_name,
+            "--",
+            &tasks_prefix,
+        ],
+    )
+    .unwrap_or_default();
+    output
+        .lines()
+        .filter_map(|repo_relative_path| {
+            let filename = std::path::Path::new(repo_relative_path)
+                .file_name()
+                .and_then(|name| name.to_str())?;
+            let parsed = taskmd_core::filename::parse_filename(filename)?;
+            let content = run_git(cwd, &["show", &format!("{ref_name}:{repo_relative_path}")]).ok();
+            Some(TaskEntryParts {
+                id: parsed.id,
+                priority: parsed.priority.to_string(),
+                status: parsed.status.to_string(),
+                slug: parsed.slug,
+                path: cwd.join(repo_relative_path).to_string_lossy().into_owned(),
+                source_ref: Some(ref_name.to_string()),
+                content,
+            })
+        })
+        .take(limit.unwrap_or(usize::MAX))
+        .collect()
+}
+
+fn project_task_entries_from_default_ref(cwd: &std::path::Path) -> Vec<TaskEntryParts> {
+    let Some(task_ref) = refreshed_default_task_ref(cwd) else {
+        let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
+            .to_string_lossy()
+            .into_owned();
+        return local_task_entry_parts(cwd, &tasks_dir_name);
+    };
+    let tasks_dir_name = discover_task_dir_from_git_ref(cwd, &task_ref);
+    task_entries_from_git_ref(cwd, &task_ref, &tasks_dir_name)
+}
+
+async fn project_task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -> Vec<TaskEntry> {
+    let task_to_slug = task_conversation_slug_map(state, cwd).await;
+    let scan_cwd = cwd.to_path_buf();
+    let task_parts =
+        tokio::task::spawn_blocking(move || project_task_entries_from_default_ref(&scan_cwd))
+            .await
+            .unwrap_or_default();
+    task_parts
+        .into_iter()
+        .map(|parts| {
+            let conversation_slug = task_to_slug.get(&parts.id).cloned();
+            task_entry_with_conversation(parts, conversation_slug)
+        })
+        .collect()
+}
+
+fn project_tasks_available(cwd: &std::path::Path) -> bool {
+    let Some(task_ref) = refreshed_default_task_ref(cwd) else {
+        let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
+            .to_string_lossy()
+            .into_owned();
+        return local_task_entry_parts(cwd, &tasks_dir_name)
+            .into_iter()
+            .next()
+            .is_some();
+    };
+    let tasks_dir_name = discover_task_dir_from_git_ref(cwd, &task_ref);
+    task_entries_from_git_ref_with_limit(cwd, &task_ref, &tasks_dir_name, Some(1))
+        .into_iter()
+        .next()
+        .is_some()
+}
+
+async fn get_project_task_availability(
+    Query(query): Query<ProjectTasksQuery>,
+) -> Result<Json<TaskAvailabilityResponse>, AppError> {
+    let cwd = std::path::PathBuf::from(&query.cwd);
+    if !cwd.exists() || !cwd.is_dir() {
+        return Err(AppError::BadRequest("Directory does not exist".to_string()));
+    }
+    let available = tokio::task::spawn_blocking(move || project_tasks_available(&cwd))
+        .await
+        .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+    Ok(Json(TaskAvailabilityResponse { available }))
 }
 
 /// List task files from a project's tasks/ directory before a conversation exists.
@@ -4816,7 +5046,7 @@ async fn list_project_tasks(
         return Err(AppError::BadRequest("Directory does not exist".to_string()));
     }
     Ok(Json(TasksResponse {
-        tasks: task_entries_for_cwd(&state, &cwd).await,
+        tasks: project_task_entries_for_cwd(&state, &cwd).await,
     }))
 }
 
@@ -5556,6 +5786,7 @@ mod conversation_cwd_validation_tests {
             files: Vec::new(),
             mode: Some("direct".to_string()),
             base_branch: None,
+            checkout_ref: None,
             seed_parent_id: None,
             seed_label: None,
         }
@@ -8641,6 +8872,116 @@ mod file_read_tests {
             ReadFileResponse::Text { content, .. } => assert_eq!(content, "skill prompt\n"),
             other @ ReadFileResponse::Image { .. } => panic!("expected text, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod project_task_ref_tests {
+    use super::*;
+
+    fn git(cwd: &std::path::Path, args: &[&str]) -> String {
+        run_git(cwd, args).unwrap_or_else(|e| panic!("git {args:?} failed: {e}"))
+    }
+
+    fn repo_with_remote_only_task() -> tempfile::TempDir {
+        repo_with_remote_only_task_in("tasks")
+    }
+
+    fn repo_with_remote_only_task_in(tasks_dir: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        git(repo, &["init", "--initial-branch=main"]);
+        git(repo, &["config", "user.email", "test@phoenix"]);
+        git(repo, &["config", "user.name", "phoenix-test"]);
+        std::fs::write(repo.join("README.md"), "base\n").expect("write readme");
+        git(repo, &["add", "README.md"]);
+        git(repo, &["commit", "-m", "base"]);
+        let base = git(repo, &["rev-parse", "HEAD"]);
+
+        let queue_path = repo.join(tasks_dir);
+        std::fs::create_dir_all(&queue_path).expect("tasks dir");
+        std::fs::write(
+            queue_path.join(taskmd_core::constants::TEMPLATE_FILENAME),
+            "# Template\n",
+        )
+        .expect("write template");
+        let task_rel = format!("{tasks_dir}/07004-p1-ready--merged-target-task.md");
+        std::fs::write(repo.join(&task_rel), "# merged task\n").expect("write task");
+        git(repo, &["add", tasks_dir]);
+        git(repo, &["commit", "-m", "add task"]);
+        let remote_default = git(repo, &["rev-parse", "HEAD"]);
+        git(
+            repo,
+            &["update-ref", "refs/remotes/origin/main", &remote_default],
+        );
+        git(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        git(repo, &["checkout", "-b", "feature", &base]);
+        assert!(!repo.join(tasks_dir).exists());
+        tmp
+    }
+
+    #[test]
+    fn project_task_availability_reads_refreshed_default_ref() {
+        let repo = repo_with_remote_only_task();
+
+        assert!(project_tasks_available(repo.path()));
+    }
+
+    #[test]
+    fn project_task_discovery_reads_task_dir_from_ref() {
+        let repo = repo_with_remote_only_task_in("work-items");
+
+        assert!(project_tasks_available(repo.path()));
+        let entries = project_task_entries_from_default_ref(repo.path());
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0]
+            .path
+            .ends_with("work-items/07004-p1-ready--merged-target-task.md"));
+    }
+
+    #[test]
+    fn project_task_listing_reads_refreshed_default_ref() {
+        let repo = repo_with_remote_only_task();
+
+        let entries = project_task_entries_from_default_ref(repo.path());
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "07004");
+        assert_eq!(entries[0].slug, "merged-target-task");
+        assert_eq!(entries[0].status, "ready");
+        assert_eq!(entries[0].source_ref.as_deref(), Some("origin/main"));
+        assert_eq!(entries[0].content.as_deref(), Some("# merged task"));
+        assert!(entries[0]
+            .path
+            .ends_with("tasks/07004-p1-ready--merged-target-task.md"));
+    }
+
+    #[test]
+    fn managed_worktree_can_start_from_listed_remote_ref() {
+        let repo = repo_with_remote_only_task();
+
+        let worktree = match create_managed_explore_worktree_blocking(
+            repo.path().to_str().unwrap(),
+            "12345678-1234-1234-1234-123456789abc",
+            "main",
+            "origin/main",
+        ) {
+            Ok(path) => path,
+            Err(ManagedWorktreeError::BadRequest(e) | ManagedWorktreeError::Git(e)) => {
+                panic!("{e}")
+            }
+        };
+
+        assert!(std::path::Path::new(&worktree)
+            .join("tasks/07004-p1-ready--merged-target-task.md")
+            .exists());
     }
 }
 
