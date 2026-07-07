@@ -806,13 +806,14 @@ mod tests {
             request: crate::state_machine::state::CommissionReviewInput {
                 brief: "Ready for review".to_string(),
                 focus: None,
-                allow_dirty_working_tree: false,
             },
             scope: crate::state_machine::state::CommissionReviewApprovalScope {
-                kind: "workspace_diff".to_string(),
+                kind: "committed_branch_diff".to_string(),
                 repo_root: "/tmp".to_string(),
-                base: "HEAD".to_string(),
-                head: "working-tree".to_string(),
+                base: "refs/remotes/origin/HEAD".to_string(),
+                head: "HEAD".to_string(),
+                approved_head: None,
+                approved_base: None,
                 dirty: false,
                 changed_files: 0,
                 insertions: 0,

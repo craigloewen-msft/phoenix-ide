@@ -26,8 +26,6 @@ struct CommissionReviewInput {
     brief: String,
     #[serde(default)]
     focus: Option<String>,
-    #[serde(default)]
-    allow_dirty_working_tree: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,16 +39,85 @@ struct ApprovedCommissionReviewInput {
     approved_base: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ReviewStatus {
     Success,
+    Partial,
+    Failed,
     Skipped,
-    CompletedWithWarnings,
     #[allow(dead_code)]
     Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ReviewCompletionStatus {
+    Completed,
+    CompletedWithWarnings,
+    ModelTimeoutAfterOutput,
+    ModelTimeoutNoOutput,
+    ModelFailedAfterOutput,
+    ModelFailedNoOutput,
+    Cancelled,
+    Unavailable,
     #[allow(dead_code)]
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FindingsStatus {
+    Complete,
+    Partial,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FindingsTrust {
+    Complete,
+    Partial,
+    Repaired,
+    Low,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum StageStatus {
+    Ok,
+    Partial,
+    Timeout,
     Failed,
+    Cancelled,
+    Skipped,
+    Repaired,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ReviewStageStatus {
+    target_collection: StageStatus,
+    diff_collection: StageStatus,
+    llm_review: StageStatus,
+    json_parse: StageStatus,
+    finding_extraction: StageStatus,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct FindingSummary {
+    total: usize,
+    critical: usize,
+    high: usize,
+    medium: usize,
+    low: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RetryRecommendation {
+    Retry,
+    DoNotRetry,
+    ReviewFindingsFirst,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,6 +126,8 @@ struct ReviewFinding {
     confidence: String,
     file: String,
     line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol: Option<String>,
     title: String,
     rationale: String,
     suggested_fix: String,
@@ -79,14 +148,9 @@ struct ReviewSummary {
     files_reviewed: usize,
     insertions: u64,
     deletions: u64,
-    findings_count: usize,
     elapsed_ms: u128,
     #[serde(skip)]
     usage: phoenix_core::domain::llm_types::Usage,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    input_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reviewer_summary: Option<String>,
 }
@@ -94,8 +158,7 @@ struct ReviewSummary {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ReviewTargetKind {
-    WorktreeDiff,
-    WorkspaceDiff,
+    CommittedBranchDiff,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -105,7 +168,6 @@ struct ReviewTargetSummary {
     base: String,
     head: String,
     dirty: bool,
-    allow_dirty_working_tree: bool,
 }
 
 /// Why a changed file was excluded from the review entirely. Distinct from a
@@ -131,6 +193,13 @@ struct UnreviewedFile {
 #[derive(Debug, Serialize)]
 struct ReviewOutput {
     status: ReviewStatus,
+    review_status: ReviewCompletionStatus,
+    findings_status: FindingsStatus,
+    findings_trust: FindingsTrust,
+    stage_status: ReviewStageStatus,
+    finding_summary: FindingSummary,
+    warnings_summary: Vec<String>,
+    retry_recommendation: RetryRecommendation,
     summary: ReviewSummary,
     /// Files changed by the diff that were NOT sent to the reviewer because they
     /// exceeded a size cap. Non-empty means the review did not cover everything.
@@ -147,12 +216,7 @@ struct ReviewTarget {
 
 #[derive(Debug)]
 enum DiffSpec {
-    Range {
-        base: String,
-        head: String,
-        include_worktree: bool,
-    },
-    Workspace,
+    Range { base: String, head: String },
 }
 
 #[derive(Debug)]
@@ -180,6 +244,8 @@ struct ModelFinding {
     confidence: Option<String>,
     file: Option<String>,
     line: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    symbol: Option<String>,
     title: Option<String>,
     rationale: Option<String>,
     suggested_fix: Option<String>,
@@ -194,7 +260,7 @@ impl Tool for CommissionReviewTool {
     }
 
     fn description(&self) -> String {
-        "Request an independent Phoenix-native code review of the active git work. This is a capital-spend request: provide a concise executive brief explaining why the work is ready and why review tokens are useful now. Phoenix infers the review target from the active conversation/worktree. Set allow_dirty_working_tree only when reviewing uncommitted changes is intentional.".to_string()
+        "Request an independent Phoenix-native code review of the active git work. This is a capital-spend request: provide a concise executive brief explaining why the work is ready and why review tokens are useful now. Phoenix reviews committed changes only, comparing HEAD against the approved origin base branch (or origin default branch when no base is approved), and refuses dirty working trees.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -209,11 +275,6 @@ impl Tool for CommissionReviewTool {
                 "focus": {
                     "type": "string",
                     "description": "Optional review focus, e.g. security and correctness"
-                },
-                "allow_dirty_working_tree": {
-                    "type": "boolean",
-                    "description": "Default false. Required for git-aware task/worktree review when uncommitted changes are present",
-                    "default": false
                 }
             }
         })
@@ -222,14 +283,7 @@ impl Tool for CommissionReviewTool {
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
         match run_review(input, ctx).await {
             Ok(out) => {
-                let display = json!({
-                    "kind": "commission_review",
-                    "status": &out.status,
-                    "summary": &out.summary,
-                    "unreviewed": &out.unreviewed,
-                    "findings": &out.findings,
-                    "warnings": &out.warnings,
-                });
+                let display = review_display(&out);
                 ToolOutput::success(pretty_json(&out))
                     .with_display(display)
                     .with_llm_usage(ToolLlmUsage {
@@ -240,6 +294,33 @@ impl Tool for CommissionReviewTool {
             Err(err) => ToolOutput::error(err),
         }
     }
+}
+
+fn review_display(out: &ReviewOutput) -> Value {
+    json!({
+        "kind": "commission_review",
+        "status_panel": [
+            {"name": "status", "value": &out.status},
+            {"name": "review_status", "value": &out.review_status},
+            {"name": "findings_status", "value": &out.findings_status},
+            {"name": "findings_trust", "value": &out.findings_trust},
+            {"name": "finding_summary", "value": &out.finding_summary},
+            {"name": "warnings_summary", "value": &out.warnings_summary},
+            {"name": "retry_recommendation", "value": &out.retry_recommendation},
+        ],
+        "status": &out.status,
+        "review_status": &out.review_status,
+        "findings_status": &out.findings_status,
+        "findings_trust": &out.findings_trust,
+        "stage_status": &out.stage_status,
+        "finding_summary": &out.finding_summary,
+        "warnings_summary": &out.warnings_summary,
+        "retry_recommendation": &out.retry_recommendation,
+        "summary": &out.summary,
+        "unreviewed": &out.unreviewed,
+        "findings": &out.findings,
+        "warnings": &out.warnings,
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -276,51 +357,49 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         );
     }
 
-    let target = resolve_target(&ctx, &input, approved.runtime_base_branch.as_deref()).await?;
-    let collection = collect_diff(&target, &ctx).await?;
+    let target = match resolve_target(&ctx, &input, approved.runtime_base_branch.as_deref()).await {
+        Ok(target) => target,
+        Err(reason) => {
+            return Ok(ReviewRun::CollectionFailed {
+                target: fallback_target_summary(&ctx),
+                stage: CollectionFailureStage::TargetCollection,
+                reason,
+            }
+            .into_output(started.elapsed().as_millis()));
+        }
+    };
+    let collection = match collect_diff(&target, &ctx).await {
+        Ok(collection) => collection,
+        Err(reason) => {
+            return Ok(ReviewRun::CollectionFailed {
+                target: target.summary,
+                stage: CollectionFailureStage::DiffCollection,
+                reason,
+            }
+            .into_output(started.elapsed().as_millis()));
+        }
+    };
 
     if ctx.cancel.is_cancelled() {
         return Err("commission_review cancelled before LLM review".to_string());
     }
 
     if collection.files_reviewed == 0 {
-        // Nothing was reviewed, but distinguish "no reviewable text diff" from
-        // "every changed file was excluded by a size cap". The latter is a
-        // coverage gap, not a clean no-op, so it must not read as an ordinary
-        // Skipped run with no findings.
-        let (status, reviewer_summary) = if collection.unreviewed.is_empty() {
-            (
-                ReviewStatus::Skipped,
-                "No reviewable text diff was found".to_string(),
+        let has_unreviewed = !collection.unreviewed.is_empty();
+        let reviewer_summary = if has_unreviewed {
+            format!(
+                "No files were reviewed: all {} changed file(s) exceeded a size cap",
+                collection.unreviewed.len()
             )
         } else {
-            (
-                ReviewStatus::CompletedWithWarnings,
-                format!(
-                    "No files were reviewed: all {} changed file(s) exceeded a size cap",
-                    collection.unreviewed.len()
-                ),
-            )
+            "No reviewable text diff was found".to_string()
         };
-        return Ok(ReviewOutput {
-            status,
-            summary: ReviewSummary {
-                target: target.summary,
-                files_changed: collection.files_changed,
-                files_reviewed: 0,
-                insertions: collection.insertions,
-                deletions: collection.deletions,
-                findings_count: 0,
-                elapsed_ms: started.elapsed().as_millis(),
-                usage: phoenix_core::domain::llm_types::Usage::default(),
-                input_tokens: None,
-                output_tokens: None,
-                reviewer_summary: Some(reviewer_summary),
-            },
-            unreviewed: collection.unreviewed,
-            findings: Vec::new(),
-            warnings: collection.warnings,
-        });
+        return Ok(ReviewRun::SkippedNoReviewableDiff {
+            target: target.summary,
+            coverage: ReviewCoverage::from_collection(collection),
+            reason: reviewer_summary,
+        }
+        .into_output(started.elapsed().as_millis()));
     }
 
     let service = ctx.llm_selector().default_service().ok_or_else(|| {
@@ -337,17 +416,23 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
 
     for (index, chunk) in chunks.iter().enumerate() {
         if ctx.cancel.is_cancelled() {
-            return Ok(failed_review_output(
+            return Ok(interrupted_review_output(
                 started,
                 target.summary.clone(),
                 &collection,
-                findings,
-                warnings,
-                input_tokens,
-                output_tokens,
-                cache_creation_tokens,
-                cache_read_tokens,
-                "commission_review cancelled during LLM review",
+                InterruptedReview {
+                    findings,
+                    warnings,
+                    reviewer_summaries,
+                    usage: phoenix_core::domain::llm_types::Usage {
+                        input_tokens,
+                        output_tokens,
+                        cache_creation_tokens,
+                        cache_read_tokens,
+                    },
+                    reason: "commission_review cancelled during LLM review".to_string(),
+                    interruption: ReviewInterruption::Cancelled,
+                },
             ));
         }
         let request = LlmRequest {
@@ -373,33 +458,45 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
 
         let response = tokio::select! {
             () = ctx.cancel.cancelled() => {
-                return Ok(failed_review_output(
+                return Ok(interrupted_review_output(
                     started,
                     target.summary.clone(),
                     &collection,
-                    findings,
-                    warnings,
-                    input_tokens,
-                    output_tokens,
-                    cache_creation_tokens,
-                    cache_read_tokens,
-                    "commission_review cancelled during LLM review",
+                    InterruptedReview {
+                        findings,
+                        warnings,
+                        reviewer_summaries,
+                        usage: phoenix_core::domain::llm_types::Usage {
+                            input_tokens,
+                            output_tokens,
+                            cache_creation_tokens,
+                            cache_read_tokens,
+                        },
+                        reason: "commission_review cancelled during LLM review".to_string(),
+                        interruption: ReviewInterruption::Cancelled,
+                    },
                 ));
             }
             response = service.complete(&request) => match response {
                 Ok(response) => response,
                 Err(e) => {
-                    return Ok(failed_review_output(
+                    return Ok(interrupted_review_output(
                         started,
                         target.summary.clone(),
                         &collection,
-                        findings,
-                        warnings,
-                        input_tokens,
-                        output_tokens,
-                        cache_creation_tokens,
-                        cache_read_tokens,
-                        &format!("commission_review LLM review failed: {e}"),
+                        InterruptedReview {
+                            findings,
+                            warnings,
+                            reviewer_summaries,
+                            usage: phoenix_core::domain::llm_types::Usage {
+                                input_tokens,
+                                output_tokens,
+                                cache_creation_tokens,
+                                cache_read_tokens,
+                            },
+                            reason: format!("commission_review LLM review failed: {e}"),
+                            interruption: classify_llm_error(&e),
+                        },
                     ));
                 }
             },
@@ -409,93 +506,899 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         cache_creation_tokens += response.usage.cache_creation_tokens;
         cache_read_tokens += response.usage.cache_read_tokens;
         let (mut chunk_findings, chunk_summary, chunk_warnings) = parse_findings(&response.text());
+        let chunk_parse_failed = has_warning(&chunk_warnings, "model_output_parse");
         findings.append(&mut chunk_findings);
-        if let Some(summary) = chunk_summary.filter(|s| !s.trim().is_empty()) {
-            reviewer_summaries.push(summary);
+        if !chunk_parse_failed {
+            if let Some(summary) = chunk_summary.filter(|s| !s.trim().is_empty()) {
+                reviewer_summaries.push(summary);
+            }
         }
         warnings.extend(chunk_warnings);
     }
 
     normalize_findings(&mut findings, &mut warnings);
-    warnings.extend(collection.warnings);
-    let unreviewed = collection.unreviewed;
-    // Unreviewed files are a coverage gap, not advisory noise: a clean run that
-    // nonetheless skipped files must not report Success and read as full coverage.
-    let status = if warnings.is_empty() && unreviewed.is_empty() {
-        ReviewStatus::Success
-    } else {
-        ReviewStatus::CompletedWithWarnings
-    };
+    Ok(ReviewRun::Completed {
+        target: target.summary,
+        coverage: ReviewCoverage::from_collection(collection),
+        parsed: ParsedReviewOutput::from_parts(findings, &reviewer_summaries),
+        warnings,
+        usage: phoenix_core::domain::llm_types::Usage {
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+        },
+    }
+    .into_output(started.elapsed().as_millis()))
+}
 
-    Ok(ReviewOutput {
-        status,
-        summary: ReviewSummary {
-            target: target.summary,
+#[derive(Debug)]
+struct ReviewOutputDraft {
+    status: ReviewStatus,
+    review_status: ReviewCompletionStatus,
+    findings_status: FindingsStatus,
+    findings_trust: FindingsTrust,
+    stage_status: ReviewStageStatus,
+    retry_recommendation: RetryRecommendation,
+    summary: ReviewSummary,
+    unreviewed: Vec<UnreviewedFile>,
+    findings: Vec<ReviewFinding>,
+    warnings: Vec<ReviewWarning>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewInterruption {
+    Timeout,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug)]
+struct InterruptedReview {
+    findings: Vec<ReviewFinding>,
+    warnings: Vec<ReviewWarning>,
+    reviewer_summaries: Vec<String>,
+    usage: phoenix_core::domain::llm_types::Usage,
+    reason: String,
+    interruption: ReviewInterruption,
+}
+
+#[derive(Debug)]
+struct ReviewCoverage {
+    files_changed: usize,
+    files_reviewed: usize,
+    insertions: u64,
+    deletions: u64,
+    warnings: Vec<ReviewWarning>,
+    unreviewed: Vec<UnreviewedFile>,
+}
+
+impl ReviewCoverage {
+    fn from_collection(collection: DiffCollection) -> Self {
+        Self {
             files_changed: collection.files_changed,
             files_reviewed: collection.files_reviewed,
             insertions: collection.insertions,
             deletions: collection.deletions,
-            findings_count: findings.len(),
-            elapsed_ms: started.elapsed().as_millis(),
-            usage: phoenix_core::domain::llm_types::Usage {
-                input_tokens,
-                output_tokens,
-                cache_creation_tokens,
-                cache_read_tokens,
-            },
-            input_tokens: Some(input_tokens),
-            output_tokens: Some(output_tokens),
+            warnings: collection.warnings,
+            unreviewed: collection.unreviewed,
+        }
+    }
+
+    fn from_collection_ref(collection: &DiffCollection) -> Self {
+        Self {
+            files_changed: collection.files_changed,
+            files_reviewed: collection.files_reviewed,
+            insertions: collection.insertions,
+            deletions: collection.deletions,
+            warnings: collection.warnings.clone(),
+            unreviewed: collection.unreviewed.clone(),
+        }
+    }
+
+    fn has_unreviewed(&self) -> bool {
+        !self.unreviewed.is_empty()
+    }
+}
+
+#[derive(Debug)]
+struct ParsedReviewOutput {
+    findings: Vec<ReviewFinding>,
+    reviewer_summary: Option<String>,
+}
+
+impl ParsedReviewOutput {
+    fn from_parts(findings: Vec<ReviewFinding>, reviewer_summaries: &[String]) -> Self {
+        Self {
+            findings,
             reviewer_summary: if reviewer_summaries.is_empty() {
                 None
             } else {
                 Some(reviewer_summaries.join("\n\n"))
             },
+        }
+    }
+
+    fn has_output(&self) -> bool {
+        !self.findings.is_empty()
+            || self
+                .reviewer_summary
+                .as_ref()
+                .is_some_and(|summary| !summary.trim().is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollectionFailureStage {
+    TargetCollection,
+    DiffCollection,
+}
+
+#[derive(Debug)]
+enum ReviewRun {
+    CollectionFailed {
+        target: ReviewTargetSummary,
+        stage: CollectionFailureStage,
+        reason: String,
+    },
+    SkippedNoReviewableDiff {
+        target: ReviewTargetSummary,
+        coverage: ReviewCoverage,
+        reason: String,
+    },
+    Completed {
+        target: ReviewTargetSummary,
+        coverage: ReviewCoverage,
+        parsed: ParsedReviewOutput,
+        warnings: Vec<ReviewWarning>,
+        usage: phoenix_core::domain::llm_types::Usage,
+    },
+    InterruptedAfterOutput {
+        target: ReviewTargetSummary,
+        coverage: ReviewCoverage,
+        parsed: ParsedReviewOutput,
+        warnings: Vec<ReviewWarning>,
+        usage: phoenix_core::domain::llm_types::Usage,
+        reason: String,
+        interruption: ReviewInterruption,
+    },
+    InterruptedNoOutput {
+        target: ReviewTargetSummary,
+        coverage: ReviewCoverage,
+        warnings: Vec<ReviewWarning>,
+        usage: phoenix_core::domain::llm_types::Usage,
+        reason: String,
+        interruption: ReviewInterruption,
+    },
+}
+
+impl ReviewRun {
+    fn into_output(self, elapsed_ms: u128) -> ReviewOutput {
+        match self {
+            ReviewRun::CollectionFailed {
+                target,
+                stage,
+                reason,
+            } => collection_failed_output(target, stage, &reason, elapsed_ms),
+            ReviewRun::SkippedNoReviewableDiff {
+                target,
+                coverage,
+                reason,
+            } => skipped_no_reviewable_output(target, coverage, reason, elapsed_ms),
+            ReviewRun::Completed {
+                target,
+                coverage,
+                parsed,
+                warnings,
+                usage,
+            } => completed_review_output(target, coverage, parsed, warnings, usage, elapsed_ms),
+            ReviewRun::InterruptedAfterOutput {
+                target,
+                coverage,
+                parsed,
+                warnings,
+                usage,
+                reason,
+                interruption,
+            } => interrupted_after_output(
+                target,
+                coverage,
+                parsed,
+                warnings,
+                usage,
+                ReviewInterruptionContext {
+                    reason: &reason,
+                    interruption,
+                },
+                elapsed_ms,
+            ),
+            ReviewRun::InterruptedNoOutput {
+                target,
+                coverage,
+                warnings,
+                usage,
+                reason,
+                interruption,
+            } => interrupted_no_output(
+                target,
+                coverage,
+                warnings,
+                usage,
+                &reason,
+                interruption,
+                elapsed_ms,
+            ),
+        }
+    }
+}
+
+fn fallback_target_summary(ctx: &ToolContext) -> ReviewTargetSummary {
+    ReviewTargetSummary {
+        kind: ReviewTargetKind::CommittedBranchDiff,
+        repo_root: ctx.working_dir.display().to_string(),
+        base: "unknown".to_string(),
+        head: "unknown".to_string(),
+        dirty: false,
+    }
+}
+
+fn collection_failed_output(
+    target: ReviewTargetSummary,
+    stage: CollectionFailureStage,
+    reason: &str,
+    elapsed_ms: u128,
+) -> ReviewOutput {
+    let cancelled = reason.to_ascii_lowercase().contains("cancelled");
+    let coverage = ReviewCoverage {
+        files_changed: 0,
+        files_reviewed: 0,
+        insertions: 0,
+        deletions: 0,
+        warnings: vec![warning(
+            if cancelled {
+                "review_cancelled"
+            } else {
+                "collection_failed"
+            },
+            reason,
+            None,
+        )],
+        unreviewed: Vec::new(),
+    };
+    finalize_review_output(ReviewOutputDraft {
+        status: ReviewStatus::Failed,
+        review_status: if cancelled {
+            ReviewCompletionStatus::Cancelled
+        } else {
+            ReviewCompletionStatus::Unavailable
         },
-        unreviewed,
-        findings,
+        findings_status: FindingsStatus::Unavailable,
+        findings_trust: FindingsTrust::Low,
+        stage_status: ReviewStageStatus {
+            target_collection: if stage == CollectionFailureStage::TargetCollection {
+                if cancelled {
+                    StageStatus::Cancelled
+                } else {
+                    StageStatus::Failed
+                }
+            } else {
+                StageStatus::Ok
+            },
+            diff_collection: if stage == CollectionFailureStage::DiffCollection {
+                if cancelled {
+                    StageStatus::Cancelled
+                } else {
+                    StageStatus::Failed
+                }
+            } else {
+                StageStatus::Skipped
+            },
+            llm_review: StageStatus::Skipped,
+            json_parse: StageStatus::Skipped,
+            finding_extraction: StageStatus::Skipped,
+        },
+        retry_recommendation: if cancelled {
+            RetryRecommendation::DoNotRetry
+        } else {
+            RetryRecommendation::Retry
+        },
+        summary: review_summary(
+            target,
+            &coverage,
+            elapsed_ms,
+            phoenix_core::domain::llm_types::Usage::default(),
+            None,
+        ),
+        unreviewed: coverage.unreviewed,
+        findings: Vec::new(),
+        warnings: coverage.warnings,
+    })
+}
+
+fn review_summary(
+    target: ReviewTargetSummary,
+    coverage: &ReviewCoverage,
+    elapsed_ms: u128,
+    usage: phoenix_core::domain::llm_types::Usage,
+    reviewer_summary: Option<String>,
+) -> ReviewSummary {
+    ReviewSummary {
+        target,
+        files_changed: coverage.files_changed,
+        files_reviewed: coverage.files_reviewed,
+        insertions: coverage.insertions,
+        deletions: coverage.deletions,
+        elapsed_ms,
+        usage,
+        reviewer_summary,
+    }
+}
+
+fn skipped_no_reviewable_output(
+    target: ReviewTargetSummary,
+    coverage: ReviewCoverage,
+    reason: String,
+    elapsed_ms: u128,
+) -> ReviewOutput {
+    let has_unreviewed = coverage.has_unreviewed();
+    finalize_review_output(ReviewOutputDraft {
+        status: if has_unreviewed {
+            ReviewStatus::Partial
+        } else {
+            ReviewStatus::Skipped
+        },
+        review_status: if has_unreviewed {
+            ReviewCompletionStatus::CompletedWithWarnings
+        } else {
+            ReviewCompletionStatus::Unavailable
+        },
+        findings_status: FindingsStatus::Unavailable,
+        findings_trust: FindingsTrust::Low,
+        stage_status: ReviewStageStatus {
+            target_collection: StageStatus::Ok,
+            diff_collection: diff_stage_status(&coverage.warnings, has_unreviewed),
+            llm_review: StageStatus::Skipped,
+            json_parse: StageStatus::Skipped,
+            finding_extraction: StageStatus::Skipped,
+        },
+        retry_recommendation: RetryRecommendation::DoNotRetry,
+        summary: review_summary(
+            target,
+            &coverage,
+            elapsed_ms,
+            phoenix_core::domain::llm_types::Usage::default(),
+            Some(reason),
+        ),
+        unreviewed: coverage.unreviewed,
+        findings: Vec::new(),
+        warnings: coverage.warnings,
+    })
+}
+
+fn completed_review_output(
+    target: ReviewTargetSummary,
+    coverage: ReviewCoverage,
+    parsed: ParsedReviewOutput,
+    mut warnings: Vec<ReviewWarning>,
+    usage: phoenix_core::domain::llm_types::Usage,
+    elapsed_ms: u128,
+) -> ReviewOutput {
+    warnings.extend(coverage.warnings.clone());
+    let has_unreviewed = coverage.has_unreviewed();
+    let has_diff_coverage_gap =
+        diff_stage_status(&warnings, has_unreviewed) == StageStatus::Partial;
+    let (status, findings_status, findings_trust, retry_recommendation) =
+        completed_result_contract(&warnings, parsed.has_output(), has_diff_coverage_gap);
+    let review_status = completed_review_status(&status, warnings.is_empty() && !has_unreviewed);
+
+    finalize_review_output(ReviewOutputDraft {
+        status,
+        review_status,
+        findings_status,
+        findings_trust,
+        stage_status: ReviewStageStatus {
+            target_collection: StageStatus::Ok,
+            diff_collection: diff_stage_status(&warnings, has_unreviewed),
+            llm_review: StageStatus::Ok,
+            json_parse: json_parse_stage_status(&warnings),
+            finding_extraction: finding_extraction_stage_status(&warnings),
+        },
+        retry_recommendation,
+        summary: review_summary(
+            target,
+            &coverage,
+            elapsed_ms,
+            usage,
+            parsed.reviewer_summary,
+        ),
+        unreviewed: coverage.unreviewed,
+        findings: parsed.findings,
         warnings,
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn failed_review_output(
+#[derive(Clone, Copy)]
+struct ReviewInterruptionContext<'a> {
+    reason: &'a str,
+    interruption: ReviewInterruption,
+}
+
+fn interrupted_after_output(
+    target: ReviewTargetSummary,
+    coverage: ReviewCoverage,
+    parsed: ParsedReviewOutput,
+    mut warnings: Vec<ReviewWarning>,
+    usage: phoenix_core::domain::llm_types::Usage,
+    context: ReviewInterruptionContext<'_>,
+    elapsed_ms: u128,
+) -> ReviewOutput {
+    let ReviewInterruptionContext {
+        reason,
+        interruption,
+    } = context;
+    warnings.extend(coverage.warnings.clone());
+    warnings.push(warning(
+        interrupted_warning_kind(interruption, true),
+        reason,
+        None,
+    ));
+    let (status, review_status, findings_status, mut findings_trust, retry_recommendation) =
+        interrupted_contract(interruption, true);
+    if has_warning(&warnings, "model_output_parse") {
+        findings_trust = FindingsTrust::Low;
+    }
+    finalize_review_output(ReviewOutputDraft {
+        status,
+        review_status,
+        findings_status,
+        findings_trust,
+        stage_status: ReviewStageStatus {
+            target_collection: StageStatus::Ok,
+            diff_collection: diff_stage_status(&warnings, coverage.has_unreviewed()),
+            llm_review: llm_interruption_stage(interruption),
+            json_parse: interrupted_json_parse_stage_status(&warnings, true),
+            finding_extraction: interrupted_finding_extraction_stage_status(&warnings, true),
+        },
+        retry_recommendation,
+        summary: review_summary(
+            target,
+            &coverage,
+            elapsed_ms,
+            usage,
+            parsed.reviewer_summary,
+        ),
+        unreviewed: coverage.unreviewed,
+        findings: parsed.findings,
+        warnings,
+    })
+}
+
+fn interrupted_no_output(
+    target: ReviewTargetSummary,
+    coverage: ReviewCoverage,
+    mut warnings: Vec<ReviewWarning>,
+    usage: phoenix_core::domain::llm_types::Usage,
+    reason: &str,
+    interruption: ReviewInterruption,
+    elapsed_ms: u128,
+) -> ReviewOutput {
+    warnings.extend(coverage.warnings.clone());
+    warnings.push(warning(
+        interrupted_warning_kind(interruption, false),
+        reason,
+        None,
+    ));
+    let (status, review_status, findings_status, findings_trust, retry_recommendation) =
+        interrupted_contract(interruption, false);
+    finalize_review_output(ReviewOutputDraft {
+        status,
+        review_status,
+        findings_status,
+        findings_trust,
+        stage_status: ReviewStageStatus {
+            target_collection: StageStatus::Ok,
+            diff_collection: diff_stage_status(&warnings, coverage.has_unreviewed()),
+            llm_review: llm_interruption_stage(interruption),
+            json_parse: interrupted_json_parse_stage_status(&warnings, false),
+            finding_extraction: interrupted_finding_extraction_stage_status(&warnings, false),
+        },
+        retry_recommendation,
+        summary: review_summary(target, &coverage, elapsed_ms, usage, None),
+        unreviewed: coverage.unreviewed,
+        findings: Vec::new(),
+        warnings,
+    })
+}
+
+fn interrupted_warning_kind(interruption: ReviewInterruption, has_output: bool) -> &'static str {
+    match (interruption, has_output) {
+        (ReviewInterruption::Timeout, true) => "review_timeout_partial",
+        (ReviewInterruption::Timeout, false) => "review_timeout_no_output",
+        (ReviewInterruption::Failed, _) => "review_failed",
+        (ReviewInterruption::Cancelled, _) => "review_cancelled",
+    }
+}
+
+fn llm_interruption_stage(interruption: ReviewInterruption) -> StageStatus {
+    match interruption {
+        ReviewInterruption::Timeout => StageStatus::Timeout,
+        ReviewInterruption::Failed => StageStatus::Failed,
+        ReviewInterruption::Cancelled => StageStatus::Cancelled,
+    }
+}
+
+fn interrupted_review_output(
     started: Instant,
     target: ReviewTargetSummary,
     collection: &DiffCollection,
-    findings: Vec<ReviewFinding>,
-    mut warnings: Vec<ReviewWarning>,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_creation_tokens: u64,
-    cache_read_tokens: u64,
-    reason: &str,
+    mut interrupted: InterruptedReview,
 ) -> ReviewOutput {
-    warnings.extend(collection.warnings.clone());
-    warnings.push(warning("review_failed", reason, None));
-    ReviewOutput {
-        status: ReviewStatus::Failed,
-        summary: ReviewSummary {
+    normalize_findings(&mut interrupted.findings, &mut interrupted.warnings);
+    let parsed =
+        ParsedReviewOutput::from_parts(interrupted.findings, &interrupted.reviewer_summaries);
+    let coverage = ReviewCoverage::from_collection_ref(collection);
+    let run = if interrupted.interruption == ReviewInterruption::Cancelled || !parsed.has_output() {
+        ReviewRun::InterruptedNoOutput {
             target,
-            files_changed: collection.files_changed,
-            files_reviewed: collection.files_reviewed,
-            insertions: collection.insertions,
-            deletions: collection.deletions,
-            findings_count: findings.len(),
-            elapsed_ms: started.elapsed().as_millis(),
-            usage: phoenix_core::domain::llm_types::Usage {
-                input_tokens,
-                output_tokens,
-                cache_creation_tokens,
-                cache_read_tokens,
-            },
-            input_tokens: Some(input_tokens),
-            output_tokens: Some(output_tokens),
-            reviewer_summary: Some(reason.to_string()),
-        },
-        unreviewed: collection.unreviewed.clone(),
-        findings,
-        warnings,
+            coverage,
+            warnings: interrupted.warnings,
+            usage: interrupted.usage,
+            reason: interrupted.reason,
+            interruption: interrupted.interruption,
+        }
+    } else {
+        ReviewRun::InterruptedAfterOutput {
+            target,
+            coverage,
+            parsed,
+            warnings: interrupted.warnings,
+            usage: interrupted.usage,
+            reason: interrupted.reason,
+            interruption: interrupted.interruption,
+        }
+    };
+    run.into_output(started.elapsed().as_millis())
+}
+
+fn completed_review_status(status: &ReviewStatus, clean_complete: bool) -> ReviewCompletionStatus {
+    if matches!(status, ReviewStatus::Failed) {
+        ReviewCompletionStatus::Unavailable
+    } else if clean_complete {
+        ReviewCompletionStatus::Completed
+    } else {
+        ReviewCompletionStatus::CompletedWithWarnings
     }
+}
+
+fn completed_result_contract(
+    warnings: &[ReviewWarning],
+    has_parsed_output: bool,
+    has_diff_coverage_gap: bool,
+) -> (
+    ReviewStatus,
+    FindingsStatus,
+    FindingsTrust,
+    RetryRecommendation,
+) {
+    if has_warning(warnings, "model_output_parse") {
+        if has_parsed_output {
+            (
+                ReviewStatus::Partial,
+                FindingsStatus::Partial,
+                FindingsTrust::Low,
+                RetryRecommendation::ReviewFindingsFirst,
+            )
+        } else {
+            (
+                ReviewStatus::Failed,
+                FindingsStatus::Unavailable,
+                FindingsTrust::Low,
+                RetryRecommendation::Retry,
+            )
+        }
+    } else if has_warning(warnings, "dropped_findings") && !has_parsed_output {
+        (
+            ReviewStatus::Failed,
+            FindingsStatus::Unavailable,
+            FindingsTrust::Low,
+            RetryRecommendation::Retry,
+        )
+    } else if has_diff_coverage_gap {
+        (
+            ReviewStatus::Partial,
+            findings_status_for_completed(warnings),
+            findings_trust_for_completed(warnings),
+            RetryRecommendation::DoNotRetry,
+        )
+    } else {
+        (
+            ReviewStatus::Success,
+            findings_status_for_completed(warnings),
+            findings_trust_for_completed(warnings),
+            RetryRecommendation::DoNotRetry,
+        )
+    }
+}
+
+fn interrupted_contract(
+    interruption: ReviewInterruption,
+    has_output: bool,
+) -> (
+    ReviewStatus,
+    ReviewCompletionStatus,
+    FindingsStatus,
+    FindingsTrust,
+    RetryRecommendation,
+) {
+    match (interruption, has_output) {
+        (ReviewInterruption::Timeout, true) => (
+            ReviewStatus::Partial,
+            ReviewCompletionStatus::ModelTimeoutAfterOutput,
+            FindingsStatus::Partial,
+            FindingsTrust::Partial,
+            RetryRecommendation::ReviewFindingsFirst,
+        ),
+        (ReviewInterruption::Timeout, false) => (
+            ReviewStatus::Failed,
+            ReviewCompletionStatus::ModelTimeoutNoOutput,
+            FindingsStatus::Unavailable,
+            FindingsTrust::Low,
+            RetryRecommendation::Retry,
+        ),
+        (ReviewInterruption::Failed, true) => (
+            ReviewStatus::Partial,
+            ReviewCompletionStatus::ModelFailedAfterOutput,
+            FindingsStatus::Partial,
+            FindingsTrust::Partial,
+            RetryRecommendation::ReviewFindingsFirst,
+        ),
+        (ReviewInterruption::Failed, false) => (
+            ReviewStatus::Failed,
+            ReviewCompletionStatus::ModelFailedNoOutput,
+            FindingsStatus::Unavailable,
+            FindingsTrust::Low,
+            RetryRecommendation::Retry,
+        ),
+        (ReviewInterruption::Cancelled, true | false) => (
+            ReviewStatus::Failed,
+            ReviewCompletionStatus::Cancelled,
+            FindingsStatus::Unavailable,
+            FindingsTrust::Low,
+            RetryRecommendation::DoNotRetry,
+        ),
+    }
+}
+
+fn finalize_review_output(draft: ReviewOutputDraft) -> ReviewOutput {
+    let finding_summary = summarize_findings(&draft.findings);
+    let warnings_summary = summarize_warnings(&draft.warnings);
+    let output = ReviewOutput {
+        status: draft.status,
+        review_status: draft.review_status,
+        findings_status: draft.findings_status,
+        findings_trust: draft.findings_trust,
+        stage_status: draft.stage_status,
+        finding_summary,
+        warnings_summary,
+        retry_recommendation: draft.retry_recommendation,
+        summary: draft.summary,
+        unreviewed: draft.unreviewed,
+        findings: draft.findings,
+        warnings: draft.warnings,
+    };
+    debug_assert!(
+        review_output_invariant_error(&output).is_none(),
+        "invalid commission review output: {:?}",
+        review_output_invariant_error(&output)
+    );
+    output
+}
+
+fn review_output_invariant_error(output: &ReviewOutput) -> Option<&'static str> {
+    if output.finding_summary.total != output.findings.len() {
+        return Some("finding_summary.total must equal findings.len()");
+    }
+    if matches!(output.status, ReviewStatus::Failed) {
+        if !output.findings.is_empty() || output.finding_summary.total != 0 {
+            return Some("failed output must not carry findings");
+        }
+        if output.summary.reviewer_summary.is_some() {
+            return Some("failed output must not carry reviewer summary");
+        }
+    }
+    if matches!(output.findings_status, FindingsStatus::Unavailable)
+        && (!output.findings.is_empty() || output.finding_summary.total != 0)
+    {
+        return Some("unavailable findings must not carry findings");
+    }
+    match output.review_status {
+        ReviewCompletionStatus::ModelTimeoutAfterOutput
+        | ReviewCompletionStatus::ModelFailedAfterOutput => {
+            if !matches!(output.status, ReviewStatus::Partial) {
+                return Some("after-output review status requires partial top-level status");
+            }
+            if output.findings.is_empty() && output.summary.reviewer_summary.is_none() {
+                return Some("after-output review status requires parsed output");
+            }
+        }
+        ReviewCompletionStatus::ModelTimeoutNoOutput
+        | ReviewCompletionStatus::ModelFailedNoOutput => {
+            if !matches!(output.status, ReviewStatus::Failed)
+                || !matches!(output.findings_status, FindingsStatus::Unavailable)
+            {
+                return Some("no-output review status requires failed unavailable result");
+            }
+        }
+        ReviewCompletionStatus::Completed
+        | ReviewCompletionStatus::CompletedWithWarnings
+        | ReviewCompletionStatus::Cancelled
+        | ReviewCompletionStatus::Unavailable
+        | ReviewCompletionStatus::Rejected => {}
+    }
+    None
+}
+
+fn classify_llm_error(error: &str) -> ReviewInterruption {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("timeout") || lower.contains("timed out") {
+        ReviewInterruption::Timeout
+    } else {
+        ReviewInterruption::Failed
+    }
+}
+
+fn summarize_findings(findings: &[ReviewFinding]) -> FindingSummary {
+    let mut summary = FindingSummary {
+        total: findings.len(),
+        critical: 0,
+        high: 0,
+        medium: 0,
+        low: 0,
+    };
+    for finding in findings {
+        match finding.severity.as_str() {
+            "critical" => summary.critical += 1,
+            "high" => summary.high += 1,
+            "medium" => summary.medium += 1,
+            "low" => summary.low += 1,
+            _ => {}
+        }
+    }
+    summary
+}
+
+fn summarize_warnings(warnings: &[ReviewWarning]) -> Vec<String> {
+    let mut summaries = Vec::new();
+    let mut seen = HashSet::new();
+    for warning in warnings {
+        let summary = match warning.kind.as_str() {
+            "model_output_repaired" => "model output repaired".to_string(),
+            "model_output_parse" => "model output could not be parsed as JSON".to_string(),
+            "review_timeout_partial" => "review request timed out after partial output".to_string(),
+            "review_timeout_no_output" => {
+                "review request timed out before parsed output".to_string()
+            }
+            "review_failed" => "review request failed".to_string(),
+            "review_cancelled" => "review request was cancelled".to_string(),
+            "review_truncated" => "review material was truncated".to_string(),
+            "file_too_large" => "some file diffs exceeded review limits".to_string(),
+            "unsupported_file" => "some changed files were not reviewable".to_string(),
+            "diff_capture_failed" => "some file diffs could not be captured".to_string(),
+            "collection_failed" => "review target or diff collection failed".to_string(),
+            "untracked_file" => "some untracked files were not reviewed".to_string(),
+            "dropped_findings" => warning.message.clone(),
+            "invalid_severity" => "some finding severities were normalized".to_string(),
+            "invalid_confidence" => "some finding confidences were normalized".to_string(),
+            _ => continue,
+        };
+        if seen.insert(summary.clone()) {
+            summaries.push(summary);
+        }
+    }
+    summaries
+}
+
+fn findings_status_for_completed(warnings: &[ReviewWarning]) -> FindingsStatus {
+    if has_warning(warnings, "dropped_findings") {
+        FindingsStatus::Partial
+    } else {
+        FindingsStatus::Complete
+    }
+}
+
+fn findings_trust_for_completed(warnings: &[ReviewWarning]) -> FindingsTrust {
+    if has_warning(warnings, "model_output_parse") {
+        FindingsTrust::Low
+    } else if has_warning(warnings, "dropped_findings") {
+        FindingsTrust::Partial
+    } else if has_normalized_finding_warning(warnings)
+        || has_warning(warnings, "model_output_repaired")
+    {
+        FindingsTrust::Repaired
+    } else {
+        FindingsTrust::Complete
+    }
+}
+
+fn has_normalized_finding_warning(warnings: &[ReviewWarning]) -> bool {
+    has_warning(warnings, "invalid_severity") || has_warning(warnings, "invalid_confidence")
+}
+
+fn diff_stage_status(warnings: &[ReviewWarning], has_unreviewed: bool) -> StageStatus {
+    if has_unreviewed
+        || warnings.iter().any(|w| {
+            matches!(
+                w.kind.as_str(),
+                "review_truncated"
+                    | "file_too_large"
+                    | "unsupported_file"
+                    | "diff_capture_failed"
+                    | "untracked_file"
+            )
+        })
+    {
+        StageStatus::Partial
+    } else {
+        StageStatus::Ok
+    }
+}
+
+fn json_parse_stage_status(warnings: &[ReviewWarning]) -> StageStatus {
+    if has_warning(warnings, "model_output_parse") {
+        StageStatus::Failed
+    } else if has_warning(warnings, "model_output_repaired") {
+        StageStatus::Repaired
+    } else {
+        StageStatus::Ok
+    }
+}
+
+fn finding_extraction_stage_status(warnings: &[ReviewWarning]) -> StageStatus {
+    if has_warning(warnings, "dropped_findings") {
+        StageStatus::Partial
+    } else if has_warning(warnings, "model_output_parse") {
+        StageStatus::Failed
+    } else if has_warning(warnings, "invalid_severity")
+        || has_warning(warnings, "invalid_confidence")
+    {
+        StageStatus::Repaired
+    } else {
+        StageStatus::Ok
+    }
+}
+
+fn interrupted_json_parse_stage_status(
+    warnings: &[ReviewWarning],
+    has_output: bool,
+) -> StageStatus {
+    if !has_output && !has_warning(warnings, "model_output_parse") {
+        StageStatus::Skipped
+    } else {
+        json_parse_stage_status(warnings)
+    }
+}
+
+fn interrupted_finding_extraction_stage_status(
+    warnings: &[ReviewWarning],
+    has_output: bool,
+) -> StageStatus {
+    if !has_output && !has_warning(warnings, "model_output_parse") {
+        StageStatus::Skipped
+    } else if has_warning(warnings, "model_output_parse") {
+        StageStatus::Failed
+    } else if has_warning(warnings, "dropped_findings") {
+        StageStatus::Partial
+    } else if has_warning(warnings, "invalid_severity")
+        || has_warning(warnings, "invalid_confidence")
+    {
+        StageStatus::Repaired
+    } else {
+        StageStatus::Ok
+    }
+}
+
+fn has_warning(warnings: &[ReviewWarning], kind: &str) -> bool {
+    warnings.iter().any(|warning| warning.kind == kind)
 }
 
 fn assert_approved_context_has_not_drifted(
@@ -535,25 +1438,54 @@ fn assert_approved_paths_match(
     Ok(())
 }
 
-/// Prefer the remote-tracking ref `origin/<base>` over the bare local branch,
-/// falling back to the local ref when no remote-tracking ref exists. See
-/// `specs/commission-review/design.md` (REQ-CR-004..006) for why the remote ref
-/// is the correct comparator.
-async fn effective_base_ref(repo: &Path, base_branch: &str) -> String {
-    let remote = format!("origin/{base_branch}");
-    if git_capture(repo, &["rev-parse", "--verify", "--quiet", &remote])
-        .await
-        .is_ok()
-    {
-        remote
+async fn origin_default_ref(repo: &Path) -> Result<String, String> {
+    let remote = git_capture(
+        repo,
+        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+    )
+    .await
+    .map_err(|_| {
+        "commission_review requires fetched origin default branch ref `origin/HEAD`. Fetch origin before requesting review.".to_string()
+    })?;
+    let remote = remote.trim();
+    if remote.starts_with("refs/remotes/origin/") {
+        Ok(remote.to_string())
     } else {
-        base_branch.to_string()
+        Err(format!(
+            "commission_review expected `origin/HEAD` to resolve to an origin remote-tracking branch, got `{remote}`."
+        ))
+    }
+}
+
+async fn remote_base_ref(
+    repo: &Path,
+    approved_base_branch: Option<&str>,
+) -> Result<String, String> {
+    if let Some(base_branch) = approved_base_branch.filter(|branch| !branch.trim().is_empty()) {
+        let branch = base_branch
+            .trim()
+            .strip_prefix("refs/remotes/origin/")
+            .or_else(|| base_branch.trim().strip_prefix("origin/"))
+            .unwrap_or_else(|| base_branch.trim());
+        let remote = format!("refs/remotes/origin/{branch}");
+        if git_capture(repo, &["rev-parse", "--verify", "--quiet", &remote])
+            .await
+            .is_ok()
+        {
+            Ok(remote)
+        } else {
+            Err(format!(
+                "commission_review requires fetched approved base ref `{remote}`. Fetch origin before requesting review."
+            ))
+        }
+    } else {
+        origin_default_ref(repo).await
     }
 }
 
 async fn resolve_target(
     ctx: &ToolContext,
-    input: &CommissionReviewInput,
+    _input: &CommissionReviewInput,
     runtime_base_branch: Option<&str>,
 ) -> Result<ReviewTarget, String> {
     let repo_root = git_capture(&ctx.working_dir, &["rev-parse", "--show-toplevel"]).await?;
@@ -564,39 +1496,23 @@ async fn resolve_target(
         .is_empty();
     let head = git_capture(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
 
-    if ctx.worktree_path.is_some() {
-        if dirty && !input.allow_dirty_working_tree {
-            return Err("commission_review refused dirty worktree review. Commit/stash changes, or set allow_dirty_working_tree=true to include uncommitted changes.".to_string());
-        }
-        let base = effective_base_ref(&repo, runtime_base_branch.unwrap_or("main")).await;
-        Ok(ReviewTarget {
-            summary: ReviewTargetSummary {
-                kind: ReviewTargetKind::WorktreeDiff,
-                repo_root: repo.display().to_string(),
-                base: base.clone(),
-                head: head.trim().to_string(),
-                dirty,
-                allow_dirty_working_tree: input.allow_dirty_working_tree,
-            },
-            diff_spec: DiffSpec::Range {
-                base,
-                head: "HEAD".to_string(),
-                include_worktree: dirty && input.allow_dirty_working_tree,
-            },
-        })
-    } else {
-        Ok(ReviewTarget {
-            summary: ReviewTargetSummary {
-                kind: ReviewTargetKind::WorkspaceDiff,
-                repo_root: repo.display().to_string(),
-                base: "workspace-base".to_string(),
-                head: "working-tree".to_string(),
-                dirty,
-                allow_dirty_working_tree: input.allow_dirty_working_tree,
-            },
-            diff_spec: DiffSpec::Workspace,
-        })
+    if dirty {
+        return Err("commission_review refused dirty working tree. Commit or stash changes before requesting review; commission_review only reviews committed changes against the approved origin base branch.".to_string());
     }
+    let base = remote_base_ref(&repo, runtime_base_branch).await?;
+    Ok(ReviewTarget {
+        summary: ReviewTargetSummary {
+            kind: ReviewTargetKind::CommittedBranchDiff,
+            repo_root: repo.display().to_string(),
+            base: base.clone(),
+            head: head.trim().to_string(),
+            dirty,
+        },
+        diff_spec: DiffSpec::Range {
+            base,
+            head: "HEAD".to_string(),
+        },
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -604,64 +1520,19 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
     let repo = Path::new(&target.summary.repo_root);
     let mut warnings = Vec::new();
     let mut unreviewed = Vec::new();
-    let effective_range_base = match &target.diff_spec {
-        DiffSpec::Range { base, head, .. } => {
-            Some(git_capture_cancel(repo, &["merge-base", base, head], &ctx.cancel).await?)
-        }
-        DiffSpec::Workspace => None,
-    };
-    let numstat = match &target.diff_spec {
-        DiffSpec::Range {
-            base,
-            head,
-            include_worktree,
-        } => {
-            if *include_worktree {
-                let merge_base = effective_range_base.as_deref().unwrap_or(base);
-                git_capture_cancel(
-                    repo,
-                    &[
-                        "diff",
-                        "--no-ext-diff",
-                        "--no-textconv",
-                        "--numstat",
-                        merge_base,
-                        "--",
-                    ],
-                    &ctx.cancel,
-                )
-                .await?
-            } else {
-                git_capture_cancel(
-                    repo,
-                    &[
-                        "diff",
-                        "--no-ext-diff",
-                        "--no-textconv",
-                        "--numstat",
-                        &format!("{base}...{head}"),
-                    ],
-                    &ctx.cancel,
-                )
-                .await?
-            }
-        }
-        DiffSpec::Workspace => {
-            git_capture_cancel(
-                repo,
-                &[
-                    "diff",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--numstat",
-                    "HEAD",
-                    "--",
-                ],
-                &ctx.cancel,
-            )
-            .await?
-        }
-    };
+    let DiffSpec::Range { base, head } = &target.diff_spec;
+    let numstat = git_capture_cancel(
+        repo,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--numstat",
+            &format!("{base}...{head}"),
+        ],
+        &ctx.cancel,
+    )
+    .await?;
     let mut insertions = 0;
     let mut deletions = 0;
     let mut files_changed = 0;
@@ -712,94 +1583,40 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
             ));
             continue;
         }
-        let diff = match &target.diff_spec {
-            DiffSpec::Range {
-                base,
-                head,
-                include_worktree,
-            } => {
-                let capture_result = if *include_worktree {
-                    let merge_base = effective_range_base.as_deref().unwrap_or(base);
-                    git_capture_limited_cancel(
-                        repo,
-                        &[
-                            "diff",
-                            "--no-ext-diff",
-                            "--no-textconv",
-                            merge_base,
-                            "--",
-                            file,
-                        ],
-                        MAX_FILE_BYTES + 1,
-                        &ctx.cancel,
-                    )
-                    .await
-                } else {
-                    let merge_base_range = format!("{base}...{head}");
-                    git_capture_limited_cancel(
-                        repo,
-                        &[
-                            "diff",
-                            "--no-ext-diff",
-                            "--no-textconv",
-                            &merge_base_range,
-                            "--",
-                            file,
-                        ],
-                        MAX_FILE_BYTES + 1,
-                        &ctx.cancel,
-                    )
-                    .await
-                };
-                let (diff_output, truncated) = match capture_result {
-                    Ok(result) => result,
-                    Err(e) => {
-                        warnings.push(warning(
-                            "diff_capture_failed",
-                            &format!("failed to capture file diff: {e}"),
-                            Some(file),
-                        ));
-                        continue;
-                    }
-                };
-                if truncated {
-                    unreviewed.push(UnreviewedFile {
-                        file: file.clone(),
-                        reason: OversizedReason::PerFileCap,
-                    });
-                    continue;
-                }
-                diff_output
-            }
-            DiffSpec::Workspace => {
-                let (diff_output, truncated) = match git_capture_limited_cancel(
-                    repo,
-                    &["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--", file],
-                    MAX_FILE_BYTES + 1,
-                    &ctx.cancel,
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(e) => {
-                        warnings.push(warning(
-                            "diff_capture_failed",
-                            &format!("failed to capture file diff: {e}"),
-                            Some(file),
-                        ));
-                        continue;
-                    }
-                };
-                if truncated {
-                    unreviewed.push(UnreviewedFile {
-                        file: file.clone(),
-                        reason: OversizedReason::PerFileCap,
-                    });
-                    continue;
-                }
-                diff_output
+        let DiffSpec::Range { base, head } = &target.diff_spec;
+        let merge_base_range = format!("{base}...{head}");
+        let capture_result = git_capture_limited_cancel(
+            repo,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                &merge_base_range,
+                "--",
+                file,
+            ],
+            MAX_FILE_BYTES + 1,
+            &ctx.cancel,
+        )
+        .await;
+        let (diff, truncated) = match capture_result {
+            Ok(result) => result,
+            Err(e) => {
+                warnings.push(warning(
+                    "diff_capture_failed",
+                    &format!("failed to capture file diff: {e}"),
+                    Some(file),
+                ));
+                continue;
             }
         };
+        if truncated {
+            unreviewed.push(UnreviewedFile {
+                file: file.clone(),
+                reason: OversizedReason::PerFileCap,
+            });
+            continue;
+        }
         if diff.len() > MAX_FILE_BYTES {
             unreviewed.push(UnreviewedFile {
                 file: file.clone(),
@@ -840,7 +1657,7 @@ fn review_prompt(
     chunk_count: usize,
 ) -> String {
     format!(
-        "Brief:\n{}\n\nFocus:\n{}\n\nTarget:\n{}\n\nStats: {} changed files, {} reviewed files, +{}/-{}. Dirty: {}, dirty opt-in: {}. Chunk {}/{}.\n\nDiff:\n{}",
+        "Brief:\n{}\n\nFocus:\n{}\n\nTarget:\n{}\n\nStats: {} changed files, {} reviewed files, +{}/-{}. Dirty: {}. Chunk {}/{}.\n\nDiff:\n{}",
         input.brief.trim(),
         input.focus.as_deref().unwrap_or("general correctness review"),
         serde_json::to_string_pretty(target).unwrap_or_default(),
@@ -849,7 +1666,6 @@ fn review_prompt(
         collection.insertions,
         collection.deletions,
         target.dirty,
-        target.allow_dirty_working_tree,
         chunk_index,
         chunk_count,
         diff_chunk
@@ -885,6 +1701,17 @@ fn review_chunks(body: &str) -> Vec<String> {
         chunks.push(current);
     }
     chunks
+}
+
+fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(Value::String(value)) => Some(value),
+        _ => None,
+    })
 }
 
 fn parse_findings(text: &str) -> (Vec<ReviewFinding>, Option<String>, Vec<ReviewWarning>) {
@@ -951,6 +1778,7 @@ fn parse_findings(text: &str) -> (Vec<ReviewFinding>, Option<String>, Vec<Review
                 confidence: f.confidence.unwrap_or_else(|| "medium".to_string()),
                 file,
                 line: f.line,
+                symbol: f.symbol.filter(|symbol| !symbol.trim().is_empty()),
                 title: f.title.unwrap_or_else(|| "Review finding".to_string()),
                 rationale: f.rationale.unwrap_or_default(),
                 suggested_fix: f.suggested_fix.unwrap_or_default(),
@@ -1000,6 +1828,11 @@ fn normalize_findings(findings: &mut Vec<ReviewFinding>, warnings: &mut Vec<Revi
             "invalid_confidence",
         );
         finding.file = finding.file.trim().to_string();
+        finding.symbol = finding
+            .symbol
+            .as_ref()
+            .map(|symbol| symbol.trim().to_string())
+            .filter(|symbol| !symbol.is_empty());
         finding.title = finding.title.trim().to_string();
     }
 
@@ -1294,12 +2127,10 @@ mod tests {
         );
     }
 
-    /// The review comparator must prefer origin/<base> over the (often stale)
-    /// local base ref, and fall back to the local ref only when no
-    /// remote-tracking ref exists. Diffing against a stale local base is what
-    /// inflated a 3-commit PR into a 118-commit review in production.
+    /// The review target resolves the fetched origin default branch through
+    /// `origin/HEAD` instead of assuming a branch name such as `main`.
     #[tokio::test]
-    async fn effective_base_ref_prefers_remote_tracking_ref() {
+    async fn origin_default_ref_uses_origin_head() {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
         git_ok(repo, &["init", "-q"]).await;
@@ -1312,16 +2143,123 @@ mod tests {
             .await
             .expect("head");
 
-        // No remote-tracking ref yet: fall back to the bare local branch.
-        assert_eq!(effective_base_ref(repo, "main").await, "main");
+        assert!(origin_default_ref(repo).await.is_err());
 
-        // Once origin/main exists, it must win.
-        git_ok(repo, &["update-ref", "refs/remotes/origin/main", &head]).await;
-        assert_eq!(effective_base_ref(repo, "main").await, "origin/main");
+        git_ok(repo, &["update-ref", "refs/remotes/origin/master", &head]).await;
+        git_ok(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/master",
+            ],
+        )
+        .await;
+        assert_eq!(
+            origin_default_ref(repo).await.unwrap(),
+            "refs/remotes/origin/master"
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_working_tree_is_always_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git_ok(repo, &["init", "-q"]).await;
+        git_ok(repo, &["config", "user.email", "t@t.t"]).await;
+        git_ok(repo, &["config", "user.name", "t"]).await;
+        git_ok(repo, &["commit", "-qm", "base", "--allow-empty"]).await;
+        let base = git_capture(repo, &["rev-parse", "HEAD"])
+            .await
+            .expect("base");
+        git_ok(repo, &["update-ref", "refs/remotes/origin/main", &base]).await;
+        git_ok(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        )
+        .await;
+        std::fs::write(repo.join("dirty.rs"), "uncommitted\n").expect("write");
+
+        let ctx = ToolContext::new(
+            CancellationToken::new(),
+            "test-conv".to_string(),
+            repo.to_path_buf(),
+            std::sync::Arc::new(crate::BrowserSessionManager::default()),
+            std::sync::Arc::new(crate::BashHandleRegistry::new()),
+            std::sync::Arc::new(crate::NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            std::sync::Arc::new(crate::TmuxRegistry::new()),
+            Some(repo.to_path_buf()),
+        );
+        let err = resolve_target(
+            &ctx,
+            &CommissionReviewInput {
+                brief: "ready".to_string(),
+                focus: None,
+            },
+            Some("main"),
+        )
+        .await
+        .expect_err("dirty working tree is refused");
+
+        assert!(err.contains("refused dirty working tree"));
+        assert!(err.contains("only reviews committed changes"));
+    }
+
+    #[tokio::test]
+    async fn resolve_target_uses_approved_remote_base_when_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git_ok(repo, &["init", "-q"]).await;
+        git_ok(repo, &["config", "user.email", "t@t.t"]).await;
+        git_ok(repo, &["config", "user.name", "t"]).await;
+        git_ok(repo, &["commit", "-qm", "base", "--allow-empty"]).await;
+        let base = git_capture(repo, &["rev-parse", "HEAD"])
+            .await
+            .expect("base");
+        git_ok(repo, &["update-ref", "refs/remotes/origin/master", &base]).await;
+        git_ok(repo, &["update-ref", "refs/remotes/origin/develop", &base]).await;
+        git_ok(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/master",
+            ],
+        )
+        .await;
+
+        let ctx = ToolContext::new(
+            CancellationToken::new(),
+            "test-conv".to_string(),
+            repo.to_path_buf(),
+            std::sync::Arc::new(crate::BrowserSessionManager::default()),
+            std::sync::Arc::new(crate::BashHandleRegistry::new()),
+            std::sync::Arc::new(crate::NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            std::sync::Arc::new(crate::TmuxRegistry::new()),
+            Some(repo.to_path_buf()),
+        );
+        let target = resolve_target(
+            &ctx,
+            &CommissionReviewInput {
+                brief: "ready".to_string(),
+                focus: None,
+            },
+            Some("develop"),
+        )
+        .await
+        .expect("target resolves");
+
+        assert_eq!(target.summary.base, "refs/remotes/origin/develop");
     }
 
     /// A diff whose only changed files all exceed the per-file cap reviews
-    /// nothing, but must report the coverage gap (`completed_with_warnings` +
+    /// nothing, but must report the coverage gap (partial status + top-level
     /// unreviewed list), not look like an ordinary empty-diff skip.
     #[tokio::test]
     async fn all_files_over_cap_reports_coverage_gap_not_skip() {
@@ -1335,6 +2273,15 @@ mod tests {
             .await
             .expect("base");
         git_ok(repo, &["update-ref", "refs/remotes/origin/main", &base]).await;
+        git_ok(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        )
+        .await;
         // One changed file, far over MAX_FILE_BYTES, on a committed branch.
         let big = "let x = 0;\n".repeat(MAX_FILE_BYTES / 5);
         std::fs::write(repo.join("big.rs"), &big).expect("write");
@@ -1357,7 +2304,6 @@ mod tests {
             &CommissionReviewInput {
                 brief: "ready".to_string(),
                 focus: None,
-                allow_dirty_working_tree: false,
             },
             Some("main"),
         )
@@ -1375,25 +2321,40 @@ mod tests {
     #[test]
     fn unreviewed_files_serialize_as_top_level_snake_case() {
         let out = ReviewOutput {
-            status: ReviewStatus::CompletedWithWarnings,
+            status: ReviewStatus::Partial,
+            review_status: ReviewCompletionStatus::CompletedWithWarnings,
+            findings_status: FindingsStatus::Unavailable,
+            findings_trust: FindingsTrust::Low,
+            stage_status: ReviewStageStatus {
+                target_collection: StageStatus::Ok,
+                diff_collection: StageStatus::Partial,
+                llm_review: StageStatus::Skipped,
+                json_parse: StageStatus::Skipped,
+                finding_extraction: StageStatus::Skipped,
+            },
+            finding_summary: FindingSummary {
+                total: 0,
+                critical: 0,
+                high: 0,
+                medium: 0,
+                low: 0,
+            },
+            warnings_summary: Vec::new(),
+            retry_recommendation: RetryRecommendation::DoNotRetry,
             summary: ReviewSummary {
                 target: ReviewTargetSummary {
-                    kind: ReviewTargetKind::WorktreeDiff,
+                    kind: ReviewTargetKind::CommittedBranchDiff,
                     repo_root: "/r".to_string(),
                     base: "main".to_string(),
                     head: "HEAD".to_string(),
                     dirty: false,
-                    allow_dirty_working_tree: false,
                 },
                 files_changed: 2,
                 files_reviewed: 0,
                 insertions: 0,
                 deletions: 0,
-                findings_count: 0,
                 elapsed_ms: 0,
                 usage: phoenix_core::domain::llm_types::Usage::default(),
-                input_tokens: None,
-                output_tokens: None,
                 reviewer_summary: None,
             },
             unreviewed: vec![
@@ -1487,7 +2448,6 @@ mod tests {
             request: CommissionReviewInput {
                 brief: "Ready".to_string(),
                 focus: None,
-                allow_dirty_working_tree: false,
             },
             runtime_base_branch: Some("main".to_string()),
             approved_working_dir: "/repo/approved".to_string(),
@@ -1519,7 +2479,6 @@ mod tests {
             request: CommissionReviewInput {
                 brief: "Ready".to_string(),
                 focus: None,
-                allow_dirty_working_tree: false,
             },
             runtime_base_branch: Some("main".to_string()),
             approved_working_dir: "/repo/approved".to_string(),
@@ -1531,6 +2490,651 @@ mod tests {
         assert!(assert_approved_paths_match("/repo/approved", None, &approved).is_ok());
     }
 
+    fn sample_target() -> ReviewTargetSummary {
+        ReviewTargetSummary {
+            kind: ReviewTargetKind::CommittedBranchDiff,
+            repo_root: "/repo".to_string(),
+            base: "main".to_string(),
+            head: "task".to_string(),
+            dirty: false,
+        }
+    }
+
+    fn sample_collection() -> DiffCollection {
+        DiffCollection {
+            files_changed: 1,
+            files_reviewed: 1,
+            insertions: 3,
+            deletions: 1,
+            body: "diff".to_string(),
+            warnings: Vec::new(),
+            unreviewed: Vec::new(),
+        }
+    }
+
+    fn sample_coverage() -> ReviewCoverage {
+        ReviewCoverage::from_collection(sample_collection())
+    }
+
+    fn assert_review_output_invariants(output: &ReviewOutput) {
+        assert_eq!(review_output_invariant_error(output), None);
+    }
+
+    fn sample_finding(severity: &str, file: &str, title: &str) -> ReviewFinding {
+        ReviewFinding {
+            severity: severity.to_string(),
+            confidence: "high".to_string(),
+            file: file.to_string(),
+            line: Some(7),
+            symbol: Some("parse_external_models".to_string()),
+            title: title.to_string(),
+            rationale: "bad".to_string(),
+            suggested_fix: "fix".to_string(),
+        }
+    }
+
+    #[test]
+    fn outcome_cancelled_with_buffered_findings_clears_actionable_output() {
+        let output = ReviewRun::InterruptedNoOutput {
+            target: sample_target(),
+            coverage: sample_coverage(),
+            warnings: Vec::new(),
+            usage: phoenix_core::domain::llm_types::Usage::default(),
+            reason: "cancelled".to_string(),
+            interruption: ReviewInterruption::Cancelled,
+        }
+        .into_output(0);
+
+        assert_review_output_invariants(&output);
+        assert_eq!(output.status, ReviewStatus::Failed);
+        assert_eq!(output.findings_status, FindingsStatus::Unavailable);
+        assert!(output.findings.is_empty());
+        assert_eq!(output.finding_summary.total, 0);
+        assert_eq!(output.summary.reviewer_summary, None);
+    }
+
+    #[test]
+    fn outcome_after_output_requires_summary_or_findings() {
+        let summaries = vec!["Reviewed chunks before timeout".to_string()];
+        let output = ReviewRun::InterruptedAfterOutput {
+            target: sample_target(),
+            coverage: sample_coverage(),
+            parsed: ParsedReviewOutput::from_parts(Vec::new(), &summaries),
+            warnings: Vec::new(),
+            usage: phoenix_core::domain::llm_types::Usage::default(),
+            reason: "timed out".to_string(),
+            interruption: ReviewInterruption::Timeout,
+        }
+        .into_output(0);
+
+        assert_review_output_invariants(&output);
+        assert_eq!(output.status, ReviewStatus::Partial);
+        assert_eq!(
+            output.review_status,
+            ReviewCompletionStatus::ModelTimeoutAfterOutput
+        );
+        assert_eq!(output.finding_summary.total, 0);
+        assert_eq!(
+            output.summary.reviewer_summary.as_deref(),
+            Some("Reviewed chunks before timeout")
+        );
+    }
+
+    #[test]
+    fn outcome_collection_failure_marks_exact_failed_stage() {
+        let output = ReviewRun::CollectionFailed {
+            target: sample_target(),
+            stage: CollectionFailureStage::DiffCollection,
+            reason: "git diff failed".to_string(),
+        }
+        .into_output(0);
+
+        assert_review_output_invariants(&output);
+        assert_eq!(output.status, ReviewStatus::Failed);
+        assert_eq!(output.review_status, ReviewCompletionStatus::Unavailable);
+        assert_eq!(output.stage_status.target_collection, StageStatus::Ok);
+        assert_eq!(output.stage_status.diff_collection, StageStatus::Failed);
+        assert_eq!(output.stage_status.llm_review, StageStatus::Skipped);
+    }
+
+    #[test]
+    fn outcome_collection_cancellation_marks_stage_cancelled() {
+        let output = ReviewRun::CollectionFailed {
+            target: sample_target(),
+            stage: CollectionFailureStage::DiffCollection,
+            reason: "commission_review cancelled while collecting diffs".to_string(),
+        }
+        .into_output(0);
+
+        assert_review_output_invariants(&output);
+        assert_eq!(output.status, ReviewStatus::Failed);
+        assert_eq!(output.review_status, ReviewCompletionStatus::Cancelled);
+        assert_eq!(output.stage_status.diff_collection, StageStatus::Cancelled);
+        assert_eq!(output.retry_recommendation, RetryRecommendation::DoNotRetry);
+        assert!(output
+            .warnings_summary
+            .contains(&"review request was cancelled".to_string()));
+    }
+
+    #[test]
+    fn non_json_text_is_not_counted_as_parsed_partial_output() {
+        let (findings, summary, warnings) = parse_findings("plain reviewer prose");
+        let mut reviewer_summaries = Vec::new();
+        if !has_warning(&warnings, "model_output_parse") {
+            if let Some(summary) = summary.filter(|s| !s.trim().is_empty()) {
+                reviewer_summaries.push(summary);
+            }
+        }
+        let output = interrupted_review_output(
+            Instant::now(),
+            sample_target(),
+            &sample_collection(),
+            InterruptedReview {
+                findings,
+                warnings,
+                reviewer_summaries,
+                usage: phoenix_core::domain::llm_types::Usage::default(),
+                reason: "request timed out".to_string(),
+                interruption: ReviewInterruption::Timeout,
+            },
+        );
+
+        assert_eq!(output.status, ReviewStatus::Failed);
+        assert_eq!(output.findings_status, FindingsStatus::Unavailable);
+        assert_eq!(
+            output.review_status,
+            ReviewCompletionStatus::ModelTimeoutNoOutput
+        );
+        assert_eq!(output.stage_status.json_parse, StageStatus::Failed);
+        assert_eq!(output.stage_status.finding_extraction, StageStatus::Failed);
+    }
+
+    #[test]
+    fn completed_parse_failure_without_findings_is_failed_unavailable() {
+        let warnings = vec![warning(
+            "model_output_parse",
+            "reviewer returned non-JSON output",
+            None,
+        )];
+        let (status, findings_status, findings_trust, retry_recommendation) =
+            completed_result_contract(&warnings, false, false);
+
+        assert_eq!(status, ReviewStatus::Failed);
+        assert_eq!(findings_status, FindingsStatus::Unavailable);
+        assert_eq!(findings_trust, FindingsTrust::Low);
+        assert_eq!(retry_recommendation, RetryRecommendation::Retry);
+        assert_eq!(json_parse_stage_status(&warnings), StageStatus::Failed);
+        assert_eq!(
+            finding_extraction_stage_status(&warnings),
+            StageStatus::Failed
+        );
+    }
+
+    #[test]
+    fn completed_failed_result_uses_unavailable_review_status() {
+        assert_eq!(
+            completed_review_status(&ReviewStatus::Failed, false),
+            ReviewCompletionStatus::Unavailable
+        );
+        assert_eq!(
+            completed_review_status(&ReviewStatus::Success, true),
+            ReviewCompletionStatus::Completed
+        );
+        assert_eq!(
+            completed_review_status(&ReviewStatus::Partial, false),
+            ReviewCompletionStatus::CompletedWithWarnings
+        );
+    }
+
+    #[test]
+    fn completed_parse_failure_with_parsed_summary_is_partial() {
+        let warnings = vec![warning(
+            "model_output_parse",
+            "later reviewer chunk returned non-JSON output",
+            None,
+        )];
+        let (status, findings_status, findings_trust, retry_recommendation) =
+            completed_result_contract(&warnings, true, false);
+
+        assert_eq!(status, ReviewStatus::Partial);
+        assert_eq!(findings_status, FindingsStatus::Partial);
+        assert_eq!(findings_trust, FindingsTrust::Low);
+        assert_eq!(
+            retry_recommendation,
+            RetryRecommendation::ReviewFindingsFirst
+        );
+    }
+
+    #[test]
+    fn coverage_warnings_make_completed_result_partial() {
+        let warnings = vec![warning(
+            "unsupported_file",
+            "unsupported file type skipped",
+            Some("image.png"),
+        )];
+        let has_diff_coverage_gap = diff_stage_status(&warnings, false) == StageStatus::Partial;
+        let (status, findings_status, findings_trust, retry_recommendation) =
+            completed_result_contract(&warnings, true, has_diff_coverage_gap);
+
+        assert_eq!(status, ReviewStatus::Partial);
+        assert_eq!(findings_status, FindingsStatus::Complete);
+        assert_eq!(findings_trust, FindingsTrust::Complete);
+        assert_eq!(retry_recommendation, RetryRecommendation::DoNotRetry);
+    }
+
+    #[test]
+    fn dropped_findings_make_completed_findings_partial() {
+        let warnings = vec![warning(
+            "dropped_findings",
+            "dropped 1 reviewer finding(s) without a file",
+            None,
+        )];
+        let (status, findings_status, findings_trust, retry_recommendation) =
+            completed_result_contract(&warnings, true, false);
+
+        assert_eq!(status, ReviewStatus::Success);
+        assert_eq!(findings_status, FindingsStatus::Partial);
+        assert_eq!(findings_trust, FindingsTrust::Partial);
+        assert_eq!(retry_recommendation, RetryRecommendation::DoNotRetry);
+    }
+
+    #[test]
+    fn all_dropped_findings_without_summary_is_failed_unavailable() {
+        let warnings = vec![warning(
+            "dropped_findings",
+            "dropped 1 reviewer finding(s) without a file",
+            None,
+        )];
+        let (status, findings_status, findings_trust, retry_recommendation) =
+            completed_result_contract(&warnings, false, false);
+
+        assert_eq!(status, ReviewStatus::Failed);
+        assert_eq!(findings_status, FindingsStatus::Unavailable);
+        assert_eq!(findings_trust, FindingsTrust::Low);
+        assert_eq!(retry_recommendation, RetryRecommendation::Retry);
+    }
+
+    #[test]
+    fn cancellation_after_output_is_not_a_deliverable_partial_result() {
+        let (status, review_status, findings_status, findings_trust, retry_recommendation) =
+            interrupted_contract(ReviewInterruption::Cancelled, true);
+
+        assert_eq!(status, ReviewStatus::Failed);
+        assert_eq!(review_status, ReviewCompletionStatus::Cancelled);
+        assert_eq!(findings_status, FindingsStatus::Unavailable);
+        assert_eq!(findings_trust, FindingsTrust::Low);
+        assert_eq!(retry_recommendation, RetryRecommendation::DoNotRetry);
+    }
+
+    #[test]
+    fn malformed_symbol_does_not_discard_finding() {
+        let (findings, summary, warnings) = parse_findings(
+            r#"{"summary":"ok","findings":[{"severity":"high","confidence":"high","file":"src/lib.rs","line":7,"symbol":{"name":"parse_external_models"},"title":"bug","rationale":"bad","suggested_fix":"fix"}]}"#,
+        );
+
+        assert_eq!(summary.as_deref(), Some("ok"));
+        assert!(warnings.is_empty());
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].symbol, None);
+    }
+
+    #[test]
+    fn interrupted_review_preserves_unreviewed_diff_stage_gap() {
+        let mut collection = sample_collection();
+        collection.unreviewed.push(UnreviewedFile {
+            file: "big.rs".to_string(),
+            reason: OversizedReason::PerFileCap,
+        });
+        let output = interrupted_review_output(
+            Instant::now(),
+            sample_target(),
+            &collection,
+            InterruptedReview {
+                findings: vec![sample_finding("high", "src/lib.rs", "Bug")],
+                warnings: Vec::new(),
+                reviewer_summaries: Vec::new(),
+                usage: phoenix_core::domain::llm_types::Usage::default(),
+                reason: "request timed out".to_string(),
+                interruption: ReviewInterruption::Timeout,
+            },
+        );
+
+        assert_eq!(output.status, ReviewStatus::Partial);
+        assert_eq!(output.stage_status.diff_collection, StageStatus::Partial);
+        assert_eq!(output.unreviewed.len(), 1);
+    }
+
+    #[test]
+    fn skipped_unsupported_files_mark_diff_stage_partial() {
+        let warnings = vec![warning(
+            "unsupported_file",
+            "unsupported file type skipped",
+            Some("x.png"),
+        )];
+        assert_eq!(diff_stage_status(&warnings, false), StageStatus::Partial);
+    }
+
+    #[test]
+    fn untracked_files_mark_diff_stage_partial_and_are_summarized() {
+        let warnings = vec![warning(
+            "untracked_file",
+            "untracked file not included in git diff",
+            Some("new.rs"),
+        )];
+        assert_eq!(diff_stage_status(&warnings, false), StageStatus::Partial);
+        assert!(summarize_warnings(&warnings)
+            .contains(&"some untracked files were not reviewed".to_string()));
+    }
+
+    #[test]
+    fn summary_only_interruption_does_not_fail_finding_extraction() {
+        let output = interrupted_review_output(
+            Instant::now(),
+            sample_target(),
+            &sample_collection(),
+            InterruptedReview {
+                findings: Vec::new(),
+                warnings: Vec::new(),
+                reviewer_summaries: vec!["No issues found in reviewed chunks.".to_string()],
+                usage: phoenix_core::domain::llm_types::Usage::default(),
+                reason: "request timed out".to_string(),
+                interruption: ReviewInterruption::Timeout,
+            },
+        );
+
+        assert_eq!(output.status, ReviewStatus::Partial);
+        assert_eq!(
+            output.review_status,
+            ReviewCompletionStatus::ModelTimeoutAfterOutput
+        );
+        assert_eq!(output.stage_status.llm_review, StageStatus::Timeout);
+        assert_eq!(output.stage_status.json_parse, StageStatus::Ok);
+        assert_eq!(output.stage_status.finding_extraction, StageStatus::Ok);
+    }
+
+    #[test]
+    fn diff_capture_failures_are_summarized_near_status() {
+        let summaries = summarize_warnings(&[warning(
+            "diff_capture_failed",
+            "failed to capture file diff",
+            Some("src/lib.rs"),
+        )]);
+        assert!(summaries.contains(&"some file diffs could not be captured".to_string()));
+    }
+
+    #[test]
+    fn timeout_before_findings_returns_failed_unavailable() {
+        let output = interrupted_review_output(
+            Instant::now(),
+            sample_target(),
+            &sample_collection(),
+            InterruptedReview {
+                findings: Vec::new(),
+                warnings: Vec::new(),
+                reviewer_summaries: Vec::new(),
+                usage: phoenix_core::domain::llm_types::Usage::default(),
+                reason: "request timed out".to_string(),
+                interruption: ReviewInterruption::Timeout,
+            },
+        );
+
+        assert_eq!(output.status, ReviewStatus::Failed);
+        assert_eq!(
+            output.review_status,
+            ReviewCompletionStatus::ModelTimeoutNoOutput
+        );
+        assert_eq!(output.findings_status, FindingsStatus::Unavailable);
+        assert_eq!(output.findings_trust, FindingsTrust::Low);
+        assert_eq!(output.stage_status.llm_review, StageStatus::Timeout);
+        assert_eq!(output.stage_status.json_parse, StageStatus::Skipped);
+        assert_eq!(output.stage_status.finding_extraction, StageStatus::Skipped);
+        assert!(output.findings.is_empty());
+        assert!(output
+            .warnings_summary
+            .contains(&"review request timed out before parsed output".to_string()));
+    }
+
+    #[test]
+    fn timeout_after_output_returns_partial_actionable_output() {
+        let output = interrupted_review_output(
+            Instant::now(),
+            sample_target(),
+            &sample_collection(),
+            InterruptedReview {
+                findings: vec![sample_finding("high", "src/lib.rs", "Bug")],
+                warnings: Vec::new(),
+                reviewer_summaries: Vec::new(),
+                usage: phoenix_core::domain::llm_types::Usage::default(),
+                reason: "request timed out".to_string(),
+                interruption: ReviewInterruption::Timeout,
+            },
+        );
+
+        assert_eq!(output.status, ReviewStatus::Partial);
+        assert_eq!(
+            output.review_status,
+            ReviewCompletionStatus::ModelTimeoutAfterOutput
+        );
+        assert_eq!(output.findings_status, FindingsStatus::Partial);
+        assert_eq!(output.findings_trust, FindingsTrust::Partial);
+        assert_eq!(
+            output.retry_recommendation,
+            RetryRecommendation::ReviewFindingsFirst
+        );
+        assert_eq!(output.finding_summary.total, 1);
+        assert_eq!(output.finding_summary.high, 1);
+        assert_eq!(
+            output.findings[0].symbol.as_deref(),
+            Some("parse_external_models")
+        );
+        assert_eq!(output.stage_status.finding_extraction, StageStatus::Ok);
+        assert!(output
+            .warnings_summary
+            .contains(&"review request timed out after partial output".to_string()));
+    }
+
+    #[test]
+    fn timeout_after_output_with_parse_failure_has_low_trust() {
+        let output = interrupted_review_output(
+            Instant::now(),
+            sample_target(),
+            &sample_collection(),
+            InterruptedReview {
+                findings: vec![sample_finding("high", "src/lib.rs", "Bug")],
+                warnings: vec![warning("model_output_parse", "bad json", None)],
+                reviewer_summaries: Vec::new(),
+                usage: phoenix_core::domain::llm_types::Usage::default(),
+                reason: "request timed out".to_string(),
+                interruption: ReviewInterruption::Timeout,
+            },
+        );
+
+        assert_eq!(output.status, ReviewStatus::Partial);
+        assert_eq!(output.findings_status, FindingsStatus::Partial);
+        assert_eq!(output.findings_trust, FindingsTrust::Low);
+        assert_eq!(output.stage_status.json_parse, StageStatus::Failed);
+    }
+
+    #[test]
+    fn parse_repair_sets_trust_and_warning_summary() {
+        let (findings, _summary, warnings) = parse_findings(
+            "prefix {\"findings\":[{\"file\":\"src/lib.rs\",\"symbol\":\" f \",\"title\":\"bug\"}]} suffix",
+        );
+        let mut normalized = findings;
+        let mut all_warnings = warnings;
+        normalize_findings(&mut normalized, &mut all_warnings);
+        let output = finalize_review_output(ReviewOutputDraft {
+            status: ReviewStatus::Success,
+            review_status: ReviewCompletionStatus::CompletedWithWarnings,
+            findings_status: FindingsStatus::Complete,
+            findings_trust: findings_trust_for_completed(&all_warnings),
+            stage_status: ReviewStageStatus {
+                target_collection: StageStatus::Ok,
+                diff_collection: StageStatus::Ok,
+                llm_review: StageStatus::Ok,
+                json_parse: json_parse_stage_status(&all_warnings),
+                finding_extraction: finding_extraction_stage_status(&all_warnings),
+            },
+            retry_recommendation: RetryRecommendation::DoNotRetry,
+            summary: ReviewSummary {
+                target: sample_target(),
+                files_changed: 1,
+                files_reviewed: 1,
+                insertions: 1,
+                deletions: 0,
+                elapsed_ms: 0,
+                usage: phoenix_core::domain::llm_types::Usage::default(),
+                reviewer_summary: None,
+            },
+            unreviewed: Vec::new(),
+            findings: normalized,
+            warnings: all_warnings,
+        });
+
+        assert_eq!(output.findings_trust, FindingsTrust::Repaired);
+        assert_eq!(output.stage_status.json_parse, StageStatus::Repaired);
+        assert!(output
+            .warnings_summary
+            .contains(&"model output repaired".to_string()));
+        assert_eq!(output.findings[0].symbol.as_deref(), Some("f"));
+    }
+
+    #[test]
+    fn normalized_findings_are_repaired_trust_and_summarized() {
+        let mut findings = vec![sample_finding("unexpected", "src/lib.rs", "Bug")];
+        findings[0].confidence = "certain".to_string();
+        let mut warnings = Vec::new();
+        normalize_findings(&mut findings, &mut warnings);
+
+        assert_eq!(
+            findings_trust_for_completed(&warnings),
+            FindingsTrust::Repaired
+        );
+        assert_eq!(
+            finding_extraction_stage_status(&warnings),
+            StageStatus::Repaired
+        );
+        let summaries = summarize_warnings(&warnings);
+        assert!(summaries.contains(&"some finding severities were normalized".to_string()));
+        assert!(summaries.contains(&"some finding confidences were normalized".to_string()));
+    }
+
+    #[test]
+    fn severity_summary_counts_normalized_deduped_findings() {
+        let mut findings = vec![
+            sample_finding("HIGH", "b.rs", "Dup"),
+            sample_finding("high", "b.rs", "dup"),
+            sample_finding("critical", "a.rs", "Critical"),
+            sample_finding("unknown", "c.rs", "Fallback"),
+            sample_finding("low", "d.rs", "Low"),
+        ];
+        let mut warnings = Vec::new();
+        normalize_findings(&mut findings, &mut warnings);
+        let summary = summarize_findings(&findings);
+
+        assert_eq!(summary.total, 4);
+        assert_eq!(summary.critical, 1);
+        assert_eq!(summary.high, 1);
+        assert_eq!(summary.medium, 1);
+        assert_eq!(summary.low, 1);
+    }
+
+    #[test]
+    fn display_status_panel_preserves_status_field_order() {
+        let output = finalize_review_output(ReviewOutputDraft {
+            status: ReviewStatus::Failed,
+            review_status: ReviewCompletionStatus::Unavailable,
+            findings_status: FindingsStatus::Unavailable,
+            findings_trust: FindingsTrust::Low,
+            stage_status: ReviewStageStatus {
+                target_collection: StageStatus::Ok,
+                diff_collection: StageStatus::Ok,
+                llm_review: StageStatus::Ok,
+                json_parse: StageStatus::Failed,
+                finding_extraction: StageStatus::Failed,
+            },
+            retry_recommendation: RetryRecommendation::Retry,
+            summary: ReviewSummary {
+                target: sample_target(),
+                files_changed: 1,
+                files_reviewed: 1,
+                insertions: 1,
+                deletions: 0,
+                elapsed_ms: 0,
+                usage: phoenix_core::domain::llm_types::Usage::default(),
+                reviewer_summary: None,
+            },
+            unreviewed: Vec::new(),
+            findings: Vec::new(),
+            warnings: Vec::new(),
+        });
+        let display = review_display(&output);
+        let names: Vec<_> = display["status_panel"]
+            .as_array()
+            .expect("status panel is an array")
+            .iter()
+            .map(|entry| entry["name"].as_str().expect("name is a string"))
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "status",
+                "review_status",
+                "findings_status",
+                "findings_trust",
+                "finding_summary",
+                "warnings_summary",
+                "retry_recommendation",
+            ]
+        );
+    }
+
+    #[test]
+    fn user_facing_token_fields_are_absent() {
+        let output = finalize_review_output(ReviewOutputDraft {
+            status: ReviewStatus::Success,
+            review_status: ReviewCompletionStatus::Completed,
+            findings_status: FindingsStatus::Complete,
+            findings_trust: FindingsTrust::Complete,
+            stage_status: ReviewStageStatus {
+                target_collection: StageStatus::Ok,
+                diff_collection: StageStatus::Ok,
+                llm_review: StageStatus::Ok,
+                json_parse: StageStatus::Ok,
+                finding_extraction: StageStatus::Ok,
+            },
+            retry_recommendation: RetryRecommendation::DoNotRetry,
+            summary: ReviewSummary {
+                target: sample_target(),
+                files_changed: 1,
+                files_reviewed: 1,
+                insertions: 1,
+                deletions: 0,
+                elapsed_ms: 0,
+                usage: phoenix_core::domain::llm_types::Usage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    cache_creation_tokens: 30,
+                    cache_read_tokens: 40,
+                },
+                reviewer_summary: None,
+            },
+            unreviewed: Vec::new(),
+            findings: Vec::new(),
+            warnings: Vec::new(),
+        });
+        let value = serde_json::to_value(&output).expect("serializes");
+        let serialized = serde_json::to_string(&value).expect("stringifies");
+
+        assert!(value.get("summary").is_some());
+        assert!(!serialized.contains("input_tokens"));
+        assert_eq!(value["finding_summary"]["total"], 0);
+        assert!(!serialized.contains("findings_count"));
+        assert!(!serialized.contains("output_tokens"));
+        assert!(!serialized.contains("cache_creation_tokens"));
+        assert!(!serialized.contains("cost"));
+    }
     #[test]
     fn findings_are_normalized_sorted_and_deduped() {
         let mut findings = vec![
@@ -1539,6 +3143,7 @@ mod tests {
                 confidence: "certain".to_string(),
                 file: "b.rs".to_string(),
                 line: Some(2),
+                symbol: None,
                 title: "Dup".to_string(),
                 rationale: String::new(),
                 suggested_fix: String::new(),
@@ -1548,6 +3153,7 @@ mod tests {
                 confidence: "high".to_string(),
                 file: "a.rs".to_string(),
                 line: Some(1),
+                symbol: Some("parse_external_models".to_string()),
                 title: "Bad".to_string(),
                 rationale: String::new(),
                 suggested_fix: String::new(),
@@ -1557,6 +3163,7 @@ mod tests {
                 confidence: "low".to_string(),
                 file: "b.rs".to_string(),
                 line: Some(2),
+                symbol: None,
                 title: "dup".to_string(),
                 rationale: String::new(),
                 suggested_fix: String::new(),

@@ -17,7 +17,7 @@ use super::event::{
 };
 use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 use super::state::{
-    AssistantMessage, CommissionReviewApprovalOutcome, CommissionReviewApprovalScope,
+    AssistantMessage, CommissionReviewApprovalAvailability, CommissionReviewApprovalOutcome,
     ContextExhaustionBehavior, ContinuationSummaryRequest, CoreState, ModeKind, ParentState,
     RecoveryKind, RecoveryResumeTarget, SubAgentOutcome, SubAgentResult, SubAgentState,
     TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
@@ -304,47 +304,15 @@ enum CommissionReviewCall<'a> {
     Malformed(&'a str),
 }
 
+const COMMISSION_REVIEW_SCOPE_UNAVAILABLE: &str = "commission_review is unavailable: this conversation does not have a current committed branch diff scope.";
+
 fn commission_review_scope_from_context(
     context: &ConvContext,
-    input: &super::state::CommissionReviewInput,
-) -> CommissionReviewApprovalScope {
-    let (kind, base, head) = match context.mode_context.as_ref() {
-        Some(
-            ModeContext::Work {
-                base_branch,
-                branch_name,
-                ..
-            }
-            | ModeContext::Branch {
-                base_branch,
-                branch_name,
-                ..
-            },
-        ) => (
-            "worktree_diff".to_string(),
-            base_branch.clone(),
-            branch_name.clone(),
-        ),
-        _ => (
-            "workspace_diff".to_string(),
-            "HEAD".to_string(),
-            "working-tree".to_string(),
-        ),
-    };
-
-    let repo_root = context.working_dir.display().to_string();
-    let dirty = input.allow_dirty_working_tree;
-    let (changed_files, insertions, deletions) = (0, 0, 0);
-
-    CommissionReviewApprovalScope {
-        kind,
-        repo_root,
-        base,
-        head,
-        dirty,
-        changed_files,
-        insertions,
-        deletions,
+) -> Result<super::state::CommissionReviewApprovalScope, String> {
+    match context.commission_review_approval.as_ref() {
+        Some(CommissionReviewApprovalAvailability::Available(scope)) => Ok(scope.clone()),
+        Some(CommissionReviewApprovalAvailability::Unavailable { reason }) => Err(reason.clone()),
+        None => Err(COMMISSION_REVIEW_SCOPE_UNAVAILABLE.to_string()),
     }
 }
 
@@ -1814,31 +1782,44 @@ pub fn transition_parent(
                 tool_use_id,
                 request,
                 assistant_message,
-                ..
+                scope,
             },
             ParentEvent::Parent(ParentOnlyEvent::CommissionReviewApprovalDecided {
                 outcome: CommissionReviewApprovalOutcome::Approved,
             }),
         ) => {
+            let (Some(approved_head), Some(approved_base)) =
+                (scope.approved_head.clone(), scope.approved_base.clone())
+            else {
+                let tool_result = ToolResult::error(
+                    tool_use_id.clone(),
+                    "commission_review approval expired: the approved diff range was not frozen. Request review again to approve a fresh committed diff scope.".to_string(),
+                );
+                let checkpoint =
+                    CheckpointData::tool_round(assistant_message.clone(), vec![tool_result])
+                        .expect("commission_review approval expiry pairs exactly one tool_use");
+                return Ok(ParentTransitionResult::new(ParentState::Core(
+                    CoreState::LlmRequesting { attempt: 1 },
+                ))
+                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::RequestLlm));
+            };
+
             let approved_tool = ToolCall::new(
                 tool_use_id.clone(),
                 ToolInput::ApprovedCommissionReview(
                     phoenix_core::domain::sm_state::ApprovedCommissionReviewInput {
                         request: request.clone(),
-                        runtime_base_branch: match context.mode_context.as_ref() {
-                            Some(
-                                ModeContext::Work { base_branch, .. }
-                                | ModeContext::Branch { base_branch, .. },
-                            ) => Some(base_branch.clone()),
-                            Some(ModeContext::Explore { .. } | ModeContext::Direct) | None => None,
-                        },
+                        runtime_base_branch: Some(scope.base.clone()),
                         approved_working_dir: context.working_dir.display().to_string(),
                         approved_worktree_path: context
                             .work_scope_worktree
                             .as_ref()
                             .map(|path| path.display().to_string()),
-                        approved_head: None,
-                        approved_base: None,
+                        approved_head: Some(approved_head),
+                        approved_base: Some(approved_base),
                     },
                 ),
             );
@@ -1874,7 +1855,6 @@ pub fn transition_parent(
                     "summary": {
                         "brief": request.brief,
                         "focus": request.focus,
-                        "allow_dirty_working_tree": request.allow_dirty_working_tree,
                         "reviewer_summary": "Commission review rejected before LLM execution"
                     },
                     "findings": [],
@@ -2484,6 +2464,31 @@ pub fn transition_parent(
                     });
                 }
 
+                let scope = match commission_review_scope_from_context(context) {
+                    Ok(scope) => scope,
+                    Err(err) => {
+                        let err_msg = err;
+                        let display_data = make_display_data(&content);
+                        let assistant_message = AssistantMessage::new(
+                            request_id.clone(),
+                            content,
+                            Some(usage_data),
+                            display_data,
+                        );
+                        let tool_result = ToolResult::error(tool.id.clone(), err_msg);
+                        let checkpoint =
+                            CheckpointData::tool_round(assistant_message, vec![tool_result])
+                                .expect("commission_review produces exactly one result");
+                        return Ok(ParentTransitionResult::new(ParentState::Core(
+                            CoreState::LlmRequesting { attempt: 1 },
+                        ))
+                        .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                        .with_effect(Effect::PersistState)
+                        .with_effect(Effect::notify_state_change())
+                        .with_effect(Effect::RequestLlm));
+                    }
+                };
+
                 // Park for approval without writing a tool_result placeholder.
                 // The original assistant message is carried in state and paired
                 // with the real review result after approval; writing an ack for
@@ -2501,7 +2506,7 @@ pub fn transition_parent(
                     ParentState::AwaitingCommissionReviewApproval {
                         tool_use_id: tool.id.clone(),
                         request: input.clone(),
-                        scope: commission_review_scope_from_context(context, input),
+                        scope,
                         assistant_message,
                     },
                 )
@@ -3579,10 +3584,58 @@ pub fn llm_error_to_db_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::state::CommissionReviewApprovalScope;
+    use std::path::{Path, PathBuf};
 
     fn test_context() -> ConvContext {
         ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
+    }
+
+    fn context_with_dir(dir: &Path) -> ConvContext {
+        ConvContext::new("test-conv", dir.to_path_buf(), "test-model", 200_000)
+    }
+
+    fn git_ok(repo: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn commission_review_scope_uses_precomputed_availability() {
+        let mut ctx = test_context();
+        ctx.commission_review_approval = Some(CommissionReviewApprovalAvailability::Available(
+            CommissionReviewApprovalScope {
+                kind: "committed_branch_diff".to_string(),
+                repo_root: "/repo".to_string(),
+                base: "refs/remotes/origin/main".to_string(),
+                head: "HEAD".to_string(),
+                approved_head: None,
+                approved_base: None,
+                dirty: false,
+                changed_files: 0,
+                insertions: 0,
+                deletions: 0,
+            },
+        ));
+
+        let scope = commission_review_scope_from_context(&ctx).expect("scope available");
+        assert_eq!(scope.base, "refs/remotes/origin/main");
+        assert_eq!(scope.head, "HEAD");
+    }
+
+    #[test]
+    fn commission_review_scope_preserves_precomputed_unavailable_reason() {
+        let mut ctx = test_context();
+        ctx.commission_review_approval = Some(CommissionReviewApprovalAvailability::Unavailable {
+            reason: "commission_review refused dirty working tree".to_string(),
+        });
+
+        let err = commission_review_scope_from_context(&ctx).expect_err("scope unavailable");
+        assert_eq!(err, "commission_review refused dirty working tree");
     }
 
     fn test_tool_call(id: &str) -> ToolCall {
@@ -4235,6 +4288,7 @@ mod tests {
         // Create a sub-agent context
         let subagent_ctx = ConvContext {
             mode_context: None,
+            commission_review_approval: None,
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
@@ -4303,6 +4357,7 @@ mod tests {
         use crate::state::ContextExhaustionBehavior;
         ConvContext {
             mode_context: None,
+            commission_review_approval: None,
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-cancel".to_string(),
             root_conversation_id: "test-root".to_string(),
@@ -4627,6 +4682,7 @@ mod tests {
 
         let subagent_ctx = ConvContext {
             mode_context: None,
+            commission_review_approval: None,
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
@@ -4735,6 +4791,7 @@ mod tests {
 
         let subagent_ctx = ConvContext {
             mode_context: None,
+            commission_review_approval: None,
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
@@ -4789,6 +4846,7 @@ mod tests {
 
         let subagent_ctx = ConvContext {
             mode_context: None,
+            commission_review_approval: None,
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
@@ -4850,6 +4908,7 @@ mod tests {
 
         let subagent_ctx = ConvContext {
             mode_context: None,
+            commission_review_approval: None,
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
@@ -6026,13 +6085,51 @@ mod tests {
         use crate::state::{CommissionReviewInput, ToolInput};
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
+        fn work_context() -> ConvContext {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let repo = dir.path().to_path_buf();
+            git_ok(&repo, &["init", "-q"]);
+            git_ok(&repo, &["config", "user.email", "t@t.t"]);
+            git_ok(&repo, &["config", "user.name", "t"]);
+            git_ok(&repo, &["config", "commit.gpgsign", "false"]);
+            git_ok(&repo, &["commit", "-qm", "base", "--allow-empty"]);
+            let head = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .expect("git rev-parse");
+            let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+            git_ok(&repo, &["update-ref", "refs/remotes/origin/main", &head]);
+            let mut context = context_with_dir(&repo);
+            context.mode_context = Some(ModeContext::Work {
+                branch_name: "task".to_string(),
+                base_branch: "main".to_string(),
+                worktree_path: repo.display().to_string(),
+            });
+            context.commission_review_approval = Some(
+                CommissionReviewApprovalAvailability::Available(CommissionReviewApprovalScope {
+                    kind: "committed_branch_diff".to_string(),
+                    repo_root: repo.display().to_string(),
+                    base: "refs/remotes/origin/main".to_string(),
+                    head: "task".to_string(),
+                    approved_head: None,
+                    approved_base: None,
+                    dirty: false,
+                    changed_files: 0,
+                    insertions: 0,
+                    deletions: 0,
+                }),
+            );
+            std::mem::forget(dir);
+            context
+        }
+
         fn commission_review_event() -> Event {
             let tool = ToolCall::new(
                 "tool-review-1",
                 ToolInput::CommissionReview(CommissionReviewInput {
                     brief: "Ready for independent review".to_string(),
                     focus: Some("correctness".to_string()),
-                    allow_dirty_working_tree: false,
                 }),
             );
             Event::LlmResponse {
@@ -6042,7 +6139,6 @@ mod tests {
                     input: serde_json::json!({
                         "brief": "Ready for independent review",
                         "focus": "correctness",
-                        "allow_dirty_working_tree": false,
                     }),
                 }],
                 tool_calls: vec![tool],
@@ -6058,14 +6154,15 @@ mod tests {
                 request: CommissionReviewInput {
                     brief: "Ready for independent review".to_string(),
                     focus: None,
-                    allow_dirty_working_tree: true,
                 },
                 scope: CommissionReviewApprovalScope {
-                    kind: "worktree_diff".to_string(),
+                    kind: "committed_branch_diff".to_string(),
                     repo_root: "/tmp".to_string(),
-                    base: "main".to_string(),
+                    base: "refs/remotes/origin/main".to_string(),
                     head: "task".to_string(),
-                    dirty: true,
+                    approved_head: None,
+                    approved_base: None,
+                    dirty: false,
                     changed_files: 0,
                     insertions: 0,
                     deletions: 0,
@@ -6102,6 +6199,25 @@ mod tests {
 
             assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
             assert!(!has_execute_tool(&result.effects));
+        }
+
+        #[test]
+        fn approval_without_frozen_range_does_not_execute_review() {
+            let result = transition(
+                &approval_state(),
+                &test_context(),
+                Event::CommissionReviewApprovalDecided {
+                    outcome: CommissionReviewApprovalOutcome::Approved,
+                },
+            )
+            .expect("expired approval should settle as a tool error");
+
+            assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
+            assert!(!has_execute_tool(&result.effects));
+            assert!(result
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PersistCheckpoint { .. })));
         }
 
         #[test]
@@ -6142,7 +6258,6 @@ mod tests {
                 ToolInput::CommissionReview(CommissionReviewInput {
                     brief: "   ".to_string(),
                     focus: None,
-                    allow_dirty_working_tree: false,
                 }),
             );
             let event = Event::LlmResponse {
@@ -6201,7 +6316,7 @@ mod tests {
         fn commission_review_parks_for_approval() {
             let result = transition(
                 &ConvState::LlmRequesting { attempt: 1 },
-                &test_context(),
+                &work_context(),
                 commission_review_event(),
             )
             .expect("commission_review should enter approval state");
@@ -6222,14 +6337,15 @@ mod tests {
                 request: CommissionReviewInput {
                     brief: "Ready for independent review".to_string(),
                     focus: None,
-                    allow_dirty_working_tree: true,
                 },
                 scope: CommissionReviewApprovalScope {
-                    kind: "worktree_diff".to_string(),
+                    kind: "committed_branch_diff".to_string(),
                     repo_root: "/tmp".to_string(),
-                    base: "main".to_string(),
+                    base: "refs/remotes/origin/develop".to_string(),
                     head: "task".to_string(),
-                    dirty: true,
+                    approved_head: Some("head-sha".to_string()),
+                    approved_base: Some("base-sha".to_string()),
+                    dirty: false,
                     changed_files: 0,
                     insertions: 0,
                     deletions: 0,
@@ -6281,11 +6397,16 @@ mod tests {
             match &tool_call.input {
                 ToolInput::ApprovedCommissionReview(input) => {
                     assert_eq!(input.request.brief, "Ready for independent review");
-                    assert_eq!(input.runtime_base_branch.as_deref(), Some("develop"));
+                    assert_eq!(
+                        input.runtime_base_branch.as_deref(),
+                        Some("refs/remotes/origin/develop")
+                    );
                     assert_eq!(
                         input.approved_working_dir,
                         context.working_dir.display().to_string()
                     );
+                    assert_eq!(input.approved_head.as_deref(), Some("head-sha"));
+                    assert_eq!(input.approved_base.as_deref(), Some("base-sha"));
                 }
                 other @ (ToolInput::Bash(_)
                 | ToolInput::Think(_)
