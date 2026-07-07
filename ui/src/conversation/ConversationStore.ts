@@ -15,6 +15,10 @@ function cachedPrEqual(a: CachedPrSummary | null | undefined, b: CachedPrSummary
     && a.head === b.head;
 }
 
+interface SnapshotUpsertOptions {
+  allowEqualTimestampSlugMove?: boolean;
+}
+
 /**
  * Per-slug conversation atoms.
  *
@@ -51,6 +55,29 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
     super(() => createInitialAtom(), conversationReducer);
   }
 
+  override dispatch(slug: string, action: SSEAction): void {
+    super.dispatch(slug, action);
+    if (action.type === 'sse_init' || action.type === 'set_initial_data') {
+      this.indexDirectHydration(slug);
+    }
+  }
+
+  private indexDirectHydration(slug: string): void {
+    const conversation = this.atomByKey(slug)?.conversation;
+    if (!conversation) return;
+    const indexedSlug = this.slugByConvId.get(conversation.id);
+    if (!indexedSlug) {
+      this.slugByConvId.set(conversation.id, slug);
+      this.notifyChanged(slug);
+      return;
+    }
+    const indexedConversation = this.atomByKey(indexedSlug)?.conversation;
+    if (indexedSlug !== slug && (!indexedConversation || conversation.updated_at > indexedConversation.updated_at)) {
+      this.slugByConvId.set(conversation.id, slug);
+      this.notifyChanged(slug);
+    }
+  }
+
   /**
    * Upsert a single conversation snapshot. Creates a snapshot-only atom
    * if the slug is unknown; otherwise updates `atom.conversation` if the
@@ -67,47 +94,93 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
    *
    * Returns true iff this atom changed.
    */
-  upsertSnapshot(slug: string, conversation: Conversation): boolean {
-    const current = this.getSnapshot(slug);
-    if (current.conversation) {
+  upsertSnapshot(slug: string, conversation: Conversation, options: SnapshotUpsertOptions = {}): boolean {
+    const destination = this.getSnapshot(slug);
+    const destinationConversation = destination.conversation;
+    if (
+      destinationConversation &&
+      destinationConversation.id !== conversation.id &&
+      conversation.updated_at <= destinationConversation.updated_at
+    ) {
+      return false;
+    }
+    const existingForId = this.bestConversationForId(conversation.id);
+    if (existingForId) {
       // Monotonic: only accept newer or equal-but-different rows.
       // We compare ISO timestamps as strings (lexicographic = chronological).
-      if (conversation.updated_at < current.conversation.updated_at) {
+      if (conversation.updated_at < existingForId.updated_at) {
         return false;
       }
-      if (conversation.updated_at === current.conversation.updated_at) {
-        if (
-          conversation.id === current.conversation.id &&
-          !cachedPrEqual(conversation.cached_pr, current.conversation.cached_pr)
-        ) {
-          const merged: Conversation = { ...current.conversation };
-          if (conversation.cached_pr === undefined) {
-            delete merged.cached_pr;
-          } else {
-            merged.cached_pr = conversation.cached_pr;
+      if (conversation.updated_at === existingForId.updated_at) {
+        if (!cachedPrEqual(conversation.cached_pr, existingForId.cached_pr)) {
+          const destinationConversation = destination.conversation;
+          if (destinationConversation?.id === conversation.id && destinationConversation.slug === conversation.slug) {
+            return this.setConversationSnapshot(
+              slug,
+              this.withCachedPr(destinationConversation, conversation.cached_pr),
+              destination,
+            );
           }
-          this.slugByConvId.set(merged.id, slug);
-          notifyConversationSnapshotChange(merged);
-          return this.setAtom(slug, { ...current, conversation: merged });
+          const canonicalSlug = this.validIndexedSlugForId(conversation.id) ?? existingForId.slug;
+          const canonicalDestination = this.getSnapshot(canonicalSlug);
+          return this.setConversationSnapshot(
+            canonicalSlug,
+            this.withCachedPr(existingForId, conversation.cached_pr),
+            canonicalDestination,
+          );
         }
-        if (conversation.id === current.conversation.id) {
+        const destinationConversation = destination.conversation;
+        if (
+          destinationConversation?.id === conversation.id &&
+          destinationConversation.slug === conversation.slug
+        ) {
+          return false;
+        }
+        if (!options.allowEqualTimestampSlugMove) {
           return false;
         }
       }
     }
+    return this.setConversationSnapshot(slug, conversation, destination);
+  }
+
+  private setConversationSnapshot(
+    slug: string,
+    conversation: Conversation,
+    destination: ConversationAtom,
+  ): boolean {
+    this.removeInactiveAliases(conversation.id, slug);
+    const destinationAtom = this.atomByKey(slug);
+    const overwrittenId = destinationAtom?.conversation?.id;
+    if (overwrittenId && overwrittenId !== conversation.id && this.slugByConvId.get(overwrittenId) === slug) {
+      this.slugByConvId.delete(overwrittenId);
+    }
     this.slugByConvId.set(conversation.id, slug);
     notifyConversationSnapshotChange(conversation);
-    return this.setAtom(slug, { ...current, conversation });
+    return this.setAtom(slug, { ...destination, conversation });
+  }
+
+  private withCachedPr(
+    conversation: Conversation,
+    cachedPr: CachedPrSummary | null | undefined,
+  ): Conversation {
+    const merged: Conversation = { ...conversation };
+    if (cachedPr === undefined) {
+      delete merged.cached_pr;
+    } else {
+      merged.cached_pr = cachedPr;
+    }
+    return merged;
   }
 
   /**
    * Bulk variant of {@link upsertSnapshot}. Returns the slugs whose
    * atoms actually changed (callers can use this to gate cache writes).
    */
-  upsertSnapshots(rows: readonly Conversation[]): string[] {
+  upsertSnapshots(rows: readonly Conversation[], options: SnapshotUpsertOptions = {}): string[] {
     const changed: string[] = [];
     for (const row of rows) {
-      if (this.upsertSnapshot(row.slug, row)) {
+      if (this.upsertSnapshot(row.slug, row, options)) {
         changed.push(row.slug);
       }
     }
@@ -120,11 +193,58 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
       return this.upsertSnapshot(newSlug, conversation);
     }
 
+    const changed = this.upsertSnapshot(newSlug, conversation, { allowEqualTimestampSlugMove: true });
     const oldAtom = this.atomByKey(oldSlug);
     if (oldAtom?.conversation?.id === conversation.id) {
       this.removeAtom(oldSlug);
     }
-    return this.upsertSnapshot(newSlug, conversation);
+    return changed;
+  }
+
+  private validIndexedSlugForId(convId: string): string | undefined {
+    const indexedSlug = this.slugByConvId.get(convId);
+    if (!indexedSlug) return undefined;
+    const indexedConversation = this.atomByKey(indexedSlug)?.conversation;
+    if (indexedConversation?.id === convId) return indexedSlug;
+    this.slugByConvId.delete(convId);
+    return undefined;
+  }
+
+  private bestConversationForId(convId: string): Conversation | undefined {
+    let best: Conversation | undefined;
+    for (const [, atom] of this.entries()) {
+      const conversation = atom.conversation;
+      if (conversation?.id !== convId) continue;
+      if (!best || this.preferForSidebar(conversation, best)) best = conversation;
+    }
+    return best;
+  }
+
+  private removeInactiveAliases(convId: string, keepSlug: string): void {
+    for (const [slug, atom] of this.entries()) {
+      if (slug === keepSlug || atom.conversation?.id !== convId) continue;
+      if (this.isSnapshotOnly(slug, atom)) {
+        this.removeAtom(slug);
+      }
+    }
+  }
+
+  private isSnapshotOnly(slug: string, atom: ConversationAtom): boolean {
+    return !this.hasSubscribers(slug)
+      && atom.conversationId === null
+      && atom.messages.length === 0
+      && atom.connectionEpoch === null
+      && atom.streamingBuffer === null
+      && atom.systemPrompt === null;
+  }
+
+  private preferForSidebar(candidate: Conversation, existing: Conversation): boolean {
+    if (candidate.updated_at > existing.updated_at) return true;
+    if (candidate.updated_at < existing.updated_at) return false;
+    const indexedSlug = this.slugByConvId.get(candidate.id);
+    if (candidate.slug === indexedSlug && existing.slug !== indexedSlug) return true;
+    if (existing.slug === indexedSlug && candidate.slug !== indexedSlug) return false;
+    return candidate.slug > existing.slug;
   }
 
   /**
@@ -134,11 +254,16 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
    * a snapshot equality function).
    */
   listSnapshots(): Conversation[] {
-    const out: Conversation[] = [];
+    const byId = new Map<string, Conversation>();
     for (const [, atom] of this.entries()) {
-      if (atom.conversation) out.push(atom.conversation);
+      const conversation = atom.conversation;
+      if (!conversation) continue;
+      const existing = byId.get(conversation.id);
+      if (!existing || this.preferForSidebar(conversation, existing)) {
+        byId.set(conversation.id, conversation);
+      }
     }
-    return out;
+    return [...byId.values()];
   }
 
   /**
@@ -161,10 +286,18 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
     const existing = this.atomByKey(slug);
     if (existing) {
       const convId = existing.conversation?.id;
-      if (convId) this.slugByConvId.delete(convId);
+      if (convId && this.slugByConvId.get(convId) === slug) this.slugByConvId.delete(convId);
     }
-    if (this.removeAtom(slug)) {
-      // notify already happened inside removeAtom
+    this.removeAtom(slug);
+  }
+
+  removeByConversationId(convId: string): string[] {
+    const removed: string[] = [];
+    for (const [slug, atom] of this.entries()) {
+      if (atom.conversation?.id !== convId) continue;
+      if (this.removeAtom(slug)) removed.push(slug);
     }
+    this.slugByConvId.delete(convId);
+    return removed;
   }
 }

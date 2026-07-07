@@ -145,6 +145,17 @@ export class RoutedStore<K, S, A> {
     };
   }
 
+  /** Notify subscribers when subclass-owned indexes change the derived view
+   *  of held atoms without replacing an atom reference. */
+  protected notifyChanged(key: K): void {
+    this.notify(key);
+    this.notifyAny();
+  }
+
+  protected hasSubscribers(key: K): boolean {
+    return (this.listenersByKey.get(key)?.size ?? 0) > 0;
+  }
+
   private notify(key: K): void {
     const listeners = this.listenersByKey.get(key);
     if (!listeners) return;
