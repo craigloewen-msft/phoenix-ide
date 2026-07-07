@@ -23,6 +23,7 @@ interface MenuState {
 
 interface MessageContextMenuProps {
   messages: Message[];
+  enableMessageSidepanel?: boolean | undefined;
 }
 
 /** Extract plain text (strip markdown) by reading innerText from the DOM */
@@ -31,7 +32,9 @@ function getPlainText(element: HTMLElement): string {
   return content?.textContent || '';
 }
 
-export function MessageContextMenu({ messages }: MessageContextMenuProps) {
+export const OPEN_MESSAGE_VIEWER_EVENT = 'phoenix:open-message-viewer';
+
+export function MessageContextMenu({ messages, enableMessageSidepanel = true }: MessageContextMenuProps) {
   const [menu, setMenu] = useState<MenuState | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -164,6 +167,13 @@ export function MessageContextMenu({ messages }: MessageContextMenuProps) {
     setMenu(null);
   };
 
+  const openInSidepanel = () => {
+    window.dispatchEvent(new CustomEvent<{ sequenceId: number }>(OPEN_MESSAGE_VIEWER_EVENT, {
+      detail: { sequenceId: menu.message.sequence_id },
+    }));
+    setMenu(null);
+  };
+
   const copyPlainText = () => {
     const el = document.querySelector(
       `.message[data-sequence-id="${menu.message.sequence_id}"]`
@@ -222,6 +232,11 @@ export function MessageContextMenu({ messages }: MessageContextMenuProps) {
       {menu.toolContext?.output && (
         <button className="msg-context-item" onClick={copyOutput}>
           Copy output
+        </button>
+      )}
+      {enableMessageSidepanel && getMessageMarkdown(menu.message).trim() && (
+        <button className="msg-context-item" onClick={openInSidepanel}>
+          Open in sidepanel
         </button>
       )}
       {menu.toolContext && <div className="msg-context-divider" />}
