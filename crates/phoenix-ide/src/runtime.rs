@@ -462,6 +462,33 @@ enum RingOp {
     Append,
 }
 
+#[derive(Debug)]
+struct QueuedBroadcast {
+    event: SseEvent,
+    seq: i64,
+    op: RingOp,
+}
+
+#[derive(Debug, Default)]
+struct BroadcastGate {
+    reserved_until: Option<i64>,
+    queued: Vec<QueuedBroadcast>,
+}
+
+pub struct ReservedBroadcastRange {
+    broadcaster: SseBroadcaster,
+    active: bool,
+}
+
+impl Drop for ReservedBroadcastRange {
+    fn drop(&mut self) {
+        if self.active {
+            self.broadcaster.release_reserved_range();
+            self.active = false;
+        }
+    }
+}
+
 /// Per-conversation SSE broadcaster with monotonic `sequence_id` allocation.
 ///
 /// Every [`SseEvent`] emitted for a conversation carries a `sequence_id` drawn
@@ -505,6 +532,9 @@ pub struct SseBroadcaster {
     /// the same buffer. Mutex contention is acceptable: every broadcast
     /// is already serialised through tokio's broadcast channel.
     ring: Arc<Mutex<ReplayRing>>,
+    /// Queues higher-sequence broadcasts while checkpoint persistence holds a
+    /// reserved persisted-message sequence range.
+    gate: Arc<Mutex<BroadcastGate>>,
 }
 
 impl SseBroadcaster {
@@ -524,6 +554,7 @@ impl SseBroadcaster {
             tx,
             last_seq: Arc::new(AtomicI64::new(initial_last_seq)),
             ring: Arc::new(Mutex::new(ring)),
+            gate: Arc::new(Mutex::new(BroadcastGate::default())),
         }
     }
 
@@ -537,6 +568,11 @@ impl SseBroadcaster {
 
     /// Atomically allocate the next `sequence_id` and return it.
     pub fn next_seq(&self) -> i64 {
+        let _gate = self.gate.lock().expect("BroadcastGate mutex");
+        self.next_seq_unlocked()
+    }
+
+    fn next_seq_unlocked(&self) -> i64 {
         self.last_seq.fetch_add(1, Ordering::AcqRel) + 1
     }
 
@@ -587,7 +623,7 @@ impl SseBroadcaster {
     /// `broadcast::error::SendError<SseEvent>` is ~320 bytes, which triggers
     /// clippy's `result_large_err` lint, and every call site here only ever
     /// reads `.is_err()`.
-    fn send_with_ring(&self, event: SseEvent, seq: i64, op: RingOp) -> Result<usize, ()> {
+    fn send_with_ring_raw(&self, event: SseEvent, seq: i64, op: RingOp) -> Result<usize, ()> {
         match op {
             RingOp::Anchor => {
                 self.ring.lock().expect("ReplayRing mutex").reset(seq);
@@ -603,6 +639,57 @@ impl SseBroadcaster {
             }
         }
         self.tx.send(event).map_err(|_| ())
+    }
+
+    fn send_with_ring(&self, event: SseEvent, seq: i64, op: RingOp) -> Result<usize, ()> {
+        {
+            let mut gate = self.gate.lock().expect("BroadcastGate mutex");
+            if gate
+                .reserved_until
+                .is_some_and(|reserved_until| seq > reserved_until)
+            {
+                gate.queued.push(QueuedBroadcast { event, seq, op });
+                return Ok(self.tx.receiver_count());
+            }
+        }
+        self.send_with_ring_raw(event, seq, op)
+    }
+
+    pub fn reserve_next_persisted_message_range(
+        &self,
+        count: usize,
+    ) -> (ReservedBroadcastRange, Vec<i64>) {
+        assert!(
+            count > 0,
+            "persisted-message range must contain at least one row"
+        );
+        let mut gate = self.gate.lock().expect("BroadcastGate mutex");
+        debug_assert!(
+            gate.reserved_until.is_none(),
+            "nested persisted-message broadcast ranges are not supported"
+        );
+        let mut seqs = Vec::with_capacity(count);
+        for _ in 0..count {
+            seqs.push(self.next_seq_unlocked());
+        }
+        gate.reserved_until = seqs.last().copied();
+        (
+            ReservedBroadcastRange {
+                broadcaster: self.clone(),
+                active: true,
+            },
+            seqs,
+        )
+    }
+
+    fn release_reserved_range(&self) {
+        let mut gate = self.gate.lock().expect("BroadcastGate mutex");
+        let mut queued = std::mem::take(&mut gate.queued);
+        queued.sort_by_key(|entry| entry.seq);
+        for QueuedBroadcast { event, seq, op } in queued {
+            let _ = self.send_with_ring_raw(event, seq, op);
+        }
+        gate.reserved_until = None;
     }
 
     /// Allocate the next `sequence_id`, pass it to `build`, broadcast the
@@ -2922,6 +3009,43 @@ mod broadcaster_tests {
              ephemeral seqs ({last_ephemeral})"
         );
         assert_eq!(message_seq, last_ephemeral + 1);
+    }
+
+    #[test]
+    fn reserved_message_range_queues_higher_sequence_broadcasts_until_released() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let b = SseBroadcaster::new(16, 0);
+        let mut rx = b.subscribe();
+
+        let (guard, reserved_seqs) = b.reserve_next_persisted_message_range(2);
+        let first_seq = reserved_seqs[0];
+        let second_seq = reserved_seqs[1];
+
+        let _ = b.send_seq(|seq| token_event(seq, "queued"));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        let _ = b.send_message(test_message(first_seq, "reserved-1"));
+        let _ = b.send_message(test_message(second_seq, "reserved-2"));
+        drop(guard);
+
+        let first = rx.try_recv().expect("first reserved message");
+        let second = rx.try_recv().expect("second reserved message");
+        let queued = rx.try_recv().expect("queued higher-sequence event");
+
+        assert!(matches!(
+            first,
+            SseEvent::Message { ref message } if message.message_id == "reserved-1"
+        ));
+        assert!(matches!(
+            second,
+            SseEvent::Message { ref message } if message.message_id == "reserved-2"
+        ));
+        assert!(matches!(
+            queued,
+            SseEvent::Token { sequence_id, ref text, .. } if sequence_id == second_seq + 1 && text == "queued"
+        ));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
     /// `observe_seq` is idempotent when the broadcaster's counter is

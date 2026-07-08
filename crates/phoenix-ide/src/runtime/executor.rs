@@ -4581,8 +4581,13 @@ where
                 // (`Effect::BroadcastAssistantMessage`) already delivered for
                 // this `message_id`, so a reconnect that lands during persistence
                 // never sees a shifted timestamp on the message the UI displays.
+                let (reserved_broadcast_range, reserved_seqs) = self
+                    .broadcast_tx
+                    .reserve_next_persisted_message_range(1 + tool_results.len());
+                let _reserved_broadcast_range = reserved_broadcast_range;
+
                 let agent_content = MessageContent::agent(assistant_message.content);
-                let agent_seq = self.broadcast_tx.next_seq();
+                let agent_seq = reserved_seqs[0];
                 let agent_msg = crate::db::Message {
                     message_id: assistant_message.message_id.clone(),
                     conversation_id: conv_id.clone(),
@@ -4596,7 +4601,7 @@ where
 
                 // Build all tool-result rows.
                 let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
-                for result in &tool_results {
+                for (result, tool_seq) in tool_results.iter().zip(reserved_seqs.iter().skip(1)) {
                     let tool_content = MessageContent::tool_with_images(
                         &result.tool_use_id,
                         result.output(),
@@ -4605,11 +4610,10 @@ where
                     );
                     let merged_display =
                         merge_duration_into_display_data(result.display_data(), result.duration_ms);
-                    let tool_seq = self.broadcast_tx.next_seq();
                     tool_msgs.push(crate::db::Message {
                         message_id: tool_result_message_id(&result.tool_use_id),
                         conversation_id: conv_id.clone(),
-                        sequence_id: tool_seq,
+                        sequence_id: *tool_seq,
                         message_type: tool_content.message_type(),
                         content: tool_content,
                         display_data: merged_display,
@@ -4627,24 +4631,16 @@ where
                     .await?;
 
                 // Broadcast the now-durable rows so connected clients render
-                // the assistant message and each tool result.
+                // the assistant message and each tool result. Tool-result
+                // durations are already baked into each row's display_data by
+                // `merge_duration_into_display_data`; emitting separate
+                // `MessageUpdated { duration_ms }` events here would allocate
+                // sequence ids after the preallocated tool-message ids and can
+                // therefore leapfrog later tool-result messages in live
+                // delivery.
                 let _ = self.broadcast_tx.send_message(agent_msg);
-                for (msg, result) in tool_msgs.into_iter().zip(tool_results.iter()) {
-                    let _ = self.broadcast_tx.send_message(msg.clone());
-                    // Emit a typed `MessageUpdated` so the live-connection reducer
-                    // can populate `display_data.duration_ms` without parsing the
-                    // opaque `display_data` blob. Reconnect paths read from the
-                    // DB where `duration_ms` is already baked into `display_data`
-                    // by `merge_duration_into_display_data` above.
-                    if result.duration_ms.is_some() {
-                        let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
-                            sequence_id: seq,
-                            message_id: msg.message_id.clone(),
-                            display_data: None,
-                            content: None,
-                            duration_ms: result.duration_ms,
-                        });
-                    }
+                for msg in tool_msgs {
+                    let _ = self.broadcast_tx.send_message(msg);
                 }
             }
         }
@@ -4680,8 +4676,13 @@ where
 
         // Build the assistant message row with a seq strictly greater than any
         // ephemeral event broadcast earlier (mirrors `persist_checkpoint`).
+        let (reserved_broadcast_range, reserved_seqs) = self
+            .broadcast_tx
+            .reserve_next_persisted_message_range(1 + tool_results.len());
+        let _reserved_broadcast_range = reserved_broadcast_range;
+
         let agent_content = MessageContent::agent(assistant_message.content);
-        let agent_seq = self.broadcast_tx.next_seq();
+        let agent_seq = reserved_seqs[0];
         let agent_msg = crate::db::Message {
             message_id: assistant_message.message_id.clone(),
             conversation_id: conv_id.clone(),
@@ -4697,7 +4698,7 @@ where
         // `fork_proposal_id` in its display_data (UI-only) per the interception
         // contract; `merge_duration_into_display_data` preserves it.
         let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
-        for result in &tool_results {
+        for (result, tool_seq) in tool_results.iter().zip(reserved_seqs.iter().skip(1)) {
             let tool_content = MessageContent::tool_with_images(
                 &result.tool_use_id,
                 result.output(),
@@ -4706,11 +4707,10 @@ where
             );
             let merged_display =
                 merge_duration_into_display_data(result.display_data(), result.duration_ms);
-            let tool_seq = self.broadcast_tx.next_seq();
             tool_msgs.push(crate::db::Message {
                 message_id: tool_result_message_id(&result.tool_use_id),
                 conversation_id: conv_id.clone(),
-                sequence_id: tool_seq,
+                sequence_id: *tool_seq,
                 message_type: tool_content.message_type(),
                 content: tool_content,
                 display_data: merged_display,
@@ -4739,18 +4739,11 @@ where
 
         // Broadcast the now-durable rows so connected clients render the
         // assistant message and the success ack (matches `persist_checkpoint`).
+        // Duration is already present in each tool-result message's display_data;
+        // do not emit a follow-up update that can overtake later persisted rows.
         let _ = self.broadcast_tx.send_message(agent_msg);
-        for (msg, result) in tool_msgs.into_iter().zip(tool_results.iter()) {
-            let _ = self.broadcast_tx.send_message(msg.clone());
-            if result.duration_ms.is_some() {
-                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
-                    sequence_id: seq,
-                    message_id: msg.message_id.clone(),
-                    display_data: None,
-                    content: None,
-                    duration_ms: result.duration_ms,
-                });
-            }
+        for msg in tool_msgs {
+            let _ = self.broadcast_tx.send_message(msg);
         }
 
         Ok(None)
@@ -9233,6 +9226,91 @@ mod steer_drain_detector_tests {
                 data: "QUJD".to_string(),
             }],
             "typed images must not be dropped at checkpoint persistence"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_checkpoint_broadcasts_duration_in_tool_message_without_followup_update() {
+        use crate::db::{MessageContent, ToolOutcome, ToolResult};
+        use crate::state_machine::{AssistantMessage, CheckpointData};
+        use phoenix_llm::ContentBlock;
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-duration-broadcast",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        let mut rx = rt.broadcast_tx.subscribe();
+
+        let assistant = AssistantMessage::new(
+            uuid::Uuid::new_v4().to_string(),
+            vec![ContentBlock::ToolUse {
+                id: "tool-duration-1".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "README.md"}),
+            }],
+            None,
+            None,
+        );
+        let result = ToolResult {
+            tool_use_id: "tool-duration-1".to_string(),
+            outcome: ToolOutcome::Success {
+                output: "contents".to_string(),
+                display_data: None,
+                images: vec![],
+            },
+            duration_ms: Some(12),
+        };
+        let data = CheckpointData::tool_round(assistant, vec![result]).expect("tool_round");
+
+        rt.execute_effect(Effect::PersistCheckpoint { data })
+            .await
+            .expect("PersistCheckpoint must succeed");
+
+        let msgs = storage.get_all_messages("conv-duration-broadcast");
+        let tool_row = msgs
+            .iter()
+            .find(|m| matches!(&m.content, MessageContent::Tool(tc) if tc.tool_use_id == "tool-duration-1"))
+            .expect("persisted tool result message");
+        assert_eq!(
+            tool_row
+                .display_data
+                .as_ref()
+                .and_then(|v| v.get("duration_ms"))
+                .and_then(serde_json::Value::as_u64),
+            Some(12),
+            "duration must be carried by the persisted/broadcast message row"
+        );
+
+        let mut saw_tool_message = false;
+        let mut saw_duration_update = false;
+        loop {
+            match rx.try_recv() {
+                Ok(SseEvent::Message { message }) => {
+                    if message.message_id == "tool-duration-1-result" {
+                        saw_tool_message = true;
+                    }
+                }
+                Ok(SseEvent::MessageUpdated {
+                    message_id,
+                    duration_ms: Some(_),
+                    ..
+                }) => {
+                    if message_id == "tool-duration-1-result" {
+                        saw_duration_update = true;
+                    }
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => break,
+                Err(e) => panic!("unexpected broadcast receive error: {e:?}"),
+            }
+        }
+
+        assert!(saw_tool_message, "tool result message must be broadcast");
+        assert!(
+            !saw_duration_update,
+            "duration must not be rebroadcast as a follow-up MessageUpdated"
         );
     }
 }
