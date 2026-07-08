@@ -37,7 +37,8 @@ import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './BrowserProfileResponseView';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
-import { ConversationMarkdownAnchor, CONVERSATION_MARKDOWN_COMPONENTS } from './conversationMarkdown';
+import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
+import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
 import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
 
@@ -759,7 +760,7 @@ const AgentTextBlock = memo(function AgentTextBlock({
 }) {
   return (
     <div className="agent-text-block">
-      <ReactMarkdown remarkPlugins={remarkPlugins} components={components}>
+      <ReactMarkdown remarkPlugins={remarkPlugins} components={components} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
         {text}
       </ReactMarkdown>
     </div>
@@ -788,7 +789,7 @@ function CollapsibleTextImpl({
   if (expanded) {
     return (
       <div className="agent-text-block">
-        <ReactMarkdown remarkPlugins={remarkPlugins} components={components}>
+        <ReactMarkdown remarkPlugins={remarkPlugins} components={components} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
           {text}
         </ReactMarkdown>
       </div>
@@ -996,8 +997,14 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
       li: ({ children }: { children?: React.ReactNode }) => <li>{processChildren(children)}</li>,
       a: ConversationMarkdownAnchor,
       table: MarkdownTable,
+      img: ({ src, ...props }: React.ComponentPropsWithoutRef<'img'> & { node?: unknown }) => (
+        <ConversationMarkdownImage
+          {...props}
+          src={resolveConversationMarkdownImageSrc(src, filePathRootDir)}
+        />
+      ),
     } satisfies Components;
-  }, [onOpenFile, filePathCopyContext, syntaxStyle]);
+  }, [onOpenFile, filePathCopyContext, filePathRootDir, syntaxStyle]);
 
   // Check if there's any renderable content
   const hasRenderableContent = blocks.some(block => {
@@ -2128,7 +2135,7 @@ function ChildToolActivity({ block, result }: { block: ContentBlock; result: Mes
 // `toolResults` map are referentially stable across token-only atom updates, so
 // a shallow prop compare bails. Mirrors the AgentTextBlock / StreamingBlock
 // memoization for the same re-parse-on-unchanged-content problem.
-const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResults }: { message: Message; toolResults: Map<string, Message> }) {
+const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResults, markdownComponents }: { message: Message; toolResults: Map<string, Message>; markdownComponents: React.ComponentProps<typeof ReactMarkdown>['components'] }) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   return (
     <>
@@ -2138,7 +2145,7 @@ const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResul
           if (!text) return null;
           return (
             <div key={`${message.message_id}-text-${idx}`} className="subagent-activity-event agent-text">
-              <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={CONVERSATION_MARKDOWN_COMPONENTS}>{text.length > 900 ? `${text.slice(0, 900)}…` : text}</ReactMarkdown>
+              <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{text.length > 900 ? `${text.slice(0, 900)}…` : text}</ReactMarkdown>
             </div>
           );
         }
@@ -2168,7 +2175,7 @@ const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResul
  * `running` drives only the "live" badge; `full` shows every agent step instead
  * of the latest dozen.
  */
-export function SubAgentTranscript({ inline, running, full = false }: { inline: InlineStreamState; running: boolean; full?: boolean }) {
+export function SubAgentTranscript({ inline, running, full = false, finalResult }: { inline: InlineStreamState; running: boolean; full?: boolean; finalResult?: { text: string; statusClass: string } | undefined }) {
   const { atom } = inline;
   const messages = atom.messages;
   // Derived once per messages change, not per streaming token. `sse_token`
@@ -2186,6 +2193,11 @@ export function SubAgentTranscript({ inline, running, full = false }: { inline: 
   );
   const hiddenCount = Math.max(0, agentMessages.length - visibleAgentMessages.length);
   const toolCount = useMemo(() => countToolUses(messages), [messages]);
+  const rootDir = atom.conversation?.worktree_path ?? atom.conversation?.cwd ?? undefined;
+  const markdownComponents = useMemo(
+    () => (rootDir ? createConversationMarkdownComponents({ rootDir }) : CONVERSATION_MARKDOWN_COMPONENTS),
+    [rootDir],
+  );
 
   return (
     <div className="subagent-activity-panel">
@@ -2200,15 +2212,21 @@ export function SubAgentTranscript({ inline, running, full = false }: { inline: 
         <div className="subagent-activity-placeholder">Showing latest {visibleAgentMessages.length} agent steps ({hiddenCount} earlier hidden)</div>
       )}
       {visibleAgentMessages.map((message) => (
-        <ChildAgentActivity key={message.message_id} message={message} toolResults={toolResults} />
+        <ChildAgentActivity key={message.message_id} message={message} toolResults={toolResults} markdownComponents={markdownComponents} />
       ))}
       {atom.streamingBuffer?.text && (
         <div className="subagent-activity-event agent-text streaming">
-          <StreamingBlocks text={atom.streamingBuffer.text} />
+          <StreamingBlocks text={atom.streamingBuffer.text} rootDir={rootDir} />
         </div>
       )}
       {inline.type !== 'connecting' && inline.type !== 'error' && visibleAgentMessages.length === 0 && !atom.streamingBuffer?.text && (
         <div className="subagent-activity-placeholder">No sub-agent activity yet.</div>
+      )}
+      {finalResult?.text && (
+        <div className={`subagent-final-result ${finalResult.statusClass}`}>
+          <div className="subagent-final-result-label">final outcome</div>
+          <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{finalResult.text}</ReactMarkdown>
+        </div>
       )}
     </div>
   );
@@ -2219,10 +2237,10 @@ export function SubAgentTranscript({ inline, running, full = false }: { inline: 
  * card. Owns its own read-only stream; `running` is the card's authoritative
  * status (the card is mounted whenever it's visible).
  */
-function ChildConversationActivity({ agentId, expanded, running }: { agentId: string; expanded: boolean; running: boolean }) {
+function ChildConversationActivity({ agentId, expanded, running, finalResult }: { agentId: string; expanded: boolean; running: boolean; finalResult?: { text: string; statusClass: string } | undefined }) {
   const inline = useConversationInlineStream(agentId, expanded, running);
   if (!expanded) return null;
-  return <SubAgentTranscript inline={inline} running={running} />;
+  return <SubAgentTranscript inline={inline} running={running} finalResult={finalResult} />;
 }
 
 function SubAgentActivityCard({ agentId, task, outcome }: { agentId: string; task: string; outcome: SubAgentResult['outcome'] | null }) {
@@ -2252,13 +2270,12 @@ function SubAgentActivityCard({ agentId, task, outcome }: { agentId: string; tas
       {resultText && !expanded && (
         <div className="subagent-result preview">{truncate(resultText, 180)}</div>
       )}
-      <ChildConversationActivity agentId={agentId} expanded={expanded} running={running} />
-      {expanded && resultText && (
-        <div className={`subagent-final-result ${statusClass}`}>
-          <div className="subagent-final-result-label">final outcome</div>
-          <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={CONVERSATION_MARKDOWN_COMPONENTS}>{resultText}</ReactMarkdown>
-        </div>
-      )}
+      <ChildConversationActivity
+        agentId={agentId}
+        expanded={expanded}
+        running={running}
+        finalResult={resultText ? { text: resultText, statusClass } : undefined}
+      />
     </div>
   );
 }
