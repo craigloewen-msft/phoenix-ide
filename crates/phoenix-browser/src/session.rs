@@ -14,10 +14,13 @@ use futures::StreamExt;
 use serde::{Serialize, Serializer};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex as StdMutex,
+};
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
@@ -854,6 +857,15 @@ pub type ScopeLivenessHook =
 struct ScopedSession {
     scope: WorkScope,
     session: Arc<RwLock<BrowserSession>>,
+    user_data_key: String,
+    kill_done: Arc<Notify>,
+    kill_requested: Arc<AtomicBool>,
+}
+
+enum KillSessionOutcome {
+    Absent,
+    Started(JoinHandle<()>),
+    AlreadyRequested { key: String, done: Arc<Notify> },
 }
 
 /// Global manager for all browser sessions
@@ -955,6 +967,24 @@ impl BrowserSessionManager {
         }
     }
 
+    async fn wait_for_kill_completion(&self, key: &str, done: Arc<Notify>) {
+        loop {
+            let notified = done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let still_waiting_for_same_kill = {
+                let sessions = self.sessions.read().await;
+                sessions
+                    .get(key)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.kill_done, &done))
+            };
+            if !still_waiting_for_same_kill {
+                break;
+            }
+            notified.await;
+        }
+    }
+
     /// Get a session for a `work_scope` (creates if needed).
     /// Returns Arc to the session - caller manages locking.
     ///
@@ -973,21 +1003,34 @@ impl BrowserSessionManager {
     ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
         let key = work_scope.stable_key();
 
-        // Check if session exists
-        {
-            let sessions = self.sessions.read().await;
+        let mut sessions = loop {
+            {
+                let sessions = self.sessions.read().await;
+                if let Some(entry) = sessions.get(&key) {
+                    if entry.kill_requested.load(Ordering::SeqCst) {
+                        let kill_done = entry.kill_done.clone();
+                        drop(sessions);
+                        self.wait_for_kill_completion(&key, kill_done).await;
+                        continue;
+                    }
+                    return Ok(entry.session.clone());
+                }
+            }
+
+            let sessions = self.sessions.write().await;
             if let Some(entry) = sessions.get(&key) {
+                if entry.kill_requested.load(Ordering::SeqCst) {
+                    let kill_done = entry.kill_done.clone();
+                    drop(sessions);
+                    self.wait_for_kill_completion(&key, kill_done).await;
+                    continue;
+                }
                 return Ok(entry.session.clone());
             }
-        }
+            break sessions;
+        };
 
         // Create new session
-        let mut sessions = self.sessions.write().await;
-
-        // Double-check after acquiring write lock
-        if let Some(entry) = sessions.get(&key) {
-            return Ok(entry.session.clone());
-        }
 
         tracing::info!(work_scope = %work_scope, "Creating new browser session");
         // BrowserSession::new bounds its own CDP launch (and may legitimately
@@ -1022,10 +1065,13 @@ impl BrowserSessionManager {
         }
 
         sessions.insert(
-            key,
+            key.clone(),
             ScopedSession {
                 scope: work_scope.clone(),
                 session: session_arc.clone(),
+                user_data_key: key.clone(),
+                kill_done: Arc::new(Notify::new()),
+                kill_requested: Arc::new(AtomicBool::new(false)),
             },
         );
         // Drop the write lock before emitting — the receiver may grab the
@@ -1120,38 +1166,107 @@ impl BrowserSessionManager {
     /// lock-free so concurrent `get_session` / `get_existing` /
     /// `is_active` calls on unrelated scopes are not blocked for the
     /// duration of fs deletion + Chrome shutdown.
-    pub async fn kill_session(&self, work_scope: &WorkScope) {
+    async fn spawn_kill_session(self: &Arc<Self>, work_scope: &WorkScope) -> KillSessionOutcome {
         let key = work_scope.stable_key();
-        let removed = {
-            let mut sessions = self.sessions.write().await;
-            sessions.remove(&key)
+        let Some((session, kill_requested, kill_done)) = ({
+            let sessions = self.sessions.read().await;
+            sessions.get(&key).map(|entry| {
+                (
+                    entry.session.clone(),
+                    entry.kill_requested.clone(),
+                    entry.kill_done.clone(),
+                )
+            })
+        }) else {
+            return KillSessionOutcome::Absent;
         };
-        let was_present = removed.is_some();
-        if let Some(entry) = removed {
-            tracing::info!(work_scope = %work_scope, "Killing browser session");
 
-            // Force-close Chrome under a write lock on the session itself
-            // (independent of the sessions map lock). Other `Arc` holders
-            // will observe a dead `Browser`/`Page` on their next CDP call.
+        if kill_requested.swap(true, Ordering::SeqCst) {
+            tracing::debug!(work_scope = %work_scope, "browser kill already requested");
+            return KillSessionOutcome::AlreadyRequested {
+                key,
+                done: kill_done,
+            };
+        }
+
+        let requested_scope = work_scope.clone();
+        let manager = Arc::clone(self);
+        KillSessionOutcome::Started(tokio::spawn(async move {
+            tracing::info!(work_scope = %requested_scope, "Killing browser session");
+
+            // Force-close Chrome under a write lock on the session itself,
+            // independent of the sessions map lock. If an in-flight browser tool
+            // holds this guard, keep the session tracked as live until the guard
+            // is released and Chrome has actually been terminated.
             {
-                let mut session_guard = entry.session.write().await;
+                let mut session_guard = session.write().await;
                 session_guard.terminate().await;
             }
-            // Drop our `Arc` clone. If we were the last holder,
-            // `BrowserSession::drop` re-aborts (no-op) and frees memory.
-            drop(entry);
 
-            // Clean up user data directory — lock-free.
-            let user_data_dir = user_data_dir_for_key(&key);
+            let Some(user_data_key) = ({
+                let sessions = manager.sessions.read().await;
+                sessions
+                    .iter()
+                    .find(|(_, entry)| Arc::ptr_eq(&entry.session, &session))
+                    .map(|(_, entry)| entry.user_data_key.clone())
+            }) else {
+                tracing::debug!(work_scope = %requested_scope, "browser kill completed after session was already removed");
+                kill_done.notify_waiters();
+                return;
+            };
+
+            let user_data_dir = user_data_dir_for_key(&user_data_key);
             if let Err(e) = tokio::fs::remove_dir_all(&user_data_dir).await {
                 tracing::warn!(path = %user_data_dir, error = %e, "Failed to clean up browser data dir");
             }
-        }
-        // Lifecycle edge is "session was present and is now gone". A no-op
-        // kill (no session existed) must NOT emit — that would falsely
-        // signal a transition the UI hasn't seen the up-edge of.
-        if was_present {
-            self.emit_lifecycle(work_scope, false);
+
+            let removed = {
+                let mut sessions = manager.sessions.write().await;
+                let removed_key = sessions
+                    .iter()
+                    .find(|(_, entry)| Arc::ptr_eq(&entry.session, &session))
+                    .map(|(key, _)| key.clone());
+                removed_key.and_then(|key| sessions.remove(&key))
+            };
+
+            let Some(entry) = removed else {
+                tracing::debug!(work_scope = %requested_scope, "browser kill cleaned profile after session was already removed");
+                kill_done.notify_waiters();
+                return;
+            };
+            let removed_scope = entry.scope.clone();
+            drop(entry);
+
+            manager.emit_lifecycle(&removed_scope, false);
+            kill_done.notify_waiters();
+        }))
+    }
+
+    /// Request session kill and return as soon as teardown has been queued.
+    /// The session remains tracked as live until the spawned teardown task has
+    /// actually terminated Chrome, removed the manager entry, and emitted the
+    /// lifecycle false edge.
+    pub async fn request_kill_session(self: &Arc<Self>, work_scope: &WorkScope) {
+        let _ = self.spawn_kill_session(work_scope).await;
+    }
+
+    /// Kill a session and wait for teardown to complete.
+    ///
+    /// Delete cascades use this stronger operation because the conversation is
+    /// going away; user-facing Stop browser endpoints use
+    /// [`Self::request_kill_session`] so they do not block behind an in-flight
+    /// browser tool guard.
+    pub async fn kill_session(self: &Arc<Self>, work_scope: &WorkScope) {
+        match self.spawn_kill_session(work_scope).await {
+            KillSessionOutcome::Absent => {}
+            KillSessionOutcome::Started(handle) => {
+                if let Err(err) = handle.await {
+                    tracing::warn!(work_scope = %work_scope, error = %err, "browser kill task failed");
+                }
+            }
+            KillSessionOutcome::AlreadyRequested { key, done } => {
+                self.wait_for_kill_completion(&key, done).await;
+            }
         }
     }
 

@@ -179,6 +179,27 @@ also the natural surface for any future non-UI client (REQ-WSUI-011).
 
 ---
 
+### REQ-WSUI-006b: Browser Session Stop Endpoint
+
+WHEN a client issues `DELETE /api/work-scope/:scope_key/browser-session`
+THE SYSTEM SHALL parse `:scope_key` as a `WorkScope::stable_key()` and request termination of the browser session owned by that scope via `BrowserSessionManager::kill_session`.
+
+WHEN a client issues `DELETE /api/conversations/:id/browser-session`
+THE SYSTEM SHALL resolve the conversation's current server-side `WorkScope` and request termination of the browser session owned by that scope via `BrowserSessionManager::kill_session`.
+
+WHEN the conversation's current server-side `WorkScope` differs from its conversation scope
+THE SYSTEM SHALL also request termination for the conversation scope so a stop request during an Explore-to-Work approval window cannot miss a pre-rekey browser session.
+
+WHEN no browser session exists for the scope
+THE SYSTEM SHALL treat the request as a successful no-op.
+
+WHEN the session is present and termination completes
+THE SYSTEM SHALL rely on the browser lifecycle edge to publish the corresponding `WorkScopeUpdate` rather than maintaining a parallel client-side browser liveness value.
+
+**Rationale:** The work-scope row is keyed by `scope_key`, and the same browser session can be shared across worktree-backed continuation members. Terminating by `WorkScope` directly avoids conversation-member ambiguity and reuses the authoritative lifecycle path that already drives browser-session and inventory freshness.
+
+---
+
 ### REQ-WSUI-007: Inventory Push Event
 
 WHEN a bash handle in a scope is spawned, transitions to a terminal state, or
@@ -292,6 +313,9 @@ WHERE the browser section reports `state` `live` with an `idle_ms` past a
 frontend-chosen threshold
 THE section MAY present the browser row as "idle" — a purely client-side
 rendering derived from `idle_ms`, distinct from the wire `state` (REQ-WSUI-004).
+
+WHEN the browser row reports `state` `live`
+THE section and standalone dock SHALL expose a stop action that invokes REQ-WSUI-006b with the inventory's `scope_key`. The conversation-page section MAY also expose an open action for the live browser viewer; the standalone dock SHALL NOT require a viewer slot in order to stop the session.
 
 **Rationale:** The right side of the layout is reserved for the meta viewer
 (prose/diff/browser); the work scope is an always-present resource view, so it
