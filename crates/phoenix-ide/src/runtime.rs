@@ -702,6 +702,7 @@ pub struct CachedPrSummary {
     pub display_state: phoenix_core::domain::pr_display_state::PrDisplayState,
     pub base: String,
     pub head: String,
+    pub feedback_status: phoenix_core::domain::pr_feedback_status::PrFeedbackStatus,
 }
 
 /// A conversation enriched with derived display fields for the API layer.

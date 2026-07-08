@@ -156,6 +156,7 @@ export interface Conversation {
 export type PrUnavailableReason = 'gh_missing' | 'not_authenticated' | 'not_git_repo' | 'command_failed';
 export type PrCheckState = 'passing' | 'pending' | 'failing' | 'unknown';
 export type PrDisplayState = 'open' | 'draft' | 'merged' | 'closed';
+export type PrFeedbackStatus = 'open' | 'in_progress' | 'approved';
 
 export interface CachedPrSummary {
   number: number;
@@ -164,6 +165,7 @@ export interface CachedPrSummary {
   display_state: PrDisplayState;
   base: string;
   head: string;
+  feedback_status?: PrFeedbackStatus;
 }
 
 export interface PrCheckSummary {
@@ -177,13 +179,18 @@ export interface PrCheckSummary {
 }
 
 export type PrFeedbackSource = 'issue_comment' | 'review_comment' | 'review_summary' | 'review_thread';
-export type PrFeedbackCoverageSurface = 'issue_comments' | 'review_comments' | 'review_summaries' | 'review_threads';
+export type PrFeedbackCoverageSurface = 'issue_comments' | 'issue_comment_reactions' | 'review_comments' | 'review_comment_reactions' | 'review_summaries' | 'review_summary_reactions' | 'review_threads';
 export type PrFeedbackCoverageStatus = 'fetched' | 'unavailable' | 'auth_failed';
 
 export interface PrFeedbackCoverage {
   surface: PrFeedbackCoverageSurface;
   status: PrFeedbackCoverageStatus;
   detail?: string;
+}
+
+export interface PrFeedbackReaction {
+  content: string;
+  count: number;
 }
 
 export interface PrFeedbackItem {
@@ -196,12 +203,15 @@ export interface PrFeedbackItem {
   path?: string;
   url?: string;
   created_at?: string;
+  reactions: PrFeedbackReaction[];
+  feedback_status: PrFeedbackStatus;
   resolved?: boolean;
 }
 
 export interface PrFeedbackSummary {
   total: number;
   unresolved: number;
+  feedback_status: PrFeedbackStatus;
   items: PrFeedbackItem[];
   coverage: PrFeedbackCoverage[];
 }
@@ -289,6 +299,7 @@ export interface PrStatusResponse {
   updated_at?: string;
   display_state?: PrDisplayState;
   feedback_freshness?: PrFeedbackFreshness;
+  feedback_status?: PrFeedbackStatus;
   feedback_coverage?: PrFeedbackCoverageHealth;
   work_change: WorkChangeSummary;
 }

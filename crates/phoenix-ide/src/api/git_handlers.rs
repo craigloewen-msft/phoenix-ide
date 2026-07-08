@@ -5,8 +5,8 @@
 use super::handlers::AppError;
 use super::types::{
     ConversationDiffResponse, GitBranchEntry, GitBranchesQuery, GitBranchesResponse,
-    PrAutoFixContextResponse, PrStatusResponse, PrUnavailableReason, WorkChangeNeedsReviewReason,
-    WorkChangeSummary,
+    PrAutoFixContextResponse, PrFeedbackStatus, PrStatusResponse, PrUnavailableReason,
+    WorkChangeNeedsReviewReason, WorkChangeSummary,
 };
 use super::AppState;
 use crate::db::ConvMode;
@@ -512,6 +512,21 @@ async fn pr_status_response_for_missing_worktree(
     Ok(response)
 }
 
+fn effective_feedback_status_for_cache(
+    previous: Option<PrFeedbackStatus>,
+    fetched: PrFeedbackStatus,
+    degraded: bool,
+) -> (Option<PrFeedbackStatus>, bool) {
+    let preserve_previous = degraded
+        && fetched == PrFeedbackStatus::Open
+        && previous.is_some_and(|status| status != PrFeedbackStatus::Open);
+    if preserve_previous {
+        (previous, false)
+    } else {
+        (Some(fetched), true)
+    }
+}
+
 pub(crate) async fn get_conversation_pr_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -626,15 +641,21 @@ async fn attach_pr_feedback_freshness(
         return Ok(response);
     };
 
-    let Some(baseline) = db
-        .work_scope_pr_feedback_baseline(work_scope, pr_number)
+    let previous_feedback_status = db
+        .primary_work_scope_pr_association(work_scope)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
-    else {
-        return Ok(response);
-    };
+        .filter(|pr| pr.pr_number == pr_number)
+        .map(|pr| pr.feedback_status);
 
-    if crate::api::pr_monitoring::pr_updated_after_baseline(&baseline, updated_at) {
+    let baseline = db
+        .work_scope_pr_feedback_baseline(work_scope, pr_number)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    if baseline.as_ref().is_some_and(|baseline| {
+        crate::api::pr_monitoring::pr_updated_after_baseline(baseline, updated_at)
+    }) {
         let cwd_for_feedback = cwd.to_path_buf();
         let feedback = tokio::task::spawn_blocking(move || {
             crate::api::pr_monitoring::fetch_pr_feedback_for_pr(&cwd_for_feedback, pr_number)
@@ -643,20 +664,54 @@ async fn attach_pr_feedback_freshness(
         .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
         match feedback {
             Ok(feedback) => {
-                // Content change and coverage health are independent signals
-                // derived from the same fetch: the count reflects only the
-                // surfaces that were read, and coverage flags any that weren't.
+                let coverage_health = crate::api::pr_monitoring::coverage_health(&feedback);
+                let (effective_feedback_status, should_update_cache) =
+                    effective_feedback_status_for_cache(
+                        previous_feedback_status,
+                        feedback.feedback_status,
+                        coverage_health.is_some(),
+                    );
+                response.feedback_status = effective_feedback_status;
+                if should_update_cache {
+                    db.update_work_scope_pr_feedback_status(
+                        work_scope,
+                        pr_number,
+                        feedback.feedback_status,
+                    )
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                }
                 response.feedback_freshness =
                     crate::api::pr_monitoring::actionable_feedback_freshness_from_baseline(
-                        &baseline,
+                        baseline
+                            .as_ref()
+                            .expect("baseline exists in full feedback branch"),
                         Some(&feedback),
                     );
-                response.feedback_coverage = crate::api::pr_monitoring::coverage_health(&feedback);
+                response.feedback_coverage = coverage_health;
             }
             Err(err) => {
-                // Couldn't fetch feedback at all (e.g. not a git repo) — leave
-                // both signals absent rather than guessing.
                 tracing::debug!(pr = pr_number, error = %err, "could not fetch PR feedback to classify freshness");
+            }
+        }
+    } else {
+        let cwd_for_status = cwd.to_path_buf();
+        let status = tokio::task::spawn_blocking(move || {
+            crate::api::pr_monitoring::fetch_pr_feedback_status_for_pr(&cwd_for_status, pr_number)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+        match status {
+            Ok(status) => {
+                response.feedback_status = Some(status);
+                if Some(status) != previous_feedback_status {
+                    db.update_work_scope_pr_feedback_status(work_scope, pr_number, status)
+                        .await
+                        .map_err(|e| AppError::Internal(e.to_string()))?;
+                }
+            }
+            Err(err) => {
+                tracing::debug!(pr = pr_number, error = %err, "could not fetch bounded PR feedback reaction status");
             }
         }
     }
@@ -725,16 +780,17 @@ pub(crate) async fn create_pr_auto_fix_context(
     .await
     .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
 
-    let (response, observations, _result_baseline) = match result {
+    let (response, observations, _result_baseline, feedback_status) = match result {
         Ok(capture) => (
             Ok(capture.response),
             capture.observations,
             Some(capture.baseline),
+            Some(capture.feedback_status),
         ),
         Err(crate::api::pr_monitoring::PrMonitorError::BadRequestWithObservations {
             message,
             observations,
-        }) => (Err(AppError::BadRequest(message)), observations, None),
+        }) => (Err(AppError::BadRequest(message)), observations, None, None),
         Err(crate::api::pr_monitoring::PrMonitorError::BadRequest(message)) => {
             return Err(AppError::BadRequest(message));
         }
@@ -745,6 +801,12 @@ pub(crate) async fn create_pr_auto_fix_context(
 
     if !observations.is_empty() {
         db.upsert_work_scope_pr_observations(&work_scope, &observations)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+    }
+
+    if let (Ok(response), Some(feedback_status)) = (&response, feedback_status) {
+        db.update_work_scope_pr_feedback_status(&work_scope, response.pr_number, feedback_status)
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
     }
@@ -927,6 +989,38 @@ fn truncated_kib(stdout: &str, total_bytes: u64, saturated: bool) -> Option<u32>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn degraded_open_feedback_preserves_previous_non_open_cache_status() {
+        assert_eq!(
+            effective_feedback_status_for_cache(
+                Some(PrFeedbackStatus::Approved),
+                PrFeedbackStatus::Open,
+                true,
+            ),
+            (Some(PrFeedbackStatus::Approved), false)
+        );
+        assert_eq!(
+            effective_feedback_status_for_cache(
+                Some(PrFeedbackStatus::InProgress),
+                PrFeedbackStatus::Open,
+                true,
+            ),
+            (Some(PrFeedbackStatus::InProgress), false)
+        );
+    }
+
+    #[test]
+    fn complete_open_feedback_updates_cache_status() {
+        assert_eq!(
+            effective_feedback_status_for_cache(
+                Some(PrFeedbackStatus::Approved),
+                PrFeedbackStatus::Open,
+                false,
+            ),
+            (Some(PrFeedbackStatus::Open), true)
+        );
+    }
 
     fn conversation_with_mode(
         cwd: &std::path::Path,
