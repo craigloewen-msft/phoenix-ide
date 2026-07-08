@@ -299,6 +299,7 @@ function ConversationPageContent() {
   // Task approval overlay
   const [showTaskApproval, setShowTaskApproval] = useState(false);
   const [approvalContextWindowUsed, setApprovalContextWindowUsed] = useState<number | null>(null);
+  const taskApprovalError = atom.uiError?.type === 'BackendError' ? atom.uiError.message : null;
   const [showFirstTaskWelcome, setShowFirstTaskWelcome] = useState(false);
   // Context-full banner: summary expanded by default; user can collapse to
   // read the conversation above.
@@ -914,6 +915,7 @@ function ConversationPageContent() {
 
   const handleApproveTask = async (handoff: 'continue_in_current_conversation' | 'start_fresh_work_conversation') => {
     if (!conversationId || isArchived) return;
+    dispatch({ type: 'clear_error' });
     try {
       const result = await api.approveTask(conversationId, handoff);
       if (result.first_task) {
@@ -1697,6 +1699,7 @@ function ConversationPageContent() {
             plan={atom.phase.plan}
             contextWindowUsed={approvalContextWindowUsed ?? undefined}
             modelContextWindow={actualModelContextWindow ?? undefined}
+            approvalError={taskApprovalError}
             onApprove={handleApproveTask}
             onReject={handleRejectTask}
             onSendFeedback={handleTaskFeedback}

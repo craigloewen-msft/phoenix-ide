@@ -5295,7 +5295,12 @@ where
                 Ok(())
             }
             Err(e) => {
-                tracing::error!(error = %e, "Task approval git operations failed");
+                tracing::error!(
+                    error = %e,
+                    conv_id = %self.context.conversation_id,
+                    error_class = if e.contains("already exists") { "branch_already_exists" } else { "approval_git_failure" },
+                    "Task approval git operations failed"
+                );
 
                 // Revert in-memory state to AwaitingTaskApproval so the user can retry.
                 // The DB still has AwaitingTaskApproval (PersistState hasn't run for the
@@ -5333,7 +5338,7 @@ where
                     ),
                 });
 
-                Ok(())
+                Err(e)
             }
         }
     }
@@ -6568,7 +6573,9 @@ mod strip_tool_blocks_tests {
 
 // Re-export git helpers so existing `crate::runtime::executor::{run_git, ensure_gitignore_has_phoenix}`
 // imports continue to resolve. Canonical definitions live in `crate::git_ops`.
-pub(crate) use crate::git_ops::{ensure_gitignore_has_phoenix, run_git};
+pub(crate) use crate::git_ops::{
+    ensure_gitignore_has_phoenix, find_branch_in_worktree_list, run_git,
+};
 
 /// Rename a task file to `in-progress` status if it isn't already.
 ///
@@ -6597,6 +6604,59 @@ pub(crate) fn promote_task_status_to_in_progress(
     )
     .map_err(|e| format!("Failed to rename task file to in-progress status: {e}"))?;
     Ok(result.new_filename)
+}
+
+struct TaskmdApprovalFilenameInput<'a> {
+    cwd: &'a std::path::Path,
+    tasks_dir_name: &'a str,
+    task_file: &'a str,
+    original_filename: &'a str,
+    task_id: &'a str,
+    priority: taskmd_core::constants::Priority,
+    status: taskmd_core::constants::Status,
+    slug: &'a str,
+    allow_promoted_retry_recovery: bool,
+}
+
+fn resolve_taskmd_approval_filename(
+    input: &TaskmdApprovalFilenameInput<'_>,
+) -> Result<(String, taskmd_core::constants::Status), String> {
+    let cwd_filepath = input.cwd.join(std::path::Path::new(input.task_file));
+    if cwd_filepath.exists() {
+        return Ok((input.original_filename.to_string(), input.status));
+    }
+
+    let in_progress_filename = taskmd_core::filename::format_filename(
+        input.task_id,
+        input.priority,
+        taskmd_core::constants::Status::InProgress,
+        input.slug,
+    );
+    if input.allow_promoted_retry_recovery
+        && input.status != taskmd_core::constants::Status::InProgress
+        && input
+            .cwd
+            .join(input.tasks_dir_name)
+            .join(&in_progress_filename)
+            .exists()
+    {
+        tracing::info!(
+            original_task_file = %input.task_file,
+            recovered_task_file = %format!("{}/{in_progress_filename}", input.tasks_dir_name),
+            "Task approval retry recovered already-promoted task filename"
+        );
+        return Ok((
+            in_progress_filename,
+            taskmd_core::constants::Status::InProgress,
+        ));
+    }
+
+    Err(format!(
+        "Task file '{}' does not exist under {}. \
+         The file must be on disk before approval.",
+        input.task_file,
+        input.cwd.display()
+    ))
 }
 
 /// Global mutex serializing the scan-tasks + write + commit sequence.
@@ -6633,7 +6693,7 @@ fn open_early_worktree_and_rename_branch(
     repo_root: &std::path::Path,
     conv_id: &str,
     task_branch: &str,
-) -> Result<std::path::PathBuf, String> {
+) -> Result<(std::path::PathBuf, String), String> {
     let worktree_path = repo_root.join(".phoenix/worktrees").join(conv_id);
     let exists = worktree_path.is_dir()
         && run_git(&worktree_path, &["rev-parse", "--is-inside-work-tree"]).is_ok();
@@ -6649,9 +6709,217 @@ fn open_early_worktree_and_rename_branch(
         .trim()
         .to_string();
     tracing::info!(temp_branch = %temp_branch, task_branch, "REQ-PROJ-028: renaming temp branch");
-    run_git(&worktree_path, &["branch", "-m", &temp_branch, task_branch])
-        .map_err(|e| format!("Failed to rename branch '{temp_branch}' to '{task_branch}': {e}"))?;
-    Ok(worktree_path)
+    if task_approval_branch_is_retry_match(repo_root, task_branch, &temp_branch) {
+        tracing::info!(
+            current_branch = %temp_branch,
+            task_branch = %task_branch,
+            "Task approval retry found worktree already on approval branch; skipping rename"
+        );
+        return Ok((worktree_path, temp_branch));
+    }
+    if !temp_branch.starts_with("task-pending-") {
+        return Err(format!(
+            "Expected approval worktree to be on a task-pending branch or the exact approval branch, but found '{temp_branch}'"
+        ));
+    }
+    let target_branch = unique_task_approval_branch(repo_root, task_branch, &temp_branch);
+    if target_branch != task_branch {
+        run_git(
+            repo_root,
+            &[
+                "config",
+                &format!("branch.{target_branch}.phoenix-approval-desired"),
+                task_branch,
+            ],
+        )
+        .map_err(|e| {
+            format!(
+                "Failed to record approval fallback branch '{target_branch}' for '{task_branch}': {e}"
+            )
+        })?;
+    }
+    run_git(
+        &worktree_path,
+        &["branch", "-m", &temp_branch, &target_branch],
+    )
+    .map_err(|e| format!("Failed to rename branch '{temp_branch}' to '{target_branch}': {e}"))?;
+    Ok((worktree_path, target_branch))
+}
+
+fn branch_ref_exists(repo_root: &std::path::Path, git_ref: &str) -> bool {
+    run_git(repo_root, &["show-ref", "--verify", "--quiet", git_ref]).is_ok()
+}
+
+fn branch_ref_has_children(repo_root: &std::path::Path, namespace_ref: &str) -> bool {
+    run_git(
+        repo_root,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("{namespace_ref}/"),
+        ],
+    )
+    .map(|stdout| {
+        stdout
+            .lines()
+            .any(|line| line.starts_with(&format!("{namespace_ref}/")))
+    })
+    .unwrap_or(false)
+}
+
+enum TaskApprovalBranchNameStatus {
+    Free,
+    Occupied,
+    ActiveWorktree,
+}
+
+fn task_approval_remote_head_exists(repo_root: &std::path::Path, branch_name: &str) -> bool {
+    let expected_ref = format!("refs/heads/{branch_name}");
+    run_git(
+        repo_root,
+        &[
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            &expected_ref,
+        ],
+    )
+    .map(|stdout| {
+        stdout
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some(&expected_ref))
+    })
+    .unwrap_or(false)
+}
+
+fn task_approval_remote_head_has_children(repo_root: &std::path::Path, branch_name: &str) -> bool {
+    let expected_prefix = format!("refs/heads/{branch_name}/");
+    run_git(
+        repo_root,
+        &[
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            &format!("{expected_prefix}*"),
+        ],
+    )
+    .map(|stdout| {
+        stdout.lines().any(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .is_some_and(|git_ref| git_ref.starts_with(&expected_prefix))
+        })
+    })
+    .unwrap_or(false)
+}
+
+fn task_approval_branch_name_status(
+    repo_root: &std::path::Path,
+    branch_name: &str,
+) -> TaskApprovalBranchNameStatus {
+    let local_ref = format!("refs/heads/{branch_name}");
+    if branch_ref_exists(repo_root, &local_ref) {
+        if find_branch_in_worktree_list(repo_root, branch_name).is_some() {
+            return TaskApprovalBranchNameStatus::ActiveWorktree;
+        }
+        return TaskApprovalBranchNameStatus::Occupied;
+    }
+    if branch_ref_has_children(repo_root, &local_ref) {
+        return TaskApprovalBranchNameStatus::Occupied;
+    }
+    let origin_ref = format!("refs/remotes/origin/{branch_name}");
+    if branch_ref_exists(repo_root, &origin_ref)
+        || branch_ref_has_children(repo_root, &origin_ref)
+        || task_approval_remote_head_exists(repo_root, branch_name)
+        || task_approval_remote_head_has_children(repo_root, branch_name)
+    {
+        return TaskApprovalBranchNameStatus::Occupied;
+    }
+    TaskApprovalBranchNameStatus::Free
+}
+
+fn task_approval_branch_is_retry_match(
+    repo_root: &std::path::Path,
+    desired_branch: &str,
+    current_branch: &str,
+) -> bool {
+    if current_branch == desired_branch {
+        return true;
+    }
+    run_git(
+        repo_root,
+        &[
+            "config",
+            "--get",
+            &format!("branch.{current_branch}.phoenix-approval-desired"),
+        ],
+    )
+    .map(|recorded| recorded.trim() == desired_branch)
+    .unwrap_or(false)
+}
+
+fn task_approval_worktree_is_retry(
+    repo_root: &std::path::Path,
+    cwd: &std::path::Path,
+    desired_branch: &str,
+) -> bool {
+    run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .map(|branch| task_approval_branch_is_retry_match(repo_root, desired_branch, branch.trim()))
+        .unwrap_or(false)
+}
+
+fn unique_task_approval_branch(
+    repo_root: &std::path::Path,
+    desired_branch: &str,
+    temp_branch: &str,
+) -> String {
+    match task_approval_branch_name_status(repo_root, desired_branch) {
+        TaskApprovalBranchNameStatus::Free => return desired_branch.to_string(),
+        TaskApprovalBranchNameStatus::Occupied | TaskApprovalBranchNameStatus::ActiveWorktree => {}
+    }
+
+    for _ in 0..8 {
+        let suffix: String = uuid::Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(8)
+            .collect();
+        let candidate = format!("{desired_branch}-{suffix}");
+        if matches!(
+            task_approval_branch_name_status(repo_root, &candidate),
+            TaskApprovalBranchNameStatus::Free
+        ) {
+            tracing::warn!(
+                temp_branch = %temp_branch,
+                target_branch = %desired_branch,
+                fallback_branch = %candidate,
+                error_class = "branch_name_collision",
+                "Task approval branch name already exists locally or at origin; using suffixed fallback"
+            );
+            return candidate;
+        }
+    }
+
+    let fallback = format!("{desired_branch}-{}", uuid::Uuid::new_v4().simple());
+    tracing::warn!(
+        temp_branch = %temp_branch,
+        target_branch = %desired_branch,
+        fallback_branch = %fallback,
+        error_class = "branch_name_collision",
+        "Task approval branch name collision fallback exhausted short suffixes; using full UUID suffix"
+    );
+    fallback
+}
+
+fn detect_plain_markdown_task_stem(task_file: &str) -> Option<String> {
+    let filename = std::path::Path::new(task_file).file_name()?.to_str()?;
+    match crate::task_source::TaskSource::detect(filename)? {
+        crate::task_source::TaskSource::PlainMarkdown { stem } => Some(stem),
+        crate::task_source::TaskSource::Taskmd { .. } => None,
+    }
 }
 
 /// Blocking implementation of taskmd task approval (REQ-PROJ-028).
@@ -6681,33 +6949,18 @@ fn execute_approve_task_blocking(
     title: &str,
     desired_base_branch: Option<&str>,
 ) -> Result<TaskApprovalResult, String> {
-    // task 13009: a plain-markdown task file (a `.md` file whose name doesn't
-    // match the taskmd pattern) takes a separate, simpler approval path — no
-    // taskmd id/status/slug, no status-rename, branch uniquified by conversation
-    // id. The empty-string legacy shim and all taskmd handling fall through to
-    // the code below (a non-`.md`, non-taskmd path produces the taskmd-pattern
-    // error there).
-    if let Some(filename) = std::path::Path::new(task_file)
-        .file_name()
-        .and_then(|f| f.to_str())
-    {
-        if let Some(crate::task_source::TaskSource::PlainMarkdown { stem }) =
-            crate::task_source::TaskSource::detect(filename)
-        {
-            return execute_approve_plain_markdown_blocking(
-                cwd,
-                repo_root,
-                conv_id,
-                task_file,
-                &stem,
-                title,
-                desired_base_branch,
-            );
-        }
+    if let Some(stem) = detect_plain_markdown_task_stem(task_file) {
+        return execute_approve_plain_markdown_blocking(
+            cwd,
+            repo_root,
+            conv_id,
+            task_file,
+            &stem,
+            title,
+            desired_base_branch,
+        );
     }
 
-    // Serialize approvals so concurrent attempts can't race on the same
-    // branch/worktree name.
     let _guard = TASK_APPROVAL_MUTEX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6724,8 +6977,6 @@ fn execute_approve_task_blocking(
 
     let base_branch = resolve_approval_base_branch(cwd, repo_root, desired_base_branch)?;
 
-    // Parse the on-disk task filename — in taskmd 1.0 the filename is the sole
-    // source of id/priority/status/slug; Phoenix allocates no ID.
     let rel_path = std::path::Path::new(task_file);
     let original_filename = rel_path
         .file_name()
@@ -6742,33 +6993,35 @@ fn execute_approve_task_blocking(
     let slug = parsed.slug.clone();
     let branch_name = format!("task-{task_id}-{slug}");
 
-    let cwd_filepath = cwd.join(rel_path);
-    if !cwd_filepath.exists() {
-        return Err(format!(
-            "Task file '{task_file}' does not exist under {}. \
-             The file must be on disk before approval.",
-            cwd.display()
-        ));
-    }
+    let allow_promoted_retry_recovery =
+        task_approval_worktree_is_retry(repo_root, cwd, &branch_name);
 
-    // REQ-PROJ-028: `cwd` IS the early Explore worktree, on a `task-pending-…`
-    // temp branch, with the task file already under `{tasks_dir}/`. Rename the
-    // temp branch, promote the file's status to `in-progress` if needed, then
-    // commit it on the task branch.
-    let worktree_path = open_early_worktree_and_rename_branch(repo_root, conv_id, &branch_name)?;
+    let taskmd_filename_input = TaskmdApprovalFilenameInput {
+        cwd,
+        tasks_dir_name,
+        task_file,
+        original_filename: &original_filename,
+        task_id: &task_id,
+        priority: parsed.priority,
+        status: parsed.status,
+        slug: &slug,
+        allow_promoted_retry_recovery,
+    };
+    let (approval_filename, approval_status) =
+        resolve_taskmd_approval_filename(&taskmd_filename_input)?;
+
+    let (worktree_path, branch_name) =
+        open_early_worktree_and_rename_branch(repo_root, conv_id, &branch_name)?;
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
 
     let final_filename = promote_task_status_to_in_progress(
         &worktree_path.join(tasks_dir_name),
         &task_id,
-        parsed.status,
-        &original_filename,
+        approval_status,
+        &approval_filename,
     )?;
 
     ensure_gitignore_has_phoenix(&worktree_path)?;
-    // If `update_task` renamed the file, the old name is now a deletion — stage
-    // it so the commit captures the rename rather than a duplicate task ID.
-    // `git add` on an untracked-and-missing path errors harmlessly.
     if final_filename != original_filename {
         let _ = run_git(
             &worktree_path,
@@ -6784,8 +7037,6 @@ fn execute_approve_task_blocking(
         &["add", "--", &format!("{tasks_dir_name}/{final_filename}")],
     )?;
     let commit_msg = format!("task {task_id}: {title}");
-    // Nothing staged — e.g. reusing an existing already-`in-progress` task file
-    // that wasn't modified: it's already on the branch, skip the commit.
     if run_git(&worktree_path, &["diff", "--cached", "--quiet"]).is_err() {
         if let Err(e) = run_git(&worktree_path, &["commit", "-m", &commit_msg]) {
             return Err(format!("Failed to commit task file in worktree: {e}"));
@@ -6867,7 +7118,8 @@ fn execute_approve_plain_markdown_blocking(
     // REQ-PROJ-028: `cwd` IS the early Explore worktree, on a temp branch, with
     // the task file already in place. Rename the temp branch, then commit the
     // file at its own path on it.
-    let worktree_path = open_early_worktree_and_rename_branch(repo_root, conv_id, &branch_name)?;
+    let (worktree_path, branch_name) =
+        open_early_worktree_and_rename_branch(repo_root, conv_id, &branch_name)?;
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
     ensure_gitignore_has_phoenix(&worktree_path)?;
     run_git(&worktree_path, &["add", "--", task_file])?;
@@ -7652,6 +7904,574 @@ mod cwd_immutability_tests {
             !explore_wt.join(".phoenix").exists(),
             ".phoenix must not exist inside the worktree; \
              its presence means a nested worktree was created"
+        );
+    }
+}
+
+#[cfg(test)]
+mod approve_task_branch_collision_tests {
+    use super::test_git_helpers::{add_explore_worktree, add_worktree, branch_exists, init_repo};
+    use super::*;
+
+    #[test]
+    fn approve_task_uses_suffixed_fallback_when_target_branch_exists_locally() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "collision-conv-1234";
+        let base_branch = "main";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
+        let tasks_dir = explore_wt.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let task_filename = "12345-p2-ready--fix-the-login-bug.md";
+        std::fs::write(tasks_dir.join(task_filename), "# Fix\n").unwrap();
+
+        let target_branch = "task-12345-fix-the-login-bug";
+        run_git(&repo_root, &["branch", target_branch]).unwrap();
+        let temp_branch = "task-pending-collisio";
+
+        let result = execute_approve_task_blocking(
+            &explore_wt,
+            &repo_root,
+            conv_id,
+            "tasks",
+            &format!("tasks/{task_filename}"),
+            "Fix the login bug",
+            Some(base_branch),
+        )
+        .expect("approval should fall back to a suffixed branch");
+
+        assert_ne!(result.branch_name, target_branch);
+        assert!(
+            result
+                .branch_name
+                .starts_with("task-12345-fix-the-login-bug-"),
+            "unexpected fallback branch: {}",
+            result.branch_name
+        );
+        assert!(
+            !branch_exists(&repo_root, temp_branch),
+            "temp branch should be renamed to the fallback branch"
+        );
+        assert!(
+            branch_exists(&repo_root, target_branch),
+            "existing branch must be left untouched"
+        );
+        assert!(
+            branch_exists(&repo_root, &result.branch_name),
+            "fallback execution branch must exist"
+        );
+    }
+
+    #[test]
+    fn local_child_ref_namespace_collision_uses_fallback() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "namespace-local";
+        add_explore_worktree(&repo_root, conv_id, "main");
+        let desired_branch = "task-12345-fix-the-login-bug";
+        run_git(&repo_root, &["branch", &format!("{desired_branch}/foo")]).unwrap();
+
+        let (_worktree, branch_name) =
+            open_early_worktree_and_rename_branch(&repo_root, conv_id, desired_branch)
+                .expect("approval should avoid branch namespace prefix collisions");
+
+        assert_ne!(branch_name, desired_branch);
+        assert!(branch_name.starts_with("task-12345-fix-the-login-bug-"));
+        assert!(branch_exists(&repo_root, &branch_name));
+    }
+
+    #[test]
+    fn remote_child_ref_namespace_collision_uses_fallback() {
+        let (_tmp, repo_root) = init_repo();
+        let origin = tempfile::TempDir::new().unwrap();
+        run_git(origin.path(), &["init", "--bare", "-q"]).unwrap();
+        run_git(
+            &repo_root,
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        )
+        .unwrap();
+        run_git(&repo_root, &["push", "-u", "origin", "main"]).unwrap();
+        let desired_branch = "task-12345-fix-the-login-bug";
+        let head = run_git(&repo_root, &["rev-parse", "HEAD"]).unwrap();
+        run_git(
+            origin.path(),
+            &[
+                "update-ref",
+                &format!("refs/heads/{desired_branch}/foo"),
+                &head,
+            ],
+        )
+        .unwrap();
+
+        let conv_id = "namespace-remote";
+        add_explore_worktree(&repo_root, conv_id, "main");
+        let (_worktree, branch_name) =
+            open_early_worktree_and_rename_branch(&repo_root, conv_id, desired_branch)
+                .expect("approval should avoid remote branch namespace prefix collisions");
+
+        assert_ne!(branch_name, desired_branch);
+        assert!(branch_name.starts_with("task-12345-fix-the-login-bug-"));
+        assert!(branch_exists(&repo_root, &branch_name));
+    }
+
+    #[test]
+    fn approval_retry_accepts_recorded_fallback_branch() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "fallback-retry";
+        let base_branch = "main";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
+        let desired_branch = "task-12345-fix-the-login-bug";
+        run_git(&repo_root, &["branch", desired_branch]).unwrap();
+
+        let (first_worktree, fallback_branch) =
+            open_early_worktree_and_rename_branch(&repo_root, conv_id, desired_branch)
+                .expect("first approval should select and record a fallback branch");
+        assert_eq!(first_worktree, explore_wt);
+        assert_ne!(fallback_branch, desired_branch);
+
+        let (retry_worktree, retry_branch) =
+            open_early_worktree_and_rename_branch(&repo_root, conv_id, desired_branch)
+                .expect("retry should accept the recorded fallback branch");
+
+        assert_eq!(retry_worktree, explore_wt);
+        assert_eq!(retry_branch, fallback_branch);
+    }
+
+    #[test]
+    fn fallback_marker_failure_happens_before_branch_rename() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "config-lock";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        let desired_branch = "task-12345-fix-the-login-bug";
+        run_git(&repo_root, &["branch", desired_branch]).unwrap();
+        let config_lock = repo_root.join(".git/config.lock");
+        std::fs::write(&config_lock, "lock").unwrap();
+
+        let error = open_early_worktree_and_rename_branch(&repo_root, conv_id, desired_branch)
+            .expect_err("config lock should fail before the non-idempotent branch rename");
+
+        assert!(
+            error.contains("Failed to record approval fallback branch"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            run_git(&explore_wt, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .unwrap()
+                .trim(),
+            "task-pending-config-l"
+        );
+        std::fs::remove_file(config_lock).unwrap();
+    }
+
+    #[test]
+    fn approve_task_uses_suffixed_fallback_when_target_branch_exists_as_fetched_origin_ref() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "remote-collision";
+        let base_branch = "main";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
+        let tasks_dir = explore_wt.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let task_filename = "12345-p2-ready--fix-the-login-bug.md";
+        std::fs::write(tasks_dir.join(task_filename), "# Fix\n").unwrap();
+
+        let target_branch = "task-12345-fix-the-login-bug";
+        run_git(
+            &repo_root,
+            &[
+                "update-ref",
+                &format!("refs/remotes/origin/{target_branch}"),
+                "HEAD",
+            ],
+        )
+        .unwrap();
+
+        let result = execute_approve_task_blocking(
+            &explore_wt,
+            &repo_root,
+            conv_id,
+            "tasks",
+            &format!("tasks/{task_filename}"),
+            "Fix the login bug",
+            Some(base_branch),
+        )
+        .expect("approval should avoid a poisoned remote branch name");
+
+        assert_ne!(result.branch_name, target_branch);
+        assert!(
+            result
+                .branch_name
+                .starts_with("task-12345-fix-the-login-bug-"),
+            "unexpected fallback branch: {}",
+            result.branch_name
+        );
+        assert!(branch_exists(&repo_root, &result.branch_name));
+    }
+
+    #[test]
+    fn approve_task_uses_suffixed_fallback_when_target_branch_exists_only_on_remote() {
+        let (_tmp, repo_root) = init_repo();
+        let origin = tempfile::TempDir::new().unwrap();
+        run_git(origin.path(), &["init", "--bare", "-q"]).unwrap();
+        run_git(
+            &repo_root,
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        )
+        .unwrap();
+        run_git(&repo_root, &["push", "-u", "origin", "main"]).unwrap();
+
+        let target_branch = "task-12345-fix-the-login-bug";
+        let head = run_git(&repo_root, &["rev-parse", "HEAD"]).unwrap();
+        run_git(
+            origin.path(),
+            &["update-ref", &format!("refs/heads/{target_branch}"), &head],
+        )
+        .unwrap();
+
+        let conv_id = "unfetched-remote";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        let tasks_dir = explore_wt.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let task_filename = "12345-p2-ready--fix-the-login-bug.md";
+        std::fs::write(tasks_dir.join(task_filename), "# Fix\n").unwrap();
+
+        let result = execute_approve_task_blocking(
+            &explore_wt,
+            &repo_root,
+            conv_id,
+            "tasks",
+            &format!("tasks/{task_filename}"),
+            "Fix the login bug",
+            Some("main"),
+        )
+        .expect("approval should query origin and avoid an unfetched remote branch name");
+
+        assert_ne!(result.branch_name, target_branch);
+        assert!(
+            result
+                .branch_name
+                .starts_with("task-12345-fix-the-login-bug-"),
+            "unexpected fallback branch: {}",
+            result.branch_name
+        );
+        assert!(branch_exists(&repo_root, &result.branch_name));
+    }
+
+    #[test]
+    fn namespaced_remote_branch_does_not_poison_exact_task_branch_name() {
+        let (_tmp, repo_root) = init_repo();
+        let origin = tempfile::TempDir::new().unwrap();
+        run_git(origin.path(), &["init", "--bare", "-q"]).unwrap();
+        run_git(
+            &repo_root,
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        )
+        .unwrap();
+        run_git(&repo_root, &["push", "-u", "origin", "main"]).unwrap();
+
+        let target_branch = "task-12345-fix-the-login-bug";
+        let head = run_git(&repo_root, &["rev-parse", "HEAD"]).unwrap();
+        run_git(
+            origin.path(),
+            &[
+                "update-ref",
+                &format!("refs/heads/alice/{target_branch}"),
+                &head,
+            ],
+        )
+        .unwrap();
+
+        let conv_id = "namespaced-remote";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        let tasks_dir = explore_wt.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let task_filename = "12345-p2-ready--fix-the-login-bug.md";
+        std::fs::write(tasks_dir.join(task_filename), "# Fix\n").unwrap();
+
+        let result = execute_approve_task_blocking(
+            &explore_wt,
+            &repo_root,
+            conv_id,
+            "tasks",
+            &format!("tasks/{task_filename}"),
+            "Fix the login bug",
+            Some("main"),
+        )
+        .expect("namespaced remote branch must not force a fallback for the exact free name");
+
+        assert_eq!(result.branch_name, target_branch);
+        assert!(branch_exists(&repo_root, target_branch));
+    }
+
+    #[test]
+    fn phoenix_worktree_branch_collision_uses_fallback() {
+        let (_tmp, repo_root) = init_repo();
+        let target_branch = "task-12345-fix-the-login-bug";
+        add_worktree(&repo_root, "active-other", target_branch);
+
+        let conv_id = "active-collision";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        let tasks_dir = explore_wt.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let task_filename = "12345-p2-ready--fix-the-login-bug.md";
+        std::fs::write(tasks_dir.join(task_filename), "# Fix\n").unwrap();
+
+        let result = execute_approve_task_blocking(
+            &explore_wt,
+            &repo_root,
+            conv_id,
+            "tasks",
+            &format!("tasks/{task_filename}"),
+            "Fix the login bug",
+            Some("main"),
+        )
+        .expect("checked-out Phoenix worktree branch should be left untouched via fallback");
+
+        assert_ne!(result.branch_name, target_branch);
+        assert!(
+            result
+                .branch_name
+                .starts_with("task-12345-fix-the-login-bug-"),
+            "unexpected fallback branch: {}",
+            result.branch_name
+        );
+        assert!(branch_exists(&repo_root, target_branch));
+        assert!(branch_exists(&repo_root, &result.branch_name));
+    }
+
+    #[test]
+    fn non_phoenix_checked_out_branch_collision_uses_fallback() {
+        let (_tmp, repo_root) = init_repo();
+        let target_branch = "task-12345-fix-the-login-bug";
+        let external = tempfile::TempDir::new().unwrap();
+        run_git(
+            &repo_root,
+            &[
+                "worktree",
+                "add",
+                external.path().to_str().unwrap(),
+                "-b",
+                target_branch,
+                "HEAD",
+            ],
+        )
+        .unwrap();
+
+        let conv_id = "external-active";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        let tasks_dir = explore_wt.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let task_filename = "12345-p2-ready--fix-the-login-bug.md";
+        std::fs::write(tasks_dir.join(task_filename), "# Fix\n").unwrap();
+
+        let result = execute_approve_task_blocking(
+            &explore_wt,
+            &repo_root,
+            conv_id,
+            "tasks",
+            &format!("tasks/{task_filename}"),
+            "Fix the login bug",
+            Some("main"),
+        )
+        .expect("non-Phoenix checked-out branch should be left untouched via fallback");
+
+        assert_ne!(result.branch_name, target_branch);
+        assert!(
+            result
+                .branch_name
+                .starts_with("task-12345-fix-the-login-bug-"),
+            "unexpected fallback branch: {}",
+            result.branch_name
+        );
+        assert!(branch_exists(&repo_root, target_branch));
+        assert!(branch_exists(&repo_root, &result.branch_name));
+    }
+
+    #[test]
+    fn approval_retry_requires_exact_branch_match() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "prefix-retry";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        let old_branch = "task-12345-fix-the-login-bug-tests";
+        run_git(
+            &explore_wt,
+            &["branch", "-m", "task-pending-prefix-r", old_branch],
+        )
+        .unwrap();
+
+        let error = open_early_worktree_and_rename_branch(
+            &repo_root,
+            conv_id,
+            "task-12345-fix-the-login-bug",
+        )
+        .expect_err("prefix branch must not be treated as an approval retry");
+
+        assert!(
+            error.contains("Expected approval worktree to be on a task-pending branch"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn approval_retry_skips_rename_when_worktree_already_on_task_branch() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "retry-conv-1234";
+        let base_branch = "main";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
+        let target_branch = "task-12345-fix-the-login-bug";
+        run_git(
+            &explore_wt,
+            &["branch", "-m", "task-pending-retry-co", target_branch],
+        )
+        .unwrap();
+
+        let (worktree_path, branch_name) =
+            open_early_worktree_and_rename_branch(&repo_root, conv_id, target_branch)
+                .expect("retry should continue on the already-renamed branch");
+
+        assert_eq!(worktree_path, explore_wt);
+        assert_eq!(branch_name, target_branch);
+        assert!(branch_exists(&repo_root, target_branch));
+    }
+}
+
+#[cfg(test)]
+mod approve_task_promoted_filename_tests {
+    use super::test_git_helpers::{add_explore_worktree, init_repo};
+    use super::*;
+
+    #[test]
+    fn approval_retry_recovers_already_promoted_task_filename() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "promoted-retry";
+        let base_branch = "main";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
+        let tasks_dir = explore_wt.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let ready_filename = "12345-p2-ready--fix-the-login-bug.md";
+        let in_progress_filename = "12345-p2-in-progress--fix-the-login-bug.md";
+        std::fs::write(tasks_dir.join(in_progress_filename), "# Fix\n").unwrap();
+        let target_branch = "task-12345-fix-the-login-bug";
+        run_git(
+            &explore_wt,
+            &["branch", "-m", "task-pending-promoted", target_branch],
+        )
+        .unwrap();
+
+        let result = execute_approve_task_blocking(
+            &explore_wt,
+            &repo_root,
+            conv_id,
+            "tasks",
+            &format!("tasks/{ready_filename}"),
+            "Fix the login bug",
+            Some(base_branch),
+        )
+        .expect("retry should recover the already-promoted in-progress filename");
+
+        assert_eq!(result.branch_name, target_branch);
+        assert_eq!(result.task_file, format!("tasks/{in_progress_filename}"));
+        assert!(explore_wt.join("tasks").join(in_progress_filename).exists());
+    }
+
+    #[test]
+    fn first_approval_does_not_adopt_promoted_filename_when_ready_file_is_missing() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "not-retry";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        let tasks_dir = explore_wt.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let ready_filename = "12345-p2-ready--fix-the-login-bug.md";
+        let in_progress_filename = "12345-p2-in-progress--fix-the-login-bug.md";
+        std::fs::write(tasks_dir.join(in_progress_filename), "# Fix\n").unwrap();
+
+        let result = execute_approve_task_blocking(
+            &explore_wt,
+            &repo_root,
+            conv_id,
+            "tasks",
+            &format!("tasks/{ready_filename}"),
+            "Fix the login bug",
+            Some("main"),
+        );
+        let Err(error) = result else {
+            panic!("first approval must not silently adopt a different task file path");
+        };
+
+        assert!(
+            error.contains("does not exist"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod approve_task_failure_effect_tests {
+    use super::test_git_helpers::{add_explore_worktree, init_repo};
+    use super::*;
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::state_machine::state::{TaskApprovalHandoff, TaskApprovalOutcome};
+    use crate::state_machine::{ConvContext, ConvState, Event};
+    use crate::tools::BrowserSessionManager;
+    use phoenix_llm::ModelRegistry;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn approval_failure_does_not_dispatch_llm() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "collision-effect-1";
+        let base_branch = "main";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
+        let tasks_dir = explore_wt.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let task_filename = "12345-p2-ready--fix-the-login-bug.md";
+        std::fs::write(tasks_dir.join(task_filename), "# Fix\n").unwrap();
+        std::fs::remove_file(tasks_dir.join(task_filename)).unwrap();
+
+        let mut context = ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000);
+        context.desired_base_branch = Some(base_branch.to_string());
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        let mut rt = ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: format!("tasks/{task_filename}"),
+                title: "Fix the login bug".to_string(),
+                priority: crate::task_source::Priority::P2,
+                plan: "Plan".to_string(),
+            },
+            Arc::new(InMemoryStorage::new()),
+            llm.clone(),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            SseBroadcaster::new(128, 0),
+        );
+
+        let result = rt
+            .process_event(Event::TaskApprovalDecided {
+                outcome: TaskApprovalOutcome::Approved {
+                    handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+                },
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "approval failure must stop the effect chain"
+        );
+        assert!(
+            matches!(rt.state, ConvState::AwaitingTaskApproval { .. }),
+            "approval failure must restore retryable approval state, got {:?}",
+            rt.state
+        );
+        assert!(
+            llm.recorded_requests().is_empty(),
+            "failed approval must not continue into RequestLlm"
         );
     }
 }
