@@ -1,0 +1,654 @@
+-- allium: 3
+-- inline-terminal.allium
+--
+-- Phoenix Inline Terminal: Behavioural Specification
+--
+-- Scope: The `!`-triggered inline PTY terminal hosted in the conversation
+--        composer, and the bridge from its OSC-133-delimited commands to
+--        durable, user-attributed `bash` tool rounds in conversation history.
+-- Includes: session lifecycle (open/close), conversation gating (open only
+--           when idle; busy while live; no agent turn), per-command commit
+--           as a user-originated bash-run round, and the interrupted-round
+--           rule that makes every started command resolve to exactly one round.
+-- Excludes: the PTY/transport/OSC-133 machinery itself (owned by
+--           `specs/terminal`); the bedrock `core_status` busy-state coupling
+--           (a named coordination point, see Deferred); TUI output
+--           snapshotting; backgrounded bash ops; the general user-tool
+--           invocation syntax. The canonical scope boundary is in
+--           requirements.md and executive.md and is not re-duplicated here.
+--
+-- Requirement traceability: REQ-IT-001 through REQ-IT-008
+
+use "../bedrock/bedrock.allium" as bedrock
+use "../terminal/terminal.allium" as terminal
+
+------------------------------------------------------------
+-- Actors
+------------------------------------------------------------
+
+-- The human driving the conversation. Opening or closing an inline terminal
+-- requires a valid API session, as with every other authenticated surface.
+actor User {
+    identified_by: ApiSession
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The resolution of a started command. `completed` when the command's own
+-- OSC 133;D arrived; `interrupted` when its bracket was superseded by the next
+-- command or by session close without a D (REQ-IT-005).
+enum CommandOutcome {
+    completed
+    | interrupted
+}
+
+-- The attribution of a committed tool round. Stored once per round and the
+-- single source of truth for both the LLM-history role and the UI attribution
+-- (REQ-IT-007). The inline terminal path always commits with origin = user;
+-- the existing agent tool path is origin = agent by construction.
+enum Origin {
+    user
+    | agent
+}
+
+-- Why an inline-terminal open was rejected. Carried on
+-- InlineTerminalOpenRejected so the UI can surface an actionable error, in the
+-- shape of bedrock's MessageRejected(reason). A live inline session makes the
+-- conversation busy, so an "already open" attempt is a `conversation_busy` case
+-- too — not a distinct reason.
+enum OpenRejectReason {
+    conversation_busy
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- The `bash` tool-use of an inline round, encoded so REQ-IT-004 holds by
+-- construction: apart from the recorded cwd it carries only a command, so the
+-- backgrounded ops (wait / kill / handle / label / since) are structurally
+-- unrepresentable — an inline round cannot be anything but `bash` `run`. Maps to
+-- `BashToolInput { op: BashOp::Run, cmd }`.
+--
+-- `cwd` is recorded because the inline shell is *persistent* — a `cd` carries
+-- across later commands in the session — while agent `bash` rounds are
+-- independent and run from the conversation cwd. Without the cwd, `cd ui`
+-- followed by `pnpm test` would persist as a bare `pnpm test` that a later agent
+-- reads as running in the conversation root. The cwd is the shell's OSC 7
+-- report at command time (terminal/CwdReportedFromOsc7 → reported_cwd), so each
+-- round is self-describing.
+value BashRunToolUse {
+    cmd: String                    -- the user's typed command (OSC 133;C payload)
+    cwd: String                    -- working directory at execution (OSC 7 reported_cwd)
+}
+
+-- The tool-result half of an inline round. bedrock/ToolResult models only
+-- {tool_use_id, outcome} — the LLM-facing acknowledgement — not the captured
+-- output and exit code REQ-IT-003 commits, so the round carries this dedicated
+-- type instead. `output` is a String, not a richer structure, so
+-- cursor-addressing-output resolution (empty for alt-screen, vt100-resolved for
+-- in-place rewriting; Deferred: TuiCursorAddressedOutput) fits without a shape
+-- change. For an interrupted command `output` is best-effort (may be empty; the
+-- guarantee is that the command is recorded, not that its output survives) and
+-- `exit_code` is None.
+value InlineToolResult {
+    output:    String              -- captured command output (best-effort if interrupted)
+    exit_code: Integer?            -- from OSC 133;D; None when omitted or interrupted
+}
+
+-- The unit committed to conversation history for one inline command: a `bash`
+-- `run` tool-use plus its tool-result, so the LLM history builder reads it on
+-- the same path as an agent `bash` round (Track B shared history, REQ-IT-003).
+-- `tool_use_id` is a fresh Phoenix-generated id (the user authored the call, so
+-- there is no LLM-provided id): it stamps the persisted `tool_use` block and is
+-- referenced by the `tool_result`, the single unique wire-pairing key for the
+-- pair. Origin is NOT derived by scanning history for this id (ids can recur
+-- across turns); it is a property of the round, carried on the round's Agent
+-- message and inherited by the round's Tool message through atomic same-round
+-- commit (OriginDiscriminatorSchema).
+value InlineCommandRound {
+    tool_use_id: String            -- generated, unique; on both the tool_use and tool_result
+    tool_use:    BashRunToolUse    -- structurally `bash` `run` (REQ-IT-004)
+    result:      InlineToolResult
+    outcome:     CommandOutcome
+    origin:      Origin            -- always user on this path (REQ-IT-007)
+}
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+--
+-- Allium has no formal helper-function declaration; the rules below call these
+-- by bare identifier. This block is the single source of truth for their
+-- signatures and semantics.
+--
+--   inline_bracket_open(session: InlineTerminalSession) -> Boolean
+--       True when the session holds a started-but-uncommitted command — i.e.
+--       session.open_command != None. Reads the session's OWN field, which is
+--       defined in every session state (including closed), so the bracket check
+--       never depends on the underlying terminal's transient current_command
+--       (undefined after terminal teardown). (REQ-IT-005)
+--
+--   command_cwd(session: InlineTerminalSession) -> String
+--       The working directory for a command committed now: the session's most
+--       recent OSC 7 report (terminal/CwdReportedFromOsc7 → reported_cwd),
+--       falling back to the conversation cwd when the shell has emitted no OSC 7.
+--
+--   command_text_or_unknown(raw: String) -> String
+--       `raw` when the OSC 133;C payload is non-empty; otherwise an explicit
+--       "[command unavailable]" marker. Some shells emit C with no payload; a
+--       blank `cmd` beside real output would misrepresent what the user ran, so
+--       it is recorded as unavailable rather than an empty `bash` command. The
+--       inline terminal installs integration hooks that populate the payload, so
+--       this fallback is defensive, not the norm.
+--
+--   completed_round(session: InlineTerminalSession, record: terminal/CommandRecord)
+--           -> InlineCommandRound
+--       The round for a command that finished (OSC 133;D). tool_use_id = a fresh
+--       generated id; tool_use = BashRunToolUse(cmd:
+--       command_text_or_unknown(record.command_text), cwd: command_cwd(session));
+--       the `bash` tool-result comes from the finalized `record` (captured output
+--       + exit-code annotation, using the bash tool's existing result
+--       formatting; a None exit_code renders as "no exit code", never fabricated
+--       as 0). outcome = completed, origin = user (REQ-IT-007 — origin is fixed
+--       by this path, not a caller choice).
+--
+--   interrupted_round(session: InlineTerminalSession, command_text: String)
+--           -> InlineCommandRound
+--       The round for a command whose bracket was superseded or closed without a
+--       D. tool_use_id = a fresh generated id; tool_use = BashRunToolUse(cmd:
+--       command_text_or_unknown(command_text), cwd: command_cwd(session)); a
+--       best-effort tool-result — the guarantee is that the command is recorded,
+--       its output may be empty (output fidelity for a cut-off command is the
+--       shared CommandTracker concern, Deferred: TuiCursorAddressedOutput).
+--       outcome = interrupted, origin = user. The inline layer keeps only the
+--       command text for an open bracket (session.open_command).
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- The inline session's own pseudoterminal: a PTY spawned via the `specs/terminal`
+-- spawn path but NOT the panel `terminal/Terminal` entity, so it is deliberately
+-- outside that spec's OneTerminalPerWorkScope invariant — the inline session is a
+-- separate, short-lived terminal, not a second panel terminal for the scope. Its
+-- OSC 133 byte stream (fed through the terminal CommandTracker) is the source of
+-- the session's command-boundary events (Osc133CommandStart / Osc133CommandFinish
+-- on the InlineCommandBridge surface); finalized commands reuse
+-- terminal/CommandRecord.
+external entity InlinePty {
+}
+
+-- An inline PTY terminal hosted in the composer for one conversation, opened by
+-- the `!` sigil. Distinct from the per-WorkScope panel terminal of
+-- `specs/terminal` (REQ-TERM-003). Short-lived: spawned on open, torn down on
+-- close.
+entity InlineTerminalSession {
+    -- The conversation whose composer hosts this session and whose history
+    -- receives the committed rounds.
+    conversation: bedrock/Conversation
+
+    -- The session's own pseudoterminal (InlinePty), distinct from the panel
+    -- `terminal/Terminal` and outside its OneTerminalPerWorkScope invariant. Its
+    -- OSC 133 tracking drives the InlineCommandBridge command events. Present
+    -- only while live — spawned on open, torn down on close — matching the
+    -- OS-handle-when-active pattern in specs/terminal (master_fd/child_pid).
+    pty: InlinePty when status = live
+
+    -- Lifecycle state. `closed` is both the initial and terminal state: a `!`
+    -- opens a fresh live session; closing returns to closed.
+    status: closed | live
+
+    transitions status {
+        closed -> live
+        live -> closed
+    }
+
+    -- The command text of the started-but-uncommitted command, if any: set on
+    -- Osc133CommandStart, cleared on every commit path. The inline commit
+    -- layer's OWN state, held so the bracket check and the interrupted flush
+    -- never read the terminal's transient current_command (undefined after
+    -- teardown, and overwritten by the terminal's own C handling). This is a
+    -- non-overlapping contract, not a parallel representation of
+    -- terminal.current_command: that field drives the terminal HUD ring
+    -- (capacity-5, ✓/✗); this holds only the text needed to commit the single
+    -- outstanding interrupted round. Not status-guarded — `None` in a closed
+    -- session, which the ClosedSessionHasNoOpenBracket invariant depends on.
+    open_command: String?
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    return_to_composer_idle_debounce: Duration = 600.ms
+    -- The terminal input line must sit empty and idle (no edits) for at least
+    -- this long before a backspace on it is read as the deliberate
+    -- return-to-composer gesture rather than the tail of a hold-to-delete burst
+    -- that just emptied the line (REQ-IT-006). A tuning parameter: the
+    -- disambiguation intent is the stable contract; the exact window is
+    -- calibrated against real typing.
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- ===========================================================
+-- 1. SESSION LIFECYCLE (REQ-IT-001, REQ-IT-002, REQ-IT-006)
+-- ===========================================================
+
+-- REQ-IT-001, REQ-IT-002: `!` opens an inline terminal, only when idle.
+rule OpenInlineTerminal {
+    when: UserOpensInlineTerminal(session, conversation, pty)
+
+    requires: session.status = closed
+    -- Idle-only: the conversation must not be busy. By
+    -- LiveInlineSessionImpliesConversationBusy an idle conversation has no
+    -- live inline session, so this also guarantees the at-most-one rule.
+    requires: conversation.core_status = idle
+
+    ensures: session.status = live
+    ensures: session.conversation = conversation
+    ensures: session.pty = pty
+    -- Drive the conversation busy: this transition is what maintains
+    -- LiveInlineSessionImpliesConversationBusy. It is realized as the bedrock
+    -- `inline_terminal` core_status (non-idle, never followed by an LLM
+    -- request); the enum variant itself is the deferred bedrock coupling
+    -- (BedrockInlineTerminalBusyState), but the transition is emitted here so
+    -- opening does not leave the conversation idle while a live session exists.
+    ensures: EnterInlineTerminalBusy(conversation)
+
+    @guidance
+        -- `!` as the first character of the composer is the trigger. It does
+        -- NOT flow through the @/ message expander (those rewrite a prose
+        -- message that is still submitted as a UserMessage and requests the
+        -- LLM). Opening the inline terminal submits no message and requests no
+        -- LLM; it switches the composer to terminal mode and spawns a PTY via
+        -- the `specs/terminal` spawn path, with the conversation's working
+        -- directory as cwd.
+}
+
+-- REQ-IT-002: opening is rejected while the conversation is busy.
+rule RejectOpenInlineTerminalWhileBusy {
+    when: UserOpensInlineTerminal(_session, conversation, _pty)
+
+    requires: conversation.core_status != idle
+
+    ensures: InlineTerminalOpenRejected(conversation, conversation_busy)
+
+    @guidance
+        -- Disjoint with OpenInlineTerminal on core_status (idle vs not idle).
+        -- A conversation that already hosts a live inline session is non-idle
+        -- by LiveInlineSessionImpliesConversationBusy, so the "second session"
+        -- case is covered here. Surface as a non-blocking rejection; no PTY is
+        -- spawned.
+}
+
+-- REQ-IT-005, REQ-IT-006: closing flushes any open bracket, then returns idle.
+rule UserClosesInlineTerminal {
+    when: UserClosesInlineTerminal(session)
+
+    requires: session.status = live
+
+    -- Guaranteed terminal flush: an open bracket (a command with no D) is
+    -- committed as interrupted before the session goes away, so it is never
+    -- lost (REQ-IT-005). Built from the session's own open_command, so it does
+    -- not depend on the terminal still being alive.
+    ensures:
+        if inline_bracket_open(session):
+            InlineRoundCommitted(
+                session.conversation,
+                interrupted_round(session, session.open_command)
+            )
+
+    ensures: session.open_command = None
+    ensures: session.status = closed
+    -- Return the conversation to idle (no LLM request) — the counterpart to
+    -- OpenInlineTerminal's EnterInlineTerminalBusy, clearing the bedrock
+    -- `inline_terminal` busy state (BedrockInlineTerminalBusyState).
+    ensures: ExitInlineTerminalToIdle(session.conversation)
+
+    @guidance
+        -- Two trigger sources, both ending at session closed:
+        --   1. The shell process terminates (exit, Ctrl-D).
+        --   2. The return-to-composer gesture: a backspace on an empty terminal
+        --      input line that has been idle (no edits) for at least
+        --      return_to_composer_idle_debounce. The debounce disambiguates a
+        --      deliberate, isolated backspace-on-empty (exit) from the final
+        --      backspaces of a hold-to-delete burst that just emptied the line
+        --      (not exit) — a backspace within the debounce window after the
+        --      line empties is consumed by the terminal, not read as the exit
+        --      gesture. Detecting an empty input line depends on OSC 133 prompt
+        --      markers / cursor position; a shell without integration falls back
+        --      to shell exit (Ctrl-D) as the only close path (see the shell
+        --      integration prerequisite in requirements.md, REQ-IT-001).
+        -- The interrupted flush reads session.open_command and commits BEFORE
+        -- the PTY teardown, so it does not race the terminal dropping its
+        -- current_command. The conversation returns to idle WITHOUT an LLM
+        -- request (REQ-IT-006); see the NoAgentTurn guarantee and Deferred:
+        -- BedrockInlineTerminalBusyState for the core_status return-to-idle
+        -- coupling. The PTY is torn down (`specs/terminal` teardown path).
+}
+
+-- REQ-IT-006: transport loss is a close path, not a stuck busy state. A live
+-- session owns the conversation busy state, but the close events above are all
+-- user-driven; if the transport drops (WebSocket disconnect, browser tab
+-- reload, composer unmount) no user actor remains to close it. Transport loss
+-- therefore drives the same close-and-flush as UserClosesInlineTerminal, so the
+-- conversation cannot be left non-idle — rejecting messages and reopening —
+-- with no way back.
+rule TransportLossClosesInlineSession {
+    when: InlineSessionTransportLost(session)
+
+    requires: session.status = live
+
+    -- Identical close semantics to UserClosesInlineTerminal: flush any open
+    -- bracket interrupted, clear it, close, and return the conversation to idle.
+    ensures:
+        if inline_bracket_open(session):
+            InlineRoundCommitted(
+                session.conversation,
+                interrupted_round(session, session.open_command)
+            )
+
+    ensures: session.open_command = None
+    ensures: session.status = closed
+    ensures: ExitInlineTerminalToIdle(session.conversation)
+
+    @guidance
+        -- Emitted when the session's transport is lost: the composer WebSocket
+        -- disconnects, the tab reloads, or the composer unmounts while the shell
+        -- is still live. Mirrors the panel terminal's teardown-on-disconnect
+        -- (`specs/terminal`: master fd closed on WebSocket disconnect). The
+        -- inline PTY is ephemeral, so the session is closed rather than held for
+        -- reconnection; the committed rounds are the durable record.
+}
+
+-- ===========================================================
+-- 2. PER-COMMAND COMMIT (REQ-IT-003, REQ-IT-004, REQ-IT-005)
+-- ===========================================================
+--
+-- The inline session commits rounds at the terminal's OSC 133 command
+-- boundaries, delivered as the Osc133CommandStart / Osc133CommandFinish events
+-- of the InlineCommandBridge surface (derived from `specs/terminal`'s
+-- CommandExecutionStarted on C / CommandExecutionFinished on D). The session's
+-- open_command holds the outstanding bracket between those events.
+
+-- REQ-IT-005: a new command starting supersedes any still-open bracket.
+rule InlineCommandStarting {
+    when: Osc133CommandStart(session, command_text)
+
+    requires: session.status = live
+
+    -- Supersession flush: if the previous command never produced a D, its
+    -- bracket is committed interrupted here, then this same rule opens the new
+    -- bracket. Flush-then-reopen in one rule pins the ordering structurally —
+    -- the outgoing bracket is committed before it is overwritten, with no
+    -- cross-spec race against the terminal's own current_command handling. This
+    -- is the "C then another C" flush.
+    ensures:
+        if inline_bracket_open(session):
+            InlineRoundCommitted(
+                session.conversation,
+                interrupted_round(session, session.open_command)
+            )
+
+    ensures: session.open_command = command_text
+
+    @guidance
+        -- Osc133CommandStart is derived from terminal/CommandExecutionStarted
+        -- (OSC 133;C). The bracket records only the command text. An interrupted
+        -- round built from it (interrupted_round) carries that text and
+        -- best-effort output — output fidelity for a cut-off command is the
+        -- shared CommandTracker concern (Deferred: TuiCursorAddressedOutput),
+        -- not a hard postcondition. The structural guarantee is that the bracket
+        -- exists and resolves to exactly one round.
+}
+
+-- REQ-IT-003, REQ-IT-004: a completed command commits as a completed round.
+rule InlineCommandCompleted {
+    when: Osc133CommandFinish(session, record)
+
+    requires: session.status = live
+
+    -- `record` is the finalized terminal CommandRecord: output captured between
+    -- C and D, exit_code from the D payload (None when D omits it — never
+    -- fabricated as 0, matching terminal/CommandRecord). Committed as a
+    -- user-originated bash-run round (Track B), then the bracket is cleared.
+    ensures: InlineRoundCommitted(session.conversation, completed_round(session, record))
+    ensures: session.open_command = None
+
+    @guidance
+        -- Osc133CommandFinish is derived from terminal/CommandExecutionFinished
+        -- (OSC 133;D). InlineRoundCommitted persists the InlineCommandRound as
+        -- two messages on the conversation: an Agent message carrying a `bash`
+        -- tool-use ContentBlock (op run, cmd = record.command_text) and a Tool
+        -- message carrying the tool-result. Only the `run` operation is ever
+        -- produced (REQ-IT-004); the bash wait/kill/handle operations have no
+        -- inline analog. origin = user (REQ-IT-007), fixed by completed_round.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- REQ-IT-002: at most one live inline session per conversation. Opening
+-- requires core_status = idle, and a live session keeps the conversation busy,
+-- so a second concurrent live session for the same conversation is
+-- unreachable.
+invariant AtMostOneLiveInlineSessionPerConversation {
+    for s in InlineTerminalSession where s.status = live:
+        count(InlineTerminalSession{conversation: s.conversation, status: live}) <= 1
+}
+
+-- REQ-IT-002: a live inline session keeps the conversation out of idle, so the
+-- agent cannot run while the user drives the terminal. Established by the
+-- transitions this spec emits — OpenInlineTerminal's EnterInlineTerminalBusy
+-- sets it, UserClosesInlineTerminal's ExitInlineTerminalToIdle clears it — and
+-- realized as the bedrock `inline_terminal` core_status (the enum variant is the
+-- deferred coupling, BedrockInlineTerminalBusyState). A cross-spec invariant:
+-- this spec drives the transition, bedrock holds the state.
+invariant LiveInlineSessionImpliesConversationBusy {
+    for s in InlineTerminalSession:
+        s.status = live implies
+            s.conversation.core_status != idle
+}
+
+-- REQ-IT-005: a closed session leaves no started-but-uncommitted command
+-- behind. Every bracket is closed exactly once — by its own D
+-- (InlineCommandCompleted), by the next command's C (InlineCommandStarting),
+-- or by session close (UserClosesInlineTerminal) — each of which clears
+-- open_command after committing exactly one round. The invariant is stated over
+-- the session's OWN open_command (defined in the closed state), not the
+-- terminal's transient current_command, so it holds independently of terminal
+-- teardown ordering.
+invariant ClosedSessionHasNoOpenBracket {
+    for s in InlineTerminalSession:
+        s.status = closed implies
+            not inline_bracket_open(s)
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface UserInlineTerminalAccess {
+    facing user: User
+        -- Opening or closing an inline terminal requires a valid API session,
+        -- as with the panel terminal (`specs/terminal` REQ-TERM-013).
+
+    context session: InlineTerminalSession
+    context conversation: bedrock/Conversation
+    context pty: InlinePty
+
+    exposes:
+        session.status
+
+    provides:
+        UserOpensInlineTerminal(session, conversation, pty)
+            when session.status = closed
+
+        UserClosesInlineTerminal(session)
+            when session.status = live
+
+    @guarantee NoAgentTurn
+        -- No rule on this surface issues an LLM request. Opening, running
+        -- commands in, and closing an inline terminal advance the conversation
+        -- without any agent turn (REQ-IT-006). Contrast bedrock's
+        -- UserSendsMessage, which transitions a prose message to
+        -- llm_requesting. Mutual exclusion via the busy state
+        -- (LiveInlineSessionImpliesConversationBusy) also prevents the agent
+        -- running concurrently with the user's terminal.
+
+    @guarantee UserOriginated
+        -- Every round committed via InlineRoundCommitted carries origin = user,
+        -- stored once (REQ-IT-007). The LLM-history role (read as prior agent
+        -- tool activity) and the UI attribution (user-initiated command) are
+        -- both derived from that single marker, never stored independently —
+        -- mirroring the MessageContent::Skill role/attribution split. This
+        -- provenance is what keeps an un-gated user command from being
+        -- mistaken for an agent-issued one (REQ-IT-008).
+
+    @guarantee RunOpOnly
+        -- Inline rounds are `bash` tool calls with operation `run` only. The
+        -- backgrounded operations (wait, kill, and the handle/label/since
+        -- machinery) are never produced by the inline terminal path
+        -- (REQ-IT-004).
+
+    @guarantee EveryStartedCommandResolvesOnce
+        -- Every command that starts (OSC 133;C) in a live session resolves to
+        -- exactly one committed round: `completed` when its own D arrives, or
+        -- `interrupted` when its bracket is superseded by the next command or
+        -- by session close (REQ-IT-005). No started command is dropped, and
+        -- none is committed twice — see ClosedSessionHasNoOpenBracket.
+}
+
+-- The OSC 133 → commit bridge. The command-boundary events the commit rules
+-- fire on arrive here as external inputs, derived from the session terminal's
+-- OSC 133 tracking (`specs/terminal`). Modeling them as `expects:` on a surface
+-- makes the commit triggers reachable — they are provider inputs, not events
+-- some rule must emit — the same shape as terminal.allium's
+-- ShellIntegrationProtocol.
+surface InlineCommandBridge {
+    facing source: InlinePty
+        -- The session's own PTY and its OSC 133 command tracking. Phoenix derives
+        -- the two events below from terminal/CommandExecutionStarted (C) and
+        -- terminal/CommandExecutionFinished (D), scoped to the inline session.
+
+    context session: InlineTerminalSession
+
+    exposes:
+        session.status
+        session.open_command
+
+    expects:
+        Osc133CommandStart(session, command_text)
+            -- A command began (OSC 133;C). Payload is the typed command text
+            -- (may be empty). Drives InlineCommandStarting: supersede any open
+            -- bracket, then open the new one.
+
+        Osc133CommandFinish(session, record)
+            -- A command finished (OSC 133;D). Carries the finalized terminal
+            -- CommandRecord (output + exit_code, or None). Drives
+            -- InlineCommandCompleted: commit the completed round, clear bracket.
+
+        InlineSessionTransportLost(session)
+            -- The session's transport dropped (WebSocket disconnect, tab reload,
+            -- composer unmount) with no user actor to close it. Drives
+            -- TransportLossClosesInlineSession: flush, close, return to idle —
+            -- so a live session cannot strand the conversation non-idle.
+
+    @guarantee CommitOrderingPinned
+        -- The commit layer holds its own open_command, so supersession
+        -- (flush-then-reopen in InlineCommandStarting) and the close flush both
+        -- resolve the outgoing bracket without reading the terminal's transient
+        -- current_command. There is no cross-spec ordering dependency on the
+        -- terminal's own C/D handling — the data-loss race REQ-IT-005 guards
+        -- against cannot occur.
+}
+
+------------------------------------------------------------
+-- Deferred
+------------------------------------------------------------
+
+deferred BedrockInlineTerminalBusyState
+    -- The conversation-busy representation while an inline session is live is a
+    -- new bedrock `core_status` variant (`inline_terminal`): non-idle so the
+    -- agent cannot run, but never followed by an LLM request, and exiting to
+    -- `idle` on session close. It must join bedrock's `is_busy` predicate so
+    -- `RejectMessageWhileBusy` covers it. This spec drives the transitions —
+    -- OpenInlineTerminal emits EnterInlineTerminalBusy, UserClosesInlineTerminal
+    -- emits ExitInlineTerminalToIdle — and reads the gate (core_status = idle on
+    -- open; non-idle while live). What is deferred is only bedrock's side: the
+    -- enum variant and its idle-return transition, added in `specs/bedrock`
+    -- (`Conversation.core_status`, `Conversation.is_busy`), which consume these
+    -- two transitions.
+    --
+    -- The `inline_terminal` busy state must also be NON-STEERABLE:
+    -- `specs/steering-messages` queues a message for any busy conversation and
+    -- drains it — issuing an agent request — on the next transition to idle.
+    -- Since close transitions inline_terminal → idle, a queued steering message
+    -- would fire an agent turn on close, breaking the no-agent-turn contract
+    -- (NoAgentTurn). So steering acceptance must exclude `inline_terminal`
+    -- (reject rather than queue), alongside the bedrock enum change.
+    -- Location: specs/bedrock/, specs/steering-messages/
+
+deferred OriginDiscriminatorSchema
+    -- REQ-IT-007's single `origin` marker (user | agent) is a new persisted
+    -- field. A tool round is two message rows — an Agent message carrying the
+    -- `tool_use` and a Tool message carrying the `tool_result` — so "stored
+    -- once" means origin lives on exactly one: the Agent message (the authored
+    -- `tool_use`). The paired Tool message stores no copy; it inherits origin by
+    -- belonging to the same round — the Agent + Tool pair is committed
+    -- atomically and adjacently — NOT by scanning history for a matching
+    -- `tool_use_id`, which is unsafe because ids can recur across turns.
+    -- `tool_use_id` is the LLM-format wire pairing key (generated unique per
+    -- round; see InlineCommandRound), a separate concern from origin.
+    -- `MessageContent` carries no `origin` today; no new variant is added
+    -- (inline rounds reuse Agent + Tool messages), but the Agent message gains
+    -- an `origin` column (default `agent` for existing rows — a true-absence
+    -- default, since pre-feature messages were all agent-authored). Tracked here
+    -- so the schema addition is visible the way the core_status coupling is,
+    -- rather than left implicit. Rationale: ADR-004.
+    -- Location: crates/phoenix-core/src/domain/db_schema.rs
+
+deferred TuiCursorAddressedOutput
+    -- The OSC-133 output capture concatenates ANSI-stripped printable bytes
+    -- between C and D, which is correct for line-oriented commands but produces
+    -- a smear of paint traffic for cursor-addressing programs. Two sub-cases,
+    -- both ultimately a `specs/terminal` CommandTracker concern (the panel
+    -- terminal's read_terminal hits the same limitation) that the inline
+    -- terminal inherits rather than re-solves:
+    --   1. Alternate-screen programs (vim, htop, less, full-screen fzf) emit
+    --      ?1049h on entry and ?1049l on exit, restoring the main screen and
+    --      discarding their scratch buffer. Their truthful captured output is
+    --      EMPTY — the program cleaned up after itself; any file edit is a
+    --      filesystem side effect, observable as for an agent bash edit. The
+    --      tracker (a vte::Perform fed every byte) can detect the alt-screen
+    --      enter/leave and elide the output (or store an "[interactive
+    --      program]" marker).
+    --   2. In-place main-screen rewriting (progress bars/spinners using \r and
+    --      cursor moves) wants the vt100-parser-resolved screen text, not the
+    --      raw concatenation, so overwrites collapse to the final line state.
+    -- The InlineCommandRound `result` is the typed tool-result so either
+    -- resolution fits without migrating persisted rounds.
+    -- Location: specs/terminal/
+
+deferred PanelTerminalSharing
+    -- Reconciling the inline session with the per-WorkScope panel terminal
+    -- (`specs/terminal` REQ-TERM-003) into one shared session. Kept separate
+    -- here to preserve the one-panel-terminal-per-WorkScope invariant.
+    -- Location: specs/terminal/
+
+deferred GeneralUserToolInvocation
+    -- A general `$tool` / `T.tool` syntax for invoking other eligible tools
+    -- (chiefly MCP / project integrations with no shell equivalent) directly as
+    -- the user. Shares the user-origin attribution model (Origin,
+    -- InlineRoundCommitted's provenance); the inline terminal is its `bash`
+    -- specialization. The umbrella requirements live in
+    -- `specs/user-tool-invocation`.
+    -- Location: specs/user-tool-invocation/
