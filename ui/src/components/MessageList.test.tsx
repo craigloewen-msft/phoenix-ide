@@ -1037,7 +1037,7 @@ describe('handleTotalListHeightChanged', () => {
       // Finger lifts; once the suppress window expires, a pinned user is
       // followed again.
       fireEvent.touchEnd(scroller, { touches: [] });
-      act(() => vi.advanceTimersByTime(500));
+      act(() => vi.advanceTimersByTime(1300));
       setupScroller(scroller, { scrollHeight: 700, scrollTop: 200, clientHeight: 400 });
       // oldFromBottom = 600 - 200 - 400 = 0 (pinned)
       act(() => virtuosoMock.totalListHeightChanged?.(700));
@@ -1089,7 +1089,7 @@ describe('handleTotalListHeightChanged', () => {
 
       // After the window expires with no further upward movement, a pinned
       // user is followed again.
-      act(() => vi.advanceTimersByTime(500));
+      act(() => vi.advanceTimersByTime(1300));
       setupScroller(scroller, { scrollHeight: 700, scrollTop: 200, clientHeight: 400 });
       // oldFromBottom = 600 - 200 - 400 = 0 (pinned)
       act(() => virtuosoMock.totalListHeightChanged?.(700));
@@ -1098,6 +1098,256 @@ describe('handleTotalListHeightChanged', () => {
       vi.useRealTimers();
     }
   });
+
+  it('keeps pinned auto-follow after a tap-only touch during active tail growth', () => {
+    vi.useFakeTimers();
+    try {
+      const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+      const subAgentsState: ConversationState = {
+        type: 'awaiting_sub_agents',
+        pending: [],
+        completed_results: [],
+      };
+      const { container } = render(
+        withConvContext(
+          <MessageList
+            messages={historical}
+            pendingMessages={[]}
+            convState={subAgentsState}
+            onRetry={vi.fn()}
+            onOpenFile={undefined}
+            conversationId="conv-pinned-tap"
+          />,
+        ),
+      );
+
+      const scroller = container.querySelector<HTMLElement>('#messages')!;
+      vi.setSystemTime(1000);
+      setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
+      fireEvent.scroll(scroller);
+      act(() => virtuosoMock.totalListHeightChanged?.(500));
+      virtuosoMock.scrollToIndex.mockClear();
+
+      vi.setSystemTime(1050);
+      fireEvent.touchStart(scroller, { touches: [{}] });
+      vi.setSystemTime(1060);
+      fireEvent.touchEnd(scroller, { touches: [] });
+      vi.setSystemTime(1100);
+      setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 400 });
+      act(() => virtuosoMock.totalListHeightChanged?.(600));
+
+      expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+      expect(container.querySelector('.jump-to-newest')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps pinned auto-follow after upward scroll returns to bottom before a tap', () => {
+    vi.useFakeTimers();
+    try {
+      const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+      const subAgentsState: ConversationState = {
+        type: 'awaiting_sub_agents',
+        pending: [],
+        completed_results: [],
+      };
+      const { container } = render(
+        withConvContext(
+          <MessageList
+            messages={historical}
+            pendingMessages={[]}
+            convState={subAgentsState}
+            onRetry={vi.fn()}
+            onOpenFile={undefined}
+            conversationId="conv-return-bottom-tap"
+          />,
+        ),
+      );
+
+      const scroller = container.querySelector<HTMLElement>('#messages')!;
+      vi.setSystemTime(1000);
+      setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
+      fireEvent.scroll(scroller);
+      act(() => virtuosoMock.totalListHeightChanged?.(500));
+      virtuosoMock.scrollToIndex.mockClear();
+
+      vi.setSystemTime(1050);
+      setupScroller(scroller, { scrollHeight: 500, scrollTop: 80, clientHeight: 400 });
+      fireEvent.scroll(scroller);
+      act(() => virtuosoMock.atBottomStateChange?.(true));
+
+      vi.setSystemTime(1100);
+      fireEvent.touchStart(scroller, { touches: [{}] });
+      vi.setSystemTime(1110);
+      fireEvent.touchEnd(scroller, { touches: [] });
+      vi.setSystemTime(1150);
+      setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 400 });
+      act(() => virtuosoMock.totalListHeightChanged?.(600));
+
+      expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+      expect(container.querySelector('.jump-to-newest')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+
+  it('does NOT re-snap after a second iOS braking touch with sparse scroll events', () => {
+    vi.useFakeTimers();
+    try {
+      const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+      const subAgentsState: ConversationState = {
+        type: 'awaiting_sub_agents',
+        pending: [],
+        completed_results: [],
+      };
+      const { container } = render(
+        withConvContext(
+          <MessageList
+            messages={historical}
+            pendingMessages={[]}
+            convState={subAgentsState}
+            onRetry={vi.fn()}
+            onOpenFile={undefined}
+            conversationId="conv-ios-brake"
+          />,
+        ),
+      );
+
+      const scroller = container.querySelector<HTMLElement>('#messages')!;
+      vi.setSystemTime(1000);
+      setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
+      fireEvent.scroll(scroller);
+      act(() => virtuosoMock.totalListHeightChanged?.(500));
+      virtuosoMock.scrollToIndex.mockClear();
+
+      vi.setSystemTime(1050);
+      fireEvent.touchStart(scroller, { touches: [{}] });
+      vi.setSystemTime(1070);
+      fireEvent.touchMove(scroller, { touches: [{}] });
+      vi.setSystemTime(1080);
+      fireEvent.touchEnd(scroller, { touches: [] });
+      vi.setSystemTime(1100);
+      setupScroller(scroller, { scrollHeight: 500, scrollTop: 80, clientHeight: 400 });
+      fireEvent.scroll(scroller);
+      act(() => virtuosoMock.atBottomStateChange?.(false));
+
+      vi.setSystemTime(1800);
+      fireEvent.touchStart(scroller, { touches: [{}] });
+      vi.setSystemTime(1820);
+      fireEvent.touchMove(scroller, { touches: [{}] });
+      vi.setSystemTime(1830);
+      fireEvent.touchEnd(scroller, { touches: [] });
+
+      vi.setSystemTime(1900);
+      setupScroller(scroller, { scrollHeight: 600, scrollTop: 80, clientHeight: 400 });
+      act(() => virtuosoMock.totalListHeightChanged?.(600));
+      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+      expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+      vi.setSystemTime(3101);
+      setupScroller(scroller, { scrollHeight: 700, scrollTop: 200, clientHeight: 400 });
+      act(() => virtuosoMock.totalListHeightChanged?.(700));
+      expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does NOT re-snap after a moved touch before any upward scroll event', () => {
+    vi.useFakeTimers();
+    try {
+      const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+      const subAgentsState: ConversationState = {
+        type: 'awaiting_sub_agents',
+        pending: [],
+        completed_results: [],
+      };
+      const { container } = render(
+        withConvContext(
+          <MessageList
+            messages={historical}
+            pendingMessages={[]}
+            convState={subAgentsState}
+            onRetry={vi.fn()}
+            onOpenFile={undefined}
+            conversationId="conv-touchmove-no-scroll"
+          />,
+        ),
+      );
+
+      const scroller = container.querySelector<HTMLElement>('#messages')!;
+      vi.setSystemTime(1000);
+      setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
+      fireEvent.scroll(scroller);
+      act(() => virtuosoMock.totalListHeightChanged?.(500));
+      act(() => virtuosoMock.atBottomStateChange?.(false));
+      virtuosoMock.scrollToIndex.mockClear();
+
+      vi.setSystemTime(1050);
+      fireEvent.touchStart(scroller, { touches: [{}] });
+      vi.setSystemTime(1060);
+      fireEvent.touchMove(scroller, { touches: [{}] });
+      vi.setSystemTime(1070);
+      fireEvent.touchEnd(scroller, { touches: [] });
+      vi.setSystemTime(1100);
+      setupScroller(scroller, { scrollHeight: 600, scrollTop: 95, clientHeight: 400 });
+      act(() => virtuosoMock.totalListHeightChanged?.(600));
+
+      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+      expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does NOT re-snap when at-bottom fires during a moved touch before touch end', () => {
+    vi.useFakeTimers();
+    try {
+      const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+      const subAgentsState: ConversationState = {
+        type: 'awaiting_sub_agents',
+        pending: [],
+        completed_results: [],
+      };
+      const { container } = render(
+        withConvContext(
+          <MessageList
+            messages={historical}
+            pendingMessages={[]}
+            convState={subAgentsState}
+            onRetry={vi.fn()}
+            onOpenFile={undefined}
+            conversationId="conv-atbottom-during-touchmove"
+          />,
+        ),
+      );
+
+      const scroller = container.querySelector<HTMLElement>('#messages')!;
+      vi.setSystemTime(1000);
+      setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
+      fireEvent.scroll(scroller);
+      act(() => virtuosoMock.totalListHeightChanged?.(500));
+      virtuosoMock.scrollToIndex.mockClear();
+
+      vi.setSystemTime(1050);
+      fireEvent.touchStart(scroller, { touches: [{}] });
+      vi.setSystemTime(1060);
+      fireEvent.touchMove(scroller, { touches: [{}] });
+      act(() => virtuosoMock.atBottomStateChange?.(true));
+      vi.setSystemTime(1070);
+      fireEvent.touchEnd(scroller, { touches: [] });
+      vi.setSystemTime(1100);
+      setupScroller(scroller, { scrollHeight: 600, scrollTop: 95, clientHeight: 400 });
+      act(() => virtuosoMock.totalListHeightChanged?.(600));
+
+      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
 
   it('downward scroll does not suppress the pinned re-snap', () => {
     const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
