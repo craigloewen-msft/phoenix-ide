@@ -23,11 +23,11 @@
 --   - Webhook-triggered wake
 --   - Compound semantics (wait_all, wait_any)
 --   - First-fire-wins / supersede semantics (deliberately rejected;
---     see design.md "Independent multi-contract semantics")
+--     see ADR-006 "Multiple contracts on one conversation resolve independently")
 --   - A first-class AwaitingWake conv state (deliberately rejected;
---     see design.md "Why No AwaitingWake State")
+--     see ADR-006 "A new AwaitingWake conversation state" rejected option)
 --
--- Requirement traceability: REQ-WAKE-001 through REQ-WAKE-016
+-- Requirement traceability: REQ-WAKE-001 through REQ-WAKE-018
 -- Dependencies: specs/bedrock/bedrock.allium, specs/bash/bash.allium
 
 use "../bedrock/bedrock.allium" as bedrock
@@ -69,17 +69,54 @@ value Condition {
     handle: WatchableHandle?     -- present iff kind = handle_terminal
 }
 
--- The payload delivered to the conversation when the contract
--- fires. Shape mirrors the bash op=wait response shape; this is
--- REQ-WAKE-006 "synthetic tool result indistinguishable from
--- synchronous wait."
+-- The payload delivered to the conversation when the contract resolves. The
+-- top-level cause is the only persisted cause discriminator. For fired payloads,
+-- the watched handle kind is derived from the contract row, not repeated inside
+-- terminal_payload.
 value FirePayload {
     cause: TerminalCause
-    observed_handle_status: bash/HandleStatus?       -- when kind = handle_terminal
-    observed_exit_code: Integer?                     -- when cause = fired
-    observed_duration_ms: Integer?                   -- when cause = fired
-    observed_tail: List<bash/RingLine>?              -- when cause = fired
-    forgotten_reason: String?                        -- when cause = forgotten
+    fired: FiredHandlePayload when cause = fired
+    forgotten_reason: ForgottenReason when cause = forgotten
+}
+
+value TerminalPayloadBody {
+    fired: FiredHandlePayload?
+}
+
+value FiredHandlePayload {
+    bash: BashTerminalPayload?
+    tmux: TmuxTerminalPayload?
+    sub_agent: SubAgentTerminalPayload?
+}
+
+value BashTerminalPayload {
+    status: BashTerminalStatus
+    exit_code: Integer?
+    duration_ms: Integer?
+    signal_number: Integer?        -- mirrors bash wait signal metadata when known
+    kill_signal_sent: bash/KillSignal? -- mirrors kill_pending_kernel metadata
+}
+
+value TmuxTerminalPayload {
+    terminal_status: TmuxTerminalStatus
+    exit_code: Integer?
+    duration_ms: Integer?
+}
+
+value SubAgentTerminalPayload {
+    task_text: String                 -- spawned task string supplied to the child
+    task_label: String?
+    outcome: SubAgentTerminalOutcome
+    success_result: String            when outcome = success
+    submitted_error: String           when outcome = submitted_error
+    submitted_error_kind: SubAgentErrorKind  when outcome = submitted_error
+    timed_out_message: String         when outcome = timed_out
+    cancelled_reason: String?         when outcome = cancelled
+    turn_limit_partial_text: String?  when outcome = turn_limit_exhausted
+    implicit_success_text: String     when outcome = implicit_success
+    runtime_failure_message: String   when outcome = runtime_failure
+    runtime_failure_kind: SubAgentRuntimeFailureKind  when outcome = runtime_failure
+    context_exhausted_message: String when outcome = context_exhausted
 }
 
 ------------------------------------------------------------
@@ -108,6 +145,64 @@ enum TerminalCause {
                   -- no inheritor)
 }
 
+enum ForgottenReason {
+    phoenix_restart
+    | cascade_destroyed_handle
+    | subagent_handle_missing
+    | tmux_handle_missing
+}
+
+enum BashTerminalStatus {
+    exited
+    | killed
+    | kill_pending_kernel
+}
+
+enum SubAgentErrorKind {
+    network
+    | rate_limit
+    | server_error
+    | auth
+    | invalid_request
+    | invalid_response
+    | content_filter
+    | context_exhausted
+    | timed_out
+    | cancelled
+    | sub_agent_error
+    | usage_limit_reached
+    | server_overloaded
+}
+
+enum SubAgentRuntimeFailureKind {
+    network
+    | rate_limit
+    | server_error
+    | auth
+    | invalid_request
+    | invalid_response
+    | content_filter
+    | sub_agent_error
+    | usage_limit_reached
+    | server_overloaded
+}
+
+enum TmuxTerminalStatus {
+    tmux_run_exit_marker_observed
+    | window_killed
+}
+
+enum SubAgentTerminalOutcome {
+    success                 -- explicit submit_result
+    | submitted_error       -- explicit submit_error
+    | timed_out             -- child timeout cause preserved durably
+    | cancelled             -- independently observed child cancellation cause preserved durably
+    | turn_limit_exhausted  -- grace-turn hard-stop cause preserved durably
+    | implicit_success      -- text-only implicit completion, if admitted by bedrock
+    | runtime_failure       -- non-retryable LLM/tool/runtime failure
+    | context_exhausted     -- context budget exhausted before terminal submission
+}
+
 enum ContractStatus {
     pending       -- registered, awaiting evaluation
     | terminal    -- one of the TerminalCause outcomes recorded
@@ -121,7 +216,7 @@ enum ContractStatus {
 -- registration; updated to terminal on resolution. Never silently
 -- removed. The contract row is the SINGLE SOURCE OF TRUTH for "is
 -- this conversation waiting on something" - there is no conv-state
--- mirror (see design.md "Why No AwaitingWake State").
+-- mirror (see ADR-006's rejected AwaitingWake option).
 entity Contract {
     -- Stable id allocated at registration. Survives Phoenix restart.
     id: String
@@ -159,15 +254,28 @@ entity Contract {
         terminal: terminal
     }
 
-    -- Terminal cause. Populated iff status = terminal.
-    terminal_cause: TerminalCause?    when status = terminal
+    -- Queryable terminal discriminator columns. These are columns, not JSON paths,
+    -- because metrics group by them.
+    terminal_cause: TerminalCause     when status = terminal
+    forgotten_reason: ForgottenReason when terminal_cause = forgotten
 
-    -- The full delivered payload. Persisted so a late SSE reconnect
-    -- can re-deliver the wake event without losing data.
-    fired_payload: FirePayload?       when status = terminal
+    -- Cause-specific body. Does not repeat terminal_cause or forgotten_reason.
+    terminal_payload: TerminalPayloadBody when status = terminal
 
     -- When the router resolved the contract.
-    resolved_at: Timestamp?           when status = terminal
+    resolved_at: Timestamp            when status = terminal
+}
+
+entity BashWakeTailLine {
+    contract: Contract
+    ordinal: Integer
+    line: bash/RingLine
+}
+
+entity TmuxWakeTailLine {
+    contract: Contract
+    ordinal: Integer
+    line: String
 }
 
 ------------------------------------------------------------
@@ -181,17 +289,21 @@ config {
 
     max_max_wait_seconds: Integer = 1800
     -- Upper bound. max_wait_seconds > this is rejected at
-    -- registration time (REQ-WAKE-007).
+    -- registration time (REQ-WAKE-007). expires_at is the delivery
+    -- deadline for the wait obligation, not a lifetime guarantee for
+    -- the watched handle.
 
     router_tick_handle_terminal_ms: Integer = 1000
     -- Cadence at which the wake_router evaluates handle_terminal
     -- conditions. Other condition kinds may have different cadences.
 
     forgotten_on_restart_for_kinds: Set<HandleKind> = {bash}
-    -- HandleKinds whose handles do not survive Phoenix restart. On
-    -- restart, every pending contract referencing one of these kinds
-    -- fires forgotten with reason = "phoenix_restart". tmux_pane and
-    -- subagent are durable; bash handles are in-memory and are not.
+    -- HandleKinds whose handles never survive Phoenix restart. On restart,
+    -- every pending contract referencing one of these kinds fires forgotten
+    -- with reason = "phoenix_restart". Sub-agent restart handling is conditional:
+    -- persisted terminal children are delivered, while non-terminal child runtimes
+    -- are forgotten because active sub-agent runtimes do not survive restart.
+    -- tmux_pane handles may survive and are re-registered when present.
 
     workscope_keyed_kinds: Set<HandleKind> = {bash, tmux_pane}
     -- HandleKinds whose handles are WorkScope-level resources and so
@@ -277,7 +389,12 @@ rule WaitUntilRejectedByRange {
     )
 }
 
--- REQ-WAKE-003: router fires when the underlying condition holds.
+-- REQ-WAKE-003: router fires when the underlying condition holds. For durable
+-- tmux/sub-agent terminal evidence, the evidence timestamp is compared with the
+-- contract deadline so a terminal event recorded before expires_at still fires if
+-- the next router tick happens after expires_at. For tmux_run, the condition holds
+-- when the Phoenix exit marker is observed in the watched window, not when the
+-- tmux window process exits.
 -- Other pending contracts on the same conversation are NOT
 -- cancelled (REQ-WAKE-010 independent semantics) - they continue to
 -- be evaluated and may fire later.
@@ -285,8 +402,8 @@ rule WakeRouterFiresOnConditionHold {
     when: WakeRouterTick(contract)
 
     requires: contract.status = pending
-    requires: contract.expires_at > now()
     requires: evaluator_reports_fired(contract.condition)
+    requires: now() < contract.expires_at or evaluator_terminal_evidence_recorded_at(contract.condition) < contract.expires_at
 
     let payload = evaluator_payload(contract.condition)
 
@@ -307,6 +424,12 @@ rule WakeRouterFiresOnConditionHold {
         -- AwaitingWake (it only made sense as a conv-state
         -- transition).
         --
+        -- For handle.kind = subagent, payload.fired.sub_agent is populated only
+        -- from a durable child terminal cause: explicit submit_result, explicit
+        -- submit_error, timed_out, cancelled, turn-limit hard-stop fallback,
+        -- implicit completion, runtime failure, or context exhaustion. A missing
+        -- child handle is not a condition-held fire; it follows
+        -- WakeRouterForgetsMissingSubAgentHandle and resolves with cause = forgotten.
         -- The synthetic tool result is appended to the conv message
         -- log via the same path as a normal tool result completion.
         -- The conv's next-LLM-turn trigger is the same path as
@@ -314,13 +437,59 @@ rule WakeRouterFiresOnConditionHold {
         -- returned." No new dispatcher state needed.
 }
 
--- REQ-WAKE-003 + REQ-WAKE-007: router fires when expires_at has
--- passed without the condition holding.
+-- REQ-WAKE-011 + REQ-WAKE-017: a missing sub-agent child is forgotten, not a
+-- condition-held fire. This preserves the retry/escalation signal that
+-- distinguishes missing handles from completed child failures.
+rule WakeRouterForgetsMissingSubAgentHandle {
+    when: WakeRouterTick(contract)
+
+    requires: contract.status = pending
+    requires: contract.condition.handle?.kind = subagent
+    requires: not subagent_child_exists(contract.condition.handle?.id)
+
+    let payload = FirePayload(cause: forgotten, forgotten_reason: subagent_handle_missing)
+
+    ensures: ContractTransitionsToTerminal(contract, forgotten, payload)
+    ensures: SyntheticToolResultAppendedToConversation(
+        conversation:   contract.conversation,
+        tool_use_id:    contract.registering_tool_use_id,
+        payload:        payload
+    )
+    ensures: ConversationNextLlmTurnTriggered(contract.conversation)
+    ensures: SseEmitted(WakeContractForgotten, contract.id)
+}
+
+-- REQ-WAKE-011 + REQ-WAKE-018: an absent tmux window/session is forgotten only
+-- when no recorded tmux terminal state exists. A killed window or observed
+-- tmux_run exit marker fires through evaluator_reports_fired instead.
+rule WakeRouterForgetsMissingTmuxHandle {
+    when: WakeRouterTick(contract)
+
+    requires: contract.status = pending
+    requires: contract.condition.handle?.kind = tmux_pane
+    requires: not tmux_window_exists(contract.condition.handle?.id)
+    requires: not tmux_terminal_state_recorded(contract.condition.handle?.id)
+
+    let payload = FirePayload(cause: forgotten, forgotten_reason: tmux_handle_missing)
+
+    ensures: ContractTransitionsToTerminal(contract, forgotten, payload)
+    ensures: SyntheticToolResultAppendedToConversation(
+        conversation:   contract.conversation,
+        tool_use_id:    contract.registering_tool_use_id,
+        payload:        payload
+    )
+    ensures: ConversationNextLlmTurnTriggered(contract.conversation)
+    ensures: SseEmitted(WakeContractForgotten, contract.id)
+}
+
+-- REQ-WAKE-003 + REQ-WAKE-007: router fires when expires_at has passed without
+-- the condition holding and without in-deadline durable terminal evidence.
 rule WakeRouterFiresOnExpiry {
     when: WakeRouterTick(contract)
 
     requires: contract.status = pending
     requires: contract.expires_at <= now()
+    requires: not in_deadline_terminal_evidence_exists(contract)
 
     let payload = FirePayload(cause: expired)
 
@@ -334,12 +503,10 @@ rule WakeRouterFiresOnExpiry {
     ensures: SseEmitted(WakeContractExpired, contract.id)
 
     @guidance
-        -- Expiry is evaluated BEFORE condition-hold on each tick,
-        -- so a contract whose expires_at coincides with
-        -- condition-hold fires as expired, not fired. Rationale:
-        -- the cap is the hard contract guarantee; "condition held
-        -- at the last possible instant" is not distinguishable from
-        -- clock-skew effects, and expired is the safer report.
+        -- Expiry is generic fallback, not precedence over durable terminal
+        -- evidence. A tmux/sub-agent terminal event recorded before expires_at
+        -- fires even if this router tick runs after expires_at; otherwise a
+        -- continuously running Phoenix would disagree with startup reconciliation.
 }
 
 -- REQ-WAKE-008: explicit user cancel (UI button click).
@@ -430,18 +597,50 @@ rule ContinuationBoundaryHandlesContracts {
         -- bash handle).
 }
 
--- REQ-WAKE-002 + REQ-WAKE-011: restart resync. Pending contracts on
--- non-durable handle kinds fire forgotten; pending contracts on
--- durable handle kinds re-register with the router.
+-- REQ-WAKE-002 + REQ-WAKE-011: restart resync. Startup reconciles persisted
+-- wait obligations before normal serving. Durable terminal evidence recorded
+-- before expires_at fires first; non-durable and absent handles are forgotten
+-- because the target became unknowable at restart; then overdue contracts with no
+-- terminal evidence expire. Still-pending durable handles re-register.
 rule PhoenixStartupResyncsContracts {
     when: PhoenixStartupReachesWakeRouterInit()
 
     ensures: ForEveryPendingContract(
-        if_kind_in_set: config.forgotten_on_restart_for_kinds,
-            then: ContractTransitionsToTerminal(
+        if_tmux_terminal_state_recorded_before_deadline: ContractTransitionsToTerminalAndQueuesDelivery(
+                contract,
+                fired,
+                FirePayload(cause: fired, fired: payload_from_persisted_tmux_terminal(contract))
+            ),
+        else_if_subagent_and_child_terminal_before_deadline: ContractTransitionsToTerminalAndQueuesDelivery(
+                contract,
+                fired,
+                FirePayload(cause: fired, fired: payload_from_persisted_child_terminal(contract))
+            ),
+        else_if_kind_in_set: config.forgotten_on_restart_for_kinds,
+            then: ContractTransitionsToTerminalAndQueuesDelivery(
                 contract,
                 forgotten,
-                FirePayload(cause: forgotten, forgotten_reason: "phoenix_restart")
+                FirePayload(cause: forgotten, forgotten_reason: phoenix_restart)
+            ),
+        else_if_tmux_handle_absent_without_recorded_terminal: ContractTransitionsToTerminalAndQueuesDelivery(
+                contract,
+                forgotten,
+                FirePayload(cause: forgotten, forgotten_reason: tmux_handle_missing)
+            ),
+        else_if_subagent_child_missing: ContractTransitionsToTerminalAndQueuesDelivery(
+                contract,
+                forgotten,
+                FirePayload(cause: forgotten, forgotten_reason: subagent_handle_missing)
+            ),
+        else_if_subagent_and_child_not_terminal: ContractTransitionsToTerminalAndQueuesDelivery(
+                contract,
+                forgotten,
+                FirePayload(cause: forgotten, forgotten_reason: phoenix_restart)
+            ),
+        else_if_overdue: ContractTransitionsToTerminalAndQueuesDelivery(
+                contract,
+                expired,
+                FirePayload(cause: expired)
             ),
         else: ContractReRegisteredWithRouter(contract)
     )
@@ -453,16 +652,19 @@ rule PhoenixStartupResyncsContracts {
         -- appended to the conversation history before any further
         -- LLM turn.
         --
-        -- Sequence:
-        --   1. Load conv rows.
-        --   2. Load Contract rows.
-        --   3. For each conv with contracts: queue terminal
-        --      deliveries for forgotten kinds; re-register pending
-        --      for durable kinds.
-        --   4. Open API server (which serves SSE).
-        -- Reversing 3 and 4 would let a UI client subscribe to SSE
-        -- before contracts are resync'd, missing the synthetic
-        -- forgotten event.
+        -- Startup resync exists because the contract is durable wait intent, not
+        -- durable handle state. The router must deliver exactly one accountable
+        -- outcome for every accepted contract. Terminal startup branches use
+        -- ContractTransitionsToTerminalAndQueuesDelivery so a restart-resolved
+        -- contract still appends the synthetic tool result and triggers the parent
+        -- LLM turn on first load. A sub-agent child is read before forgetting the
+        -- contract; if tmux or a child sub-agent persisted terminal evidence
+        -- before the deadline, the wake delivers that tagged terminal payload even
+        -- if Phoenix restarts after expires_at. If restart makes the target
+        -- unknowable (bash registry gone, tmux window missing, child row missing,
+        -- non-terminal child runtime gone), forgotten wins over generic expiry.
+        -- Expiry is only for evaluable contracts with no in-deadline terminal
+        -- evidence.
 }
 
 -- REQ-WAKE-004: is_busy() consults the contract table.
@@ -506,19 +708,55 @@ invariant ContractsFireOnlyTheirConversation {
 -- terminal fields populated.
 invariant TerminalContractsAreFullyPopulated {
     for c in Contract where c.status = terminal:
-        c.terminal_cause != null
-        and c.resolved_at != null
-        and c.fired_payload != null
+        c.resolved_at != null
+        and c.terminal_payload != null
 }
 
 -- REQ-WAKE-011: every contract's terminal_cause is one of exactly
--- the four documented causes. Forbids silent abandonment.
+-- the four documented causes. Forbids silent abandonment while keeping the cause
+-- queryable without JSON extraction.
 invariant TerminalCauseIsOneOfFour {
     for c in Contract where c.status = terminal:
         c.terminal_cause = fired
         or c.terminal_cause = expired
         or c.terminal_cause = cancelled
         or c.terminal_cause = forgotten
+}
+
+invariant FiredContractsCarryFiredPayloadBody {
+    for c in Contract where c.status = terminal and c.terminal_cause = fired:
+        c.terminal_payload.fired != null
+}
+invariant FiredBashContractsCarryOnlyBashBody {
+    for c in Contract where c.status = terminal and c.terminal_cause = fired and c.condition.handle.kind = bash:
+        c.terminal_payload.fired.bash != null
+        and c.terminal_payload.fired.tmux = null
+        and c.terminal_payload.fired.sub_agent = null
+}
+
+invariant FiredTmuxContractsCarryOnlyTmuxBody {
+    for c in Contract where c.status = terminal and c.terminal_cause = fired and c.condition.handle.kind = tmux_pane:
+        c.terminal_payload.fired.tmux != null
+        and c.terminal_payload.fired.bash = null
+        and c.terminal_payload.fired.sub_agent = null
+}
+
+invariant FiredSubAgentContractsCarryOnlySubAgentBody {
+    for c in Contract where c.status = terminal and c.terminal_cause = fired and c.condition.handle.kind = subagent:
+        c.terminal_payload.fired.sub_agent != null
+        and c.terminal_payload.fired.bash = null
+        and c.terminal_payload.fired.tmux = null
+}
+
+invariant NonFiredTerminalRowsCarryNoFiredBody {
+    for c in Contract where c.status = terminal and c.terminal_cause != fired:
+        c.terminal_payload.fired = null
+}
+
+
+invariant ForgottenContractsCarryReason {
+    for c in Contract where c.status = terminal and c.terminal_cause = forgotten:
+        c.forgotten_reason != null
 }
 
 -- REQ-WAKE-007: every pending contract has expires_at strictly in

@@ -12,23 +12,32 @@ re-feed, six tool-description re-feeds, and six assistant-message
 round-trips — all to deliver one bit of information (the task
 finished).
 
-Wake contracts replace the poll-loop with persistence + an
-asynchronous router: the LLM registers a contract, the conversation
-stays in `Idle`, and the runtime delivers a synthetic tool result
-into the conversation when the condition fires (or expires). The LLM
-consumes zero turns in between.
+Wake contracts replace the poll-loop with persistence + an asynchronous router:
+the LLM registers a contract, the conversation stays in `Idle`, and the runtime
+delivers exactly one synthetic terminal result into the conversation when the
+condition fires, expires, is cancelled, or becomes forgotten. The LLM consumes
+zero turns in between. Persistence makes the wait intent durable; it does not make
+every watched handle durable.
 
-V1 supports one condition kind: `HandleTerminal { handle_kind,
-handle_id }` — fires when a named bash/tmux/subagent handle reaches a
-terminal state. Future revisions add regex-in-pane, file-changed,
-port-listening, and other condition kinds against the same edge
-without revisiting the persistence layer or the delivery path.
+V1 supports one condition kind over three concrete handle kinds:
+`HandleTerminal { handle_kind, handle_id }` — fires when a named bash, tmux
+`window_id`, or sub-agent handle reaches a terminal state. For sub-agents, the
+terminal payload covers every durable child terminal cause admitted by bedrock:
+explicit `submit_result`, explicit `submit_error`, timeout, child cancellation,
+turn-limit hard-stop fallback, implicit completion, runtime failure, and context
+exhaustion. Missing child handles resolve as `Forgotten`, not as fired child
+payloads. V1 does not define parent-to-child
+continuation, `NeedMoreBudget`, arbitrary child
+questions, automatic sub-agent budget extension, or a general conversation-actor
+framework.
 
 ## Technical Summary
 
-A new `wake_contracts` SQLite table persists every active contract
-with `(id, conv_id, handle_kind, handle_id, condition_json,
-expires_at, registered_at, fire_template_json, registering_tool_use_id)`.
+A new `wake_contracts` SQLite table persists every contract with registration
+fields plus terminal accounting fields: `status`, `terminal_cause`,
+`forgotten_reason`, `terminal_payload`, and `resolved_at`. Terminal cause and the
+finite forgotten-reason discriminator are queryable columns for metrics;
+`terminal_payload` stores only the cause-specific body.
 A new background `wake_router` task polls contracts each tick (1s for
 HandleTerminal) and on resolution: marks the row terminal, appends a
 synthetic tool result to the conv message log, triggers the conv's
@@ -44,11 +53,13 @@ user interaction. `is_busy()` is augmented to return true when the
 conv has at least one pending contract (one extra SQLite count per
 evaluation; lifecycle endpoints already do at least one read).
 
-The synthetic tool result delivered on fire is byte-shape-identical
-to the tool result the equivalent synchronous `op=wait` would have
-returned. This makes wake a drop-in replacement for polling from the
-LLM's vantage point: same payload, same `tool_use_id` correlation,
-just zero intervening turns.
+The synthetic tool result delivered on fire is byte-shape-identical to the tool
+result the equivalent synchronous wait would have returned when such a
+synchronous surface exists. Bash delivery mirrors `bash op=wait`; tmux delivery
+includes the watched `window_id` terminal status and final captured tail; sub-agent
+delivery uses the structured terminal outcome described above. This makes wake a
+drop-in replacement for polling from the LLM's vantage point: same payload, same
+`tool_use_id` correlation, just zero intervening turns.
 
 Wake contracts are conversation-scoped, not WorkScope-scoped: a contract is
 owned by one conversation and delivers its synthetic result there. The handles
@@ -62,11 +73,13 @@ fires `Forgotten` only when its watched handle is genuinely destroyed (a Phoenix
 restart, or a hard-delete with no inheriting scope), not as a routine
 consequence of continuation.
 
-Mandatory `expires_at` (default 600s, cap 1800s) prevents unbounded
-commitments. Restart resync re-registers non-fired contracts; any
-contract whose underlying handle did not survive the restart — bash handles,
-which are in-memory — immediately fires `Forgotten`, never silently
-abandoned.
+Mandatory `expires_at` (default 600s, cap 1800s) is the delivery deadline for the
+wait obligation and prevents unbounded commitments. While Phoenix is running, the
+router resolves a pending contract no later than the first tick at or after that
+timestamp. After downtime, restart resync delivers in-deadline durable terminal
+evidence, emits `Forgotten` for handles that became unknowable, expires only
+evaluable contracts with no such evidence, or re-registers still-pending durable
+handles.
 
 The LLM-facing surface is a single unified `wait_until { handle: {
 kind, id }, condition, max_wait_seconds }` tool with a `#[serde(tag
@@ -86,7 +99,7 @@ land separately.
 | REQ-WAKE-005 V1 Condition Kinds | Proposed | HandleTerminal only; regex/file/port/webhook deferred |
 | REQ-WAKE-006 Wake Event Delivery | Proposed | Synthetic tool result; shape-identical to `op=wait` response |
 | REQ-WAKE-007 Mandatory Timeout | Proposed | Default 600s, cap 1800s |
-| REQ-WAKE-008 User Status + Cancel | Proposed | UI indicator on Idle conv + cancel endpoint |
+| REQ-WAKE-008 User Status + Cancel | Proposed | UI/CLI wake status on Idle conv + cancel endpoint |
 | REQ-WAKE-009 Conv-Scoped | Proposed | Not WorkScope-scoped; explicit deconfliction |
 | REQ-WAKE-010 Independent Contracts | Proposed | No auto-cancel on sibling fire |
 | REQ-WAKE-011 Terminal Cause | Proposed | Fired / Expired / Cancelled / Forgotten |
@@ -95,8 +108,10 @@ land separately.
 | REQ-WAKE-014 Tool Description | Proposed | Explicit cost model + when-to-use guidance |
 | REQ-WAKE-015 Cost Observability | Proposed | Metrics on registration / fire / forgotten breakdown |
 | REQ-WAKE-016 Unified Tool Surface | Proposed | Single `wait_until` tool, tagged-enum handle discriminator |
+| REQ-WAKE-017 Sub-Agent Terminal Payload | Proposed | Tagged exhaustive sub-agent terminal causes; missing child is Forgotten |
+| REQ-WAKE-018 Handle Identity + Lifecycle | Proposed | Bash/tmux WorkScope-keyed; sub-agent keyed by child conversation / agent id |
 
-**Progress:** 0 of 16 implemented.
+**Progress:** 0 of 18 implemented.
 
 ## Dependencies
 

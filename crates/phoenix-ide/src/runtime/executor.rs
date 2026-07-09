@@ -912,6 +912,175 @@ fn forward_denial_outcome(
     ));
 }
 
+fn fresh_response_is_text_only(content: &[ContentBlock]) -> bool {
+    !content.is_empty()
+        && content
+            .iter()
+            .all(|block| matches!(block, ContentBlock::Text { .. }))
+        && content.iter().any(|block| match block {
+            ContentBlock::Text { text } => !text.trim().is_empty(),
+            _ => false,
+        })
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
+fn response_exceeds_context_threshold(usage: &phoenix_llm::Usage, context_window: usize) -> bool {
+    let threshold = (context_window as f64 * 0.90) as u64;
+    usage.context_window_used() >= threshold
+}
+
+fn content_contains_only_terminal_tool_call(
+    content: &[ContentBlock],
+    tool_call: &ToolCall,
+) -> bool {
+    let mut saw_terminal_tool = false;
+    for block in content {
+        match block {
+            ContentBlock::Text { .. } => {}
+            ContentBlock::ToolUse { id, name, .. }
+                if id == &tool_call.id && name == tool_call.name() && !saw_terminal_tool =>
+            {
+                saw_terminal_tool = true;
+            }
+            ContentBlock::ToolUse { .. }
+            | ContentBlock::ServerToolUse { .. }
+            | ContentBlock::ToolSearchToolResult { .. }
+            | ContentBlock::WebSearchToolResult { .. }
+            | ContentBlock::WebFetchToolResult { .. }
+            | ContentBlock::CodeExecutionToolResult { .. }
+            | ContentBlock::BashCodeExecutionToolResult { .. }
+            | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+            | ContentBlock::McpToolUse { .. }
+            | ContentBlock::McpToolResult { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::Image { .. } => return false,
+        }
+    }
+    saw_terminal_tool
+}
+
+fn grace_response_can_enter_reducer(content: &[ContentBlock], tool_calls: &[ToolCall]) -> bool {
+    match tool_calls {
+        [] => fresh_response_is_text_only(content),
+        [tool_call] => {
+            tool_call.input.is_terminal_tool()
+                && content_contains_only_terminal_tool_call(content, tool_call)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod grace_response_admission_tests {
+    use super::*;
+    use crate::state_machine::state::{SubmitResultInput, ToolInput};
+
+    fn tool_call(input: ToolInput) -> ToolCall {
+        ToolCall::new("toolu_1", input)
+    }
+
+    fn terminal_tool_block() -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: "toolu_1".to_string(),
+            name: "submit_result".to_string(),
+            input: serde_json::json!({ "result": "done" }),
+        }
+    }
+
+    #[test]
+    fn admits_text_only_implicit_completion() {
+        assert!(grace_response_can_enter_reducer(
+            &[ContentBlock::text("done")],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn rejects_blank_text_only_implicit_completion() {
+        assert!(!grace_response_can_enter_reducer(
+            &[ContentBlock::text("   \n\t")],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn rejects_server_tool_blocks_without_phoenix_tool_calls() {
+        assert!(!grace_response_can_enter_reducer(
+            &[ContentBlock::ServerToolUse {
+                id: "srv_1".to_string(),
+                name: "web_search".to_string(),
+                input: serde_json::json!({}),
+            }],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn admits_single_terminal_tool_call() {
+        assert!(grace_response_can_enter_reducer(
+            &[ContentBlock::text("final answer"), terminal_tool_block()],
+            &[tool_call(ToolInput::SubmitResult(SubmitResultInput {
+                result: "done".to_string(),
+            }))]
+        ));
+    }
+
+    #[test]
+    fn rejects_terminal_tool_call_with_server_tool_blocks() {
+        assert!(!grace_response_can_enter_reducer(
+            &[
+                terminal_tool_block(),
+                ContentBlock::ServerToolUse {
+                    id: "srv_1".to_string(),
+                    name: "web_search".to_string(),
+                    input: serde_json::json!({}),
+                },
+            ],
+            &[tool_call(ToolInput::SubmitResult(SubmitResultInput {
+                result: "done".to_string(),
+            }))]
+        ));
+    }
+
+    #[test]
+    fn rejects_non_terminal_or_mixed_tool_calls() {
+        assert!(!grace_response_can_enter_reducer(
+            &[ContentBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "bash".to_string(),
+                input: serde_json::json!({}),
+            }],
+            &[tool_call(ToolInput::Unknown {
+                name: "bash".to_string(),
+                input: serde_json::json!({}),
+            })]
+        ));
+        assert!(!grace_response_can_enter_reducer(
+            &[
+                terminal_tool_block(),
+                ContentBlock::ToolUse {
+                    id: "toolu_2".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({}),
+                },
+            ],
+            &[
+                tool_call(ToolInput::SubmitResult(SubmitResultInput {
+                    result: "done".to_string(),
+                })),
+                tool_call(ToolInput::Unknown {
+                    name: "bash".to_string(),
+                    input: serde_json::json!({}),
+                }),
+            ]
+        ));
+    }
+}
+
 /// Await an LLM task's oneshot outcome and forward it, generation-tagged, to
 /// the executor's LLM-outcome channel, mapping a dropped sender to a typed
 /// `NetworkError` outcome.
@@ -1615,8 +1784,11 @@ where
     active_work_subagents: u32,
     /// LLM turn counter for sub-agents (REQ-PROJ-008 max turns enforcement)
     llm_turn_count: u32,
-    /// Whether this sub-agent has been given its grace turn (one extra LLM turn to call `submit_result`)
+    /// Whether this sub-agent has been given its grace turn (one extra LLM turn to produce a terminal outcome)
     grace_turn_granted: bool,
+    /// Wall-clock marker for the start of the grace turn. The hard-stop fallback
+    /// only treats assistant text after this marker as a fresh implicit result.
+    grace_turn_started_at: Option<DateTime<Utc>>,
     /// LLM request counter for parent conversations. Resets on every
     /// `Event::UserMessage`, so a long conversation with many turns is fine;
     /// only runaway tool-use bursts within a single user turn trip the cap.
@@ -1745,6 +1917,7 @@ where
             active_work_subagents: 0,
             llm_turn_count: 0,
             grace_turn_granted: false,
+            grace_turn_started_at: None,
             parent_tool_cycle_count: 0,
             parent_tool_cycle_cap: parent_tool_cycle_cap_from_env(),
             credential_helper: None,
@@ -2240,6 +2413,28 @@ where
         }
 
         refresh_commission_review_approval_for_outcome(&mut self.context, &outcome);
+
+        if let EffectOutcome::Llm(LlmOutcome::Response {
+            content,
+            tool_calls,
+            usage,
+            ..
+        }) = &outcome
+        {
+            if self.context.is_sub_agent
+                && self.grace_turn_granted
+                && !grace_response_can_enter_reducer(content, tool_calls)
+                && !response_exceeds_context_threshold(usage, self.context.context_window)
+            {
+                tracing::debug!(
+                    conv_id = %self.context.conversation_id,
+                    "Grace-turn response produced neither terminal tool nor text-only implicit completion; failing turn-limit path"
+                );
+                return self
+                    .process_event(Event::GraceTurnExhausted { result: None })
+                    .await;
+            }
+        }
 
         let result = match handle_outcome(&self.state, &self.context, outcome) {
             Ok(r) => r,
@@ -3082,22 +3277,27 @@ where
         }
     }
 
-    /// Handle the hard stop after grace turn (REQ-BED-026 `SubAgentTurnLimitHardStop`):
-    /// extract last assistant text from conversation history and notify parent.
+    /// Handle the hard stop after grace turn (REQ-BED-026 `SubAgentTurnLimitHardStop`).
     ///
-    /// Extract partial result from conversation history and send `GraceTurnExhausted`
-    /// event to the state machine. The SM handles the transition and emits `NotifyParent`.
+    /// Extract fresh grace-turn text and send `GraceTurnExhausted` event to the
+    /// state machine. The SM handles the transition and emits `NotifyParent`.
     async fn handle_grace_turn_hard_stop(&mut self) {
-        // Extract last assistant text from conversation history (I/O — belongs in executor)
+        let grace_started_at = self.grace_turn_started_at;
+        // Extract assistant text produced during the grace turn (I/O — belongs in executor).
         let partial_result = match self
             .storage
             .get_messages(&self.context.conversation_id)
             .await
         {
             Ok(messages) => {
-                // Walk backward to find the last assistant message with text content blocks
                 let mut text = None;
                 for msg in messages.iter().rev() {
+                    let Some(grace_started_at) = grace_started_at else {
+                        break;
+                    };
+                    if msg.created_at <= grace_started_at {
+                        break;
+                    }
                     if let MessageContent::Agent(blocks) = &msg.content {
                         let text_parts: Vec<&str> = blocks
                             .iter()
@@ -3106,7 +3306,8 @@ where
                                 _ => None,
                             })
                             .collect();
-                        if !text_parts.is_empty() {
+                        let text_only = fresh_response_is_text_only(blocks);
+                        if !text_parts.is_empty() && text_only {
                             text = Some(text_parts.join("\n\n"));
                             break;
                         }
@@ -3996,7 +4197,7 @@ where
 
         // Max turns enforcement (REQ-PROJ-008, REQ-BED-026): sub-agents have a
         // finite turn budget. Grace turn mechanism gives the model one extra LLM
-        // turn to call submit_result before hard-stopping.
+        // turn to call submit_result or submit_error before hard-stopping.
         if self.context.max_turns > 0 {
             self.llm_turn_count += 1;
             if self.llm_turn_count > self.context.max_turns {
@@ -4022,16 +4223,31 @@ where
                     max = self.context.max_turns,
                     "Sub-agent reached turn limit, granting grace turn"
                 );
+                self.grace_turn_started_at = Some(Utc::now());
 
-                // Inject a meta user message prompting submit_result.
+                // Inject a meta user message with mode-specific terminal guidance.
                 // Uses UserContent::meta() so it appears in the LLM context
                 // via the existing User message path (not System, which is
                 // UI-only bookkeeping and not sent to the LLM).
                 let msg_id = uuid::Uuid::new_v4().to_string();
-                let content = MessageContent::User(crate::db::UserContent::meta(
-                    "You have reached your turn limit. Please call submit_result now \
-                         with whatever findings you have so far. Do not call any other tools.",
-                ));
+                let grace_prompt = if matches!(
+                    &self.context.mode_context,
+                    Some(ModeContext::Explore { .. })
+                ) {
+                    "You have reached your turn limit. Only submit_result or submit_error can \
+                         produce a useful terminal outcome from this grace turn. Call submit_result \
+                         with whatever findings you have so far, or call submit_error if you are \
+                         blocked and do not have useful findings to report. Other tool calls will \
+                         not help complete this grace turn."
+                } else {
+                    "You have reached your turn limit. Only submit_result or submit_error can \
+                         produce a useful terminal outcome from this grace turn. If your assigned \
+                         task required code changes and you have not made them, call submit_error \
+                         and include the useful analysis, plan, blockers, and any partial progress \
+                         for the parent. Only call submit_result if the assigned implementation is \
+                         actually complete."
+                };
+                let content = MessageContent::User(crate::db::UserContent::meta(grace_prompt));
                 if let Err(e) = self
                     .storage
                     .add_message(&msg_id, &self.context.conversation_id, &content, None, None)
