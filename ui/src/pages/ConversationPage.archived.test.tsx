@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { ConversationPage } from './ConversationPage';
 import { DesktopLayout } from '../components/DesktopLayout';
@@ -9,6 +9,7 @@ import { ConversationStore } from '../conversation';
 import { DraftStore } from '../conversation/DraftStore';
 import { api, type Conversation, type Message } from '../api';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
+import { cacheDB } from '../cache';
 
 const viewportFlags = vi.hoisted(() => ({ isDesktop: true, isWideDesktop: true }));
 
@@ -19,6 +20,9 @@ vi.mock('../api', async () => {
     api: {
       ...actual.api,
       getConversationBySlug: vi.fn(),
+      getConversationMetaBySlug: vi.fn(),
+      getConversationMessagesAfter: vi.fn(),
+      getConversationMessagesLatest: vi.fn(),
       listConversations: vi.fn(() => Promise.resolve([])),
       listArchivedConversations: vi.fn(() => Promise.resolve([])),
       getModels: vi.fn(() => Promise.resolve([])),
@@ -37,10 +41,12 @@ vi.mock('../cache', () => ({
   cacheDB: {
     getConversationBySlug: vi.fn(() => Promise.resolve(null)),
     getMessages: vi.fn(() => Promise.resolve([])),
+    getMaxMessageSequenceId: vi.fn(() => Promise.resolve(null)),
     getAllConversations: vi.fn(() => Promise.resolve([])),
     syncConversations: vi.fn(() => Promise.resolve()),
     putConversation: vi.fn(() => Promise.resolve()),
     putMessages: vi.fn(() => Promise.resolve()),
+    putReplicaMeta: vi.fn(() => Promise.resolve()),
   },
 }));
 
@@ -58,8 +64,11 @@ vi.mock('../components/ConversationNavStack', () => ({
   ConversationNavStack: ({ messages }: { messages: Message[] }) => (
     <div data-testid="message-history">
       {messages.map((message) => {
-        const content = message.content as { text?: string };
-        return <div key={message.message_id}>{content.text}</div>;
+        const content = message.content as { text?: string } | { type?: string; text?: string }[];
+        const rendered = Array.isArray(content)
+          ? content.find((block) => block.type === 'text')?.text
+          : content?.text;
+        return <div key={message.message_id}>{rendered}</div>;
       })}
     </div>
   ),
@@ -109,20 +118,36 @@ const historyMessage: Message = {
   created_at: '2024-01-01T00:00:01Z',
 };
 
+const catchUpMessage: Message = {
+  message_id: 'm2',
+  sequence_id: 2,
+  conversation_id: conversationId,
+  message_type: 'agent',
+  content: [{ type: 'text', text: 'incremental catch-up arrived' }],
+  created_at: '2024-01-01T00:00:02Z',
+};
+
 function renderPage(conversation: Conversation) {
   const store = new ConversationStore();
   store.dispatch(conversation.slug, {
-      type: 'set_initial_data',
-      conversationId: conversation.id,
-      conversation,
-      messages: [historyMessage],
-      phase: { type: 'idle' },
-      contextWindow: { used: 0 },
+    type: 'set_initial_data',
+    conversationId: conversation.id,
+    conversation,
+    messages: [historyMessage],
+    phase: { type: 'idle' },
+    contextWindow: { used: 0 },
+    transcriptGeneration: conversation.transcript_generation ?? 1,
   });
 
   vi.mocked(api.getConversationBySlug).mockResolvedValue({
     conversation,
     messages: [historyMessage],
+    agent_working: false,
+    presentation_mode: 'idle',
+    context_window_size: 0,
+  });
+  vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+    conversation,
     agent_working: false,
     presentation_mode: 'idle',
     context_window_size: 0,
@@ -188,5 +213,169 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(await screen.findByTestId('terminal-panel')).toBeInTheDocument();
     expect(document.querySelector('.conversation-column')).toContainElement(document.querySelector('[data-testid="terminal-panel"]'));
     expect(document.querySelector('.conversation-column')).toContainElement(document.querySelector('#state-bar'));
+  });
+
+  it('falls back to authoritative slug fetch when cached slug owner changed', async () => {
+    const staleConversation = makeConversation({ id: 'stale-conv' });
+    const authoritativeConversation = makeConversation({ id: 'authoritative-conv' });
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(staleConversation);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([{ ...historyMessage, conversation_id: staleConversation.id }]);
+    vi.mocked(cacheDB.getMaxMessageSequenceId).mockResolvedValue(1);
+    vi.mocked(api.getConversationMessagesAfter).mockResolvedValue({
+      messages: [],
+      tombstones: [],
+      transcript_generation: 1,
+      server_message_tail: 1,
+    });
+    vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
+      messages: [],
+      tombstones: [],
+      transcript_generation: 1,
+      server_message_tail: 1,
+    });
+    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+      conversation: authoritativeConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+    vi.mocked(api.getConversationBySlug).mockResolvedValue({
+      conversation: authoritativeConversation,
+      messages: [],
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+
+    render(
+      <ConversationContext.Provider value={new ConversationStore()}>
+        <DraftContext.Provider value={new DraftStore()}>
+          <ConversationReadinessProvider>
+            <MemoryRouter initialEntries={[`/c/${slug}`]}>
+              <Routes>
+                <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
+              </Routes>
+            </MemoryRouter>
+          </ConversationReadinessProvider>
+        </DraftContext.Provider>
+      </ConversationContext.Provider>,
+    );
+
+    await waitFor(() => {
+      expect(api.getConversationBySlug).toHaveBeenCalledWith(slug);
+    });
+  });
+
+  it('fills a tail that grows during latest-window refresh before advancing replica coverage', async () => {
+    const cachedConversation = makeConversation();
+    const message3 = { ...catchUpMessage, message_id: 'm3', sequence_id: 3, content: [{ type: 'text', text: 'middle message' }] } as Message;
+    const message4 = { ...catchUpMessage, message_id: 'm4', sequence_id: 4, content: [{ type: 'text', text: 'new tail message' }] } as Message;
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
+    vi.mocked(cacheDB.getMaxMessageSequenceId).mockResolvedValue(1);
+    vi.mocked(api.getConversationMessagesAfter).mockImplementation(async (_id, afterSequence) => (
+      afterSequence < 2
+        ? {
+            messages: [catchUpMessage],
+            tombstones: [],
+            transcript_generation: 7,
+            server_message_tail: 2,
+          }
+        : {
+            messages: [message3, message4],
+            tombstones: [],
+            transcript_generation: 7,
+            server_message_tail: 4,
+          }
+    ));
+    vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
+      messages: [message4],
+      tombstones: [],
+      transcript_generation: 7,
+      server_message_tail: 4,
+    });
+    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+      conversation: cachedConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+
+    renderPage(cachedConversation);
+
+    expect(await screen.findByText('middle message')).toBeInTheDocument();
+    expect(await screen.findByText('new tail message')).toBeInTheDocument();
+    expect(api.getConversationMessagesAfter).toHaveBeenCalledWith(conversationId, 1, 200);
+    expect(api.getConversationMessagesAfter).toHaveBeenCalledWith(conversationId, 2, 200);
+    await waitFor(() => {
+      expect(cacheDB.putReplicaMeta).toHaveBeenCalledWith(
+        expect.objectContaining({ latestMessageSequenceId: 4 }),
+      );
+    });
+  });
+
+  it('renders cached messages immediately and incrementally catches up newer messages without a full fetch', async () => {
+    const cachedConversation = makeConversation();
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
+    vi.mocked(cacheDB.getMaxMessageSequenceId).mockResolvedValue(1);
+    vi.mocked(api.getConversationMessagesAfter).mockResolvedValue({
+      messages: [catchUpMessage],
+      tombstones: [],
+      transcript_generation: 7,
+      server_message_tail: 2,
+    });
+    vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
+      messages: [catchUpMessage],
+      tombstones: [],
+      transcript_generation: 7,
+      server_message_tail: 2,
+    });
+    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+      conversation: cachedConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+    vi.mocked(api.getConversationBySlug).mockClear();
+    vi.mocked(api.getConversationBySlug).mockResolvedValue({
+      conversation: cachedConversation,
+      messages: [historyMessage],
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+
+    render(
+      <ConversationContext.Provider value={new ConversationStore()}>
+        <DraftContext.Provider value={new DraftStore()}>
+          <ConversationReadinessProvider>
+            <MemoryRouter initialEntries={[`/c/${cachedConversation.slug}`]}>
+              <Routes>
+                <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
+              </Routes>
+            </MemoryRouter>
+          </ConversationReadinessProvider>
+        </DraftContext.Provider>
+      </ConversationContext.Provider>,
+    );
+
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+    expect(await screen.findByText('incremental catch-up arrived')).toBeInTheDocument();
+    expect(api.getConversationMessagesAfter).toHaveBeenCalledWith(conversationId, 1, 200);
+    expect(api.getConversationMessagesLatest).toHaveBeenCalledWith(conversationId, 50);
+    expect(api.getConversationMetaBySlug).toHaveBeenCalledWith(cachedConversation.slug);
+    expect(cacheDB.putMessages).toHaveBeenCalledWith([catchUpMessage]);
+    await waitFor(() => {
+      expect(cacheDB.putReplicaMeta).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conversationId,
+          latestMessageSequenceId: 2,
+          latestEventSequenceId: null,
+          transcriptGeneration: 7,
+          lastHydratedAt: expect.any(String),
+        }),
+      );
+    });
   });
 });

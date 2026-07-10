@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type FileAttachment, type ImageData } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
 import { canCancelConversationState, isCancellingState, parseConversationState } from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
@@ -32,7 +32,7 @@ import { OPEN_MESSAGE_VIEWER_EVENT } from '../components/MessageContextMenu';
 import { RenderProfiler } from '../dev/renderProfiler';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkControlBar } from '../components/WorkActions';
-import { useConversationView, useCreateConversationWithStore } from '../conversation';
+import { useConversationEventCursorRef, useConversationView, useCreateConversationWithStore } from '../conversation';
 import {
   useResizablePane,
   useIsDesktop,
@@ -140,6 +140,37 @@ function RecoveryBanner({ message, recoveryKind }: { message: string; recoveryKi
       </div>
     </div>
   );
+}
+
+function latestMessageSequenceId(messages: { sequence_id: number }[]): number | null {
+  return messages.length > 0 ? messages[messages.length - 1]?.sequence_id ?? null : null;
+}
+
+function mergeConversationMessages<T extends { message_id: string; sequence_id: number }>(existing: T[], incoming: T[]): T[] {
+  const byMessageId = new Map<string, T>();
+  const bySequenceId = new Map<number, T>();
+
+  const upsert = (message: T) => {
+    const priorByMessageId = byMessageId.get(message.message_id);
+    if (priorByMessageId && priorByMessageId.sequence_id <= message.sequence_id) {
+      bySequenceId.delete(priorByMessageId.sequence_id);
+    }
+
+    const priorBySequenceId = bySequenceId.get(message.sequence_id);
+    if (priorBySequenceId && priorBySequenceId.message_id !== message.message_id) {
+      byMessageId.delete(priorBySequenceId.message_id);
+    }
+
+    if (!priorByMessageId || priorByMessageId.sequence_id <= message.sequence_id) {
+      byMessageId.set(message.message_id, message);
+      bySequenceId.set(message.sequence_id, message);
+    }
+  };
+
+  existing.forEach(upsert);
+  incoming.forEach(upsert);
+
+  return Array.from(bySequenceId.values()).toSorted((a, b) => a.sequence_id - b.sequence_id);
 }
 
 function ConversationPageContent() {
@@ -420,9 +451,15 @@ function ConversationPageContent() {
     [queuedMessages],
   );
 
+  const atomRef = useRef(atom);
+  atomRef.current = atom;
+
+  const eventCursorRef = useConversationEventCursorRef(slug!);
+
   const connectionInfo = useConnection({
     conversationId,
     dispatch,
+    getLastAppliedEventSeq: () => eventCursorRef.current,
   });
 
   const isOffline =
@@ -430,9 +467,6 @@ function ConversationPageContent() {
   const isConnected =
     connectionInfo.state === 'connected' || connectionInfo.state === 'reconnected';
 
-  // Ref to read atom state inside effects without adding it to deps
-  const atomRef = useRef(atom);
-  atomRef.current = atom;
 
   // Load conversation by slug — skip if atom already has data from a previous visit
   useEffect(() => {
@@ -450,28 +484,140 @@ function ConversationPageContent() {
     const loadConversation = async () => {
       try {
         let cached = atomRef.current.conversation;
+        let cachedMessages: Message[] = hadAtomData ? atomRef.current.messages : [];
         if (!hadAtomData) {
           cached = await cacheDB.getConversationBySlug(slug);
-          if (cached && !cancelled) {
-            const cachedMessages = await cacheDB.getMessages(cached.id);
-            dispatch({
-              type: 'set_initial_data',
-              conversationId: cached.id,
-              conversation: cached,
-              messages: cachedMessages,
-              phase: cached.state ? parseConversationState(cached.state) : { type: 'idle' },
-              contextWindow: { used: 0 },
-            });
+          if (cached) {
+            cachedMessages = await cacheDB.getMessages(cached.id);
+            if (!cancelled) {
+              dispatch({
+                type: 'set_initial_data',
+                conversationId: cached.id,
+                conversation: cached,
+                messages: cachedMessages,
+                phase: cached.state ? parseConversationState(cached.state) : { type: 'idle' },
+                contextWindow: { used: 0 },
+                transcriptGeneration: cached.transcript_generation ?? 1,
+                eventCursorFloor: latestMessageSequenceId(cachedMessages) ?? 0,
+              });
+            }
           }
         }
 
         // Step 2: Fetch authoritative data from network
         if (navigator.onLine && !cancelled) {
+          const cachedConversationId = cached?.id ?? null;
+          const hasCachedMessages = cachedConversationId !== null && cachedMessages.length > 0;
+
+          if (hasCachedMessages && cachedConversationId) {
+            try {
+              const snapshotStartedAtEventSeq = eventCursorRef.current;
+              const mergedTranscriptTail = latestMessageSequenceId(cachedMessages);
+              if (mergedTranscriptTail !== null) {
+                let contiguousTranscriptTail = mergedTranscriptTail;
+                let mergedMessages = cachedMessages;
+                let latestServerTail: number | null = null;
+                let latestTranscriptGeneration = cached?.transcript_generation ?? 1;
+
+                while (!cancelled) {
+                  const catchUp = await api.getConversationMessagesAfter(cachedConversationId, contiguousTranscriptTail, 200);
+                  latestServerTail = catchUp.server_message_tail;
+                  latestTranscriptGeneration = catchUp.transcript_generation;
+                  if (catchUp.messages.length > 0) {
+                    mergedMessages = mergeConversationMessages(mergedMessages, catchUp.messages);
+                    await cacheDB.putMessages(catchUp.messages);
+                  }
+                  if (catchUp.messages.length > 0) {
+                    const nextContiguousTail = catchUp.messages.at(-1)!.sequence_id;
+                    if (nextContiguousTail <= contiguousTranscriptTail) break;
+                    contiguousTranscriptTail = nextContiguousTail;
+                  }
+                  if (
+                    catchUp.messages.length === 0 ||
+                    latestServerTail === null ||
+                    contiguousTranscriptTail >= latestServerTail
+                  ) {
+                    break;
+                  }
+                }
+                if (cancelled) return;
+
+                const latestWindow = await api.getConversationMessagesLatest(cachedConversationId, 50);
+                latestServerTail = latestWindow.server_message_tail;
+                latestTranscriptGeneration = latestWindow.transcript_generation;
+                if (latestWindow.messages.length > 0) {
+                  mergedMessages = mergeConversationMessages(mergedMessages, latestWindow.messages);
+                  await cacheDB.putMessages(latestWindow.messages);
+                }
+                if (cancelled) return;
+
+                while (!cancelled && latestServerTail !== null && contiguousTranscriptTail < latestServerTail) {
+                  const catchUp = await api.getConversationMessagesAfter(
+                    cachedConversationId,
+                    contiguousTranscriptTail,
+                    200,
+                  );
+                  latestServerTail = catchUp.server_message_tail;
+                  latestTranscriptGeneration = catchUp.transcript_generation;
+                  if (catchUp.messages.length === 0) break;
+                  const nextContiguousTail = catchUp.messages.at(-1)!.sequence_id;
+                  if (nextContiguousTail <= contiguousTranscriptTail) break;
+                  mergedMessages = mergeConversationMessages(mergedMessages, catchUp.messages);
+                  await cacheDB.putMessages(catchUp.messages);
+                  contiguousTranscriptTail = nextContiguousTail;
+                }
+                if (cancelled) return;
+
+                await cacheDB.putReplicaMeta({
+                  conversationId: cachedConversationId,
+                  latestMessageSequenceId: contiguousTranscriptTail,
+                  latestEventSequenceId: null,
+                  transcriptGeneration: latestTranscriptGeneration,
+                  lastHydratedAt: new Date().toISOString(),
+                });
+
+                const metadata = await api.getConversationMetaBySlug(slug);
+                if (cancelled) return;
+                const authoritativeConversation = metadata.conversation;
+                if (authoritativeConversation.id !== cachedConversationId) {
+                  throw new Error('Cached conversation no longer owns the requested slug');
+                }
+                setArchiveStatusConfirmedConversationId(authoritativeConversation.id);
+                await cacheDB.putConversation(authoritativeConversation);
+
+                if (!atomRef.current.conversation || atomRef.current.conversation.slug === slug) {
+                  dispatch({
+                    type: 'merge_conversation_data',
+                    conversationId: authoritativeConversation.id,
+                    conversation: authoritativeConversation,
+                    messages: mergedMessages,
+                    phase: authoritativeConversation.state
+                      ? parseConversationState(authoritativeConversation.state)
+                      : { type: 'idle' },
+                    contextWindow: { used: metadata.context_window_size || 0 },
+                    transcriptGeneration: authoritativeConversation.transcript_generation ?? latestTranscriptGeneration,
+                    eventCursorFloor: contiguousTranscriptTail,
+                    snapshotStartedAtEventSeq,
+                  });
+                }
+                return;
+              }
+            } catch (err) {
+              if (!cancelled) {
+                console.warn('Incremental conversation catch-up failed; falling back to full fetch:', err);
+              }
+            }
+          }
+
           try {
+            const snapshotStartedAtEventSeq = eventCursorRef.current;
             const result = await api.getConversationBySlug(slug);
             if (!cancelled) {
+              const replacesDifferentConversation = atomRef.current.conversationId !== null
+                && atomRef.current.conversationId !== result.conversation.id;
               dispatch({
-                type: 'set_initial_data',
+                type: eventCursorRef.current > 0 && !replacesDifferentConversation ? 'merge_conversation_data' : 'set_initial_data',
+                reset: replacesDifferentConversation,
                 conversationId: result.conversation.id,
                 conversation: result.conversation,
                 messages: result.messages,
@@ -483,10 +629,20 @@ function ConversationPageContent() {
                 contextWindow: {
                   used: result.context_window_size || 0,
                 },
+                transcriptGeneration: result.conversation.transcript_generation ?? 1,
+                eventCursorFloor: latestMessageSequenceId(result.messages) ?? 0,
+                snapshotStartedAtEventSeq,
               });
               setArchiveStatusConfirmedConversationId(result.conversation.id);
               await cacheDB.putConversation(result.conversation);
               await cacheDB.putMessages(result.messages);
+              await cacheDB.putReplicaMeta({
+                conversationId: result.conversation.id,
+                latestMessageSequenceId: latestMessageSequenceId(result.messages),
+                latestEventSequenceId: null,
+                transcriptGeneration: null,
+                lastHydratedAt: new Date().toISOString(),
+              });
             }
           } catch (err) {
             if (!cancelled) {
@@ -513,7 +669,7 @@ function ConversationPageContent() {
     return () => {
       cancelled = true;
     };
-  }, [slug, navigate, dispatch]);
+  }, [slug, navigate, dispatch, eventCursorRef]);
 
   useEffect(() => {
     if (!slug || !conversationId || archiveStatusConfirmed || !isConnected) return;
@@ -521,10 +677,14 @@ function ConversationPageContent() {
 
     const confirmArchiveStatus = async () => {
       try {
+        const snapshotStartedAtEventSeq = eventCursorRef.current;
         const result = await api.getConversationBySlug(slug);
         if (cancelled) return;
+        const replacesDifferentConversation = atomRef.current.conversationId !== null
+          && atomRef.current.conversationId !== result.conversation.id;
         dispatch({
-          type: 'set_initial_data',
+          type: eventCursorRef.current > 0 && !replacesDifferentConversation ? 'merge_conversation_data' : 'set_initial_data',
+          reset: replacesDifferentConversation,
           conversationId: result.conversation.id,
           conversation: result.conversation,
           messages: result.messages,
@@ -536,6 +696,9 @@ function ConversationPageContent() {
           contextWindow: {
             used: result.context_window_size || 0,
           },
+          transcriptGeneration: result.conversation.transcript_generation ?? 1,
+          eventCursorFloor: latestMessageSequenceId(result.messages) ?? 0,
+          snapshotStartedAtEventSeq,
         });
         setArchiveStatusConfirmedConversationId(result.conversation.id);
         await cacheDB.putConversation(result.conversation);
@@ -549,7 +712,7 @@ function ConversationPageContent() {
     return () => {
       cancelled = true;
     };
-  }, [slug, conversationId, archiveStatusConfirmed, isConnected, dispatch]);
+  }, [slug, conversationId, archiveStatusConfirmed, isConnected, dispatch, eventCursorRef]);
 
   // Fetch system prompt once when conversationId is known
   useEffect(() => {

@@ -144,6 +144,7 @@ function emitInit(source: FakeEventSource, messages: Message[], pendingEvents: u
   source.emit('init', {
     type: 'init',
     sequence_id: 100,
+    transcript_generation: 1,
     conversation,
     messages,
     agent_working: false,
@@ -151,13 +152,45 @@ function emitInit(source: FakeEventSource, messages: Message[], pendingEvents: u
     presentation_mode: 'idle',
     context_window_size: 0,
     project_name: null,
-    pending_anchor_sequence_id: messages.reduce((max, m) => Math.max(max, m.sequence_id), 0),
+    pending_anchor_sequence_id: 100,
     pending_events: pendingEvents,
     pending_truncated: false,
   });
 }
 
 describe('inline tool timers', () => {
+  it('renders a visible waiting state when a tool_use has no matching result', () => {
+    const debugSpy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-missing-tool-result', [{
+            type: 'tool_use',
+            id: 'tool-missing',
+            name: 'read_file',
+            input: { path: 'README.md' },
+          }])}
+          toolResults={new Map()}
+          onOpenFile={undefined}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('Waiting for tool result')).toBeInTheDocument();
+    expect(screen.getByText('result not received')).toBeInTheDocument();
+    expect(debugSpy).toHaveBeenCalledWith(
+      '[MessageComponents] rendering missing tool result',
+      expect.objectContaining({
+        tool_use_id: 'tool-missing',
+        tool_call_id: 'tool-missing',
+        known_result_ids: [],
+      }),
+    );
+
+    debugSpy.mockRestore();
+  });
+
   afterEach(() => {
     vi.useRealTimers();
   });
@@ -420,6 +453,41 @@ describe('inline tool timers', () => {
     expect(document.querySelector('.tool-block-elapsed')).toBeNull();
     expect(screen.queryByText('• 54s')).not.toBeInTheDocument();
     expect(screen.queryByText('• 41s')).not.toBeInTheDocument();
+  });
+
+  it('renders completed and failed tool results with explicit status states', () => {
+    const completed = toolMessage('tool-ok', 'done', 2);
+    completed.display_data = { duration_ms: 800 };
+    const failed: Message = {
+      message_id: 'tool-tool-fail',
+      sequence_id: 3,
+      conversation_id: 'agent-1',
+      message_type: 'tool',
+      content: { tool_use_id: 'tool-fail', error: 'boom', is_error: true },
+      display_data: { duration_ms: 1200 },
+      created_at: '2026-01-01T00:00:01Z',
+    };
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-tool-statuses', [
+            { type: 'tool_use', id: 'tool-ok', name: 'read_file', input: { path: 'ok.txt' } },
+            { type: 'tool_use', id: 'tool-fail', name: 'bash', input: { op: 'run', cmd: 'false' } },
+          ])}
+          toolResults={new Map([
+            ['tool-ok', completed],
+            ['tool-fail', failed],
+          ])}
+          onOpenFile={undefined}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(document.querySelector('[data-tool-id="tool-ok"] .tool-block-status.success')).not.toBeNull();
+    expect(document.querySelector('[data-tool-id="tool-fail"] .tool-block-status.error')).not.toBeNull();
+    expect(screen.getByText('done')).toBeInTheDocument();
+    expect(screen.getByText('boom')).toBeInTheDocument();
   });
 });
 
@@ -1600,10 +1668,16 @@ describe('SubAgentStatus inline activity', () => {
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
     act(() => {
       emitInit(FakeEventSource.instances[0]!, [], [], childConversation);
-      FakeEventSource.instances[0]!.emit('token', {
+      FakeEventSource.instances[0]!.emit('message', {
         sequence_id: 101,
-        request_id: 'child-req-1',
-        text: '![live-shot](ui/qa-artifacts/live.png)',
+        message: {
+          message_id: 'child-live-message',
+          conversation_id: childConversation.id,
+          sequence_id: 101,
+          message_type: 'agent',
+          content: [{ type: 'text', text: '![live-shot](ui/qa-artifacts/live.png)' }],
+          created_at: '2024-01-01T00:00:01Z',
+        },
       });
     });
 

@@ -145,6 +145,8 @@ interface UseConnectionOptions {
   conversationId: string | undefined;
   /** Dispatch SSE events directly to the conversation atom. */
   dispatch: Dispatch<SSEAction>;
+  /** Latest event-sequence cursor already applied by the atom, if any. */
+  getLastAppliedEventSeq?: () => number;
 }
 
 function transformInitData(raw: SseInitData): InitPayload {
@@ -161,8 +163,9 @@ function transformInitData(raw: SseInitData): InitPayload {
     contextWindow: {
       used: raw.context_window_size ?? 0,
     },
-    lastSequenceId: raw.last_sequence_id ?? 0,
-    pendingAnchorSequenceId: raw.pending_anchor_sequence_id,
+    transcriptGeneration: raw.transcript_generation,
+    lastAppliedEventSeq: raw.last_sequence_id ?? 0,
+    pendingAnchorSequenceId: raw.pending_anchor_sequence_id ?? raw.last_sequence_id ?? 0,
     pendingEvents: raw.pending_events,
     pendingTruncated: raw.pending_truncated,
   };
@@ -174,13 +177,14 @@ function transformInitData(raw: SseInitData): InitPayload {
  * Socket lifecycle manager only. Receives `dispatch` from the conversation
  * atom and calls it with SSEActions. The server always returns the full
  * message list on /stream init — update-in-place mutations arrive via the
- * typed `message_updated` SSE event — so this hook carries no sequence-id
- * state of its own. Reducer-side dedup by `lastSequenceId >= event.sequenceId`
- * still applies inside the atom.
+ * typed `message_updated` SSE event — so this hook carries no event-cursor
+ * state of its own. Ordering, replay drop, and gap buffering all live in the
+ * atom reducer.
  */
 export function useConnection({
   conversationId,
   dispatch,
+  getLastAppliedEventSeq,
 }: UseConnectionOptions): ConnectionInfo {
   const [machineState, setMachineState] = useState<ConnectionMachineState>(initialState);
   const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
@@ -203,6 +207,7 @@ export function useConnection({
   machineStateRef.current = machineState;
   const latestConversationRef = useRef<import('../api').Conversation | null>(null);
   const latestPhaseRef = useRef<import('../api').ConversationState | null>(null);
+  const getLastAppliedEventSeqRef = useRef(getLastAppliedEventSeq);
 
   useEffect(() => {
     dispatchRef.current = dispatch;
@@ -211,6 +216,10 @@ export function useConnection({
   useEffect(() => {
     conversationIdRef.current = conversationId;
   }, [conversationId]);
+
+  useEffect(() => {
+    getLastAppliedEventSeqRef.current = getLastAppliedEventSeq;
+  }, [getLastAppliedEventSeq]);
 
   const getContext = useCallback((): TransitionContext => ({
     browserOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
@@ -251,7 +260,10 @@ export function useConnection({
 
           dispatchRef.current({ type: 'connection_opened', epoch });
 
-          const url = `/api/conversations/${convId}/stream`;
+          const lastAppliedEventSeq = getLastAppliedEventSeqRef.current?.() ?? 0;
+          const url = lastAppliedEventSeq > 0
+            ? `/api/conversations/${convId}/stream?after_event_sequence=${lastAppliedEventSeq}`
+            : `/api/conversations/${convId}/stream`;
           const es = new EventSource(url);
           eventSourceRef.current = es;
           const isCurrentOwner = () =>
@@ -379,13 +391,13 @@ export function useConnection({
           // Still validated so a future server change that adds teardown
           // detail cannot slip past this no-op without a schema update.
           on('conversation_became_terminal', (e) => {
-            parseEvent(
+            const res = parseEvent(
               SseConversationBecameTerminalDataSchema,
               e,
               'conversation_became_terminal',
               stampedDispatch,
             );
-            // no-op until terminal PTY teardown is implemented
+            if (res.ok) stampedDispatch({ type: 'sse_sequence_consumed', sequenceId: res.data.sequence_id });
           });
 
           on('conversation_update', (e) => {
@@ -517,6 +529,7 @@ export function useConnection({
               stampedDispatch,
             );
             if (!res.ok) return;
+            stampedDispatch({ type: 'sse_sequence_consumed', sequenceId: res.data.sequence_id });
             window.dispatchEvent(
               new CustomEvent('phoenix:conversation-hard-deleted', {
                 detail: { conversationId: res.data.conversation_id },
@@ -530,13 +543,13 @@ export function useConnection({
           // tsc error) and is otherwise a no-op. The bubble auto-clears when
           // the server echoes the delivered message as a `message` event.
           on('steer_message_queued', (e) => {
-            parseEvent(
+            const res = parseEvent(
               SseSteerMessageQueuedDataSchema,
               e,
               'steer_message_queued',
               stampedDispatch,
             );
-            // no-op: bubble state driven by POST response + message echo
+            if (res.ok) stampedDispatch({ type: 'sse_sequence_consumed', sequenceId: res.data.sequence_id });
           });
 
           // Codex quota snapshot (task 67003). Account-global, not
@@ -552,6 +565,7 @@ export function useConnection({
             );
             if (!res.ok) return;
             setCodexQuota(res.data.snapshot);
+            stampedDispatch({ type: 'sse_sequence_consumed', sequenceId: res.data.sequence_id });
           });
 
           on('error', (e) => {

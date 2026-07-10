@@ -1,13 +1,22 @@
-import { useEffect, useReducer } from 'react';
+import { useEffect, useReducer, type Dispatch } from 'react';
 import type { Message } from '../api';
 import { api, type Conversation } from '../api';
 import {
   SseAgentDoneDataSchema,
   SseErrorDataSchema,
   SseInitDataSchema,
+  SseLlmAttemptDataSchema,
+  SseLlmFirstByteDataSchema,
+  SseConversationBecameTerminalDataSchema,
+  SseConversationHardDeletedDataSchema,
+  SseConversationUpdateDataSchema,
+  SseBrowserSessionStateDataSchema,
   SseMessageDataSchema,
   SseMessageUpdatedDataSchema,
   SseStateChangeDataSchema,
+  SseSteerMessageQueuedDataSchema,
+  SseRateLimitSnapshotDataSchema,
+  SseWorkScopeUpdateDataSchema,
   SseTokenDataSchema,
   type SseInitData,
 } from '../sseSchemas';
@@ -53,8 +62,9 @@ function transformInitData(raw: SseInitData): InitPayload {
     messages: raw.messages || [],
     phase: parseConversationState(conversation?.state),
     contextWindow: { used: raw.context_window_size ?? 0 },
-    lastSequenceId: raw.last_sequence_id ?? 0,
-    pendingAnchorSequenceId: raw.pending_anchor_sequence_id,
+    transcriptGeneration: raw.transcript_generation,
+    lastAppliedEventSeq: raw.last_sequence_id ?? 0,
+    pendingAnchorSequenceId: raw.pending_anchor_sequence_id ?? raw.last_sequence_id ?? 0,
     pendingEvents: raw.pending_events,
     pendingTruncated: raw.pending_truncated,
   };
@@ -66,6 +76,14 @@ function parseEventData(event: Event): unknown | null {
   } catch {
     return null;
   }
+}
+
+function consumeSequencedEvent(event: Event, schema: v.GenericSchema<unknown, { sequence_id: number }>, dispatch: Dispatch<InlineStreamAction>) {
+  const raw = parseEventData(event);
+  if (raw === null) return;
+  const res = v.safeParse(schema, raw);
+  if (!res.success) return;
+  dispatch({ type: 'atom', atomAction: { type: 'sse_sequence_consumed', sequenceId: res.output.sequence_id } });
 }
 
 // Bounded retry for a 404 on the initial snapshot. A freshly-spawned sub-agent
@@ -84,14 +102,15 @@ function maxMessageSequence(messages: Message[]): number {
 }
 
 function snapshotPayload(conversation: Conversation, messages: Message[], contextWindowSize: number): InitPayload {
-  const lastSequenceId = maxMessageSequence(messages);
+  const lastAppliedEventSeq = maxMessageSequence(messages);
   return {
     conversation,
     messages,
     phase: conversation.state ? parseConversationState(conversation.state) : { type: 'idle' },
     contextWindow: { used: contextWindowSize },
-    lastSequenceId,
-    pendingAnchorSequenceId: lastSequenceId,
+    transcriptGeneration: conversation.transcript_generation ?? 1,
+    lastAppliedEventSeq,
+    pendingAnchorSequenceId: lastAppliedEventSeq,
     pendingEvents: [],
     pendingTruncated: false,
   };
@@ -195,14 +214,7 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
             sequenceId: res.output.sequence_id,
             phase,
             // REQ-WPV-001: thread the server-authoritative entry time
-            // (RFC3339 → ms) onto the atom. NOTE: this inline sub-agent
-            // stream does NOT register the llm_first_byte / llm_attempt /
-            // ping listeners (nor dispatch sse_event_observed) that
-            // useConnection has — the sub-agent message view renders none
-            // of the first-byte / retry-suffix / heartbeat-watchdog
-            // indicators, so those are intentionally omitted here. If this
-            // view ever grows a StateBar-style indicator, those listeners
-            // must be added too.
+            // (RFC3339 → ms) onto the atom.
             stateUpdatedAt: Date.parse(res.output.state_updated_at),
           },
         });
@@ -213,6 +225,40 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
         if (!isAgentWorking(phase)) {
           closeSource();
         }
+      });
+
+      source.addEventListener('llm_first_byte', (event) => {
+        const raw = parseEventData(event);
+        if (raw === null) return;
+        const res = v.safeParse(SseLlmFirstByteDataSchema, raw);
+        if (!res.success) return;
+        dispatch({
+          type: 'atom',
+          atomAction: {
+            type: 'sse_llm_first_byte',
+            sequenceId: res.output.sequence_id,
+            requestId: res.output.request_id,
+          },
+        });
+      });
+
+      source.addEventListener('llm_attempt', (event) => {
+        const raw = parseEventData(event);
+        if (raw === null) return;
+        const res = v.safeParse(SseLlmAttemptDataSchema, raw);
+        if (!res.success) return;
+        dispatch({
+          type: 'atom',
+          atomAction: {
+            type: 'sse_llm_attempt',
+            sequenceId: res.output.sequence_id,
+            attempt: res.output.attempt,
+            maxAttempts: res.output.max_attempts,
+            reason: res.output.reason,
+            backingOffMs: res.output.backing_off_ms,
+            resetsAt: res.output.resets_at ? Date.parse(res.output.resets_at) : null,
+          },
+        });
       });
 
       source.addEventListener('token', (event) => {
@@ -237,6 +283,34 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
         const res = v.safeParse(SseAgentDoneDataSchema, raw);
         if (!res.success) return;
         dispatch({ type: 'atom', atomAction: { type: 'sse_agent_done', sequenceId: res.output.sequence_id } });
+      });
+
+      source.addEventListener('conversation_update', (event) => {
+        consumeSequencedEvent(event, SseConversationUpdateDataSchema, dispatch);
+      });
+
+      source.addEventListener('browser_session_state', (event) => {
+        consumeSequencedEvent(event, SseBrowserSessionStateDataSchema, dispatch);
+      });
+
+      source.addEventListener('conversation_became_terminal', (event) => {
+        consumeSequencedEvent(event, SseConversationBecameTerminalDataSchema, dispatch);
+      });
+
+      source.addEventListener('conversation_hard_deleted', (event) => {
+        consumeSequencedEvent(event, SseConversationHardDeletedDataSchema, dispatch);
+      });
+
+      source.addEventListener('steer_message_queued', (event) => {
+        consumeSequencedEvent(event, SseSteerMessageQueuedDataSchema, dispatch);
+      });
+
+      source.addEventListener('rate_limit_snapshot', (event) => {
+        consumeSequencedEvent(event, SseRateLimitSnapshotDataSchema, dispatch);
+      });
+
+      source.addEventListener('work_scope_update', (event) => {
+        consumeSequencedEvent(event, SseWorkScopeUpdateDataSchema, dispatch);
       });
 
       source.addEventListener('error', (event) => {
