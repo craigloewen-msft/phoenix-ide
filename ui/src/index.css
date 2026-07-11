@@ -708,6 +708,7 @@ body.app-viewport-active #root {
   flex: 1 1 auto;
   min-height: 0;
   padding: 12px;
+  container-type: inline-size;
 }
 
 .message-virtuoso {
@@ -1002,6 +1003,21 @@ body.app-viewport-active #root {
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
   margin: 12px 0;
+}
+
+@supports (width: 1cqw) {
+  @container (width > 800px) {
+    .message.agent > .message-content > .agent-text-block > .markdown-table-scroll {
+      width: calc(100cqw - 16px);
+      max-width: none;
+      margin-inline: calc((100% - (100cqw - 16px)) / 2);
+    }
+
+    .message.agent > .message-content > .agent-text-block > .markdown-table-scroll > table {
+      min-width: min(100%, 784px);
+      margin-inline: auto;
+    }
+  }
 }
 
 .markdown-table-scroll table {
