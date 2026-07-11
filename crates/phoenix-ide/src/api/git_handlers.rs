@@ -515,16 +515,8 @@ async fn pr_status_response_for_missing_worktree(
 fn effective_feedback_status_for_cache(
     previous: Option<PrFeedbackStatus>,
     fetched: PrFeedbackStatus,
-    degraded: bool,
 ) -> (Option<PrFeedbackStatus>, bool) {
-    let preserve_previous = degraded
-        && fetched == PrFeedbackStatus::Open
-        && previous.is_some_and(|status| status != PrFeedbackStatus::Open);
-    if preserve_previous {
-        (previous, false)
-    } else {
-        (Some(fetched), true)
-    }
+    (Some(fetched), previous != Some(fetched))
 }
 
 pub(crate) async fn get_conversation_pr_status(
@@ -665,21 +657,21 @@ async fn attach_pr_feedback_freshness(
         match feedback {
             Ok(feedback) => {
                 let coverage_health = crate::api::pr_monitoring::coverage_health(&feedback);
-                let (effective_feedback_status, should_update_cache) =
-                    effective_feedback_status_for_cache(
+                response.feedback_status = feedback.feedback_status.or(previous_feedback_status);
+                if let Some(fetched_status) = feedback.feedback_status {
+                    let (_, should_update_cache) = effective_feedback_status_for_cache(
                         previous_feedback_status,
-                        feedback.feedback_status,
-                        coverage_health.is_some(),
+                        fetched_status,
                     );
-                response.feedback_status = effective_feedback_status;
-                if should_update_cache {
-                    db.update_work_scope_pr_feedback_status(
-                        work_scope,
-                        pr_number,
-                        feedback.feedback_status,
-                    )
-                    .await
-                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                    if should_update_cache {
+                        db.update_work_scope_pr_feedback_status(
+                            work_scope,
+                            pr_number,
+                            fetched_status,
+                        )
+                        .await
+                        .map_err(|e| AppError::Internal(e.to_string()))?;
+                    }
                 }
                 response.feedback_freshness =
                     crate::api::pr_monitoring::actionable_feedback_freshness_from_baseline(
@@ -785,7 +777,7 @@ pub(crate) async fn create_pr_auto_fix_context(
             Ok(capture.response),
             capture.observations,
             Some(capture.baseline),
-            Some(capture.feedback_status),
+            capture.feedback_status,
         ),
         Err(crate::api::pr_monitoring::PrMonitorError::BadRequestWithObservations {
             message,
@@ -991,35 +983,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn degraded_open_feedback_preserves_previous_non_open_cache_status() {
-        assert_eq!(
-            effective_feedback_status_for_cache(
-                Some(PrFeedbackStatus::Approved),
-                PrFeedbackStatus::Open,
-                true,
-            ),
-            (Some(PrFeedbackStatus::Approved), false)
-        );
+    fn successful_root_status_clears_stale_cache_independent_of_feedback_coverage() {
         assert_eq!(
             effective_feedback_status_for_cache(
                 Some(PrFeedbackStatus::InProgress),
                 PrFeedbackStatus::Open,
-                true,
             ),
-            (Some(PrFeedbackStatus::InProgress), false)
+            (Some(PrFeedbackStatus::Open), true)
         );
     }
 
     #[test]
-    fn complete_open_feedback_updates_cache_status() {
+    fn unchanged_root_status_skips_cache_write() {
         assert_eq!(
             effective_feedback_status_for_cache(
                 Some(PrFeedbackStatus::Approved),
-                PrFeedbackStatus::Open,
-                false,
+                PrFeedbackStatus::Approved,
             ),
-            (Some(PrFeedbackStatus::Open), true)
+            (Some(PrFeedbackStatus::Approved), false)
         );
+    }
+
+    #[test]
+    fn unavailable_root_status_falls_back_to_cached_response_status() {
+        let previous = Some(PrFeedbackStatus::InProgress);
+        let fetched = None;
+
+        assert_eq!(fetched.or(previous), Some(PrFeedbackStatus::InProgress));
+    }
+
+    #[test]
+    fn successful_open_root_status_overrides_cached_response_status() {
+        let previous = Some(PrFeedbackStatus::InProgress);
+        let fetched = Some(PrFeedbackStatus::Open);
+
+        assert_eq!(fetched.or(previous), Some(PrFeedbackStatus::Open));
     }
 
     fn conversation_with_mode(
