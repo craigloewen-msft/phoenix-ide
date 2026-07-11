@@ -100,6 +100,7 @@ value ResponsesRawResponse {
     raw_input_tokens: Integer
     raw_output_tokens: Integer
     cached_tokens: Integer
+    cache_write_tokens: Integer
     has_function_call: Boolean
     has_output_content: Boolean
 }
@@ -128,6 +129,7 @@ entity ResponsesStream {
     input_tokens: Integer
     output_tokens: Integer
     cached_tokens: Integer
+    cache_write_tokens: Integer
     recovered_from_completed: Boolean
 
     output_items: ResponsesOutputItem with stream = this
@@ -160,6 +162,14 @@ entity ResponsesOutputItem {
 entity ResponsesWireContentPart {
     surface: ResponsesPartSurface
     wire_type: String
+}
+
+-- A cacheable message content block on a GPT-5.6-era direct platform request.
+-- Function-call outputs are not members of this entity because OpenAI rejects
+-- prompt_cache_breakpoint on that surface.
+entity ResponsesCacheBreakpoint {
+    wire_type: String
+    explicit: Boolean
 }
 
 -- A capability gap: an Anthropic server-handled block (server_tool_use,
@@ -258,6 +268,28 @@ rule ResponsesToolResultOutputTranslated {
         -- branch and creates no parts (the second requires clause).
 }
 
+rule ResponsesExplicitCacheBreakpointsPlaced {
+    when: TranslateResponsesRequest(model_supports_explicit_cache, uses_codex_backend)
+
+    requires: model_supports_explicit_cache = true
+    requires: uses_codex_backend = false
+
+    ensures: ResponsesCachePolicyEmitted(mode: "implicit", ttl: "30m")
+    ensures: ResponsesCacheBreakpoints.count <= 50
+    ensures:
+        for breakpoint in ResponsesCacheBreakpoints:
+            breakpoint.wire_type in { "input_text", "input_image", "input_file" }
+            breakpoint.explicit = true
+
+    @guidance
+        -- Implicit mode owns the latest-message boundary, so Phoenix skips
+        -- that message and preserves explicit markers on up to the latest 50
+        -- earlier message boundaries considered for reads. OpenAI decides
+        -- which newest boundaries consume its four write slots. The translator
+        -- never traverses function_call_output items when placing markers.
+        -- GPT-5.5-era and Codex bridge requests omit the policy and markers.
+}
+
 -- Capability gap. An Anthropic server-handled block has no Responses API
 -- wire equivalent and is dropped from the request. The drop is recorded
 -- and logged at debug with the block kind — a silent omission would be
@@ -302,9 +334,9 @@ rule ResponsesServerBlockDropped {
 --      ignored. end_turn holds iff the status is "completed" AND no
 --      tool call is pending.
 --
--- Token accounting de-duplicates the cached subset: OpenAI's
--- raw_input_tokens already includes cached_tokens, so the cached count
--- is split out into cache_read_tokens and subtracted from input_tokens.
+-- Token accounting de-duplicates both cache detail subsets: OpenAI's
+-- raw_input_tokens includes cached_tokens and cache_write_tokens, so both
+-- are split into their Usage buckets and subtracted from input_tokens.
 -- This keeps llm/Usage.context_window_used equal to OpenAI's own
 -- input+output total instead of double-counting the cache.
 rule ResponsesResponseNormalized {
@@ -324,9 +356,9 @@ rule ResponsesResponseNormalized {
             llm/LlmResponse.created(
                 end_turn: end_turn,
                 usage: {
-                    input_tokens: saturating_sub(raw.raw_input_tokens, raw.cached_tokens),
+                    input_tokens: saturating_sub(raw.raw_input_tokens, raw.cached_tokens + raw.cache_write_tokens),
                     output_tokens: raw.raw_output_tokens,
-                    cache_creation_tokens: 0,
+                    cache_creation_tokens: raw.cache_write_tokens,
                     cache_read_tokens: raw.cached_tokens
                 }
             )
@@ -340,10 +372,10 @@ rule ResponsesResponseNormalized {
         -- this branch catches the case where even that is empty though
         -- tokens were billed. An empty response with output_tokens = 0
         -- is a genuinely-empty valid turn and takes the LlmResponse
-        -- branch. cache_creation_tokens is fixed at 0 — the Responses
-        -- API has no cache-creation concept; the field is a typed sink
-        -- for this provider. saturating_sub floors at 0; OpenAI
-        -- guarantees cached_tokens <= raw_input_tokens
+        -- branch. GPT-5.6-era Responses usage reports cache writes in
+        -- input_tokens_details.cache_write_tokens; older responses default it
+        -- to zero. saturating_sub floors at 0; OpenAI guarantees the combined
+        -- cache detail subsets do not exceed raw_input_tokens
         -- (ResponsesCachedSubsetOfInput), so the floor is defensive.
         -- A "reasoning" item is dropped silently (internal thinking,
         -- not transcript). A message's "refusal" part surfaces as text
@@ -364,6 +396,7 @@ rule ResponsesStreamOpened {
         input_tokens: 0,
         output_tokens: 0,
         cached_tokens: 0,
+        cache_write_tokens: 0,
         recovered_from_completed: false
     )
 }
@@ -393,7 +426,7 @@ rule ResponsesOutputItemCollected {
 -- recorded. Fallback: if no per-item.done events were seen, the output
 -- items are recovered from the terminal event's /response/output array.
 rule ResponsesStreamCompleted {
-    when: ResponsesCompletedEvent(stream, input_tokens, output_tokens, cached_tokens, terminal_output)
+    when: ResponsesCompletedEvent(stream, input_tokens, output_tokens, cached_tokens, cache_write_tokens, terminal_output)
 
     requires: stream.status = accumulating
 
@@ -401,6 +434,7 @@ rule ResponsesStreamCompleted {
         stream.input_tokens = input_tokens
         stream.output_tokens = output_tokens
         stream.cached_tokens = cached_tokens
+        stream.cache_write_tokens = cache_write_tokens
         if stream.output_items.count = 0:
             stream.recovered_from_completed = true
             for kind in terminal_output:
@@ -646,10 +680,8 @@ invariant ResponsesEmitsOnlyInputParts {
         part.wire_type in { "input_text", "input_image" }
 }
 
--- The "no parallel representations" guarantee. A part on the
--- function_call_output surface obeys the same discriminant rule as one
--- on the message_content surface — they cannot diverge the way they did
--- before the 2026-05 fix merged the two part types into one.
+-- Surface-specific Rust types make cache breakpoints unrepresentable on
+-- function_call_output while both types obey the same discriminant contract.
 invariant ResponsesPartContractSurfaceIndependent {
     for part in ResponsesWireContentParts:
         (part.surface = function_call_output) implies
@@ -665,14 +697,13 @@ invariant ResponsesDroppedBlockAlwaysLogged {
         dropped.logged = true
 }
 
--- The cached-token count is a subset of the raw input-token count. This
--- is the OpenAI guarantee that makes the cached-token de-duplication in
--- ResponsesResponseNormalized (saturating_sub of cached out of input)
--- never underflow, so the four llm/Usage buckets sum to OpenAI's own
--- input+output total rather than double-counting the cache.
-invariant ResponsesCachedSubsetOfInput {
+-- The combined cache-read and cache-write detail buckets are subsets of
+-- the raw input-token count. This guarantees normalization never underflows
+-- and the four llm/Usage buckets sum to OpenAI's input+output total.
+invariant ResponsesCacheDetailsSubsetOfInput {
     for stream in ResponsesStreams:
-        stream.status = done implies stream.cached_tokens <= stream.input_tokens
+        stream.status = done implies
+            stream.cached_tokens + stream.cache_write_tokens <= stream.input_tokens
 }
 
 ------------------------------------------------------------
