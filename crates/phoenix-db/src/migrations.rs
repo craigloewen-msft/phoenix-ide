@@ -181,6 +181,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_transcript_generation_to_conversations",
         sql: MIGRATION_033,
     },
+    Migration {
+        version: 34,
+        name: "create_global_recall_sessions",
+        sql: MIGRATION_034,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -1053,6 +1058,28 @@ const MIGRATION_033: &str = r"
 ALTER TABLE conversations ADD COLUMN transcript_generation INTEGER NOT NULL DEFAULT 1;
 ";
 
+const MIGRATION_034: &str = r"
+CREATE TABLE IF NOT EXISTS global_recall_sessions (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS global_recall_messages (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES global_recall_sessions(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, ordinal)
+);
+
+CREATE INDEX IF NOT EXISTS idx_global_recall_messages_session_ordinal
+    ON global_recall_messages(session_id, ordinal);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1116,7 +1143,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 33);
+        assert_eq!(first, 34);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
@@ -1153,9 +1180,9 @@ mod tests {
             .unwrap();
 
         // Every version except the stamped 29 must run: 1–28 below the stamp
-        // and 30–33 above it.
+        // and 30–34 above it.
         let applied = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(applied, 32);
+        assert_eq!(applied, 33);
 
         // Migration 005's effects must be present.
         let cols: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")

@@ -12,6 +12,7 @@ use super::git_handlers::{
     create_pr_auto_fix_context, get_conversation_diff, get_conversation_pr_status,
     list_git_branches, record_pr_auto_fix_context_baseline,
 };
+use super::global_recall;
 use super::lifecycle_handlers::{
     abandon_task, approve_commission_review, approve_fork_proposal, approve_task,
     dismiss_fork_proposal, list_fork_proposals, mark_merged, reject_commission_review, reject_task,
@@ -34,7 +35,9 @@ use super::types::{
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
-use crate::db::{ConvMode, Conversation, ConversationUsage, ImageData, NotificationSettings};
+use crate::db::{
+    ConvMode, Conversation, ConversationUsage, DbError, ImageData, NotificationSettings,
+};
 use crate::git_ops::{
     check_branch_conflict, create_worktree, materialize_branch, run_git, BranchConflict,
     GitOpError, PhoenixIgnoreStrategy,
@@ -112,6 +115,23 @@ pub fn create_router(state: AppState) -> Router {
         .route("/preview/*filepath", get(serve_preview_file))
         // Conversation listing (REQ-API-001)
         .route("/api/conversations", get(list_conversations))
+        .route("/api/global/open-work", get(global_recall::open_work))
+        .route(
+            "/api/global/recall/sessions",
+            get(global_recall::list_sessions).post(global_recall::create_session),
+        )
+        .route(
+            "/api/global/recall/sessions/:id",
+            get(global_recall::get_session),
+        )
+        .route(
+            "/api/global/recall/sessions/:id/ask",
+            post(global_recall::ask_session),
+        )
+        .route(
+            "/api/global/resolve",
+            post(global_recall::resolve_reference),
+        )
         .route(
             "/api/conversations/archived",
             get(list_archived_conversations),
@@ -4233,12 +4253,16 @@ async fn get_by_slug(
     State(state): State<AppState>,
     Path(slug): Path<String>,
 ) -> Result<Json<ConversationWithMessagesResponse>, AppError> {
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation_by_slug(&slug)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    let conversation = match state.runtime.db().get_conversation_by_slug(&slug).await {
+        Ok(conversation) => conversation,
+        Err(DbError::ConversationNotFound(_)) => state
+            .runtime
+            .db()
+            .get_conversation(&slug)
+            .await
+            .map_err(|e| AppError::NotFound(e.to_string()))?,
+        Err(e) => return Err(AppError::NotFound(e.to_string())),
+    };
 
     let messages = state
         .runtime
@@ -6113,7 +6137,7 @@ async fn shared_sse_stream(
 // ============================================================
 
 #[derive(Debug)]
-pub(super) enum AppError {
+pub(crate) enum AppError {
     BadRequest(String),
     NotFound(String),
     /// 403 — the action is restricted to a caller on the server host.

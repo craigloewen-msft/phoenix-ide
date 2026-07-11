@@ -76,6 +76,7 @@ interface MessageListProps {
    *  `unitIndex` values are guaranteed to be in virtuoso's coordinate space —
    *  no second `buildRenderUnits` pass to drift against. */
   onChaptersChange?: ((chapters: Chapter[]) => void) | undefined;
+  targetMessageId?: string | undefined;
 }
 
 /** Imperative surface exposed to the conversation nav strip. MessageList owns
@@ -85,6 +86,7 @@ export interface MessageListHandle {
   /** Scroll the render unit at `unitIndex` (a `historicalUnits` index, which
    *  equals its virtuoso item index) into view and pulse it once mounted. */
   scrollToUnitIndex: (unitIndex: number) => void;
+  scrollToMessageId: (messageId: string) => boolean;
 }
 
 
@@ -140,7 +142,7 @@ function renderHistoricalUnit(
       const c = unit.message.content as { name?: string; trigger?: string; args?: string; source?: string; snippet?: string; files?: { original_name: string; size_bytes: number; stored_path?: string }[] };
       const trigger = c.trigger?.trim() || [c.name ? `/${c.name}` : '/skill', c.args?.trim()].filter(Boolean).join(' ');
       return (
-        <div className="message user" data-sequence-id={unit.message.sequence_id}>
+        <div id={`message-${unit.message.message_id}`} className="message user" data-sequence-id={unit.message.sequence_id}>
           <div className="message-header">
             <span className="message-sender">You</span>
             {unit.message.created_at && (
@@ -313,6 +315,7 @@ function MessageListImpl({
   enableMessageSidepanel = true,
   onVisibleRangeChange,
   onChaptersChange,
+  targetMessageId,
 }: MessageListProps, ref: React.ForwardedRef<MessageListHandle>) {
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const [hasUnreadTailContent, setHasUnreadTailContent] = useState(false);
@@ -604,6 +607,7 @@ function MessageListImpl({
   // every virtuoso row wrapper (see `itemContent`).
   const pendingPulseKeyRef = useRef<string | null>(null);
   const activeJumpKeyRef = useRef<string | null>(null);
+  const jumpedTargetMessageIdRef = useRef<string | null>(null);
   const jumpRetryTimersRef = useRef<number[]>([]);
   const pulseTimersRef = useRef<number[]>([]);
 
@@ -687,7 +691,33 @@ function MessageListImpl({
     });
   }, [historicalUnits, clearJumpRetryTimers, correctPendingJumpOffset, applyPendingPulse, dispatchScrollEvent]);
 
-  useImperativeHandle(ref, () => ({ scrollToUnitIndex }), [scrollToUnitIndex]);
+  const findUnitIndexByMessageId = useCallback((messageId: string) => {
+    return historicalUnits.findIndex((unit) => {
+      if (unit.kind === 'agent_turn') return unit.agent.message_id === messageId;
+      if ('message' in unit && 'message_id' in unit.message) return unit.message.message_id === messageId;
+      return false;
+    });
+  }, [historicalUnits]);
+
+  const scrollToMessageId = useCallback((messageId: string) => {
+    const index = findUnitIndexByMessageId(messageId);
+    if (index < 0) return false;
+    scrollToUnitIndex(index);
+    return true;
+  }, [findUnitIndexByMessageId, scrollToUnitIndex]);
+
+  useEffect(() => {
+    if (!targetMessageId) {
+      jumpedTargetMessageIdRef.current = null;
+      return;
+    }
+    if (jumpedTargetMessageIdRef.current === targetMessageId) return;
+    if (scrollToMessageId(targetMessageId)) {
+      jumpedTargetMessageIdRef.current = targetMessageId;
+    }
+  }, [scrollToMessageId, targetMessageId]);
+
+  useImperativeHandle(ref, () => ({ scrollToUnitIndex, scrollToMessageId }), [scrollToMessageId, scrollToUnitIndex]);
 
   const handleRangeChanged = useCallback((range: ListRange) => {
     onVisibleRangeChange?.(range);

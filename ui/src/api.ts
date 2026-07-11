@@ -815,6 +815,75 @@ export interface LlmLanguageCatalogEntry {
   prompts: LlmLanguagePrompts;
 }
 
+export type GlobalOpenWorkSource = 'chain' | 'conversation';
+
+export interface GlobalOpenWorkItem {
+  id: string;
+  source: GlobalOpenWorkSource;
+  title: string;
+  project_id: string | null;
+  current_conversation_id: string;
+  current_conversation_slug: string | null;
+  root_conversation_id: string;
+  root_conversation_slug: string | null;
+  updated_at: string;
+  mode: string;
+  state: string;
+  task_id: string | null;
+  task_title: string | null;
+  task_status: string | null;
+  branch_name: string | null;
+  base_branch: string | null;
+  worktree_path: string | null;
+  member_count: number;
+  signals: string[];
+  href: string;
+  reference: string;
+}
+
+export interface GlobalOpenWorkProject {
+  project_id: string | null;
+  project_name: string;
+  canonical_path: string | null;
+  items: GlobalOpenWorkItem[];
+}
+
+export interface GlobalOpenWorkResponse {
+  generated_at: string;
+  groups: GlobalOpenWorkProject[];
+  has_more: boolean;
+}
+
+export interface GlobalRecallSession {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GlobalRecallMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  created_at: string;
+}
+
+export interface GlobalRecallSessionResponse {
+  session: GlobalRecallSession;
+  messages: GlobalRecallMessage[];
+  older_cursor: number | null;
+}
+
+export interface GlobalRecallSessionsResponse {
+  sessions: GlobalRecallSession[];
+  has_more: boolean;
+}
+
+export interface GlobalRecallAskResponse {
+  user_message: GlobalRecallMessage;
+  assistant_message: GlobalRecallMessage;
+}
+
 export interface LlmLanguageSetting {
   language: string;
   available: string[];
@@ -1106,6 +1175,48 @@ export const api = {
       body: JSON.stringify(settings),
     });
     if (!resp.ok) throw new Error('Failed to save notification settings');
+    return resp.json();
+  },
+
+  async getGlobalOpenWork(offset = 0): Promise<GlobalOpenWorkResponse> {
+    const resp = await fetch(`/api/global/open-work?offset=${offset}`);
+    if (!resp.ok) throw new Error('Failed to load Global Open Work');
+    return resp.json();
+  },
+
+  async listGlobalRecallSessions(offset = 0): Promise<GlobalRecallSessionsResponse> {
+    const resp = await fetch(`/api/global/recall/sessions?offset=${offset}`);
+    if (!resp.ok) throw new Error('Failed to load Global Recall sessions');
+    return resp.json();
+  },
+
+  async createGlobalRecallSession(title?: string): Promise<GlobalRecallSession> {
+    const resp = await fetch('/api/global/recall/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    });
+    if (!resp.ok) throw new Error('Failed to create Global Recall session');
+    return (await resp.json()).session;
+  },
+
+  async getGlobalRecallSession(id: string, before?: number): Promise<GlobalRecallSessionResponse> {
+    const query = before === undefined ? '' : `?before=${before}`;
+    const resp = await fetch(`/api/global/recall/sessions/${encodeURIComponent(id)}${query}`);
+    if (!resp.ok) throw new Error('Failed to load Global Recall session');
+    return resp.json();
+  },
+
+  async askGlobalRecallSession(id: string, question: string): Promise<GlobalRecallAskResponse> {
+    const resp = await fetch(`/api/global/recall/sessions/${encodeURIComponent(id)}/ask`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string };
+      throw new Error(err.error ?? 'Failed to ask Global Recall');
+    }
     return resp.json();
   },
 
