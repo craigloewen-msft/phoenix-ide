@@ -117,6 +117,43 @@ CREATE TABLE IF NOT EXISTS steering_message_images (
     PRIMARY KEY (message_id, image_ordinal)
 );
 
+CREATE TABLE IF NOT EXISTS conversation_creation_jobs (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL UNIQUE REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT UNIQUE,
+    phase TEXT NOT NULL,
+    intent_json TEXT NOT NULL,
+    error TEXT,
+    accepted_at TEXT,
+    provisioning_started_at TEXT,
+    completed_at TEXT,
+    failed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (phase IN ('accepted', 'provisioning', 'ready', 'failed'))
+);
+
+CREATE TABLE IF NOT EXISTS conversation_creation_job_files (
+    job_id TEXT NOT NULL REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    stored_path TEXT NOT NULL,
+    PRIMARY KEY (job_id, ordinal)
+);
+
+CREATE INDEX IF NOT EXISTS idx_creation_job_files_stored_path
+    ON conversation_creation_job_files(stored_path);
+
+CREATE TABLE IF NOT EXISTS conversation_creation_job_images (
+    job_id TEXT NOT NULL REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (job_id, ordinal)
+);
+
 CREATE TABLE IF NOT EXISTS turn_usage (
     id INTEGER PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,

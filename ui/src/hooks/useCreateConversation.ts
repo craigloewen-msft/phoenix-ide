@@ -48,6 +48,8 @@ function relativeTaskPath(cwd: string, taskPath: string): string {
   return taskPath.startsWith(root) ? taskPath.slice(root.length) : taskPath;
 }
 
+const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c/${conv.id}`;
+
 function buildTaskStartPrompt(cwd: string, task: TaskEntry, extraInstructions: string): string {
   const taskFile = relativeTaskPath(cwd, task.path);
   const extra = extraInstructions.trim();
@@ -479,6 +481,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
       }
 
       const messageId = generateUUID();
+      const clientConversationId = generateUUID();
       const trimmedCwd = cwd.trim();
       if (workflowNeedsGit(workflow) && isGitDir !== true) {
         setError('Choose a Git repository before starting an isolated workflow.');
@@ -509,63 +512,27 @@ export function useCreateConversation(navigate: (path: string) => void) {
       const submitText = selectedTask
         ? buildTaskStartPrompt(trimmedCwd, selectedTask, trimmed)
         : trimmed;
-      const conv = files.length > 0
-        ? submission.checkoutRef
-          ? await createConversationWithStore(
-              trimmedCwd,
-              submitText,
-              messageId,
-              selectedModel || undefined,
-              images,
-              submission.mode,
-              submission.baseBranch,
-              undefined,
-              undefined,
-              files,
-              submission.checkoutRef,
-            )
-          : await createConversationWithStore(
-              trimmedCwd,
-              submitText,
-              messageId,
-              selectedModel || undefined,
-              images,
-              submission.mode,
-              submission.baseBranch,
-              undefined,
-              undefined,
-              files,
-            )
-        : submission.checkoutRef
-          ? await createConversationWithStore(
-              trimmedCwd,
-              submitText,
-              messageId,
-              selectedModel || undefined,
-              images,
-              submission.mode,
-              submission.baseBranch,
-              undefined,
-              undefined,
-              [],
-              submission.checkoutRef,
-            )
-          : await createConversationWithStore(
-              trimmedCwd,
-              submitText,
-              messageId,
-              selectedModel || undefined,
-              images,
-              submission.mode,
-              submission.baseBranch,
-            );
+      const conv = await createConversationWithStore(
+        trimmedCwd,
+        submitText,
+        messageId,
+        selectedModel || undefined,
+        images,
+        submission.mode,
+        submission.baseBranch,
+        undefined,
+        undefined,
+        files,
+        submission.checkoutRef,
+        clientConversationId,
+      );
       addRecentDir(trimmedCwd);
       setRecentDirs(getRecentDirs());
       setDraft('');
       setImages([]);
       setFiles([]);
       clearNewConversationDraft();
-      navigate(`/c/${conv.slug}`);
+      navigate(routeForConversation(conv));
     } catch (err) {
       setCreating(false);
       // An unresolvable @reference in the first message rejects with a 422.

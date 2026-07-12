@@ -82,6 +82,15 @@ pub trait MessageStore: Send + Sync {
     /// recovery (re-drain after partial steering-queue drain).
     async fn message_exists(&self, message_id: &str) -> Result<bool, String>;
 
+    /// Complete an async creation job using the authority that enqueued the initial turn.
+    async fn complete_creation_job(
+        &self,
+        _job_id: &str,
+        _claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+    ) -> Result<crate::db::CreationCasOutcome, String> {
+        Ok(crate::db::CreationCasOutcome::ClaimLost)
+    }
+
     /// Update `display_data` for an existing message
     async fn update_message_display_data(
         &self,
@@ -352,6 +361,14 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
 
     async fn message_exists(&self, message_id: &str) -> Result<bool, String> {
         (**self).message_exists(message_id).await
+    }
+
+    async fn complete_creation_job(
+        &self,
+        job_id: &str,
+        claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+    ) -> Result<crate::db::CreationCasOutcome, String> {
+        (**self).complete_creation_job(job_id, claim).await
     }
 
     async fn update_message_display_data(
@@ -641,6 +658,17 @@ impl MessageStore for DatabaseStorage {
     async fn message_exists(&self, message_id: &str) -> Result<bool, String> {
         self.db
             .message_exists(message_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn complete_creation_job(
+        &self,
+        job_id: &str,
+        claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+    ) -> Result<crate::db::CreationCasOutcome, String> {
+        self.db
+            .complete_conversation_creation_job(job_id, claim, chrono::Utc::now())
             .await
             .map_err(|e| e.to_string())
     }

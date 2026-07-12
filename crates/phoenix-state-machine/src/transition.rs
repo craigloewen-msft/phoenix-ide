@@ -442,6 +442,9 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
         // adding a new state forces a decision here.
         ConvState::AwaitingRecovery { .. }
         | ConvState::AwaitingContinuation { .. }
+        | ConvState::Provisioning { .. }
+        | ConvState::CreationFailed { .. }
+        | ConvState::CreationCancelled { .. }
         | ConvState::Completed { .. }
         | ConvState::Failed { .. } => Err(TransitionError::InvalidTransition {
             state: state.variant_name(),
@@ -469,6 +472,32 @@ pub fn transition(
     context: &ConvContext,
     event: Event,
 ) -> Result<TransitionResult, TransitionError> {
+    if let Event::CreationRequestResume { job_id, claim } = event {
+        if !matches!(state, ConvState::LlmRequesting { .. }) || context.is_sub_agent {
+            return Err(TransitionError::InvalidTransition {
+                state: state.variant_name(),
+                event: "CreationRequestResume",
+            });
+        }
+        return Ok(TransitionResult::new(state.clone())
+            .with_effect(Effect::RequestLlm)
+            .with_effect(Effect::CompleteCreation { job_id, claim }));
+    }
+
+    if let Event::CreationProvisioned {
+        initial_message,
+        job_id,
+        claim,
+    } = event
+    {
+        if !matches!(state, ConvState::Provisioning { .. }) || context.is_sub_agent {
+            return Err(TransitionError::InvalidTransition {
+                state: state.variant_name(),
+                event: "CreationProvisioned",
+            });
+        }
+        return creation_provisioned_transition(context, initial_message, job_id, claim);
+    }
     if context.is_sub_agent {
         let sub_state = SubAgentState::try_from(state.clone()).map_err(|e| {
             TransitionError::InvalidTransition {
@@ -1625,6 +1654,45 @@ fn handle_core_continuation(
 // ============================================================================
 // transition_parent — parent-specific transitions, delegates core
 // ============================================================================
+
+fn creation_provisioned_transition(
+    context: &ConvContext,
+    initial_message: phoenix_core::domain::sm_event::SteerEntry,
+    job_id: String,
+    claim: phoenix_core::domain::creation_protocol::CreationClaim,
+) -> Result<TransitionResult, TransitionError> {
+    let mut result = transition(
+        &ConvState::Idle,
+        context,
+        Event::UserMessage {
+            text: initial_message.text,
+            llm_text: initial_message.llm_text,
+            images: initial_message.images,
+            files: initial_message.files,
+            message_id: initial_message.message_id,
+            user_agent: initial_message.user_agent,
+            skill_invocation: initial_message.skill_invocation,
+        },
+    )?;
+    for effect in &mut result.effects {
+        if let Effect::PersistMessage { idempotent, .. } = effect {
+            *idempotent = true;
+        }
+    }
+    let request_index = result
+        .effects
+        .iter()
+        .position(|effect| matches!(effect, Effect::RequestLlm))
+        .ok_or(TransitionError::InvalidTransition {
+            state: "Provisioning",
+            event: "CreationProvisioned",
+        })?;
+    result.effects.insert(
+        request_index + 1,
+        Effect::CompleteCreation { job_id, claim },
+    );
+    Ok(result)
+}
 
 /// Parent transition function. Handles parent-only states and events, delegates
 /// core state + core event combinations to `transition_core`.
@@ -3436,6 +3504,9 @@ fn current_attempt(state: &ConvState) -> u32 {
         | ConvState::AwaitingTaskApproval { .. }
         | ConvState::AwaitingUserResponse { .. }
         | ConvState::AwaitingCommissionReviewApproval { .. }
+        | ConvState::Provisioning { .. }
+        | ConvState::CreationFailed { .. }
+        | ConvState::CreationCancelled { .. }
         | ConvState::ContextExhausted { .. }
         | ConvState::HandedOff { .. }
         | ConvState::Terminal => 1,
@@ -3818,13 +3889,16 @@ mod tests {
             other @ (ConvState::Idle
             | ConvState::LlmRequesting { .. }
             | ConvState::SeededLlmRequesting { .. }
+            | ConvState::Provisioning { .. }
             | ConvState::ToolExecuting { .. }
             | ConvState::CancellingTool { .. }
             | ConvState::AwaitingSubAgents { .. }
             | ConvState::CancellingSubAgents { .. }
             | ConvState::Completed { .. }
             | ConvState::Failed { .. }
+            | ConvState::CreationFailed { .. }
             | ConvState::Error { .. }
+            | ConvState::CreationCancelled { .. }
             | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingContinuation { .. }
             | ConvState::AwaitingTaskApproval { .. }
@@ -4102,6 +4176,173 @@ mod tests {
             ConvState::LlmRequesting { attempt: 1 }
         ));
         assert!(!result.effects.is_empty());
+    }
+
+    #[test]
+    fn creation_provisioned_reuses_normal_initial_turn_transition() {
+        let claim = phoenix_core::domain::creation_protocol::CreationClaim {
+            worker_id: phoenix_core::domain::creation_protocol::CreationWorkerId("worker".into()),
+            generation: 7,
+            token: phoenix_core::domain::creation_protocol::CreationClaimToken("token".into()),
+            lease_until: 100,
+        };
+        let message = phoenix_core::domain::sm_event::SteerEntry {
+            text: "Hello".to_string(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: "creation-message-id".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        let from_provisioning = transition(
+            &ConvState::Provisioning {
+                job_id: "creation-job".to_string(),
+                phase: phoenix_core::domain::db_schema::ConversationCreationPhase::Provisioning,
+            },
+            &test_context(),
+            Event::CreationProvisioned {
+                initial_message: message.clone(),
+                job_id: "creation-job".to_string(),
+                claim: claim.clone(),
+            },
+        )
+        .unwrap();
+        let from_idle = transition(
+            &ConvState::Idle,
+            &test_context(),
+            Event::UserMessage {
+                text: message.text,
+                llm_text: message.llm_text,
+                images: message.images,
+                files: message.files,
+                message_id: message.message_id,
+                user_agent: message.user_agent,
+                skill_invocation: message.skill_invocation,
+            },
+        )
+        .unwrap();
+        assert_eq!(from_provisioning.new_state, from_idle.new_state);
+        let normal_provisioning_effects: Vec<_> = from_provisioning
+            .effects
+            .iter()
+            .filter(|effect| !matches!(effect, Effect::CompleteCreation { .. }))
+            .collect();
+        assert_eq!(normal_provisioning_effects.len(), from_idle.effects.len());
+        for (provisioning, idle) in normal_provisioning_effects.iter().zip(&from_idle.effects) {
+            match (provisioning, idle) {
+                (
+                    Effect::PersistMessage {
+                        idempotent: true, ..
+                    },
+                    Effect::PersistMessage {
+                        idempotent: false, ..
+                    },
+                ) => {}
+                _ => assert_eq!(format!("{provisioning:?}"), format!("{idle:?}")),
+            }
+        }
+        assert!(from_provisioning.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::PersistMessage {
+                idempotent: true,
+                ..
+            }
+        )));
+        assert!(from_provisioning.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::CompleteCreation {
+                job_id,
+                claim: effect_claim,
+            } if job_id == "creation-job" && effect_claim == &claim
+        )));
+    }
+
+    fn creation_request_resume_event(generation: u64) -> Event {
+        Event::CreationRequestResume {
+            job_id: "creation-job".to_string(),
+            claim: phoenix_core::domain::creation_protocol::CreationClaim {
+                worker_id: phoenix_core::domain::creation_protocol::CreationWorkerId(
+                    "worker".into(),
+                ),
+                generation,
+                token: phoenix_core::domain::creation_protocol::CreationClaimToken("token".into()),
+                lease_until: 100,
+            },
+        }
+    }
+
+    #[test]
+    fn creation_request_resume_dispatches_persisted_initial_request() {
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &test_context(),
+            creation_request_resume_event(3),
+        )
+        .expect("creation request resumes");
+        assert_eq!(result.new_state, ConvState::LlmRequesting { attempt: 1 });
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
+        assert!(result.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::CompleteCreation { job_id, claim }
+                if job_id == "creation-job" && claim.generation == 3
+        )));
+    }
+
+    #[test]
+    fn creation_request_resume_is_rejected_outside_llm_requesting() {
+        let result = transition(
+            &ConvState::Idle,
+            &test_context(),
+            creation_request_resume_event(3),
+        );
+        assert!(matches!(
+            result,
+            Err(TransitionError::InvalidTransition {
+                event: "CreationRequestResume",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn creation_provisioned_is_rejected_outside_provisioning() {
+        let result = transition(
+            &ConvState::Idle,
+            &test_context(),
+            Event::CreationProvisioned {
+                job_id: "creation-job".to_string(),
+                claim: phoenix_core::domain::creation_protocol::CreationClaim {
+                    worker_id: phoenix_core::domain::creation_protocol::CreationWorkerId(
+                        "worker".into(),
+                    ),
+                    generation: 1,
+                    token: phoenix_core::domain::creation_protocol::CreationClaimToken(
+                        "token".into(),
+                    ),
+                    lease_until: 100,
+                },
+                initial_message: phoenix_core::domain::sm_event::SteerEntry {
+                    text: "Hello".to_string(),
+                    llm_text: None,
+                    images: vec![],
+                    files: vec![],
+                    message_id: "creation-message-id".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(TransitionError::InvalidTransition {
+                event: "CreationProvisioned",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -6403,6 +6644,7 @@ mod tests {
                 Effect::PersistMessage { .. }
                 | Effect::PersistState
                 | Effect::RequestLlm
+                | Effect::CompleteCreation { .. }
                 | Effect::BroadcastAssistantMessage { .. }
                 | Effect::AbortTool { .. }
                 | Effect::AbortLlm

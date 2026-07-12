@@ -269,6 +269,8 @@ describe('canCancelConversationState', () => {
     [{ type: 'terminal' }, false],
     [{ type: 'handed_off', successor_conv_id: 'next' }, false],
     [{ type: 'seeded_llm_requesting', seed_message_id: 'seed', attempt: 1 }, true],
+    [{ type: 'provisioning', prompt: 'hello' }, true],
+    [{ type: 'creation_failed', message: 'boom', prompt: 'hello' }, false],
   ];
 
   it.each(cases)('%o -> %s', (state, expected) => {
@@ -319,6 +321,22 @@ describe('parseConversationState commission review approval', () => {
       expect(parseConversationState(raw).type).toBe('error');
     }
   });
+
+  it('parses provisioning, failed, and cancelled creation states', () => {
+    expect(parseConversationState({ type: 'provisioning', prompt: 'ship it' })).toEqual({
+      type: 'provisioning',
+      prompt: 'ship it',
+    });
+    expect(parseConversationState({ type: 'creation_failed', message: 'boom', prompt: 'ship it' })).toEqual({
+      type: 'creation_failed',
+      message: 'boom',
+      prompt: 'ship it',
+    });
+    expect(parseConversationState({ type: 'creation_cancelled', prompt: 'ship it' })).toEqual({
+      type: 'creation_cancelled',
+      prompt: 'ship it',
+    });
+  });
 });
 
 describe('canChangeModelInState (task 02713)', () => {
@@ -341,6 +359,8 @@ describe('canChangeModelInState (task 02713)', () => {
     [{ type: 'awaiting_user_response', questions: [] }, false],
     [{ type: 'context_exhausted', summary: 's' }, false],
     [{ type: 'awaiting_recovery', message: 'm', recovery_kind: 'credential', resume: { type: 'conversation_turn' } }, false],
+    [{ type: 'provisioning', prompt: 'hello' }, false],
+    [{ type: 'creation_failed', message: 'boom', prompt: 'hello' }, false],
     [{ type: 'terminal' }, false],
   ];
 

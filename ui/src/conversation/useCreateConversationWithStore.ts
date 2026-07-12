@@ -1,6 +1,7 @@
 import { useCallback, useContext } from 'react';
 import { ConversationContext } from './ConversationContext';
 import { api, type Conversation } from '../api';
+import { rememberCreateIntent } from './index';
 
 /**
  * Wraps `api.createConversation` to write the returned `Conversation`
@@ -22,7 +23,17 @@ export function useCreateConversationWithStore() {
       ...args: Parameters<typeof api.createConversation>
     ): Promise<Conversation> => {
       const conv = await api.createConversation(...args);
+      let prompt = typeof args[1] === 'string' && args[1].trim().length > 0 ? args[1] : null;
+      if (!prompt) {
+        try {
+          prompt = localStorage.getItem(`seed-draft:${conv.id}`);
+        } catch {
+          prompt = null;
+        }
+      }
+      rememberCreateIntent(conv.id, prompt);
       store.upsertSnapshot(conv.slug, conv);
+      store.upsertRouteSnapshot(conv.id, conv);
       return conv;
     },
     [store],

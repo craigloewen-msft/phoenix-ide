@@ -524,6 +524,9 @@ fn item_signals(conv: &Conversation, member_count: usize, now: DateTime<Utc>) ->
         | ConvState::AwaitingContinuation { .. }
         | ConvState::ContextExhausted { .. } => signals.push("needs action".to_string()),
         ConvState::Error { .. } => signals.push("error".to_string()),
+        ConvState::Provisioning { .. } => signals.push("provisioning".to_string()),
+        ConvState::CreationFailed { .. } => signals.push("creation failed".to_string()),
+        ConvState::CreationCancelled { .. } => signals.push("creation cancelled".to_string()),
         ConvState::Idle
         | ConvState::Completed { .. }
         | ConvState::Failed { .. }
@@ -568,6 +571,8 @@ fn is_closed_runtime_state(state: &ConvState) -> bool {
         state,
         ConvState::Completed { .. }
             | ConvState::Failed { .. }
+            | ConvState::CreationFailed { .. }
+            | ConvState::CreationCancelled { .. }
             | ConvState::HandedOff { .. }
             | ConvState::Terminal
     )
@@ -1663,6 +1668,7 @@ fn map_db_not_found(e: DbError) -> AppError {
         other @ (DbError::Sqlx(_)
         | DbError::MessageNotFound(_)
         | DbError::SlugExists(_)
+        | DbError::ConversationAlreadyExists(_)
         | DbError::Serialization(_)
         | DbError::ForkProposalConflict(_)) => AppError::Internal(other.to_string()),
     }
@@ -1913,6 +1919,22 @@ mod tests {
             result: "done".to_string(),
         };
         direct.updated_at = now;
+        assert!(!is_open_work_candidate(&direct, None, now));
+    }
+
+    #[test]
+    fn failed_and_cancelled_creation_are_not_open_work() {
+        let now = Utc::now();
+        let mut direct = conversation("direct");
+        direct.state = ConvState::CreationFailed {
+            job_id: "job-1".to_string(),
+            error: "setup failed".to_string(),
+            error_kind: phoenix_core::domain::db_schema::ErrorKind::ServerError,
+        };
+        assert!(!is_open_work_candidate(&direct, None, now));
+        direct.state = ConvState::CreationCancelled {
+            job_id: "job-1".to_string(),
+        };
         assert!(!is_open_work_candidate(&direct, None, now));
     }
 

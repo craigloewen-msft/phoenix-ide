@@ -422,6 +422,12 @@ fn terminal_status(conv: &Conversation) -> Option<String> {
     match &conv.state {
         crate::state_machine::ConvState::Completed { .. } => Some("completed".to_string()),
         crate::state_machine::ConvState::Failed { .. } => Some("failed".to_string()),
+        crate::state_machine::ConvState::CreationFailed { .. } => {
+            Some("creation_failed".to_string())
+        }
+        crate::state_machine::ConvState::CreationCancelled { .. } => {
+            Some("creation_cancelled".to_string())
+        }
         crate::state_machine::ConvState::Error { .. } => Some("error".to_string()),
         crate::state_machine::ConvState::ContextExhausted { .. } => {
             Some("context_exhausted".to_string())
@@ -431,6 +437,7 @@ fn terminal_status(conv: &Conversation) -> Option<String> {
         crate::state_machine::ConvState::Idle
         | crate::state_machine::ConvState::LlmRequesting { .. }
         | crate::state_machine::ConvState::SeededLlmRequesting { .. }
+        | crate::state_machine::ConvState::Provisioning { .. }
         | crate::state_machine::ConvState::ToolExecuting { .. }
         | crate::state_machine::ConvState::CancellingTool { .. }
         | crate::state_machine::ConvState::AwaitingSubAgents { .. }

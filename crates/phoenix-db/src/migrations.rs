@@ -186,6 +186,36 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_global_recall_sessions",
         sql: MIGRATION_034,
     },
+    Migration {
+        version: 35,
+        name: "create_conversation_creation_jobs",
+        sql: MIGRATION_035,
+    },
+    Migration {
+        version: 36,
+        name: "create_conversation_creation_job_files",
+        sql: MIGRATION_036,
+    },
+    Migration {
+        version: 37,
+        name: "create_conversation_creation_job_images",
+        sql: MIGRATION_037,
+    },
+    Migration {
+        version: 38,
+        name: "add_fenced_creation_protocol",
+        sql: MIGRATION_038,
+    },
+    Migration {
+        version: 39,
+        name: "add_creation_resource_reservations",
+        sql: MIGRATION_039,
+    },
+    Migration {
+        version: 40,
+        name: "add_creation_cleanup_claims",
+        sql: MIGRATION_040,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -978,6 +1008,191 @@ const MIGRATION_032: &str = r"
 ALTER TABLE work_scope_pr_associations ADD COLUMN feedback_status TEXT NOT NULL DEFAULT 'open';
 ";
 
+const MIGRATION_035: &str = r"
+CREATE TABLE IF NOT EXISTS conversation_creation_jobs (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL UNIQUE REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT UNIQUE,
+    phase TEXT NOT NULL,
+    intent_json TEXT NOT NULL,
+    error TEXT,
+    accepted_at TEXT,
+    provisioning_started_at TEXT,
+    completed_at TEXT,
+    failed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (phase IN ('accepted', 'provisioning', 'ready', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_creation_jobs_phase_updated
+    ON conversation_creation_jobs(phase, updated_at);
+";
+
+const MIGRATION_036: &str = r"
+CREATE TABLE IF NOT EXISTS conversation_creation_job_files (
+    job_id TEXT NOT NULL REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    stored_path TEXT NOT NULL,
+    PRIMARY KEY (job_id, ordinal)
+);
+
+CREATE INDEX IF NOT EXISTS idx_creation_job_files_stored_path
+    ON conversation_creation_job_files(stored_path);
+
+INSERT OR IGNORE INTO conversation_creation_job_files (
+    job_id, ordinal, original_name, media_type, size_bytes, stored_path
+)
+SELECT j.id,
+       file.key,
+       json_extract(file.value, '$.original_name'),
+       json_extract(file.value, '$.media_type'),
+       json_extract(file.value, '$.size_bytes'),
+       json_extract(file.value, '$.stored_path')
+FROM conversation_creation_jobs j, json_each(j.intent_json, '$.files') AS file
+WHERE json_type(j.intent_json, '$.files') = 'array'
+  AND json_extract(file.value, '$.original_name') IS NOT NULL
+  AND json_extract(file.value, '$.media_type') IS NOT NULL
+  AND json_extract(file.value, '$.size_bytes') IS NOT NULL
+  AND json_extract(file.value, '$.stored_path') IS NOT NULL;
+";
+
+const MIGRATION_037: &str = r"
+CREATE TABLE IF NOT EXISTS conversation_creation_job_images (
+    job_id TEXT NOT NULL REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (job_id, ordinal)
+);
+
+INSERT OR IGNORE INTO conversation_creation_job_images (
+    job_id, ordinal, media_type, data
+)
+SELECT j.id,
+       image.key,
+       json_extract(image.value, '$.media_type'),
+       json_extract(image.value, '$.data')
+FROM conversation_creation_jobs j, json_each(j.intent_json, '$.images') AS image
+WHERE json_type(j.intent_json, '$.images') = 'array'
+  AND json_extract(image.value, '$.media_type') IS NOT NULL
+  AND json_extract(image.value, '$.data') IS NOT NULL;
+";
+
+const MIGRATION_038: &str = r"
+ALTER TABLE conversation_creation_jobs RENAME TO conversation_creation_jobs_legacy;
+ALTER TABLE conversation_creation_job_files RENAME TO conversation_creation_job_files_legacy;
+ALTER TABLE conversation_creation_job_images RENAME TO conversation_creation_job_images_legacy;
+
+CREATE TABLE conversation_creation_jobs (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL UNIQUE REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT UNIQUE,
+    status TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    generation INTEGER NOT NULL DEFAULT 0,
+    claim_worker_id TEXT,
+    claim_token TEXT,
+    lease_until TEXT,
+    next_attempt_at TEXT,
+    intent_json TEXT NOT NULL,
+    error TEXT,
+    accepted_at TEXT NOT NULL,
+    provisioning_started_at TEXT,
+    completed_at TEXT,
+    failed_at TEXT,
+    cancelled_at TEXT,
+    deletion_requested_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling', 'cancelled', 'deletion_pending', 'ready', 'failed')),
+    CHECK (stage IN ('validate_intent', 'resolve_repository', 'reserve_resources', 'materialize_worktree', 'finalize_attachments', 'expand_initial_message', 'commit_metadata', 'bootstrap_initial_turn', 'finalize')),
+    CHECK (attempt >= 0 AND attempt <= 4),
+    CHECK (generation >= attempt),
+    CHECK ((status = 'claimed') = (claim_worker_id IS NOT NULL AND claim_token IS NOT NULL AND lease_until IS NOT NULL)),
+    CHECK ((status = 'retry_scheduled') = (next_attempt_at IS NOT NULL)),
+    CHECK ((status = 'ready') = (completed_at IS NOT NULL)),
+    CHECK ((status = 'failed') = (failed_at IS NOT NULL AND error IS NOT NULL)),
+    CHECK ((status = 'cancelled') = (cancelled_at IS NOT NULL)),
+    CHECK ((status = 'deletion_pending') = (deletion_requested_at IS NOT NULL))
+);
+
+INSERT INTO conversation_creation_jobs (
+    id, conversation_id, message_id, status, stage, attempt, generation,
+    intent_json, error, accepted_at, provisioning_started_at, completed_at,
+    failed_at, created_at, updated_at
+)
+SELECT id, conversation_id, message_id,
+       CASE phase WHEN 'provisioning' THEN 'accepted' ELSE phase END,
+       'validate_intent', 0, 0, intent_json,
+       CASE WHEN phase = 'failed' THEN COALESCE(error, 'creation failed') ELSE error END,
+       COALESCE(accepted_at, created_at), provisioning_started_at,
+       completed_at, failed_at, created_at, updated_at
+FROM conversation_creation_jobs_legacy;
+
+CREATE TABLE conversation_creation_job_files (
+    job_id TEXT NOT NULL REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    stored_path TEXT NOT NULL,
+    PRIMARY KEY (job_id, ordinal)
+);
+INSERT INTO conversation_creation_job_files SELECT * FROM conversation_creation_job_files_legacy;
+
+CREATE TABLE conversation_creation_job_images (
+    job_id TEXT NOT NULL REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (job_id, ordinal)
+);
+INSERT INTO conversation_creation_job_images SELECT * FROM conversation_creation_job_images_legacy;
+
+DROP TABLE conversation_creation_job_files_legacy;
+DROP TABLE conversation_creation_job_images_legacy;
+DROP TABLE conversation_creation_jobs_legacy;
+
+DROP INDEX IF EXISTS idx_creation_jobs_phase_updated;
+CREATE INDEX idx_creation_jobs_due
+    ON conversation_creation_jobs(status, next_attempt_at, lease_until, accepted_at);
+CREATE INDEX idx_creation_job_files_stored_path
+    ON conversation_creation_job_files(stored_path);
+";
+
+const MIGRATION_039: &str = r"
+CREATE TABLE conversation_creation_resource_reservations (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL,
+    repository_identity TEXT NOT NULL,
+    resource_identity TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(job_id, resource_identity),
+    CHECK (generation > 0),
+    CHECK (status IN ('reserved', 'present', 'cleanup_required', 'released', 'conflict'))
+);
+
+CREATE INDEX idx_creation_resource_reservations_job
+    ON conversation_creation_resource_reservations(job_id, status);
+";
+
+const MIGRATION_040: &str = r"
+ALTER TABLE conversation_creation_jobs ADD COLUMN cleanup_worker_id TEXT;
+ALTER TABLE conversation_creation_jobs ADD COLUMN cleanup_token TEXT;
+ALTER TABLE conversation_creation_jobs ADD COLUMN cleanup_lease_until TEXT;
+
+CREATE INDEX idx_creation_cleanup_due
+    ON conversation_creation_jobs(status, cleanup_lease_until, updated_at);
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -1143,7 +1358,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 34);
+        assert_eq!(first as usize, MIGRATIONS.len());
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
@@ -1179,10 +1394,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Every version except the stamped 29 must run: 1–28 below the stamp
-        // and 30–34 above it.
+        // Every version except the stamped 29 must run.
         let applied = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(applied, 33);
+        assert_eq!(applied as usize, MIGRATIONS.len() - 1);
 
         // Migration 005's effects must be present.
         let cols: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
@@ -1793,6 +2007,143 @@ mod tests {
             state.contains("tool_executing"),
             "State should be preserved: {state}"
         );
+    }
+
+    /// Migration 35: creates the durable async conversation-creation job table.
+    #[tokio::test]
+    async fn migration_035_creates_conversation_creation_jobs_table() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+
+        run_pending_migrations(&pool).await.unwrap();
+
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversation_creation_jobs)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        assert!(
+            columns.iter().any(|c| c == "conversation_id"),
+            "Expected conversation_creation_jobs table to exist after migration 35; got {columns:?}"
+        );
+
+        let due_index: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_creation_jobs_due'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(due_index, vec!["idx_creation_jobs_due".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn migration_036_creates_creation_job_files_table() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+
+        run_pending_migrations(&pool).await.unwrap();
+
+        let columns: Vec<String> =
+            sqlx::query("PRAGMA table_info(conversation_creation_job_files)")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get::<String, _>("name"))
+                .collect();
+        assert!(
+            columns.iter().any(|c| c == "stored_path"),
+            "Expected conversation_creation_job_files table to exist after migration 36; got {columns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_037_creates_creation_job_images_table() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+
+        run_pending_migrations(&pool).await.unwrap();
+
+        let columns: Vec<String> =
+            sqlx::query("PRAGMA table_info(conversation_creation_job_images)")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get::<String, _>("name"))
+                .collect();
+        assert!(
+            columns.iter().any(|c| c == "data"),
+            "Expected conversation_creation_job_images table to exist after migration 37; got {columns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_035_adds_fenced_creation_protocol_constraints() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversation_creation_jobs)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        for expected in [
+            "status",
+            "stage",
+            "attempt",
+            "generation",
+            "claim_worker_id",
+            "claim_token",
+            "lease_until",
+            "next_attempt_at",
+        ] {
+            assert!(columns.iter().any(|column| column == expected));
+        }
+
+        let invalid = sqlx::query(
+            "INSERT INTO conversation_creation_jobs (
+                id, conversation_id, status, stage, attempt, generation,
+                intent_json, accepted_at, created_at, updated_at
+             ) VALUES ('job-invalid', 'missing-conversation', 'claimed',
+                       'validate_intent', 1, 1, '{}', 'now', 'now', 'now')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            invalid.is_err(),
+            "claimed row without authority must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_036_adds_creation_resource_reservations() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+
+        let columns: Vec<String> =
+            sqlx::query("PRAGMA table_info(conversation_creation_resource_reservations)")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get::<String, _>("name"))
+                .collect();
+        for expected in [
+            "job_id",
+            "generation",
+            "repository_identity",
+            "resource_identity",
+            "status",
+        ] {
+            assert!(columns.iter().any(|column| column == expected));
+        }
     }
 
     /// Migration 003 (REQ-BED-030): adds a nullable `continued_in_conv_id`

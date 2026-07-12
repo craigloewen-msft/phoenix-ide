@@ -70,6 +70,20 @@ describe('notification policy reducer', () => {
     expect(effects[0]).toMatchObject({ type: 'show_browser_notification', title: 'Question asked', tag: 'question_asked:conv-1' });
   });
 
+  it('emits an agent error notification for async creation failure', () => {
+    const creationFailed = { type: 'creation_failed' as const, job_id: 'job-1', error: 'boom', error_kind: 'server_error', can_retry: true };
+    const { effects } = run(loadedState(), [
+      {
+        type: 'conversation_state_changed',
+        conversation: conversation({ state: creationFailed }),
+        previousState: { type: 'provisioning' },
+        nextState: creationFailed,
+      },
+    ]);
+    expect(effects).toHaveLength(1);
+    expect(effects[0]).toMatchObject({ type: 'show_browser_notification', title: 'Agent error', tag: 'agent_error:conv-1' });
+  });
+
   it('suppresses (and dedupes) when focused on the triggering conversation', () => {
     const focused = env({ visible: true, hasFocus: true, activeSlug: 'conv-a' });
     const first = notificationPolicyReducer(loadedState(),
@@ -77,6 +91,15 @@ describe('notification policy reducer', () => {
       focused);
     expect(first.effects).toHaveLength(0);
     // Focus-suppressed delivery still records attention so catch-up won't refire.
+    expect(first.state.attentionSeenByConversationId.get('conv-1')).toBe('conv-1:question_asked');
+  });
+
+  it('suppresses when focused by stable conversation id', () => {
+    const focused = env({ visible: true, hasFocus: true, activeSlug: 'conv-1' });
+    const first = notificationPolicyReducer(loadedState(),
+      { type: 'conversation_state_changed', conversation: conversation(), previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response', questions: [] } },
+      focused);
+    expect(first.effects).toHaveLength(0);
     expect(first.state.attentionSeenByConversationId.get('conv-1')).toBe('conv-1:question_asked');
   });
 

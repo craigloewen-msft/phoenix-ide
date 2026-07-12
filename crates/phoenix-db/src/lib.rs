@@ -9,6 +9,10 @@ pub mod retrieval;
 // …) moved to the phoenix-core domain crate to break the db↔state_machine
 // cycle. Alias the module back as `schema` so the persistence logic in this
 // file and `phoenix_db::*` call sites resolve unchanged.
+use phoenix_core::domain::creation_protocol::{
+    CreationClaim, CreationClaimToken, CreationError, CreationKind, CreationProtocolState,
+    CreationStage, CreationStatus, CreationWorkerId,
+};
 use phoenix_core::domain::db_schema as schema;
 
 pub use migrations::run_pending_migrations;
@@ -22,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -106,6 +110,8 @@ pub enum DbError {
     Sqlx(#[from] sqlx::Error),
     #[error("Conversation not found: {0}")]
     ConversationNotFound(String),
+    #[error("Conversation already exists: {0}")]
+    ConversationAlreadyExists(String),
     #[error("Message not found: {0}")]
     MessageNotFound(String),
     #[error("Slug already exists: {0}")]
@@ -120,6 +126,58 @@ pub enum DbError {
 }
 
 pub type DbResult<T> = Result<T, DbError>;
+
+#[derive(Debug, Clone)]
+pub struct InsertConversationCreationJob {
+    pub id: String,
+    pub conversation_id: String,
+    pub message_id: Option<String>,
+    pub intent: ConversationCreationIntent,
+}
+
+#[derive(Debug, Clone)]
+pub enum CreationClaimOutcome {
+    Claimed(Box<ConversationCreationJob>),
+    NoEligibleJob,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreationCasOutcome {
+    Applied,
+    ClaimLost,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreationResourceReservation {
+    pub id: String,
+    pub job_id: String,
+    pub generation: u64,
+    pub repository_identity: String,
+    pub resource_identity: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreationCleanupJob {
+    pub job_id: String,
+    pub conversation_id: String,
+    pub intent: ConversationCreationIntent,
+    pub status: String,
+    pub generation: u64,
+    pub worker_id: String,
+    pub token: String,
+    pub lease_until: DateTime<Utc>,
+    pub reservations: Vec<CreationResourceReservation>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ConversationCreationMetadataUpdate {
+    pub slug: Option<String>,
+    pub title: Option<Option<String>>,
+    pub cwd: Option<String>,
+    pub project_id: Option<Option<String>>,
+    pub desired_base_branch: Option<Option<String>>,
+}
 
 /// Outcome of [`Database::continue_conversation`] (REQ-BED-030).
 ///
@@ -322,6 +380,66 @@ pub struct Database {
     /// Filesystem path of the on-disk DB (empty for in-memory DBs). Retained so
     /// permissions can be re-tightened after migrations create the WAL sidecars.
     path: String,
+}
+
+fn sqlite_constraint_code_is(code: Option<&str>, expected: &str) -> bool {
+    code == Some(expected)
+}
+
+fn is_sqlite_unique_constraint(error: &dyn sqlx::error::DatabaseError) -> bool {
+    sqlite_constraint_code_is(error.code().as_deref(), "2067")
+}
+
+fn is_sqlite_primary_key_constraint(error: &dyn sqlx::error::DatabaseError) -> bool {
+    sqlite_constraint_code_is(error.code().as_deref(), "1555")
+}
+
+async fn insert_creation_job_files_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    job: &InsertConversationCreationJob,
+) -> DbResult<()> {
+    for (ordinal, file) in job.intent.files.iter().enumerate() {
+        let ordinal = i64::try_from(ordinal)
+            .map_err(|_| DbError::Serialization("attachment ordinal exceeds i64".to_string()))?;
+        let size_bytes = i64::try_from(file.size_bytes)
+            .map_err(|_| DbError::Serialization("attachment size exceeds i64".to_string()))?;
+        sqlx::query(
+            "INSERT INTO conversation_creation_job_files (
+                job_id, ordinal, original_name, media_type, size_bytes, stored_path
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(&job.id)
+        .bind(ordinal)
+        .bind(&file.original_name)
+        .bind(&file.media_type)
+        .bind(size_bytes)
+        .bind(&file.stored_path)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn insert_creation_job_images_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    job: &InsertConversationCreationJob,
+) -> DbResult<()> {
+    for (ordinal, image) in job.intent.images.iter().enumerate() {
+        let ordinal = i64::try_from(ordinal)
+            .map_err(|_| DbError::Serialization("image ordinal exceeds i64".to_string()))?;
+        sqlx::query(
+            "INSERT INTO conversation_creation_job_images (
+                job_id, ordinal, media_type, data
+             ) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(&job.id)
+        .bind(ordinal)
+        .bind(&image.media_type)
+        .bind(&image.data)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 impl Database {
@@ -1516,7 +1634,14 @@ impl Database {
 
             match result {
                 Ok(_) => break,
-                Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("2067") => {
+                Err(sqlx::Error::Database(ref e))
+                    if (is_sqlite_unique_constraint(e.as_ref())
+                        || is_sqlite_primary_key_constraint(e.as_ref()))
+                        && e.message().contains("conversations.id") =>
+                {
+                    return Err(DbError::ConversationAlreadyExists(id.to_string()));
+                }
+                Err(sqlx::Error::Database(ref e)) if is_sqlite_unique_constraint(e.as_ref()) => {
                     attempts += 1;
                     if attempts >= 10 {
                         // Last resort: full UUID fragment (UUIDs are ASCII, first 8 bytes always valid)
@@ -1788,6 +1913,10 @@ impl Database {
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 1 AND c.user_initiated = 1
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversation_creation_jobs j
+                   WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'
+               )
              ORDER BY c.updated_at DESC",
         )
         .try_map(parse_conversation_row)
@@ -1795,6 +1924,1243 @@ impl Database {
         .await?;
 
         Ok(rows)
+    }
+
+    /// Insert a durable async conversation-creation job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the insert fails, the intent cannot be serialized,
+    /// or the inserted row cannot be read back.
+    pub async fn insert_conversation_creation_job(
+        &self,
+        job: &InsertConversationCreationJob,
+    ) -> DbResult<ConversationCreationJob> {
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let intent_json = serde_json::to_string(&job.intent)
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO conversation_creation_jobs (
+                id, conversation_id, message_id, status, stage, attempt, generation,
+                intent_json, error, accepted_at, provisioning_started_at, completed_at,
+                failed_at, cancelled_at, deletion_requested_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'accepted', 'validate_intent', 0, 0,
+                       ?4, NULL, ?5, NULL, NULL, NULL, NULL, NULL, ?5, ?5)",
+        )
+        .bind(&job.id)
+        .bind(&job.conversation_id)
+        .bind(&job.message_id)
+        .bind(intent_json)
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await?;
+        insert_creation_job_files_tx(&mut tx, job).await?;
+        insert_creation_job_images_tx(&mut tx, job).await?;
+        tx.commit().await?;
+        self.get_conversation_creation_job(&job.id).await
+    }
+
+    /// Create the visible async-conversation shell and its durable replay job atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if either row cannot be inserted or the job intent cannot be serialized.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the initial provisioning state cannot be serialized.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub async fn create_conversation_with_creation_job(
+        &self,
+        id: &str,
+        slug: &str,
+        cwd: &str,
+        user_initiated: bool,
+        model: Option<&str>,
+        conv_mode: &ConvMode,
+        desired_base_branch: Option<&str>,
+        seed_parent_id: Option<&str>,
+        seed_label: Option<&str>,
+        llm_language: phoenix_core::llm_language::LlmLanguage,
+        job: &InsertConversationCreationJob,
+    ) -> DbResult<Conversation> {
+        let now = Utc::now();
+        let creation_state = ConvState::Provisioning {
+            job_id: job.id.clone(),
+            phase: ConversationCreationPhase::Accepted,
+        };
+        let creation_state_json = serde_json::to_string(&creation_state).unwrap();
+        let cm = conv_mode_columns(conv_mode);
+        let now_str = now.to_rfc3339();
+        let intent_json = serde_json::to_string(&job.intent)
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
+        let mut tx = self.pool.begin().await?;
+
+        let mut actual_slug = slug.to_string();
+        let mut attempts = 0u8;
+        loop {
+            let title_str = schema::title_from_slug(&actual_slug);
+            let result = sqlx::query(
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?7, ?7, 0, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            )
+            .bind(id)
+            .bind(&actual_slug)
+            .bind(&title_str)
+            .bind(cwd)
+            .bind(user_initiated)
+            .bind(&creation_state_json)
+            .bind(&now_str)
+            .bind(model)
+            .bind(desired_base_branch)
+            .bind(seed_parent_id)
+            .bind(seed_label)
+            .bind(llm_language.as_str())
+            .bind(cm.kind)
+            .bind(cm.branch_name)
+            .bind(cm.worktree_path)
+            .bind(cm.base_branch)
+            .bind(cm.task_id)
+            .bind(cm.task_title)
+            .bind(cm.next_taskmd_id_hint)
+            .execute(&mut *tx)
+            .await;
+
+            match result {
+                Ok(_) => break,
+                Err(sqlx::Error::Database(ref e))
+                    if (is_sqlite_unique_constraint(e.as_ref())
+                        || is_sqlite_primary_key_constraint(e.as_ref()))
+                        && e.message().contains("conversations.id") =>
+                {
+                    return Err(DbError::ConversationAlreadyExists(id.to_string()));
+                }
+                Err(sqlx::Error::Database(ref e)) if is_sqlite_unique_constraint(e.as_ref()) => {
+                    attempts += 1;
+                    if attempts >= 10 {
+                        let uuid_str = uuid::Uuid::new_v4().to_string();
+                        actual_slug = format!("{slug}-{}", uuid_str.get(..8).unwrap_or(&uuid_str));
+                    } else {
+                        actual_slug = format!("{slug}-{:04x}", rand::random::<u16>());
+                    }
+                }
+                Err(e) => return Err(DbError::Sqlx(e)),
+            }
+        }
+
+        sqlx::query(
+            "INSERT INTO conversation_creation_jobs (
+                id, conversation_id, message_id, status, stage, attempt, generation,
+                intent_json, error, accepted_at, provisioning_started_at, completed_at,
+                failed_at, cancelled_at, deletion_requested_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'accepted', 'validate_intent', 0, 0,
+                       ?4, NULL, ?5, NULL, NULL, NULL, NULL, NULL, ?5, ?5)",
+        )
+        .bind(&job.id)
+        .bind(&job.conversation_id)
+        .bind(&job.message_id)
+        .bind(intent_json)
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await?;
+        insert_creation_job_files_tx(&mut tx, job).await?;
+        insert_creation_job_images_tx(&mut tx, job).await?;
+
+        tx.commit().await?;
+        let title = schema::title_from_slug(&actual_slug);
+        Ok(Conversation {
+            id: id.to_string(),
+            slug: Some(actual_slug),
+            title: Some(title),
+            cwd: cwd.to_string(),
+            parent_conversation_id: None,
+            user_initiated,
+            state: creation_state,
+            state_updated_at: now,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            model: model.map(String::from),
+            project_id: None,
+            conv_mode: conv_mode.clone(),
+            desired_base_branch: desired_base_branch.map(String::from),
+            message_count: 0,
+            seed_parent_id: seed_parent_id.map(String::from),
+            seed_label: seed_label.map(String::from),
+            continued_in_conv_id: None,
+            chain_name: None,
+            llm_language,
+            spawned_from_conversation_id: None,
+            transcript_generation: 1,
+        })
+    }
+
+    /// Load a creation job by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the database read fails or no row exists for `job_id`.
+    pub async fn get_conversation_creation_job(
+        &self,
+        job_id: &str,
+    ) -> DbResult<ConversationCreationJob> {
+        sqlx::query(
+            "SELECT id, conversation_id, message_id, status, stage, attempt, generation,
+                    claim_worker_id, claim_token, lease_until, next_attempt_at,
+                    intent_json, error, accepted_at, provisioning_started_at,
+                    completed_at, failed_at, created_at, updated_at
+             FROM conversation_creation_jobs WHERE id = ?1",
+        )
+        .bind(job_id)
+        .try_map(parse_conversation_creation_job_row)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
+    }
+
+    /// Load the creation job for a conversation, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the database read fails.
+    pub async fn get_conversation_creation_job_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<ConversationCreationJob>> {
+        sqlx::query(
+            "SELECT id, conversation_id, message_id, status, stage, attempt, generation,
+                    claim_worker_id, claim_token, lease_until, next_attempt_at,
+                    intent_json, error, accepted_at, provisioning_started_at,
+                    completed_at, failed_at, created_at, updated_at
+             FROM conversation_creation_jobs WHERE conversation_id = ?1",
+        )
+        .bind(conversation_id)
+        .try_map(parse_conversation_creation_job_row)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
+    }
+
+    /// Load the creation job for an initial message id, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the database read fails.
+    pub async fn get_conversation_creation_job_for_message(
+        &self,
+        message_id: &str,
+    ) -> DbResult<Option<ConversationCreationJob>> {
+        sqlx::query(
+            "SELECT id, conversation_id, message_id, status, stage, attempt, generation,
+                    claim_worker_id, claim_token, lease_until, next_attempt_at,
+                    intent_json, error, accepted_at, provisioning_started_at,
+                    completed_at, failed_at, created_at, updated_at
+             FROM conversation_creation_jobs WHERE message_id = ?1",
+        )
+        .bind(message_id)
+        .try_map(parse_conversation_creation_job_row)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
+    }
+
+    /// Load normalized file attachments for a creation job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the query fails or a stored size is invalid.
+    pub async fn get_conversation_creation_job_files(
+        &self,
+        job_id: &str,
+    ) -> DbResult<Vec<FileAttachment>> {
+        let rows = sqlx::query(
+            "SELECT original_name, media_type, size_bytes, stored_path
+             FROM conversation_creation_job_files
+             WHERE job_id = ?1
+             ORDER BY ordinal ASC",
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let size = row.get::<i64, _>("size_bytes");
+                let size_bytes = u64::try_from(size).map_err(|_| {
+                    DbError::Serialization(
+                        "negative attachment size in creation job file".to_string(),
+                    )
+                })?;
+                Ok(FileAttachment {
+                    original_name: row.get("original_name"),
+                    media_type: row.get("media_type"),
+                    size_bytes,
+                    stored_path: row.get("stored_path"),
+                })
+            })
+            .collect()
+    }
+
+    /// Load normalized image attachments for a creation job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the query fails.
+    pub async fn get_conversation_creation_job_images(
+        &self,
+        job_id: &str,
+    ) -> DbResult<Vec<ImageData>> {
+        let rows = sqlx::query(
+            "SELECT media_type, data
+             FROM conversation_creation_job_images
+             WHERE job_id = ?1
+             ORDER BY ordinal ASC",
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ImageData {
+                    media_type: row.get("media_type"),
+                    data: row.get("data"),
+                })
+            })
+            .collect()
+    }
+
+    /// Atomically claim the oldest eligible creation job.
+    ///
+    /// Accepted jobs consume attempt one, due retries consume the next attempt,
+    /// and expired-lease takeover only increments the fencing generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the atomic claim transaction or row decoding fails.
+    pub async fn claim_next_conversation_creation_job(
+        &self,
+        worker_id: &CreationWorkerId,
+        token: &CreationClaimToken,
+        now: DateTime<Utc>,
+        lease_duration: chrono::Duration,
+    ) -> DbResult<CreationClaimOutcome> {
+        let now_str = now.to_rfc3339();
+        let lease_until = (now + lease_duration).to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let candidate: Option<(String, String)> = sqlx::query_as(
+            "SELECT id, status
+             FROM conversation_creation_jobs
+             WHERE status = 'accepted'
+                OR (status = 'retry_scheduled' AND next_attempt_at <= ?1)
+                OR (status = 'claimed' AND lease_until <= ?1)
+             ORDER BY accepted_at ASC, id ASC
+             LIMIT 1",
+        )
+        .bind(&now_str)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((job_id, prior_status)) = candidate else {
+            tx.rollback().await?;
+            return Ok(CreationClaimOutcome::NoEligibleJob);
+        };
+
+        let result = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'claimed',
+                 attempt = CASE
+                     WHEN status = 'accepted' THEN 1
+                     WHEN status = 'retry_scheduled' THEN attempt + 1
+                     ELSE attempt
+                 END,
+                 generation = generation + 1,
+                 claim_worker_id = ?1,
+                 claim_token = ?2,
+                 lease_until = ?3,
+                 next_attempt_at = NULL,
+                 provisioning_started_at = COALESCE(provisioning_started_at, ?4),
+                 updated_at = ?4
+             WHERE id = ?5
+               AND status = ?6
+               AND (
+                   status = 'accepted'
+                   OR (status = 'retry_scheduled' AND next_attempt_at <= ?4)
+                   OR (status = 'claimed' AND lease_until <= ?4)
+               )",
+        )
+        .bind(&worker_id.0)
+        .bind(&token.0)
+        .bind(&lease_until)
+        .bind(&now_str)
+        .bind(&job_id)
+        .bind(&prior_status)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(CreationClaimOutcome::NoEligibleJob);
+        }
+        tx.commit().await?;
+        self.get_conversation_creation_job(&job_id)
+            .await
+            .map(Box::new)
+            .map(CreationClaimOutcome::Claimed)
+    }
+
+    /// Return the earliest durable scheduler deadline, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the database read fails.
+    pub async fn next_conversation_creation_deadline(&self) -> DbResult<Option<DateTime<Utc>>> {
+        let deadline: Option<String> = sqlx::query_scalar(
+            "SELECT MIN(deadline) FROM (
+                 SELECT next_attempt_at AS deadline
+                 FROM conversation_creation_jobs
+                 WHERE status = 'retry_scheduled'
+                 UNION ALL
+                 SELECT lease_until AS deadline
+                 FROM conversation_creation_jobs
+                 WHERE status = 'claimed'
+                 UNION ALL
+                 SELECT CASE
+                            WHEN cleanup_lease_until IS NOT NULL
+                            THEN cleanup_lease_until
+                            ELSE updated_at
+                        END AS deadline
+                 FROM conversation_creation_jobs
+                 WHERE status IN ('cancelling', 'deletion_pending')
+                    OR (status = 'failed' AND EXISTS (
+                        SELECT 1 FROM conversation_creation_resource_reservations r
+                        WHERE r.job_id = conversation_creation_jobs.id
+                          AND r.status != 'released'
+                    ))
+             )",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(deadline.as_deref().map(parse_datetime))
+    }
+
+    /// Revoke provisioning authority and preserve a visible cancelled record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the transaction fails or no creation job exists.
+    pub async fn cancel_conversation_creation(
+        &self,
+        conversation_id: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<()> {
+        let now = now.to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let job: Option<(String, i64)> = sqlx::query_as(
+            "SELECT id, generation FROM conversation_creation_jobs
+             WHERE conversation_id = ?1
+               AND status IN ('accepted', 'claimed', 'retry_scheduled')",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((job_id, generation)) = job else {
+            tx.rollback().await?;
+            return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
+        };
+        let result = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'cancelling', generation = generation + 1,
+                 claim_worker_id = NULL, claim_token = NULL, lease_until = NULL,
+                 cleanup_worker_id = NULL, cleanup_token = NULL, cleanup_lease_until = NULL,
+                 next_attempt_at = NULL, updated_at = ?1
+             WHERE id = ?2 AND generation = ?3
+               AND status IN ('accepted', 'claimed', 'retry_scheduled')",
+        )
+        .bind(&now)
+        .bind(&job_id)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
+        }
+        let state = serde_json::to_string(&ConvState::CreationCancelled {
+            job_id: job_id.clone(),
+        })
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+        sqlx::query(
+            "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
+             WHERE id = ?3",
+        )
+        .bind(state)
+        .bind(&now)
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE conversation_creation_resource_reservations
+             SET generation = ?3, status = 'cleanup_required', updated_at = ?1
+             WHERE job_id = ?2 AND status IN ('reserved', 'present')",
+        )
+        .bind(now)
+        .bind(job_id)
+        .bind(generation + 1)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Revoke provisioning authority and hide a deletion tombstone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the transaction fails or no creation job exists.
+    pub async fn request_conversation_creation_deletion(
+        &self,
+        conversation_id: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<()> {
+        let now = now.to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let job: Option<(String, i64)> = sqlx::query_as(
+            "SELECT id, generation FROM conversation_creation_jobs
+             WHERE conversation_id = ?1
+               AND status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling', 'cancelled', 'failed')",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((job_id, generation)) = job else {
+            tx.rollback().await?;
+            return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
+        };
+        let result = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'deletion_pending', generation = generation + 1,
+                 claim_worker_id = NULL, claim_token = NULL, lease_until = NULL,
+                 cleanup_worker_id = NULL, cleanup_token = NULL, cleanup_lease_until = NULL,
+                 next_attempt_at = NULL, error = NULL, failed_at = NULL,
+                 cancelled_at = NULL, deletion_requested_at = ?1, updated_at = ?1
+             WHERE id = ?2 AND generation = ?3
+               AND status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling', 'cancelled', 'failed')",
+        )
+        .bind(&now)
+        .bind(&job_id)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
+        }
+        sqlx::query("UPDATE conversations SET archived = 1, updated_at = ?1 WHERE id = ?2")
+            .bind(&now)
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE conversation_creation_resource_reservations
+             SET generation = ?3, status = 'cleanup_required', updated_at = ?1
+             WHERE job_id = ?2 AND status IN ('reserved', 'present')",
+        )
+        .bind(now)
+        .bind(job_id)
+        .bind(generation + 1)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically transition a seeded-empty creation to Idle and ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if serialization or the transaction fails.
+    pub async fn complete_seeded_empty_conversation_creation(
+        &self,
+        job_id: &str,
+        claim: &CreationClaim,
+        conversation_id: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<CreationCasOutcome> {
+        let idle = serde_json::to_string(&ConvState::Idle)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let now = now.to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'ready', stage = 'finalize', completed_at = ?1, updated_at = ?1,
+                 claim_worker_id = NULL, claim_token = NULL, lease_until = NULL
+             WHERE id = ?2 AND conversation_id = ?3 AND status = 'claimed'
+               AND generation = ?4 AND claim_worker_id = ?5 AND claim_token = ?6
+               AND lease_until > ?1",
+        )
+        .bind(&now)
+        .bind(job_id)
+        .bind(conversation_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(CreationCasOutcome::ClaimLost);
+        }
+        let state_updated = sqlx::query(
+            "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
+             WHERE id = ?3",
+        )
+        .bind(idle)
+        .bind(&now)
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        if state_updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(DbError::ConversationNotFound(conversation_id.to_string()));
+        }
+        tx.commit().await?;
+        Ok(CreationCasOutcome::Applied)
+    }
+
+    /// Load one creation tombstone that requires resource reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the read fails.
+    pub async fn claim_next_conversation_creation_cleanup(
+        &self,
+        worker_id: &str,
+        token: &str,
+        now: DateTime<Utc>,
+        lease_duration: chrono::Duration,
+    ) -> DbResult<Option<CreationCleanupJob>> {
+        let now_str = now.to_rfc3339();
+        let lease_until = now + lease_duration;
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(String, String, String, String, i64)> = sqlx::query_as(
+            "SELECT id, conversation_id, intent_json, status, generation
+             FROM conversation_creation_jobs
+             WHERE updated_at <= ?1
+               AND (cleanup_lease_until IS NULL OR cleanup_lease_until <= ?1)
+               AND (
+                   status IN ('cancelling', 'deletion_pending')
+                   OR (status = 'failed' AND EXISTS (
+                       SELECT 1 FROM conversation_creation_resource_reservations r
+                       WHERE r.job_id = conversation_creation_jobs.id
+                         AND r.status != 'released'
+                   ))
+               )
+             ORDER BY updated_at, id LIMIT 1",
+        )
+        .bind(&now_str)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((job_id, conversation_id, intent_json, status, generation)) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let claimed = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET cleanup_worker_id = ?1, cleanup_token = ?2,
+                 cleanup_lease_until = ?3
+             WHERE id = ?4 AND generation = ?5
+               AND (cleanup_lease_until IS NULL OR cleanup_lease_until <= ?6)",
+        )
+        .bind(worker_id)
+        .bind(token)
+        .bind(lease_until.to_rfc3339())
+        .bind(&job_id)
+        .bind(generation)
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await?;
+        if claimed.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        tx.commit().await?;
+        let reservations = self.get_creation_resource_reservations(&job_id).await?;
+        let intent = serde_json::from_str(&intent_json)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        Ok(Some(CreationCleanupJob {
+            job_id,
+            conversation_id,
+            intent,
+            status,
+            generation: u64::try_from(generation)
+                .map_err(|_| DbError::Serialization("negative cleanup generation".to_string()))?,
+            worker_id: worker_id.to_string(),
+            token: token.to_string(),
+            lease_until,
+            reservations,
+        }))
+    }
+
+    /// Schedule another cleanup reconciliation attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the update fails.
+    pub async fn schedule_conversation_creation_cleanup_retry(
+        &self,
+        cleanup: &CreationCleanupJob,
+        next_attempt_at: DateTime<Utc>,
+    ) -> DbResult<CreationCasOutcome> {
+        let result = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET updated_at = ?1, cleanup_worker_id = NULL, cleanup_token = NULL,
+                 cleanup_lease_until = NULL
+             WHERE id = ?2 AND generation = ?3
+               AND status IN ('cancelling', 'deletion_pending', 'failed')
+               AND cleanup_worker_id = ?4 AND cleanup_token = ?5",
+        )
+        .bind(next_attempt_at.to_rfc3339())
+        .bind(&cleanup.job_id)
+        .bind(i64::try_from(cleanup.generation).map_err(|_| {
+            DbError::Serialization("cleanup generation exceeds SQLite integer".to_string())
+        })?)
+        .bind(&cleanup.worker_id)
+        .bind(&cleanup.token)
+        .execute(&self.pool)
+        .await?;
+        Ok(if result.rows_affected() == 1 {
+            CreationCasOutcome::Applied
+        } else {
+            CreationCasOutcome::ClaimLost
+        })
+    }
+
+    /// Mark one reserved resource released after reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the update fails.
+    pub async fn release_creation_resource(
+        &self,
+        cleanup: &CreationCleanupJob,
+        reservation_id: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<CreationCasOutcome> {
+        let result = sqlx::query(
+            "UPDATE conversation_creation_resource_reservations
+             SET status = 'released', updated_at = ?1
+             WHERE id = ?2 AND job_id = ?3 AND generation = ?4
+               AND status = 'cleanup_required'
+               AND EXISTS (
+                   SELECT 1 FROM conversation_creation_jobs j
+                   WHERE j.id = ?3 AND j.generation = ?4
+                     AND j.cleanup_worker_id = ?5 AND j.cleanup_token = ?6
+                     AND j.cleanup_lease_until > ?1
+               )",
+        )
+        .bind(now.to_rfc3339())
+        .bind(reservation_id)
+        .bind(&cleanup.job_id)
+        .bind(i64::try_from(cleanup.generation).map_err(|_| {
+            DbError::Serialization("cleanup generation exceeds SQLite integer".to_string())
+        })?)
+        .bind(&cleanup.worker_id)
+        .bind(&cleanup.token)
+        .execute(&self.pool)
+        .await?;
+        Ok(if result.rows_affected() == 1 {
+            CreationCasOutcome::Applied
+        } else {
+            CreationCasOutcome::ClaimLost
+        })
+    }
+
+    /// Finish cancellation or physically remove a reconciled deletion tombstone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if cleanup is incomplete or the transaction fails.
+    #[allow(clippy::too_many_lines)]
+    pub async fn finish_conversation_creation_cleanup(
+        &self,
+        cleanup: &CreationCleanupJob,
+        now: DateTime<Utc>,
+    ) -> DbResult<()> {
+        let now_str = now.to_rfc3339();
+        let generation = i64::try_from(cleanup.generation).map_err(|_| {
+            DbError::Serialization("cleanup generation exceeds SQLite integer".to_string())
+        })?;
+        let mut tx = self.pool.begin().await?;
+        let authoritative: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM conversation_creation_jobs
+             WHERE id = ?1 AND status = ?2 AND generation = ?3
+               AND cleanup_worker_id = ?4 AND cleanup_token = ?5
+               AND cleanup_lease_until > ?6",
+        )
+        .bind(&cleanup.job_id)
+        .bind(&cleanup.status)
+        .bind(generation)
+        .bind(&cleanup.worker_id)
+        .bind(&cleanup.token)
+        .bind(&now_str)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if authoritative.is_none() {
+            tx.rollback().await?;
+            return Err(DbError::Serialization(
+                "creation cleanup claim was lost".to_string(),
+            ));
+        }
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_creation_resource_reservations
+             WHERE job_id = ?1 AND status != 'released'",
+        )
+        .bind(&cleanup.job_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if remaining != 0 {
+            tx.rollback().await?;
+            return Err(DbError::Serialization(
+                "creation cleanup still has unreconciled resources".to_string(),
+            ));
+        }
+        if cleanup.status == "cancelling" {
+            let updated = sqlx::query(
+                "UPDATE conversation_creation_jobs
+                 SET status = 'cancelled', cancelled_at = ?1, updated_at = ?1,
+                     cleanup_worker_id = NULL, cleanup_token = NULL,
+                     cleanup_lease_until = NULL
+                 WHERE id = ?2 AND status = 'cancelling' AND generation = ?3
+                   AND cleanup_worker_id = ?4 AND cleanup_token = ?5
+                   AND cleanup_lease_until > ?1",
+            )
+            .bind(&now_str)
+            .bind(&cleanup.job_id)
+            .bind(generation)
+            .bind(&cleanup.worker_id)
+            .bind(&cleanup.token)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Err(DbError::Serialization(
+                    "creation cleanup claim was lost".to_string(),
+                ));
+            }
+        } else if cleanup.status == "deletion_pending" {
+            let deleted = sqlx::query(
+                "DELETE FROM conversations
+                 WHERE id = ?1 AND EXISTS (
+                     SELECT 1 FROM conversation_creation_jobs j
+                     WHERE j.conversation_id = conversations.id AND j.id = ?2
+                       AND j.status = 'deletion_pending' AND j.generation = ?3
+                       AND j.cleanup_worker_id = ?4 AND j.cleanup_token = ?5
+                       AND j.cleanup_lease_until > ?6
+                 )",
+            )
+            .bind(&cleanup.conversation_id)
+            .bind(&cleanup.job_id)
+            .bind(generation)
+            .bind(&cleanup.worker_id)
+            .bind(&cleanup.token)
+            .bind(&now_str)
+            .execute(&mut *tx)
+            .await?;
+            if deleted.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Err(DbError::Serialization(
+                    "creation cleanup claim was lost".to_string(),
+                ));
+            }
+        } else if cleanup.status == "failed" {
+            sqlx::query(
+                "UPDATE conversation_creation_jobs
+                 SET cleanup_worker_id = NULL, cleanup_token = NULL,
+                     cleanup_lease_until = NULL
+                 WHERE id = ?1 AND status = 'failed' AND generation = ?2
+                   AND cleanup_worker_id = ?3 AND cleanup_token = ?4
+                   AND cleanup_lease_until > ?5",
+            )
+            .bind(&cleanup.job_id)
+            .bind(generation)
+            .bind(&cleanup.worker_id)
+            .bind(&cleanup.token)
+            .bind(&now_str)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Reserve an external creation resource under the current claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] when authority was lost or the insert fails.
+    pub async fn reserve_conversation_creation_resource(
+        &self,
+        reservation_id: &str,
+        job_id: &str,
+        claim: &CreationClaim,
+        repository_identity: &str,
+        resource_identity: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<CreationCasOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let authoritative: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM conversation_creation_jobs
+             WHERE id = ?1 AND status = 'claimed' AND generation = ?2
+               AND claim_worker_id = ?3 AND claim_token = ?4 AND lease_until > ?5",
+        )
+        .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
+        .bind(now.to_rfc3339())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if authoritative.is_none() {
+            tx.rollback().await?;
+            return Ok(CreationCasOutcome::ClaimLost);
+        }
+        sqlx::query(
+            "INSERT INTO conversation_creation_resource_reservations (
+                id, job_id, generation, repository_identity, resource_identity,
+                status, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?6)
+             ON CONFLICT(job_id, resource_identity) DO UPDATE SET
+                generation = excluded.generation,
+                repository_identity = excluded.repository_identity,
+                status = CASE
+                    WHEN conversation_creation_resource_reservations.status = 'present'
+                        THEN 'present'
+                    ELSE 'reserved'
+                END,
+                updated_at = excluded.updated_at",
+        )
+        .bind(reservation_id)
+        .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(repository_identity)
+        .bind(resource_identity)
+        .bind(now.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(CreationCasOutcome::Applied)
+    }
+
+    /// Mark a reservation present while its generation remains current.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the guarded update fails.
+    pub async fn mark_creation_resource_present(
+        &self,
+        job_id: &str,
+        claim: &CreationClaim,
+        resource_identity: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<CreationCasOutcome> {
+        let result = sqlx::query(
+            "UPDATE conversation_creation_resource_reservations
+             SET status = 'present', updated_at = ?1
+             WHERE job_id = ?2 AND generation = ?3 AND resource_identity = ?4
+               AND EXISTS (
+                   SELECT 1 FROM conversation_creation_jobs j
+                   WHERE j.id = ?2 AND j.status = 'claimed' AND j.generation = ?3
+                     AND j.claim_worker_id = ?5 AND j.claim_token = ?6
+                     AND j.lease_until > ?1
+               )",
+        )
+        .bind(now.to_rfc3339())
+        .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(resource_identity)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
+        .execute(&self.pool)
+        .await?;
+        Ok(if result.rows_affected() == 1 {
+            CreationCasOutcome::Applied
+        } else {
+            CreationCasOutcome::ClaimLost
+        })
+    }
+
+    /// Load durable resource reservations for one creation job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the read fails or a generation is invalid.
+    pub async fn get_creation_resource_reservations(
+        &self,
+        job_id: &str,
+    ) -> DbResult<Vec<CreationResourceReservation>> {
+        let rows: Vec<(String, String, i64, String, String, String)> = sqlx::query_as(
+            "SELECT id, job_id, generation, repository_identity, resource_identity, status
+             FROM conversation_creation_resource_reservations
+             WHERE job_id = ?1 ORDER BY id",
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(
+                |(id, job_id, generation, repository_identity, resource_identity, status)| {
+                    Ok(CreationResourceReservation {
+                        id,
+                        job_id,
+                        generation: u64::try_from(generation).map_err(|_| {
+                            DbError::Serialization("negative reservation generation".to_string())
+                        })?,
+                        repository_identity,
+                        resource_identity,
+                        status,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Renew a creation lease only while the supplied claim remains current.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the update fails.
+    pub async fn renew_conversation_creation_claim(
+        &self,
+        job_id: &str,
+        claim: &CreationClaim,
+        now: DateTime<Utc>,
+        lease_duration: chrono::Duration,
+    ) -> DbResult<CreationCasOutcome> {
+        let now_str = now.to_rfc3339();
+        let lease_until = (now + lease_duration).to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET lease_until = ?1, updated_at = ?2
+             WHERE id = ?3 AND status = 'claimed' AND generation = ?4
+               AND claim_worker_id = ?5 AND claim_token = ?6 AND lease_until > ?2",
+        )
+        .bind(lease_until)
+        .bind(now_str)
+        .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
+        .execute(&self.pool)
+        .await?;
+        Ok(if result.rows_affected() == 1 {
+            CreationCasOutcome::Applied
+        } else {
+            CreationCasOutcome::ClaimLost
+        })
+    }
+
+    /// Schedule the next bounded retry while the supplied claim is current.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the update fails.
+    pub async fn schedule_conversation_creation_retry(
+        &self,
+        job_id: &str,
+        claim: &CreationClaim,
+        error: &str,
+        now: DateTime<Utc>,
+        next_attempt_at: DateTime<Utc>,
+    ) -> DbResult<CreationCasOutcome> {
+        let now = now.to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'retry_scheduled', error = ?1, next_attempt_at = ?2,
+                 updated_at = ?3, claim_worker_id = NULL, claim_token = NULL,
+                 lease_until = NULL
+             WHERE id = ?4 AND status = 'claimed' AND attempt < 4
+               AND generation = ?5 AND claim_worker_id = ?6 AND claim_token = ?7
+               AND lease_until > ?3",
+        )
+        .bind(error)
+        .bind(next_attempt_at.to_rfc3339())
+        .bind(now)
+        .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
+        .execute(&self.pool)
+        .await?;
+        Ok(if result.rows_affected() == 1 {
+            CreationCasOutcome::Applied
+        } else {
+            CreationCasOutcome::ClaimLost
+        })
+    }
+
+    /// Advance a stage only while the supplied claim remains authoritative.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the update fails.
+    pub async fn advance_conversation_creation_stage(
+        &self,
+        job_id: &str,
+        claim: &CreationClaim,
+        expected: CreationStage,
+        next: CreationStage,
+        now: DateTime<Utc>,
+    ) -> DbResult<CreationCasOutcome> {
+        let result = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET stage = ?1, updated_at = ?2
+             WHERE id = ?3 AND status = 'claimed' AND stage = ?4
+               AND generation = ?5 AND claim_worker_id = ?6 AND claim_token = ?7
+               AND lease_until > ?2",
+        )
+        .bind(creation_stage_db_str(next))
+        .bind(now.to_rfc3339())
+        .bind(job_id)
+        .bind(creation_stage_db_str(expected))
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
+        .execute(&self.pool)
+        .await?;
+        Ok(if result.rows_affected() == 1 {
+            CreationCasOutcome::Applied
+        } else {
+            CreationCasOutcome::ClaimLost
+        })
+    }
+
+    /// Mark a creation job failed only while the supplied claim is current.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the update fails.
+    pub async fn fail_conversation_creation_job(
+        &self,
+        job_id: &str,
+        claim: &CreationClaim,
+        error: &str,
+        error_kind: &ErrorKind,
+        now: DateTime<Utc>,
+    ) -> DbResult<CreationCasOutcome> {
+        let failed_state = serde_json::to_string(&ConvState::CreationFailed {
+            job_id: job_id.to_string(),
+            error: error.to_string(),
+            error_kind: error_kind.clone(),
+        })
+        .map_err(|serialization_error| DbError::Serialization(serialization_error.to_string()))?;
+        let now = now.to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'failed', error = ?1, updated_at = ?2, failed_at = ?2,
+                 claim_worker_id = NULL, claim_token = NULL, lease_until = NULL
+             WHERE id = ?3 AND status = 'claimed' AND generation = ?4
+               AND claim_worker_id = ?5 AND claim_token = ?6 AND lease_until > ?2",
+        )
+        .bind(error)
+        .bind(&now)
+        .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 1 {
+            sqlx::query(
+                "UPDATE conversation_creation_resource_reservations
+                 SET status = 'cleanup_required', generation = ?1, updated_at = ?2
+                 WHERE job_id = ?3 AND status IN ('reserved', 'present')",
+            )
+            .bind(claim_generation_i64(claim)?)
+            .bind(&now)
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+            let conversation_updated = sqlx::query(
+                "UPDATE conversations
+                 SET state = ?1, state_updated_at = ?2, updated_at = ?2
+                 WHERE id = (
+                     SELECT conversation_id FROM conversation_creation_jobs WHERE id = ?3
+                 )",
+            )
+            .bind(failed_state)
+            .bind(&now)
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+            if conversation_updated.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Err(DbError::ConversationNotFound(job_id.to_string()));
+            }
+            tx.commit().await?;
+            Ok(CreationCasOutcome::Applied)
+        } else {
+            tx.rollback().await?;
+            Ok(CreationCasOutcome::ClaimLost)
+        }
+    }
+
+    /// Mark a creation job ready only while the supplied claim is current.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the update transaction fails.
+    pub async fn complete_conversation_creation_job(
+        &self,
+        job_id: &str,
+        claim: &CreationClaim,
+        now: DateTime<Utc>,
+    ) -> DbResult<CreationCasOutcome> {
+        let cleared_intent = serde_json::json!({
+            "cwd": "",
+            "model": null,
+            "text": "",
+            "expansion_preflighted": false,
+            "llm_text": null,
+            "skill_invocation": null,
+            "images": [],
+            "mode": null,
+            "base_branch": null,
+            "checkout_ref": null,
+            "seed_parent_id": null,
+            "seed_label": null
+        })
+        .to_string();
+        let now = now.to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'ready', intent_json = ?1, updated_at = ?2, completed_at = ?2,
+                 claim_worker_id = NULL, claim_token = NULL, lease_until = NULL
+             WHERE id = ?3 AND status = 'claimed' AND generation = ?4
+               AND claim_worker_id = ?5 AND claim_token = ?6 AND lease_until > ?2",
+        )
+        .bind(cleared_intent)
+        .bind(&now)
+        .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(CreationCasOutcome::ClaimLost);
+        }
+        sqlx::query("DELETE FROM conversation_creation_job_files WHERE job_id = ?1")
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM conversation_creation_job_images WHERE job_id = ?1")
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(CreationCasOutcome::Applied)
     }
 
     /// Update conversation state, stamping `state_updated_at = now()`.
@@ -2293,7 +3659,7 @@ impl Database {
 
             match result {
                 Ok(_) => break candidate_slug,
-                Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("2067") => {
+                Err(sqlx::Error::Database(ref e)) if is_sqlite_unique_constraint(e.as_ref()) => {
                     slug_offset += 1;
                     candidate_slug = if slug_offset <= 20 {
                         format!("{base_slug}-{}", slug_offset + 1)
@@ -2542,7 +3908,7 @@ impl Database {
 
             match result {
                 Ok(_) => break candidate_slug,
-                Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("2067") => {
+                Err(sqlx::Error::Database(ref e)) if is_sqlite_unique_constraint(e.as_ref()) => {
                     slug_offset += 1;
                     candidate_slug = if slug_offset <= 20 {
                         format!("{root_slug}-{}", base_n + slug_offset)
@@ -3350,6 +4716,220 @@ impl Database {
         Ok(())
     }
 
+    /// Update creation-time conversation metadata after async provisioning.
+    ///
+    /// Fields left as `None` are untouched; `Some(None)` clears a nullable
+    /// column; `Some(Some(v))` writes the value.
+    /// Update conversation metadata after async creation provisioning completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the update fails or the conversation does not exist.
+    pub async fn update_conversation_creation_metadata(
+        &self,
+        id: &str,
+        update: &ConversationCreationMetadataUpdate,
+    ) -> DbResult<()> {
+        let base_slug = update.slug.clone();
+        let mut candidate_slug = base_slug.clone();
+        let mut attempts = 0u8;
+        loop {
+            let now = Utc::now().to_rfc3339();
+            let result = sqlx::query(
+                "UPDATE conversations
+                 SET slug = COALESCE(?1, slug),
+                     title = CASE
+                         WHEN ?2 = 1 THEN ?3
+                         ELSE title
+                     END,
+                     cwd = COALESCE(?4, cwd),
+                     project_id = CASE
+                         WHEN ?5 = 1 THEN ?6
+                         ELSE project_id
+                     END,
+                     desired_base_branch = CASE
+                         WHEN ?7 = 1 THEN ?8
+                         ELSE desired_base_branch
+                     END,
+                     updated_at = ?9
+                 WHERE id = ?10",
+            )
+            .bind(candidate_slug.as_deref())
+            .bind(update.title.is_some())
+            .bind(update.title.as_ref().and_then(|v| v.as_deref()))
+            .bind(update.cwd.as_deref())
+            .bind(update.project_id.is_some())
+            .bind(update.project_id.as_ref().and_then(|v| v.as_deref()))
+            .bind(update.desired_base_branch.is_some())
+            .bind(
+                update
+                    .desired_base_branch
+                    .as_ref()
+                    .and_then(|v| v.as_deref()),
+            )
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await;
+            match result {
+                Ok(result) => {
+                    if result.rows_affected() == 0 {
+                        return Err(DbError::ConversationNotFound(id.to_string()));
+                    }
+                    return Ok(());
+                }
+                Err(sqlx::Error::Database(ref e))
+                    if is_sqlite_unique_constraint(e.as_ref()) && base_slug.is_some() =>
+                {
+                    attempts += 1;
+                    let slug = base_slug.as_deref().unwrap_or_default();
+                    if attempts >= 10 {
+                        let uuid_str = uuid::Uuid::new_v4().to_string();
+                        candidate_slug =
+                            Some(format!("{slug}-{}", uuid_str.get(..8).unwrap_or(&uuid_str)));
+                    } else {
+                        candidate_slug = Some(format!("{slug}-{:04x}", rand::random::<u16>()));
+                    }
+                }
+                Err(e) => return Err(DbError::Sqlx(e)),
+            }
+        }
+    }
+
+    /// Update async creation metadata and ownership mode in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if serialization or either write fails.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub async fn update_conversation_creation_metadata_and_mode(
+        &self,
+        job_id: &str,
+        claim: &CreationClaim,
+        id: &str,
+        update: &ConversationCreationMetadataUpdate,
+        mode: &ConvMode,
+        model: &str,
+        expected_stage: CreationStage,
+        next_stage: CreationStage,
+    ) -> DbResult<CreationCasOutcome> {
+        let cm = conv_mode_columns(mode);
+        let base_slug = update.slug.clone();
+        let mut candidate_slug = base_slug.clone();
+        let mut attempts = 0u8;
+        loop {
+            let now = Utc::now().to_rfc3339();
+            let mut tx = self.pool.begin().await?;
+            let result = sqlx::query(
+                "UPDATE conversations
+                 SET slug = COALESCE(?1, slug),
+                     title = CASE
+                         WHEN ?2 = 1 THEN ?3
+                         ELSE title
+                     END,
+                     cwd = COALESCE(?4, cwd),
+                     project_id = CASE
+                         WHEN ?5 = 1 THEN ?6
+                         ELSE project_id
+                     END,
+                     desired_base_branch = CASE
+                         WHEN ?7 = 1 THEN ?8
+                         ELSE desired_base_branch
+                     END,
+                     cm_kind = ?9,
+                     cm_branch_name = ?10,
+                     cm_worktree_path = ?11,
+                     cm_base_branch = ?12,
+                     cm_task_id = ?13,
+                     cm_task_title = ?14,
+                     cm_next_taskmd_id_hint = ?15,
+                     model = ?16,
+                     updated_at = ?17
+                 WHERE id = ?18
+                   AND EXISTS (
+                       SELECT 1 FROM conversation_creation_jobs j
+                       WHERE j.id = ?19 AND j.conversation_id = conversations.id
+                         AND j.status = 'claimed' AND j.generation = ?20
+                         AND j.claim_worker_id = ?21 AND j.claim_token = ?22
+                         AND j.lease_until > ?17 AND j.stage = ?23
+                   )",
+            )
+            .bind(candidate_slug.as_deref())
+            .bind(update.title.is_some())
+            .bind(update.title.as_ref().and_then(|v| v.as_deref()))
+            .bind(update.cwd.as_deref())
+            .bind(update.project_id.is_some())
+            .bind(update.project_id.as_ref().and_then(|v| v.as_deref()))
+            .bind(update.desired_base_branch.is_some())
+            .bind(
+                update
+                    .desired_base_branch
+                    .as_ref()
+                    .and_then(|v| v.as_deref()),
+            )
+            .bind(cm.kind)
+            .bind(cm.branch_name)
+            .bind(cm.worktree_path)
+            .bind(cm.base_branch)
+            .bind(cm.task_id)
+            .bind(cm.task_title)
+            .bind(cm.next_taskmd_id_hint)
+            .bind(model)
+            .bind(&now)
+            .bind(id)
+            .bind(job_id)
+            .bind(claim_generation_i64(claim)?)
+            .bind(&claim.worker_id.0)
+            .bind(&claim.token.0)
+            .bind(creation_stage_db_str(expected_stage))
+            .execute(&mut *tx)
+            .await;
+            match result {
+                Ok(result) => {
+                    if result.rows_affected() == 0 {
+                        tx.rollback().await?;
+                        return Ok(CreationCasOutcome::ClaimLost);
+                    }
+                    let stage_updated = sqlx::query(
+                        "UPDATE conversation_creation_jobs SET stage = ?1, updated_at = ?2
+                         WHERE id = ?3 AND status = 'claimed' AND generation = ?4
+                           AND claim_worker_id = ?5 AND claim_token = ?6
+                           AND lease_until > ?2 AND stage = ?7",
+                    )
+                    .bind(creation_stage_db_str(next_stage))
+                    .bind(&now)
+                    .bind(job_id)
+                    .bind(claim_generation_i64(claim)?)
+                    .bind(&claim.worker_id.0)
+                    .bind(&claim.token.0)
+                    .bind(creation_stage_db_str(expected_stage))
+                    .execute(&mut *tx)
+                    .await?;
+                    if stage_updated.rows_affected() != 1 {
+                        tx.rollback().await?;
+                        return Ok(CreationCasOutcome::ClaimLost);
+                    }
+                    tx.commit().await?;
+                    return Ok(CreationCasOutcome::Applied);
+                }
+                Err(sqlx::Error::Database(ref e))
+                    if is_sqlite_unique_constraint(e.as_ref()) && base_slug.is_some() =>
+                {
+                    attempts += 1;
+                    let slug = base_slug.as_deref().unwrap_or_default();
+                    if attempts >= 10 {
+                        let uuid_str = uuid::Uuid::new_v4().to_string();
+                        candidate_slug =
+                            Some(format!("{slug}-{}", uuid_str.get(..8).unwrap_or(&uuid_str)));
+                    } else {
+                        candidate_slug = Some(format!("{slug}-{:04x}", rand::random::<u16>()));
+                    }
+                }
+                Err(e) => return Err(DbError::Sqlx(e)),
+            }
+        }
+    }
+
     /// Get all non-archived Work/Branch conversations (for startup worktree reconciliation).
     ///
     /// # Errors
@@ -3495,7 +5075,15 @@ impl Database {
         //   - terminal: task lifecycle ended (complete/abandon) — permanently read-only
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
-             WHERE json_extract(state, '$.type') NOT IN ('idle', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')",
+             WHERE json_extract(state, '$.type') NOT IN ('idle', 'provisioning', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')
+               AND NOT (
+                   json_extract(state, '$.type') = 'llm_requesting'
+                   AND EXISTS (
+                       SELECT 1 FROM conversation_creation_jobs j
+                       WHERE j.conversation_id = conversations.id
+                         AND j.status IN ('accepted', 'claimed', 'retry_scheduled')
+                   )
+               )",
         )
         .bind(&idle_state)
         .bind(now.to_rfc3339())
@@ -4907,6 +6495,139 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
     })
 }
 
+fn claim_generation_i64(claim: &CreationClaim) -> DbResult<i64> {
+    i64::try_from(claim.generation).map_err(|_| {
+        DbError::Serialization("creation generation exceeds SQLite integer".to_string())
+    })
+}
+
+fn creation_stage_db_str(stage: CreationStage) -> &'static str {
+    match stage {
+        CreationStage::ValidateIntent => "validate_intent",
+        CreationStage::ResolveRepository => "resolve_repository",
+        CreationStage::ReserveResources => "reserve_resources",
+        CreationStage::MaterializeWorktree => "materialize_worktree",
+        CreationStage::FinalizeAttachments => "finalize_attachments",
+        CreationStage::ExpandInitialMessage => "expand_initial_message",
+        CreationStage::CommitMetadata => "commit_metadata",
+        CreationStage::BootstrapInitialTurn => "bootstrap_initial_turn",
+        CreationStage::Finalize => "finalize",
+    }
+}
+
+fn creation_stage_from_db(value: &str) -> Result<CreationStage, sqlx::Error> {
+    Ok(match value {
+        "validate_intent" => CreationStage::ValidateIntent,
+        "resolve_repository" => CreationStage::ResolveRepository,
+        "reserve_resources" => CreationStage::ReserveResources,
+        "materialize_worktree" => CreationStage::MaterializeWorktree,
+        "finalize_attachments" => CreationStage::FinalizeAttachments,
+        "expand_initial_message" => CreationStage::ExpandInitialMessage,
+        "commit_metadata" => CreationStage::CommitMetadata,
+        "bootstrap_initial_turn" => CreationStage::BootstrapInitialTurn,
+        "finalize" => CreationStage::Finalize,
+        _ => {
+            return Err(sqlx::Error::Decode(
+                format!("unknown conversation creation stage: {value:?}").into(),
+            ));
+        }
+    })
+}
+
+fn creation_time(value: &str) -> u64 {
+    u64::try_from(parse_datetime(value).timestamp_millis()).unwrap_or(0)
+}
+
+/// Parse a `conversation_creation_jobs` row from the database.
+#[allow(clippy::needless_pass_by_value)] // sqlx try_map passes rows by value
+fn parse_conversation_creation_job_row(
+    row: SqliteRow,
+) -> Result<ConversationCreationJob, sqlx::Error> {
+    let status_str: String = row.try_get("status")?;
+    let stage = creation_stage_from_db(&row.try_get::<String, _>("stage")?)?;
+    let generation_i64: i64 = row.try_get("generation")?;
+    let generation = u64::try_from(generation_i64).map_err(|_| {
+        sqlx::Error::Decode(format!("negative creation generation: {generation_i64}").into())
+    })?;
+    let status = match status_str.as_str() {
+        "accepted" => CreationStatus::Accepted,
+        "claimed" => CreationStatus::Claimed(CreationClaim {
+            worker_id: CreationWorkerId(row.try_get("claim_worker_id")?),
+            generation,
+            token: CreationClaimToken(row.try_get("claim_token")?),
+            lease_until: creation_time(&row.try_get::<String, _>("lease_until")?),
+        }),
+        "retry_scheduled" => CreationStatus::RetryScheduled {
+            next_attempt_at: creation_time(&row.try_get::<String, _>("next_attempt_at")?),
+            last_error: CreationError {
+                kind: "transient".to_string(),
+                message: row
+                    .try_get::<Option<String>, _>("error")?
+                    .unwrap_or_default(),
+            },
+        },
+        "cancelling" => CreationStatus::Cancelling,
+        "cancelled" => CreationStatus::Cancelled,
+        "deletion_pending" => CreationStatus::DeletionPending,
+        "ready" => CreationStatus::Ready,
+        "failed" => CreationStatus::Failed(CreationError {
+            kind: "permanent".to_string(),
+            message: row
+                .try_get::<Option<String>, _>("error")?
+                .unwrap_or_default(),
+        }),
+        _ => {
+            return Err(sqlx::Error::Decode(
+                format!("unknown conversation creation status: {status_str:?}").into(),
+            ));
+        }
+    };
+
+    let intent_json: String = row.try_get("intent_json")?;
+    let intent = serde_json::from_str::<ConversationCreationIntent>(&intent_json).map_err(|e| {
+        sqlx::Error::Decode(format!("invalid conversation_creation_jobs.intent_json: {e}").into())
+    })?;
+
+    Ok(ConversationCreationJob {
+        id: row.try_get("id")?,
+        conversation_id: row.try_get("conversation_id")?,
+        message_id: row.try_get("message_id")?,
+        protocol: CreationProtocolState {
+            kind: match &row.try_get::<Option<String>, _>("message_id")? {
+                Some(message_id) => CreationKind::InitialTurn {
+                    message_id: message_id.clone(),
+                },
+                None => CreationKind::SeededEmpty,
+            },
+            status,
+            stage,
+            attempt: u32::try_from(row.try_get::<i64, _>("attempt")?)
+                .map_err(|_| sqlx::Error::Decode("invalid creation attempt".into()))?,
+            generation,
+        },
+        intent,
+        created_at: parse_datetime(&row.try_get::<String, _>("created_at")?),
+        updated_at: parse_datetime(&row.try_get::<String, _>("updated_at")?),
+        accepted_at: row
+            .try_get::<Option<String>, _>("accepted_at")?
+            .as_deref()
+            .map(parse_datetime),
+        provisioning_started_at: row
+            .try_get::<Option<String>, _>("provisioning_started_at")?
+            .as_deref()
+            .map(parse_datetime),
+        completed_at: row
+            .try_get::<Option<String>, _>("completed_at")?
+            .as_deref()
+            .map(parse_datetime),
+        failed_at: row
+            .try_get::<Option<String>, _>("failed_at")?
+            .as_deref()
+            .map(parse_datetime),
+        error: row.try_get("error")?,
+    })
+}
+
 /// Parse a `chain_qa` row from the database (REQ-CHN-005).
 ///
 /// Unknown `status` values are surfaced as typed errors rather than silently
@@ -5692,6 +7413,908 @@ fn parse_datetime(s: &str) -> DateTime<Utc> {
 mod tests {
     use super::*;
     use phoenix_core::llm_language::LlmLanguage;
+
+    async fn insert_test_creation_job(db: &Database, job_id: &str, conversation_id: &str) {
+        db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.insert_conversation_creation_job(&InsertConversationCreationJob {
+            id: job_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            message_id: Some(format!("message-{job_id}")),
+            intent: ConversationCreationIntent {
+                cwd: "/tmp".to_string(),
+                model: None,
+                text: "test creation".to_string(),
+                expansion_preflighted: false,
+                llm_text: None,
+                skill_invocation: None,
+                message_id: format!("message-{job_id}"),
+                images: Vec::new(),
+                files: Vec::new(),
+                mode: None,
+                base_branch: None,
+                checkout_ref: None,
+                seed_parent_id: None,
+                seed_label: None,
+            },
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn claim_test_cleanup(db: &Database) -> CreationCleanupJob {
+        db.claim_next_conversation_creation_cleanup(
+            "cleanup-worker",
+            "cleanup-token",
+            Utc::now(),
+            chrono::Duration::minutes(1),
+        )
+        .await
+        .unwrap()
+        .expect("cleanup claim")
+    }
+
+    #[tokio::test]
+    async fn creation_claim_has_one_winner_and_fences_late_results() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-claim", "conv-claim").await;
+        let now = Utc::now();
+        let first = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-a".into()),
+                now,
+                chrono::Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(first_job) = first else {
+            panic!("first worker must claim accepted job");
+        };
+        let CreationStatus::Claimed(first_claim) = first_job.protocol.status else {
+            panic!("claimed job must carry authority");
+        };
+
+        let concurrent = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-b".into()),
+                &CreationClaimToken("token-b".into()),
+                now,
+                chrono::Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(concurrent, CreationClaimOutcome::NoEligibleJob));
+
+        let takeover = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-b".into()),
+                &CreationClaimToken("token-b".into()),
+                now + chrono::Duration::seconds(11),
+                chrono::Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(second_job) = takeover else {
+            panic!("expired claim must be recoverable");
+        };
+        let CreationStatus::Claimed(second_claim) = second_job.protocol.status else {
+            panic!("replacement must carry authority");
+        };
+        assert_eq!(first_claim.generation + 1, second_claim.generation);
+        assert_eq!(second_job.protocol.attempt, 1, "takeover is not a retry");
+
+        let stale_failure = db
+            .fail_conversation_creation_job(
+                "job-claim",
+                &first_claim,
+                "late failure",
+                &ErrorKind::ServerError,
+                now + chrono::Duration::seconds(12),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_failure, CreationCasOutcome::ClaimLost);
+
+        let completed = db
+            .complete_conversation_creation_job(
+                "job-claim",
+                &second_claim,
+                now + chrono::Duration::seconds(12),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed, CreationCasOutcome::Applied);
+        let late_completion = db
+            .complete_conversation_creation_job(
+                "job-claim",
+                &first_claim,
+                now + chrono::Duration::seconds(12),
+            )
+            .await
+            .unwrap();
+        assert_eq!(late_completion, CreationCasOutcome::ClaimLost);
+        assert!(matches!(
+            db.get_conversation_creation_job("job-claim")
+                .await
+                .unwrap()
+                .protocol
+                .status,
+            CreationStatus::Ready
+        ));
+    }
+
+    #[tokio::test]
+    async fn creation_stage_checkpoint_rejects_stale_generation() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-stage", "conv-stage").await;
+        let now = Utc::now();
+        let first = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-a".into()),
+                now,
+                chrono::Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(first_job) = first else {
+            panic!("expected first claim");
+        };
+        let CreationStatus::Claimed(first_claim) = first_job.protocol.status else {
+            panic!("expected first authority");
+        };
+        assert_eq!(
+            db.advance_conversation_creation_stage(
+                "job-stage",
+                &first_claim,
+                CreationStage::ValidateIntent,
+                CreationStage::ResolveRepository,
+                now,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        let takeover = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-b".into()),
+                &CreationClaimToken("token-b".into()),
+                now + chrono::Duration::seconds(11),
+                chrono::Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(second_job) = takeover else {
+            panic!("expected replacement claim");
+        };
+        let CreationStatus::Claimed(second_claim) = second_job.protocol.status else {
+            panic!("expected replacement authority");
+        };
+        assert_eq!(second_job.protocol.stage, CreationStage::ResolveRepository);
+        assert_eq!(
+            db.advance_conversation_creation_stage(
+                "job-stage",
+                &first_claim,
+                CreationStage::ResolveRepository,
+                CreationStage::ReserveResources,
+                now + chrono::Duration::seconds(12),
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::ClaimLost
+        );
+        assert_eq!(
+            db.advance_conversation_creation_stage(
+                "job-stage",
+                &second_claim,
+                CreationStage::ResolveRepository,
+                CreationStage::ReserveResources,
+                now + chrono::Duration::seconds(12),
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_creation_reconciles_resources_without_deleting_record() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-failed-cleanup", "conv-failed-cleanup").await;
+        let now = Utc::now();
+        let claimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-a".into()),
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(job) = claimed else {
+            panic!("expected claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected authority");
+        };
+        db.reserve_conversation_creation_resource(
+            "reservation-failed",
+            "job-failed-cleanup",
+            &claim,
+            "/repo",
+            "/repo/worktree",
+            now,
+        )
+        .await
+        .unwrap();
+        let takeover_at = now + chrono::Duration::seconds(31);
+        let replacement = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-b".into()),
+                &CreationClaimToken("token-b".into()),
+                takeover_at,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(replacement_job) = replacement else {
+            panic!("expected replacement claim");
+        };
+        let CreationStatus::Claimed(replacement_claim) = replacement_job.protocol.status else {
+            panic!("expected replacement authority");
+        };
+        assert!(replacement_claim.generation > claim.generation);
+        assert_eq!(
+            db.fail_conversation_creation_job(
+                "job-failed-cleanup",
+                &replacement_claim,
+                "permanent failure",
+                &ErrorKind::InvalidRequest,
+                now,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        assert!(matches!(
+            db.get_conversation("conv-failed-cleanup")
+                .await
+                .unwrap()
+                .state,
+            ConvState::CreationFailed {
+                ref job_id,
+                ref error,
+                error_kind: ErrorKind::InvalidRequest,
+            } if job_id == "job-failed-cleanup" && error == "permanent failure"
+        ));
+        let reservation = db
+            .get_creation_resource_reservations("job-failed-cleanup")
+            .await
+            .unwrap()
+            .pop()
+            .expect("reservation");
+        assert_eq!(reservation.generation, replacement_claim.generation);
+        let cleanup = claim_test_cleanup(&db).await;
+        assert_eq!(cleanup.status, "failed");
+        assert_eq!(
+            db.release_creation_resource(&cleanup, "reservation-failed", Utc::now())
+                .await
+                .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        db.finish_conversation_creation_cleanup(&cleanup, now)
+            .await
+            .unwrap();
+        assert!(db.get_conversation("conv-failed-cleanup").await.is_ok());
+        assert!(matches!(
+            db.get_conversation_creation_job("job-failed-cleanup")
+                .await
+                .unwrap()
+                .protocol
+                .status,
+            CreationStatus::Failed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn creation_cancel_and_delete_revoke_claim_before_cleanup() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-cancel", "conv-cancel").await;
+        let now = Utc::now();
+        let claimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-a".into()),
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(job) = claimed else {
+            panic!("expected claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected authority");
+        };
+        db.reserve_conversation_creation_resource(
+            "reservation-cancel",
+            "job-cancel",
+            &claim,
+            "/repo",
+            "/repo/worktree",
+            now,
+        )
+        .await
+        .unwrap();
+
+        db.cancel_conversation_creation("conv-cancel", now)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.fail_conversation_creation_job(
+                "job-cancel",
+                &claim,
+                "late",
+                &ErrorKind::ServerError,
+                now,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::ClaimLost
+        );
+        let cleanup = claim_test_cleanup(&db).await;
+        assert_eq!(cleanup.status, "cancelling");
+        assert!(matches!(
+            db.get_conversation("conv-cancel").await.unwrap().state,
+            ConvState::CreationCancelled { .. }
+        ));
+        assert_eq!(
+            db.release_creation_resource(&cleanup, "reservation-cancel", Utc::now())
+                .await
+                .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        db.finish_conversation_creation_cleanup(&cleanup, now)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.get_conversation_creation_job("job-cancel")
+                .await
+                .unwrap()
+                .protocol
+                .status,
+            CreationStatus::Cancelled
+        ));
+
+        db.request_conversation_creation_deletion("conv-cancel", now)
+            .await
+            .unwrap();
+        assert!(db.get_conversation("conv-cancel").await.unwrap().archived);
+        let deletion = claim_test_cleanup(&db).await;
+        assert_eq!(deletion.status, "deletion_pending");
+        db.finish_conversation_creation_cleanup(&deletion, now)
+            .await
+            .unwrap();
+        assert!(db.get_conversation("conv-cancel").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn creation_delete_rejects_ready_job_without_archiving() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-ready-delete", "conv-ready-delete").await;
+        sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'ready', completed_at = ?1 WHERE id = ?2",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind("job-ready-delete")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let result = db
+            .request_conversation_creation_deletion("conv-ready-delete", Utc::now())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(DbError::Sqlx(sqlx::Error::RowNotFound))
+        ));
+        assert!(
+            !db.get_conversation("conv-ready-delete")
+                .await
+                .unwrap()
+                .archived
+        );
+    }
+
+    #[tokio::test]
+    async fn seeded_empty_completion_is_atomic_and_claim_fenced() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-seeded", "conv-seeded").await;
+        let now = Utc::now();
+        let claimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-a".into()),
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(job) = claimed else {
+            panic!("expected claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected authority");
+        };
+
+        assert_eq!(
+            db.complete_seeded_empty_conversation_creation(
+                "job-seeded",
+                &claim,
+                "conv-seeded",
+                now,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        assert!(matches!(
+            db.get_conversation("conv-seeded").await.unwrap().state,
+            ConvState::Idle
+        ));
+        assert!(matches!(
+            db.get_conversation_creation_job("job-seeded")
+                .await
+                .unwrap()
+                .protocol
+                .status,
+            CreationStatus::Ready
+        ));
+
+        insert_test_creation_job(&db, "job-seeded-stale", "conv-seeded-stale").await;
+        let claimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-stale".into()),
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(job) = claimed else {
+            panic!("expected stale claim");
+        };
+        let CreationStatus::Claimed(stale_claim) = job.protocol.status else {
+            panic!("expected stale authority");
+        };
+        db.cancel_conversation_creation("conv-seeded-stale", now)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.complete_seeded_empty_conversation_creation(
+                "job-seeded-stale",
+                &stale_claim,
+                "conv-seeded-stale",
+                now,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::ClaimLost
+        );
+        assert!(matches!(
+            db.get_conversation("conv-seeded-stale")
+                .await
+                .unwrap()
+                .state,
+            ConvState::CreationCancelled { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn creation_cancel_rejects_ready_job_without_mutating_conversation() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-ready-cancel", "conv-ready-cancel").await;
+        sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'ready', completed_at = ?1 WHERE id = ?2",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind("job-ready-cancel")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let state_before = db
+            .get_conversation("conv-ready-cancel")
+            .await
+            .unwrap()
+            .state;
+
+        let result = db
+            .cancel_conversation_creation("conv-ready-cancel", Utc::now())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(DbError::Sqlx(sqlx::Error::RowNotFound))
+        ));
+        assert_eq!(
+            db.get_conversation("conv-ready-cancel")
+                .await
+                .unwrap()
+                .state,
+            state_before
+        );
+        assert!(matches!(
+            db.get_conversation_creation_job("job-ready-cancel")
+                .await
+                .unwrap()
+                .protocol
+                .status,
+            CreationStatus::Ready
+        ));
+    }
+
+    #[tokio::test]
+    async fn deletion_pending_creation_is_hidden_from_archived_listing() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-hidden-delete", "conv-hidden-delete").await;
+        db.request_conversation_creation_deletion("conv-hidden-delete", Utc::now())
+            .await
+            .unwrap();
+
+        assert!(db
+            .list_archived_conversations()
+            .await
+            .unwrap()
+            .iter()
+            .all(|conversation| conversation.id != "conv-hidden-delete"));
+        assert!(db.get_conversation("conv-hidden-delete").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn stale_claim_cannot_commit_creation_metadata() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-stale-metadata", "conv-stale-metadata").await;
+        let now = Utc::now();
+        let claimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-a".into()),
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(job) = claimed else {
+            panic!("expected claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected claim authority");
+        };
+        db.cancel_conversation_creation("conv-stale-metadata", now)
+            .await
+            .unwrap();
+
+        let outcome = db
+            .update_conversation_creation_metadata_and_mode(
+                "job-stale-metadata",
+                &claim,
+                "conv-stale-metadata",
+                &ConversationCreationMetadataUpdate {
+                    slug: Some("stale-slug".to_string()),
+                    title: Some(Some("stale title".to_string())),
+                    cwd: Some("/stale".to_string()),
+                    project_id: Some(None),
+                    desired_base_branch: Some(None),
+                },
+                &ConvMode::Direct,
+                "stale-model",
+                CreationStage::ValidateIntent,
+                CreationStage::ResolveRepository,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, CreationCasOutcome::ClaimLost);
+        let conversation = db.get_conversation("conv-stale-metadata").await.unwrap();
+        assert_ne!(conversation.slug.as_deref(), Some("stale-slug"));
+        assert_ne!(conversation.cwd, "/stale");
+        assert!(matches!(
+            conversation.state,
+            ConvState::CreationCancelled { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn creation_resource_reservation_is_fenced_by_generation() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-resource", "conv-resource").await;
+        let now = Utc::now();
+        let first = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-a".into()),
+                now,
+                chrono::Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(first_job) = first else {
+            panic!("expected first claim");
+        };
+        let CreationStatus::Claimed(first_claim) = first_job.protocol.status else {
+            panic!("expected claim authority");
+        };
+        assert_eq!(
+            db.reserve_conversation_creation_resource(
+                "reservation-1",
+                "job-resource",
+                &first_claim,
+                "/repo",
+                "/repo/.phoenix/worktrees/conv-resource",
+                now,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        let takeover = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-b".into()),
+                &CreationClaimToken("token-b".into()),
+                now + chrono::Duration::seconds(11),
+                chrono::Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(second_job) = takeover else {
+            panic!("expected takeover");
+        };
+        let CreationStatus::Claimed(second_claim) = second_job.protocol.status else {
+            panic!("expected replacement authority");
+        };
+        assert_eq!(
+            db.mark_creation_resource_present(
+                "job-resource",
+                &first_claim,
+                "/repo/.phoenix/worktrees/conv-resource",
+                now + chrono::Duration::seconds(12),
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::ClaimLost
+        );
+        assert_eq!(
+            db.reserve_conversation_creation_resource(
+                "reservation-2",
+                "job-resource",
+                &second_claim,
+                "/repo",
+                "/repo/.phoenix/worktrees/conv-resource",
+                now + chrono::Duration::seconds(12),
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        assert_eq!(
+            db.mark_creation_resource_present(
+                "job-resource",
+                &second_claim,
+                "/repo/.phoenix/worktrees/conv-resource",
+                now + chrono::Duration::seconds(12),
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        let reservations = db
+            .get_creation_resource_reservations("job-resource")
+            .await
+            .unwrap();
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].generation, second_claim.generation);
+        assert_eq!(reservations[0].status, "present");
+    }
+
+    #[tokio::test]
+    async fn creation_cleanup_retry_clears_lease_and_uses_retry_deadline() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-cleanup-retry", "conv-cleanup-retry").await;
+        let now = Utc::now();
+        db.cancel_conversation_creation("conv-cleanup-retry", now)
+            .await
+            .unwrap();
+        let cleanup = db
+            .claim_next_conversation_creation_cleanup(
+                "cleanup-a",
+                "cleanup-token-a",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .expect("cleanup claim");
+        let retry_at = now + chrono::Duration::seconds(60);
+
+        assert_eq!(
+            db.schedule_conversation_creation_cleanup_retry(&cleanup, retry_at)
+                .await
+                .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        assert_eq!(
+            db.next_conversation_creation_deadline().await.unwrap(),
+            Some(retry_at)
+        );
+        assert!(db
+            .claim_next_conversation_creation_cleanup(
+                "cleanup-b",
+                "cleanup-token-b",
+                now + chrono::Duration::seconds(31),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db
+            .claim_next_conversation_creation_cleanup(
+                "cleanup-b",
+                "cleanup-token-b",
+                retry_at,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn creation_cleanup_deadline_waits_for_live_cleanup_lease() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-cleanup-deadline", "conv-cleanup-deadline").await;
+        let now = Utc::now();
+        db.cancel_conversation_creation("conv-cleanup-deadline", now)
+            .await
+            .unwrap();
+        let lease_duration = chrono::Duration::seconds(30);
+        let cleanup = db
+            .claim_next_conversation_creation_cleanup(
+                "cleanup-a",
+                "cleanup-token-a",
+                now,
+                lease_duration,
+            )
+            .await
+            .unwrap()
+            .expect("cleanup claim");
+
+        assert_eq!(cleanup.lease_until, now + lease_duration);
+        assert_eq!(
+            db.next_conversation_creation_deadline().await.unwrap(),
+            Some(cleanup.lease_until)
+        );
+        assert!(db
+            .claim_next_conversation_creation_cleanup(
+                "cleanup-b",
+                "cleanup-token-b",
+                now + chrono::Duration::seconds(1),
+                lease_duration,
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db
+            .claim_next_conversation_creation_cleanup(
+                "cleanup-b",
+                "cleanup-token-b",
+                cleanup.lease_until,
+                lease_duration,
+            )
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn creation_retry_is_durable_and_due_without_a_kick() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-retry", "conv-retry").await;
+        let now = Utc::now();
+        let first = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-a".into()),
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(first_job) = first else {
+            panic!("expected first claim");
+        };
+        let CreationStatus::Claimed(first_claim) = first_job.protocol.status else {
+            panic!("expected claim authority");
+        };
+        let retry_at = now + chrono::Duration::seconds(2);
+        assert_eq!(
+            db.schedule_conversation_creation_retry(
+                "job-retry",
+                &first_claim,
+                "temporary failure",
+                now,
+                retry_at,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        assert_eq!(
+            db.next_conversation_creation_deadline().await.unwrap(),
+            Some(retry_at)
+        );
+        assert!(matches!(
+            db.claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-b".into()),
+                &CreationClaimToken("token-b".into()),
+                now + chrono::Duration::seconds(1),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap(),
+            CreationClaimOutcome::NoEligibleJob
+        ));
+        let second = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-b".into()),
+                &CreationClaimToken("token-b".into()),
+                retry_at,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(second_job) = second else {
+            panic!("due retry must be claimable");
+        };
+        assert_eq!(second_job.protocol.attempt, 2);
+        assert_eq!(second_job.protocol.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn migrated_creation_database_reopens_with_rerunnable_schema() {
+        let dir = std::env::temp_dir().join(format!(
+            "phoenix-db-reopen-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_file = dir.join("reopen.db");
+        let db_path = db_file.to_string_lossy().to_string();
+
+        let db = Database::open(&db_path).await.unwrap();
+        run_pending_migrations(db.pool()).await.unwrap();
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversation_creation_jobs)")
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        assert!(columns.iter().any(|column| column == "status"));
+        assert!(!columns.iter().any(|column| column == "phase"));
+        drop(db);
+
+        let reopened = Database::open(&db_path)
+            .await
+            .expect("post-migration database must reopen");
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -6755,6 +9378,46 @@ mod tests {
             pre_allocated_seq + 1,
             "DB-MAX+1 allocation must observe seqs planted by add_message_with_seq"
         );
+    }
+
+    #[tokio::test]
+    async fn reset_preserves_llm_requesting_for_unfinished_creation() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-bootstrap", "conv-bootstrap").await;
+        let requesting = ConvState::LlmRequesting { attempt: 1 };
+        db.update_conversation_state("conv-bootstrap", &requesting)
+            .await
+            .unwrap();
+
+        db.reset_all_to_idle().await.unwrap();
+
+        assert!(matches!(
+            db.get_conversation("conv-bootstrap").await.unwrap().state,
+            ConvState::LlmRequesting { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reset_preserves_creation_cancelled_state() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("cancelled", "slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            "cancelled",
+            &ConvState::CreationCancelled {
+                job_id: "job".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        db.reset_all_to_idle().await.unwrap();
+
+        assert!(matches!(
+            db.get_conversation("cancelled").await.unwrap().state,
+            ConvState::CreationCancelled { ref job_id } if job_id == "job"
+        ));
     }
 
     #[tokio::test]

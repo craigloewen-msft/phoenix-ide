@@ -1613,6 +1613,10 @@ where
     /// persisted `Conversation.state_updated_at` and the SSE-carried value
     /// are identical — no clock drift between the two.
     state_updated_at: DateTime<Utc>,
+    startup_creation_completion: Option<(
+        String,
+        phoenix_core::domain::creation_protocol::CreationClaim,
+    )>,
     storage: S,
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
@@ -1878,6 +1882,7 @@ where
             context,
             state,
             state_updated_at: Utc::now(),
+            startup_creation_completion: None,
             storage,
             llm_client: Arc::new(llm_client),
             tool_executor,
@@ -1925,6 +1930,15 @@ where
             fork_cmd_tx: None,
             state_watcher: None,
         }
+    }
+
+    pub fn with_startup_creation_completion(
+        mut self,
+        job_id: String,
+        claim: phoenix_core::domain::creation_protocol::CreationClaim,
+    ) -> Self {
+        self.startup_creation_completion = Some((job_id, claim));
+        self
     }
 
     /// Provide the fork-resolution consumer sender used to retire still-pending
@@ -2034,6 +2048,10 @@ where
                         "resume the LLM request",
                     ),
                 });
+            } else if let Some((job_id, claim)) = self.startup_creation_completion.take() {
+                let _ = self
+                    .execute_effect(Effect::CompleteCreation { job_id, claim })
+                    .await;
             }
         }
 
@@ -2930,7 +2948,6 @@ where
                 self.state_updated_at,
             )
             .await?;
-
         if broadcast {
             let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
                 sequence_id: seq,
@@ -3790,6 +3807,19 @@ where
             Effect::PersistState => self.persist_state_effect(true).await,
 
             Effect::RequestLlm => self.dispatch_llm_request().await,
+
+            Effect::CompleteCreation { job_id, claim } => {
+                match self.storage.complete_creation_job(&job_id, &claim).await {
+                    Ok(crate::db::CreationCasOutcome::Applied) => {}
+                    Ok(crate::db::CreationCasOutcome::ClaimLost) => {
+                        tracing::debug!(conv_id = %self.context.conversation_id, %job_id, generation = claim.generation, "creation completion rejected after authority loss");
+                    }
+                    Err(error) => {
+                        tracing::warn!(conv_id = %self.context.conversation_id, %job_id, %error, "failed to mark creation job complete after LLM dispatch");
+                    }
+                }
+                Ok(None)
+            }
 
             Effect::ExecuteTool { tool } => self.dispatch_tool_execution(tool).await,
 
@@ -5292,12 +5322,19 @@ where
             .send_seq(|seq| SseEvent::ConversationUpdate {
                 sequence_id: seq,
                 update: crate::runtime::ConversationMetadataUpdate {
+                    slug: None,
+                    title: None,
                     cwd: Some(repo_root),
+                    project_id: None,
+                    project_name: None,
+                    updated_at: None,
                     branch_name: None,
                     worktree_path: None,
                     conv_mode_label: None,
                     base_branch: None,
                     task_title: None,
+                    work_scope_key: None,
+                    model: None,
                 },
             });
 
@@ -5508,12 +5545,25 @@ where
                     .send_seq(|seq| SseEvent::ConversationUpdate {
                         sequence_id: seq,
                         update: crate::runtime::ConversationMetadataUpdate {
+                            slug: None,
+                            title: None,
                             cwd: Some(approval_result.worktree_path.clone()),
+                            project_id: None,
+                            project_name: None,
+                            updated_at: None,
                             branch_name: Some(approval_result.branch_name.clone()),
                             worktree_path: Some(approval_result.worktree_path.clone()),
                             conv_mode_label: Some("Work".to_string()),
                             base_branch: Some(approval_result.base_branch.clone()),
                             task_title: Some(approval_result.task_title.clone()),
+                            work_scope_key: Some(
+                                crate::work_scope::WorkScope::resolve(
+                                    &self.context.conversation_id,
+                                    Some(std::path::Path::new(&approval_result.worktree_path)),
+                                )
+                                .stable_key(),
+                            ),
+                            model: None,
                         },
                     });
 

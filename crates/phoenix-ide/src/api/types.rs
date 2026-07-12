@@ -7,6 +7,8 @@ use std::path::Path;
 /// Request to create a new conversation with initial message
 #[derive(Debug, Deserialize)]
 pub struct CreateConversationRequest {
+    #[serde(default)]
+    pub conversation_id: Option<String>,
     pub cwd: String,
     pub model: Option<String>,
     /// Initial message text (required)
@@ -592,12 +594,14 @@ pub struct TaskEntry {
     pub conversation_slug: Option<String>,
 }
 
+#[allow(dead_code)]
 /// Response for the tasks list endpoint.
 #[derive(Debug, Serialize)]
 pub struct TasksResponse {
     pub tasks: Vec<TaskEntry>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct TaskAvailabilityResponse {
     pub available: bool,

@@ -384,6 +384,8 @@ mod tests {
             shell: Some("/bin/zsh".to_string()),
             home_dir: Some("/home/alice".to_string()),
             seed_parent_slug: None,
+            creation_prompt: None,
+            creation_error: None,
             parent_conversation_slug: None,
             browser_session_active: false,
             terminal_uses_tmux: false,
@@ -737,12 +739,19 @@ mod tests {
         let event = SseEvent::ConversationUpdate {
             sequence_id: 18,
             update: ConversationMetadataUpdate {
+                slug: None,
+                title: None,
                 cwd: Some("/new/cwd".to_string()),
+                project_id: None,
+                project_name: None,
+                updated_at: None,
                 branch_name: None,
                 worktree_path: None,
                 conv_mode_label: Some("work".to_string()),
                 base_branch: None,
                 task_title: None,
+                work_scope_key: None,
+                model: None,
             },
         };
         assert_parity(&event);

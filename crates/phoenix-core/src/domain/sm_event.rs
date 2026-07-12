@@ -45,6 +45,17 @@ pub enum Event {
         /// When present, the message is persisted as `MessageContent::Skill`.
         skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
     },
+    /// Internal first-turn event accepted only while the shell is provisioning.
+    CreationProvisioned {
+        initial_message: SteerEntry,
+        job_id: String,
+        claim: super::creation_protocol::CreationClaim,
+    },
+    /// Internal crash-recovery event for an initial request persisted before dispatch.
+    CreationRequestResume {
+        job_id: String,
+        claim: super::creation_protocol::CreationClaim,
+    },
     UserCancel {
         /// Why the cancel was issued. `None` means user-initiated or parent-propagated.
         reason: Option<String>,
@@ -239,6 +250,8 @@ impl Event {
     pub fn variant_name(&self) -> &'static str {
         match self {
             Event::UserMessage { .. } => "UserMessage",
+            Event::CreationProvisioned { .. } => "CreationProvisioned",
+            Event::CreationRequestResume { .. } => "CreationRequestResume",
             Event::UserCancel { .. } => "UserCancel",
             Event::LlmResponse { .. } => "LlmResponse",
             Event::LlmError { .. } => "LlmError",
@@ -451,6 +464,14 @@ impl TryFrom<Event> for ParentEvent {
                 user_agent,
                 skill_invocation,
             })),
+            Event::CreationProvisioned { .. } => Err(EventConversionError {
+                event_variant: "CreationProvisioned",
+                target_type: "ParentEvent",
+            }),
+            Event::CreationRequestResume { .. } => Err(EventConversionError {
+                event_variant: "CreationRequestResume",
+                target_type: "ParentEvent",
+            }),
             Event::UserCancel { reason, cause } => {
                 Ok(ParentEvent::Core(CoreEvent::UserCancel { reason, cause }))
             }
@@ -600,6 +621,14 @@ impl TryFrom<Event> for SubAgentEvent {
                 user_agent,
                 skill_invocation,
             })),
+            Event::CreationProvisioned { .. } => Err(EventConversionError {
+                event_variant: "CreationProvisioned",
+                target_type: "SubAgentEvent",
+            }),
+            Event::CreationRequestResume { .. } => Err(EventConversionError {
+                event_variant: "CreationRequestResume",
+                target_type: "SubAgentEvent",
+            }),
             Event::UserCancel { reason, cause } => {
                 Ok(SubAgentEvent::Core(CoreEvent::UserCancel { reason, cause }))
             }

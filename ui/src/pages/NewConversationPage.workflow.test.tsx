@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor, act, fireEvent } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { NewConversationPage } from './NewConversationPage';
 import { ConversationProvider } from '../conversation';
 import { api } from '../api';
@@ -62,10 +62,16 @@ vi.mock('../cache', () => ({
   },
 }));
 
+function LocationProbe() {
+  const location = useLocation();
+  return <div data-testid="location-path">{location.pathname}</div>;
+}
+
 function renderPage() {
   return render(
     <MemoryRouter>
       <ConversationProvider>
+        <LocationProbe />
         <NewConversationPage />
       </ConversationProvider>
     </MemoryRouter>,
@@ -176,6 +182,17 @@ describe('/new workflow modes', () => {
     renderPage();
 
     expect(screen.getAllByPlaceholderText('What would you like to work on?')[0]).toHaveValue('');
+  });
+
+  it('routes an accepted shell by stable id', async () => {
+    vi.mocked(api.validateCwd).mockResolvedValue({ valid: true, is_git: false });
+    renderPage();
+    await settleValidation();
+
+    fireEvent.change(screen.getAllByPlaceholderText('What would you like to work on?')[0]!, { target: { value: 'route by slug' } });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Send' })[0]!);
+
+    await waitFor(() => expect(screen.getByTestId('location-path')).toHaveTextContent('/c/c1'));
   });
 
   it('shows a stable acknowledgement while create is pending and preserves the draft', async () => {
@@ -301,6 +318,11 @@ describe('/new workflow modes', () => {
       [],
       'direct',
       null,
+      undefined,
+      undefined,
+      [],
+      null,
+      expect.any(String),
     );
     expect(api.listGitBranches).not.toHaveBeenCalled();
   });
@@ -325,6 +347,11 @@ describe('/new workflow modes', () => {
       [],
       'managed',
       'main',
+      undefined,
+      undefined,
+      [],
+      null,
+      expect.any(String),
     );
     expect(screen.queryByText('Pick a Git branch to start from.')).not.toBeInTheDocument();
     expect(screen.queryByText('Pick a Git starting point')).not.toBeInTheDocument();
@@ -349,6 +376,11 @@ describe('/new workflow modes', () => {
       [],
       'managed',
       'main',
+      undefined,
+      undefined,
+      [],
+      null,
+      expect.any(String),
     );
   });
   it('submits continue-branch as branch mode with the selected branch', async () => {
@@ -372,6 +404,11 @@ describe('/new workflow modes', () => {
       [],
       'branch',
       'feature/demo',
+      undefined,
+      undefined,
+      [],
+      null,
+      expect.any(String),
     );
   });
 
@@ -411,6 +448,11 @@ describe('/new workflow modes', () => {
       [],
       'managed',
       'trunk',
+      undefined,
+      undefined,
+      [],
+      null,
+      expect.any(String),
     );
   });
 
@@ -447,6 +489,11 @@ describe('/new workflow modes', () => {
       [],
       'managed',
       'trunk',
+      undefined,
+      undefined,
+      [],
+      null,
+      expect.any(String),
     );
   });
 

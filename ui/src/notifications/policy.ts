@@ -146,6 +146,7 @@ export function eventForState(state: ConversationState, conversation: Conversati
       if (conversation.continued_in_conv_id) return null;
       return { type: 'agent_error', title: 'Agent error', conversation };
     case 'error':
+    case 'creation_failed':
       return { type: 'agent_error', title: 'Agent error', conversation };
     default:
       return null;
@@ -170,7 +171,7 @@ export function notificationTagFor(event: PolicyNotificationEvent): string {
 }
 
 function shouldSuppressForFocus(env: NotificationEnv, conversation: Conversation): boolean {
-  return env.visible && env.hasFocus && env.activeSlug === conversation.slug;
+  return env.visible && env.hasFocus && (env.activeSlug === conversation.slug || env.activeSlug === conversation.id);
 }
 
 function markAttentionSeen(state: NotificationPolicyState, event: PolicyNotificationEvent): NotificationPolicyState {

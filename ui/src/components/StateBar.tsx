@@ -546,9 +546,13 @@ export function StateBar({
             break;
           case "terminal":
           case "handed_off":
+          case "creation_cancelled":
             dotClass += " terminal";
-            stateText =
-              convState.type === "handed_off" ? "handed off" : "completed";
+            stateText = convState.type === "handed_off"
+              ? "handed off"
+              : convState.type === "creation_cancelled"
+                ? "creation cancelled"
+                : "completed";
             break;
           case 'awaiting_task_approval':
           case 'awaiting_commission_review_approval':
@@ -567,6 +571,10 @@ export function StateBar({
             dotClass += " error";
             stateText = "error";
             break;
+          case "creation_failed":
+            dotClass += " error";
+            stateText = "creation failed";
+            break;
           case "context_exhausted":
             dotClass += " error";
             stateText = "context full";
@@ -581,6 +589,7 @@ export function StateBar({
           case "cancelling_tool":
           case "cancelling_sub_agents":
           case "awaiting_recovery":
+          case "provisioning":
             // REQ-WPV-001/003: elapsed counter is keyed off the
             // server-authoritative `phaseStateUpdatedAt`, so every
             // working phase gets a live "<reason> Ns" display (not

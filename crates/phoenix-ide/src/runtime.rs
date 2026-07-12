@@ -9,6 +9,7 @@
 //! REQ-BED-008: Sub-Agent Spawning
 //! REQ-BED-009: Sub-Agent Isolation
 
+pub(crate) mod creation_worker;
 pub mod deny_gate;
 pub(crate) mod executor;
 pub(crate) mod fork_resolve;
@@ -118,6 +119,9 @@ pub enum EvictionReason {
     /// The conversation's model was changed; the runtime is recreated so the
     /// new model takes effect.
     ModelUpgrade,
+    /// Async creation finished provisioning cwd/mode/model metadata; recreate
+    /// any shell runtime so it uses the provisioned conversation row.
+    CreationProvisioned,
 }
 
 #[derive(Debug)]
@@ -220,6 +224,8 @@ pub struct RuntimeManager {
     work_scope_browser_tx: mpsc::UnboundedSender<WorkScope>,
     /// Matching receiver, taken once by `start_work_scope_bridge`.
     work_scope_browser_rx: RwLock<Option<mpsc::UnboundedReceiver<WorkScope>>>,
+    creation_kick_tx: tokio::sync::watch::Sender<u64>,
+    creation_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
 }
 
 /// Handle to interact with a running conversation
@@ -809,7 +815,17 @@ impl SseBroadcaster {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConversationMetadataUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -820,6 +836,10 @@ pub struct ConversationMetadataUpdate {
     pub base_branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_scope_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -862,6 +882,10 @@ pub struct EnrichedConversation {
     /// case.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed_parent_slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creation_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creation_error: Option<String>,
     /// Slug of the sub-agent's parent conversation, resolved for the UI
     /// breadcrumb. `None` if `inner.parent_conversation_id` is `None` (the
     /// conversation is not a sub-agent) or the parent has been deleted — the
@@ -1164,6 +1188,7 @@ impl RuntimeManager {
         // bridge sends the affected scope here after broadcasting its own
         // edge, so the work-scope bridge re-broadcasts a `WorkScopeUpdate`.
         let (work_scope_browser_tx, work_scope_browser_rx) = mpsc::unbounded_channel();
+        let (creation_kick_tx, creation_kick_rx) = watch::channel(0u64);
         Self {
             db,
             llm_registry,
@@ -1194,6 +1219,8 @@ impl RuntimeManager {
             tmux_lifecycle_rx: RwLock::new(Some(tmux_lifecycle_rx)),
             work_scope_browser_tx,
             work_scope_browser_rx: RwLock::new(Some(work_scope_browser_rx)),
+            creation_kick_tx,
+            creation_kick_rx: RwLock::new(Some(creation_kick_rx)),
         }
     }
 
@@ -1699,6 +1726,53 @@ impl RuntimeManager {
             }
         }
         Ok(false)
+    }
+
+    pub async fn start_creation_worker(self: &Arc<Self>) {
+        let rx = self.creation_kick_rx.write().await.take();
+        let Some(mut rx) = rx else {
+            tracing::debug!("creation worker already started; skipping");
+            return;
+        };
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                if let Err(error) =
+                    crate::runtime::creation_worker::drain_pending_jobs(&manager).await
+                {
+                    tracing::error!(error = %error, "conversation creation worker drain failed");
+                }
+                let next_deadline = match manager.db().next_conversation_creation_deadline().await {
+                    Ok(deadline) => deadline,
+                    Err(error) => {
+                        tracing::error!(error = %error, "failed to read conversation creation deadline");
+                        Some(chrono::Utc::now() + chrono::Duration::seconds(1))
+                    }
+                };
+                if let Some(deadline) = next_deadline {
+                    let delay = (deadline - chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or(std::time::Duration::ZERO);
+                    tokio::select! {
+                        changed = rx.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                        }
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                } else if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            tracing::info!("Conversation creation worker stopped");
+        });
+        self.kick_creation_worker();
+    }
+
+    pub fn kick_creation_worker(&self) {
+        let next = self.creation_kick_tx.borrow().wrapping_add(1);
+        let _ = self.creation_kick_tx.send(next);
     }
 
     /// Start the background task that handles sub-agent spawn/cancel requests
@@ -2305,6 +2379,21 @@ impl RuntimeManager {
         // REQ-BED-007 says resume from idle, but we need to handle interrupted turns
         let (initial_state, initial_state_updated_at, needs_auto_continue) =
             self.determine_resume_state(conversation_id).await?;
+        let startup_creation_completion =
+            if matches!(initial_state, ConvState::LlmRequesting { .. }) {
+                self.db
+                    .get_conversation_creation_job_for_conversation(conversation_id)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .and_then(|job| match job.protocol.status {
+                        phoenix_core::domain::creation_protocol::CreationStatus::Claimed(claim) => {
+                            Some((job.id, claim))
+                        }
+                        _ => None,
+                    })
+            } else {
+                None
+            };
 
         // Seed the executor's in-memory steering queue from the normalized
         // steering_messages tables.
@@ -2344,6 +2433,11 @@ impl RuntimeManager {
             runtime
         } else {
             runtime.with_fork_command_sender(self.fork_cmd_tx.clone())
+        };
+        let runtime = if let Some((job_id, claim)) = startup_creation_completion {
+            runtime.with_startup_creation_completion(job_id, claim)
+        } else {
+            runtime
         };
 
         // Create the live-state watch channel seeded with the initial state.
@@ -2500,6 +2594,7 @@ impl RuntimeManager {
                     .await
                     .insert(conversation_id.to_string());
             }
+            EvictionReason::CreationProvisioned => {}
         }
 
         if let Some(handle) = old {
@@ -2636,6 +2731,34 @@ impl RuntimeManager {
         runtimes.get(conv_id).map(|h| h.state_rx.borrow().clone())
     }
 
+    /// Return the durable live-update channel for a conversation without starting its runtime.
+    pub async fn conversation_broadcaster(&self, conversation_id: &str) -> SseBroadcaster {
+        if let Some(handle) = self.try_get_handle(conversation_id).await {
+            return handle.broadcast_tx;
+        }
+        if let Some(broadcaster) = self
+            .evicted_broadcasters
+            .read()
+            .await
+            .get(conversation_id)
+            .cloned()
+        {
+            return broadcaster;
+        }
+        let initial_last_seq = self
+            .db
+            .get_last_sequence_id(conversation_id)
+            .await
+            .unwrap_or(0);
+        let candidate = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, initial_last_seq);
+        self.evicted_broadcasters
+            .write()
+            .await
+            .entry(conversation_id.to_string())
+            .or_insert(candidate)
+            .clone()
+    }
+
     /// Remove and return the evicted broadcaster for `conversation_id`, if any.
     ///
     /// An evicted broadcaster exists in the window between `evict_runtime` (model
@@ -2687,8 +2810,31 @@ impl RuntimeManager {
 
         let row_state_updated_at = conv.state_updated_at;
 
+        if matches!(conv.state, ConvState::LlmRequesting { .. })
+            && self
+                .db
+                .get_conversation_creation_job_for_conversation(conversation_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .is_some_and(|job| {
+                    matches!(
+                        job.protocol.status,
+                        phoenix_core::domain::creation_protocol::CreationStatus::Accepted
+                            | phoenix_core::domain::creation_protocol::CreationStatus::Claimed(_)
+                            | phoenix_core::domain::creation_protocol::CreationStatus::RetryScheduled {
+                                ..
+                            }
+                    )
+                })
+        {
+            return Ok((conv.state, row_state_updated_at, false));
+        }
+
         match &conv.state {
-            ConvState::AwaitingTaskApproval { .. }
+            ConvState::Provisioning { .. }
+            | ConvState::CreationFailed { .. }
+            | ConvState::CreationCancelled { .. }
+            | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. }
             | ConvState::ContextExhausted { .. }
@@ -3648,6 +3794,60 @@ mod scope_liveness_tests {
             mgr.scope_has_live_conversation(&scope).await.unwrap(),
             "a non-terminal, unarchived owner with a live handle is live"
         );
+    }
+
+    #[tokio::test]
+    async fn handleless_conversation_reuses_manager_owned_broadcaster() {
+        let mgr = test_manager().await;
+        let first = mgr.conversation_broadcaster("invalid-cwd-shell").await;
+        let mut receiver = first.subscribe();
+        let second = mgr.conversation_broadcaster("invalid-cwd-shell").await;
+
+        let idle = ConvState::Idle;
+        second
+            .send_seq(|seq| SseEvent::StateChange {
+                sequence_id: seq,
+                presentation_mode: idle.presentation_mode().to_string(),
+                state: idle.clone(),
+                state_updated_at: Utc::now(),
+            })
+            .expect("shared channel has receiver");
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            SseEvent::StateChange {
+                state: ConvState::Idle,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn determine_resume_state_preserves_creation_cancelled() {
+        let mgr = test_manager().await;
+        mgr.db()
+            .create_conversation("cancelled", "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        mgr.db()
+            .update_conversation_state(
+                "cancelled",
+                &ConvState::CreationCancelled {
+                    job_id: "job".to_string(),
+                },
+            )
+            .await
+            .expect("set cancelled");
+
+        let (state, _ts, needs_auto_continue) = mgr
+            .determine_resume_state("cancelled")
+            .await
+            .expect("resume");
+
+        assert!(matches!(
+            state,
+            ConvState::CreationCancelled { ref job_id } if job_id == "job"
+        ));
+        assert!(!needs_auto_continue);
     }
 
     #[tokio::test]

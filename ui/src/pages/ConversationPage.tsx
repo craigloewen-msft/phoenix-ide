@@ -4,6 +4,7 @@ import { api, canChangeModelInState, isTerminalConversationState, ExpansionError
 import { refreshModels } from '../modelsPoller';
 import { canCancelConversationState, isCancellingState, parseConversationState } from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
+import { generateUUID } from '../utils/uuid';
 import { cacheDB } from '../cache';
 import { terminalPaneStorageKey } from '../storage/terminalPaneStorage';
 import { ConversationNavStack } from '../components/ConversationNavStack';
@@ -32,7 +33,13 @@ import { OPEN_MESSAGE_VIEWER_EVENT } from '../components/MessageContextMenu';
 import { RenderProfiler } from '../dev/renderProfiler';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkControlBar } from '../components/WorkActions';
-import { useConversationEventCursorRef, useConversationView, useCreateConversationWithStore } from '../conversation';
+import {
+  useConversationEventCursorRef,
+  useConversationView,
+  useCreateConversationWithStore,
+  readCreateIntent,
+  clearCreateIntent,
+} from '../conversation';
 import {
   useResizablePane,
   useIsDesktop,
@@ -111,6 +118,10 @@ const ChevronRightSmall = () => (
     <polyline points="9 18 15 12 9 6" />
   </svg>
 );
+const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c/${conv.id}`;
+const UUID_ROUTE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isUuidRouteSegment = (segment: string) => UUID_ROUTE_RE.test(segment);
+
 
 export function ConversationPage() {
   const { slug } = useParams<{ slug: string }>();
@@ -222,6 +233,7 @@ function ConversationPageContent() {
 
   // Page-level state — not conversation data
   const [error, setError] = useState<string | null>(null);
+  const [deletingConversation, setDeletingConversation] = useState(false);
 
   // File explorer context (shared with desktop panel) — a projection of the
   // unified viewer slot below.
@@ -370,6 +382,7 @@ function ConversationPageContent() {
     setLastSlug(slug);
     // useState resets — React batches these into the same render.
     setError(null);
+    setDeletingConversation(false);
     setShowFileBrowser(false);
     setImages([]);
     setFiles([]);
@@ -491,7 +504,9 @@ function ConversationPageContent() {
         let cached = atomRef.current.conversation;
         let cachedMessages: Message[] = hadAtomData ? atomRef.current.messages : [];
         if (!hadAtomData) {
-          cached = await cacheDB.getConversationBySlug(slug);
+          cached = isUuidRouteSegment(slug)
+            ? await cacheDB.getConversation(slug) ?? await cacheDB.getConversationBySlug(slug)
+            : await cacheDB.getConversationBySlug(slug) ?? await cacheDB.getConversation(slug);
           if (cached) {
             cachedMessages = await cacheDB.getMessages(cached.id);
             if (!cancelled) {
@@ -616,7 +631,22 @@ function ConversationPageContent() {
 
           try {
             const snapshotStartedAtEventSeq = eventCursorRef.current;
-            const result = await api.getConversationBySlug(slug);
+            const result = await (async () => {
+              if (isUuidRouteSegment(slug)) {
+                try {
+                  return await api.getConversation(slug);
+                } catch (err) {
+                  if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
+                  return api.getConversationBySlug(slug);
+                }
+              }
+              try {
+                return await api.getConversationBySlug(slug);
+              } catch (err) {
+                if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
+                return api.getConversation(slug);
+              }
+            })();
             if (!cancelled) {
               const replacesDifferentConversation = atomRef.current.conversationId !== null
                 && atomRef.current.conversationId !== result.conversation.id;
@@ -683,7 +713,22 @@ function ConversationPageContent() {
     const confirmArchiveStatus = async () => {
       try {
         const snapshotStartedAtEventSeq = eventCursorRef.current;
-        const result = await api.getConversationBySlug(slug);
+        const result = await (async () => {
+          if (isUuidRouteSegment(slug)) {
+            try {
+              return await api.getConversation(slug);
+            } catch (err) {
+              if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
+              return api.getConversationBySlug(slug);
+            }
+          }
+          try {
+            return await api.getConversationBySlug(slug);
+          } catch (err) {
+            if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
+            return api.getConversation(slug);
+          }
+        })();
         if (cancelled) return;
         const replacesDifferentConversation = atomRef.current.conversationId !== null
           && atomRef.current.conversationId !== result.conversation.id;
@@ -1052,9 +1097,13 @@ function ConversationPageContent() {
   const handleAssistShellSetup = useCallback(
     async (promptText: string, seedLabel: string, homeDir: string) => {
       if (!conversation?.id) return;
-      const messageId =
-        crypto.randomUUID?.() ??
-        `seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const messageId = generateUUID();
+      const clientConversationId = generateUUID();
+      try {
+        localStorage.setItem(`seed-draft:${clientConversationId}`, promptText);
+      } catch {
+        // ignore — non-fatal
+      }
       // Stash the seed draft BEFORE navigation so it's visible to the new
       // page on first render (useDraft reads localStorage synchronously in
       // its initializer).
@@ -1068,15 +1117,11 @@ function ConversationPageContent() {
         null,
         conversation.id,
         seedLabel,
+        [],
+        null,
+        clientConversationId,
       );
-      try {
-        localStorage.setItem(`seed-draft:${newConv.id}`, promptText);
-      } catch {
-        // ignore — non-fatal
-      }
-      if (newConv.slug) {
-        navigate(`/c/${newConv.slug}`);
-      }
+      navigate(routeForConversation(newConv));
     },
     [conversation, navigate, createConversationWithStore],
   );
@@ -1266,6 +1311,50 @@ function ConversationPageContent() {
   }, [parentConvSlugForCallback, navigate]);
 
   const convStateForChildren = atom.phase;
+  const localCreateIntent = readCreateIntent(conversationId);
+  const provisioningPrompt = convStateForChildren.type === 'provisioning'
+    ? (convStateForChildren.prompt ?? conversation?.creation_prompt ?? localCreateIntent?.prompt ?? null)
+    : null;
+  const creationFailedPrompt = convStateForChildren.type === 'creation_failed'
+    ? (convStateForChildren.prompt ?? conversation?.creation_prompt ?? localCreateIntent?.prompt ?? null)
+    : null;
+  const creationCancelledPrompt = convStateForChildren.type === 'creation_cancelled'
+    ? (convStateForChildren.prompt ?? conversation?.creation_prompt ?? localCreateIntent?.prompt ?? null)
+    : null;
+  const creationFailedDraft = convStateForChildren.type === 'creation_failed' || convStateForChildren.type === 'creation_cancelled'
+    ? (localCreateIntent?.prompt ?? convStateForChildren.prompt ?? conversation?.creation_prompt ?? null)
+    : null;
+  const handleStartOverFromFailedCreation = useCallback(() => {
+    const prompt = creationFailedDraft;
+    if (prompt) {
+      try {
+        localStorage.setItem('phoenix-new-conversation-draft', prompt);
+      } catch {
+        // ignore — non-fatal
+      }
+    }
+    navigate('/new');
+  }, [creationFailedDraft, navigate]);
+  const handleDeleteProvisioningConversation = useCallback(async () => {
+    if (!conversationId || deletingConversation) return;
+    setDeletingConversation(true);
+    try {
+      await api.deleteConversation(conversationId);
+      await cacheDB.deleteConversation(conversationId);
+      clearCreateIntent(conversationId);
+      navigate('/');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to delete conversation');
+      setDeletingConversation(false);
+    }
+  }, [conversationId, deletingConversation, navigate]);
+
+  useEffect(() => {
+    if (convStateForChildren.type === 'provisioning') return;
+    if (convStateForChildren.type !== 'creation_failed' && convStateForChildren.type !== 'creation_cancelled') {
+      clearCreateIntent(conversationId);
+    }
+  }, [convStateForChildren.type, conversationId]);
   const handleSendTextOnly = useCallback((text: string) => handleSend(text, []), [handleSend]);
   const fileRootPath = isArchived || !conversation ? null : (conversation.worktree_path ?? conversation.cwd);
   const handleOpenFiles = useCallback(() => {
@@ -1423,6 +1512,9 @@ function ConversationPageContent() {
     !isArchived &&
     convStateForChildren.type !== 'terminal' &&
     convStateForChildren.type !== 'handed_off' &&
+    convStateForChildren.type !== 'provisioning' &&
+    convStateForChildren.type !== 'creation_failed' &&
+    convStateForChildren.type !== 'creation_cancelled' &&
     convStateForChildren.type !== 'context_exhausted';
 
   // Derived: model context window is a pure function of the current model's
@@ -1562,6 +1654,101 @@ function ConversationPageContent() {
           <button className="sse-error-dismiss" onClick={() => dispatch({ type: 'clear_error' })}>
             Dismiss
           </button>
+        </div>
+      )}
+      {convStateForChildren.type === 'provisioning' && (
+        <div className="terminal-banner">
+          <span>
+            Creating conversation… shell ready{provisioningPrompt ? ' • prompt queued' : ''}
+          </span>
+          {provisioningPrompt && (
+            <button
+              type="button"
+              className="context-exhausted-copy"
+              onClick={async () => {
+                const ok = await copyToClipboard(provisioningPrompt);
+                showInfo(ok ? 'Queued prompt copied to clipboard' : 'Copy failed -- select and copy manually');
+              }}
+            >
+              Copy prompt
+            </button>
+          )}
+          <button
+            type="button"
+            className="context-exhausted-copy"
+            onClick={() => void handleCancel()}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            className="context-exhausted-copy"
+            disabled={deletingConversation}
+            onClick={() => void handleDeleteProvisioningConversation()}
+          >
+            {deletingConversation ? 'Deleting…' : 'Delete'}
+          </button>
+        </div>
+      )}
+      {convStateForChildren.type === 'creation_failed' && (
+        <div className="context-exhausted-banner context-exhausted-banner--expanded">
+          <div className="context-exhausted-summary">
+            <div className="error-body-title">Conversation creation failed</div>
+            <div className="error-body-details">
+              {convStateForChildren.message ?? 'Phoenix created the shell but could not finish setup.'}
+            </div>
+            <div className="context-exhausted-actions">
+              <button type="button" className="context-exhausted-continue" onClick={handleStartOverFromFailedCreation}>
+                Start over
+              </button>
+              <button
+                type="button"
+                className="context-exhausted-copy"
+                disabled={deletingConversation}
+                onClick={() => void handleDeleteProvisioningConversation()}
+              >
+                {deletingConversation ? 'Deleting…' : 'Delete'}
+              </button>
+              {creationFailedPrompt && (
+                <button
+                  type="button"
+                  className="context-exhausted-copy"
+                  onClick={async () => {
+                    const ok = await copyToClipboard(creationFailedPrompt);
+                    showInfo(ok ? 'Prompt copied to clipboard' : 'Copy failed -- select and copy manually');
+                  }}
+                >
+                  Copy prompt
+                </button>
+              )}
+            </div>
+            {creationFailedPrompt && (
+              <pre className="context-exhausted-content">{creationFailedPrompt}</pre>
+            )}
+          </div>
+        </div>
+      )}
+      {convStateForChildren.type === 'creation_cancelled' && (
+        <div className="context-exhausted-banner context-exhausted-banner--expanded">
+          <div className="context-exhausted-summary">
+            <div className="error-body-title">Conversation creation cancelled</div>
+            <div className="context-exhausted-actions">
+              <button type="button" className="context-exhausted-continue" onClick={handleStartOverFromFailedCreation}>
+                Start over
+              </button>
+              <button
+                type="button"
+                className="context-exhausted-copy"
+                disabled={deletingConversation}
+                onClick={() => void handleDeleteProvisioningConversation()}
+              >
+                {deletingConversation ? 'Deleting…' : 'Delete'}
+              </button>
+            </div>
+            {creationCancelledPrompt && (
+              <pre className="context-exhausted-content">{creationCancelledPrompt}</pre>
+            )}
+          </div>
         </div>
       )}
       {convStateForChildren.type === 'context_exhausted' && (
@@ -1779,7 +1966,7 @@ function ConversationPageContent() {
           onAnswered={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}
           onDismissed={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id })}
         />
-      ) : !isArchived && convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'handed_off' && convStateForChildren.type !== 'terminal' ? (
+      ) : !isArchived && convStateForChildren.type !== 'provisioning' && convStateForChildren.type !== 'creation_failed' && convStateForChildren.type !== 'creation_cancelled' && convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'handed_off' && convStateForChildren.type !== 'terminal' ? (
         <>
         {conversationId && (
           <WorkControlBar

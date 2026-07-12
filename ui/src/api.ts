@@ -70,6 +70,7 @@ import type { BashHandleInspection as BashHandleInspectionType } from './generat
 export interface Conversation {
   id: string;
   slug: string;
+  title?: string | null;
   model: string;
   cwd: string;
   created_at: string;
@@ -113,6 +114,8 @@ export interface Conversation {
   /** Slug of the seed parent, resolved server-side for the breadcrumb link.
    *  `null` if the parent has been deleted; UI renders unlinked text. */
   seed_parent_slug?: string | null;
+  creation_prompt?: string | null;
+  creation_error?: string | null;
   /** Continuation pointer (REQ-BED-030). If this conversation has been
    *  continued into a new conversation (context-exhausted handoff), this is
    *  the continuation's id. The UI uses this to (a) swap the Continue
@@ -377,10 +380,12 @@ export type ConversationState =
   | { type: 'handed_off'; successor_conv_id: string }
   | { type: 'error'; message: string; error_kind: ErrorKind; error?: ErrorPresentation }
   | { type: 'awaiting_recovery'; message: string; recovery_kind: string; resume: RecoveryResumeTarget }
+  | { type: 'provisioning'; prompt?: string | null }
+  | { type: 'creation_failed'; message?: string | null; prompt?: string | null }
+  | { type: 'creation_cancelled'; prompt?: string | null }
   | { type: 'terminal' };
 
-/** Mirror of the backend `ConvState::allows_model_change`: true only for
- *  `idle` and `error`. */
+/** Mirror of the backend `ConvState::allows_model_change`. */
 export function canChangeModelInState(state: ConversationState): boolean {
   return state.type === 'idle' || state.type === 'error';
 }
@@ -395,6 +400,9 @@ export function isTerminalConversationState(state: ConversationState): boolean {
     case 'terminal':
     case 'context_exhausted':
     case 'handed_off':
+    case 'creation_failed':
+      return true;
+    case 'creation_cancelled':
       return true;
     case 'idle':
     case 'awaiting_llm':
@@ -411,6 +419,7 @@ export function isTerminalConversationState(state: ConversationState): boolean {
     case 'awaiting_user_response':
     case 'error':
     case 'awaiting_recovery':
+    case 'provisioning':
       return false;
     default:
       state satisfies never;
@@ -425,6 +434,7 @@ function getDisplayState(stateType: string | undefined): 'idle' | 'working' | 'e
     case 'idle': return 'idle';
     case 'terminal': return 'terminal';
     case 'handed_off': return 'terminal';
+    case 'creation_cancelled': return 'terminal';
     case 'error': return 'error';
     case 'context_exhausted': return 'idle';
     case 'awaiting_task_approval': return 'awaiting-approval';
@@ -1331,8 +1341,12 @@ export const api = {
     seedLabel?: string | null,
     files: File[] = [],
     checkoutRef?: string | null,
+    conversationId?: string,
   ): Promise<Conversation> {
     const body: Record<string, unknown> = { cwd, model, text, message_id: messageId, images, mode };
+    if (conversationId) {
+      body['conversation_id'] = conversationId;
+    }
     if (baseBranch) {
       body['base_branch'] = baseBranch;
     }
