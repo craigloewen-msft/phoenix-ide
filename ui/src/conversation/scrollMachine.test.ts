@@ -45,7 +45,7 @@ function reading(): Extract<ScrollMachineState, { kind: 'live' }> {
 
 const effectTypes = (effects: ScrollEffect[]) => effects.map((effect) => effect.type);
 
-function expectLiveMode(state: ScrollMachineState, mode: 'following' | 'reading' | 'returning-to-tail') {
+function expectLiveMode(state: ScrollMachineState, mode: 'following' | 'reading' | 'navigating' | 'returning-to-tail') {
   expect(state.kind).toBe('live');
   if (state.kind === 'live') expect(state.follow.kind).toBe(mode);
 }
@@ -190,17 +190,148 @@ describe('scrollMachine durable follow policy', () => {
     expect(stranded.effects).toEqual([{ type: 'writeDomBottom' }]);
   });
 
+  it('preserves a navigation jump made before first measurement', () => {
+    let result = reduceScrollMachine(initialScrollMachineState('conv'), { type: 'navigationJumped' });
+    expect(result.state.kind === 'unmeasured' && result.state.navigationPending).toBe(true);
+
+    result = reduceScrollMachine(result.state, {
+      type: 'conversationMeasured',
+      conversationId: 'conv',
+      totalHeight: 1_000,
+      unitCount: 5,
+      snapshot: snap(1_000, 200, 400),
+      nowMs: 1_000,
+    });
+
+    expectLiveMode(result.state, 'navigating');
+    expect(result.state.kind === 'live' && result.state.follow.kind === 'navigating' && result.state.follow.phase).toBe('positioning');
+    expect(result.effects).toEqual([]);
+
+    result = reduceScrollMachine(result.state, { type: 'viewportPinnedChanged', atBottom: true });
+    expectLiveMode(result.state, 'navigating');
+  });
+
+  it('preserves a navigation jump while an initially empty list waits for content', () => {
+    let result = reduceScrollMachine(initialScrollMachineState('conv'), { type: 'navigationJumped' });
+    result = reduceScrollMachine(result.state, {
+      type: 'conversationMeasured',
+      conversationId: 'conv',
+      totalHeight: 0,
+      unitCount: 0,
+      snapshot: snap(0, 0, 400),
+      nowMs: 1_000,
+    });
+    expect(result.state.kind === 'measured-empty' && result.state.navigationPending).toBe(true);
+
+    result = reduceScrollMachine(result.state, {
+      type: 'conversationMeasured',
+      conversationId: 'conv',
+      totalHeight: 1_000,
+      unitCount: 5,
+      snapshot: snap(1_000, 600, 400),
+      nowMs: 1_100,
+    });
+    expectLiveMode(result.state, 'navigating');
+    expect(result.effects).toEqual([]);
+  });
+
   it('navigation jumps take durable ownership and disable mount rescue', () => {
     const mounted = measured();
     const result = reduceScrollMachine(mounted.state, { type: 'navigationJumped' });
 
-    expectLiveMode(result.state, 'reading');
+    expectLiveMode(result.state, 'navigating');
     expect(result.effects).toEqual([{ type: 'stopSettleWatch' }]);
     expect(reduceScrollMachine(result.state, {
       type: 'settleProbe',
       snapshot: snap(1_000, 0, 400),
       nowMs: 1_001,
     }).effects).toEqual([]);
+  });
+
+  it('keeps an off-bottom jump positioning until post-jump user interaction', () => {
+    let state = reduceScrollMachine(liveFollowing(), {
+      type: 'viewportPinnedChanged',
+      atBottom: false,
+    }).state;
+    state = reduceScrollMachine(state, { type: 'navigationJumped' }).state;
+
+    let result = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true });
+    expectLiveMode(result.state, 'navigating');
+    result = reduceScrollMachine(result.state, { type: 'viewportPinnedChanged', atBottom: false });
+
+    result = reduceScrollMachine(result.state, { type: 'interactionStarted' });
+    expect(result.state.kind === 'live' && result.state.follow.kind === 'navigating' && result.state.follow.phase).toBe('user-returning');
+    result = reduceScrollMachine(result.state, { type: 'viewportPinnedChanged', atBottom: true });
+    expectLiveMode(result.state, 'following');
+  });
+
+  it('preserves positioning through programmatic upward scroll events', () => {
+    let state = reduceScrollMachine(liveFollowing(), { type: 'navigationJumped' }).state;
+    state = reduceScrollMachine(state, {
+      type: 'upwardIntent',
+      snapshot: snap(1_000, 200, 400),
+    }).state;
+
+    expectLiveMode(state, 'navigating');
+    expect(state.kind === 'live' && state.follow.kind === 'navigating' && state.follow.phase).toBe('positioning');
+  });
+
+  it('does not mark a near-tail navigation jump as departed while it remains pinned', () => {
+    let state = reduceScrollMachine(liveFollowing(), { type: 'navigationJumped' }).state;
+    state = reduceScrollMachine(state, {
+      type: 'upwardIntent',
+      snapshot: snap(1_000, 550, 400),
+    }).state;
+
+    expectLiveMode(state, 'navigating');
+    expect(state.kind === 'live' && state.follow.kind === 'navigating' && state.follow.phase).toBe('positioning');
+
+    const result = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true });
+    expectLiveMode(result.state, 'navigating');
+  });
+
+  it('releases positioned navigation on interaction when geometry is already pinned', () => {
+    let result = reduceScrollMachine(liveFollowing(), { type: 'navigationJumped' });
+    result = reduceScrollMachine(result.state, { type: 'viewportPinnedChanged', atBottom: true });
+    expectLiveMode(result.state, 'navigating');
+
+    result = reduceScrollMachine(result.state, { type: 'interactionStarted' });
+    expectLiveMode(result.state, 'following');
+    expect(result.effects).toEqual([]);
+  });
+
+  it('navigation ownership survives movement and later height growth without a tail snap', () => {
+    let result = reduceScrollMachine(liveFollowing(), { type: 'navigationJumped' });
+    result = reduceScrollMachine(result.state, {
+      type: 'downwardMovement',
+      snapshot: snap(1_000, 250, 400),
+    });
+    expectLiveMode(result.state, 'navigating');
+    expect(result.effects).toEqual([]);
+
+    result = reduceScrollMachine(result.state, { type: 'viewportPinnedChanged', atBottom: true });
+    expectLiveMode(result.state, 'navigating');
+    expect(result.effects).toEqual([]);
+
+    result = reduceScrollMachine(result.state, { type: 'viewportPinnedChanged', atBottom: false });
+    expectLiveMode(result.state, 'navigating');
+    result = reduceScrollMachine(result.state, { type: 'interactionStarted' });
+    result = reduceScrollMachine(result.state, { type: 'viewportPinnedChanged', atBottom: true });
+    expectLiveMode(result.state, 'following');
+    expect(result.effects).toEqual([]);
+
+    result = reduceScrollMachine(
+      reduceScrollMachine(liveFollowing(), { type: 'navigationJumped' }).state,
+      {
+        type: 'heightChanged',
+        totalHeight: 1_200,
+        unitCount: 5,
+        snapshot: snap(1_200, 250, 400),
+        tailActivity: 'active',
+      },
+    );
+    expectLiveMode(result.state, 'navigating');
+    expect(result.effects).toEqual([{ type: 'showUnread' }]);
   });
 
   it('tail advance while following requests one live follow action', () => {
@@ -348,7 +479,7 @@ describe('scrollMachine durable follow policy', () => {
       conversationId: 'new',
     });
 
-    expect(result.state).toEqual({ kind: 'unmeasured', conversationId: 'new' });
+    expect(result.state).toEqual({ kind: 'unmeasured', conversationId: 'new', navigationPending: false });
     expect(result.effects).toEqual([{ type: 'clearUnread' }]);
   });
 });
@@ -425,7 +556,9 @@ describe('scrollMachine reachable-history properties', () => {
 
   it('never returns reading ownership merely because more events or time pass', () => {
     const nonReleaseArb = commandArb.filter((event) =>
-      event.type !== 'viewportPinnedChanged' && event.type !== 'jumpToNewestRequested',
+      event.type !== 'viewportPinnedChanged' &&
+      event.type !== 'jumpToNewestRequested' &&
+      event.type !== 'navigationJumped',
     );
     fc.assert(
       fc.property(fc.array(nonReleaseArb, { maxLength: 100 }), (events) => {

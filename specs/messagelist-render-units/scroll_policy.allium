@@ -10,7 +10,8 @@ config {
 }
 
 enum Lifecycle { unmeasured measured_empty mount_rescue live }
-enum FollowMode { following reading returning_to_tail }
+enum FollowMode { following reading navigating returning_to_tail }
+enum NavigationPhase { positioning user_returning }
 enum GestureMode { idle touch_stationary touch_moved }
 enum EffectKind {
     snap_to_last_index
@@ -29,6 +30,8 @@ entity ScrollPolicy {
     follow_mode: FollowMode
     gesture_mode: GestureMode
     mode_before_gesture: FollowMode
+    navigation_phase: NavigationPhase
+    navigation_pending: Boolean
     gesture_departed_bottom: Boolean
     at_bottom: Boolean
     unread: Boolean
@@ -39,7 +42,9 @@ entity ScrollPolicy {
     transitions lifecycle {
         unmeasured -> measured_empty
         unmeasured -> mount_rescue
+        unmeasured -> live
         measured_empty -> mount_rescue
+        measured_empty -> live
         measured_empty -> unmeasured
         mount_rescue -> live
         mount_rescue -> unmeasured
@@ -48,11 +53,17 @@ entity ScrollPolicy {
 
     transitions follow_mode {
         following -> reading
+        following -> navigating
         following -> returning_to_tail
         reading -> following
+        reading -> navigating
         reading -> returning_to_tail
+        navigating -> following
+        navigating -> reading
+        navigating -> returning_to_tail
         returning_to_tail -> following
         returning_to_tail -> reading
+        returning_to_tail -> navigating
     }
 
     transitions gesture_mode {
@@ -80,7 +91,7 @@ surface ScrollPolicyAdapter {
 
     provides:
         ConversationChanged(policy, conversation_id)
-        ConversationMeasured(policy, conversation_id, total_height, unit_count, now_ms)
+        ConversationMeasured(policy, conversation_id, total_height, unit_count, snapshot, now_ms)
         ScrollerAttached(policy, snapshot)
         DownwardMovement(policy, snapshot)
         ViewportPinnedChanged(policy, at_bottom)
@@ -89,7 +100,7 @@ surface ScrollPolicyAdapter {
         TouchMoved(policy)
         TouchEnded(policy, remaining_touches)
         TouchCancelled(policy, remaining_touches)
-        UpwardIntent(policy)
+        UpwardIntent(policy, snapshot)
         NavigationJumped(policy)
         TailContentAdvanced(policy)
         HeightChanged(policy, total_height, unit_count, cause)
@@ -118,9 +129,32 @@ rule DownwardMovementUpdatesGeometryWithoutChangingOwnership {
     ensures: policy.follow_mode = policy.follow_mode
 }
 
+rule NavigationBeforeMeasurementRemainsPending {
+    when: NavigationJumped(policy)
+    requires: policy.lifecycle in { unmeasured, measured_empty }
+    ensures: policy.navigation_pending = true
+}
+
+rule PendingNavigationMeasurementEntersLiveNavigation {
+    when: ConversationMeasured(policy, conversation_id, total_height, unit_count, snapshot, _)
+    requires: policy.lifecycle in { unmeasured, measured_empty }
+    requires: policy.navigation_pending = true
+    requires: unit_count > 0
+    ensures: policy.conversation_id = conversation_id
+    ensures: policy.lifecycle = live
+    ensures: policy.follow_mode = navigating
+    ensures: policy.previous_total_height = total_height
+    ensures: policy.navigation_pending = false
+    ensures: policy.at_bottom = snapshot.at_bottom
+    ensures: policy.navigation_phase = positioning
+    ensures: not ScrollEffect.created(policy: policy, kind: start_settle_watch)
+    ensures: not ScrollEffect.created(policy: policy, kind: schedule_dom_bottom_write)
+}
+
 rule PopulatedMeasurementStartsMountRescue {
-    when: ConversationMeasured(policy, conversation_id, total_height, unit_count, now_ms)
+    when: ConversationMeasured(policy, conversation_id, total_height, unit_count, _, now_ms)
     requires: policy.lifecycle = unmeasured
+    requires: policy.navigation_pending = false
     requires: unit_count > 0
     ensures: policy.conversation_id = conversation_id
     ensures: policy.lifecycle = mount_rescue
@@ -135,17 +169,19 @@ rule PopulatedMeasurementStartsMountRescue {
 }
 
 rule EmptyMeasurementWaitsForContent {
-    when: ConversationMeasured(policy, conversation_id, total_height, unit_count, _)
+    when: ConversationMeasured(policy, conversation_id, total_height, unit_count, _, _)
     requires: policy.lifecycle = unmeasured
     requires: unit_count = 0
     ensures: policy.conversation_id = conversation_id
     ensures: policy.lifecycle = measured_empty
     ensures: policy.previous_total_height = total_height
+    ensures: policy.navigation_pending = policy.navigation_pending
 }
 
 rule FirstContentAfterEmptyStartsRescueAndSnaps {
-    when: ConversationMeasured(policy, conversation_id, total_height, unit_count, now_ms)
+    when: ConversationMeasured(policy, conversation_id, total_height, unit_count, _, now_ms)
     requires: policy.lifecycle = measured_empty
+    requires: policy.navigation_pending = false
     requires: unit_count > 0
     ensures: policy.conversation_id = conversation_id
     ensures: policy.lifecycle = mount_rescue
@@ -165,28 +201,60 @@ rule InteractionPermanentlyExitsMountRescue {
     ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
 }
 
-rule NavigationFromLiveTakesReadingOwnership {
+rule NavigationFromLiveTakesDurableOwnership {
     when: NavigationJumped(policy)
     requires: policy.lifecycle = live
-    ensures: policy.follow_mode = reading
+    ensures: policy.follow_mode = navigating
+    ensures: policy.navigation_phase = positioning
 }
 
 rule NavigationExitsMountRescueIntoReading {
     when: NavigationJumped(policy)
     requires: policy.lifecycle = mount_rescue
     ensures: policy.lifecycle = live
-    ensures: policy.follow_mode = reading
+    ensures: policy.follow_mode = navigating
+    ensures: policy.navigation_phase = positioning
     ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
 }
 
-rule UpwardIntentFromLiveTakesReadingOwnership {
-    when: UpwardIntent(policy)
+rule NavigationOwnershipSurvivesBottomConfirmation {
+    when: ViewportPinnedChanged(policy, true)
     requires: policy.lifecycle = live
+    requires: policy.follow_mode = navigating
+    requires: policy.gesture_mode = idle
+    requires: policy.navigation_phase = positioning
+    ensures: policy.follow_mode = navigating
+    ensures: not ScrollEffect.created(policy: policy, kind: snap_to_last_index)
+    ensures: not ScrollEffect.created(policy: policy, kind: schedule_tail_follow)
+}
+
+rule ReadingOwnershipSurvivesDownwardGeometryChanges {
+    when: DownwardMovement(policy, snapshot)
+    requires: policy.lifecycle = live
+    requires: policy.follow_mode = reading
+    ensures: policy.follow_mode = reading
+    ensures: policy.last_scroll_top = snapshot.scroll_top
+    ensures: not ScrollEffect.created(policy: policy, kind: snap_to_last_index)
+    ensures: not ScrollEffect.created(policy: policy, kind: schedule_tail_follow)
+}
+
+rule UpwardIntentFromLiveTakesReadingOwnership {
+    when: UpwardIntent(policy, _)
+    requires: policy.lifecycle = live
+    requires: policy.follow_mode != navigating
     ensures: policy.follow_mode = reading
 }
 
+rule NavigationUpwardMovementPreservesNavigationOwnership {
+    when: UpwardIntent(policy, snapshot)
+    requires: policy.lifecycle = live
+    requires: policy.follow_mode = navigating
+    ensures: policy.follow_mode = navigating
+    ensures: policy.navigation_phase = policy.navigation_phase
+}
+
 rule UpwardIntentExitsMountRescueIntoReading {
-    when: UpwardIntent(policy)
+    when: UpwardIntent(policy, _)
     requires: policy.lifecycle = mount_rescue
     ensures: policy.lifecycle = live
     ensures: policy.follow_mode = reading
@@ -273,6 +341,24 @@ rule LeavingBottomWhileIdleUpdatesGeometry {
     ensures: policy.at_bottom = false
 }
 
+rule OffBottomNavigationInteractionEnablesManualReturn {
+    when: InteractionStarted(policy)
+    requires: policy.lifecycle = live
+    requires: policy.follow_mode = navigating
+    requires: policy.at_bottom = false
+    ensures: policy.navigation_phase = user_returning
+}
+
+rule PinnedNavigationInteractionRestoresFollowing {
+    when: InteractionStarted(policy)
+    requires: policy.lifecycle = live
+    requires: policy.follow_mode = navigating
+    requires: policy.at_bottom = true
+    ensures: policy.follow_mode = following
+    ensures: policy.unread = false
+    ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
+}
+
 rule LeavingBottomDuringTouchIsRemembered {
     when: ViewportPinnedChanged(policy, at_bottom)
     requires: at_bottom = false
@@ -301,6 +387,19 @@ rule LiveIdleBottomConfirmationRestoresFollowing {
     requires: at_bottom = true
     requires: policy.gesture_mode = idle
     requires: policy.lifecycle = live
+    requires: policy.follow_mode != navigating
+    ensures: policy.at_bottom = true
+    ensures: policy.follow_mode = following
+    ensures: policy.unread = false
+    ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
+}
+
+rule NavigationManualReturnRestoresFollowing {
+    when: ViewportPinnedChanged(policy, true)
+    requires: policy.lifecycle = live
+    requires: policy.follow_mode = navigating
+    requires: policy.navigation_phase = user_returning
+    requires: policy.gesture_mode = idle
     ensures: policy.at_bottom = true
     ensures: policy.follow_mode = following
     ensures: policy.unread = false
@@ -321,6 +420,15 @@ rule TailAdvanceWhileReadingShowsUnread {
     requires: policy.follow_mode = reading
     ensures: policy.unread = true
     ensures: ScrollEffect.created(policy: policy, kind: show_unread)
+}
+
+rule TailAdvanceWhileNavigatingShowsUnread {
+    when: TailContentAdvanced(policy)
+    requires: policy.lifecycle = live
+    requires: policy.follow_mode = navigating
+    ensures: policy.unread = true
+    ensures: ScrollEffect.created(policy: policy, kind: show_unread)
+    ensures: not ScrollEffect.created(policy: policy, kind: schedule_tail_follow)
 }
 
 rule TailAdvanceWhileFollowingKeepsUnreadClear {
@@ -355,6 +463,19 @@ rule ReadingTailGrowthShowsUnreadWithoutScrolling {
     ensures: ScrollEffect.created(policy: policy, kind: show_unread)
 }
 
+rule NavigatingTailGrowthShowsUnreadWithoutScrolling {
+    when: HeightChanged(policy, total_height, unit_count, cause)
+    requires: policy.lifecycle = live
+    requires: policy.follow_mode = navigating
+    requires: unit_count > 0
+    requires: cause = tail_activity
+    requires: total_height > policy.previous_total_height
+    ensures: policy.previous_total_height = total_height
+    ensures: policy.unread = true
+    ensures: ScrollEffect.created(policy: policy, kind: show_unread)
+    ensures: not ScrollEffect.created(policy: policy, kind: snap_to_last_index)
+}
+
 rule ReadingUnrelatedGrowthDoesNotChangeUnreadOrScroll {
     when: HeightChanged(policy, total_height, unit_count, cause)
     requires: policy.lifecycle = live
@@ -362,6 +483,16 @@ rule ReadingUnrelatedGrowthDoesNotChangeUnreadOrScroll {
     requires: unit_count > 0
     requires: cause = unrelated_layout
     ensures: policy.previous_total_height = total_height
+}
+
+rule NavigatingUnrelatedGrowthDoesNotChangeUnreadOrScroll {
+    when: HeightChanged(policy, total_height, unit_count, cause)
+    requires: policy.lifecycle = live
+    requires: policy.follow_mode = navigating
+    requires: unit_count > 0
+    requires: cause = unrelated_layout
+    ensures: policy.previous_total_height = total_height
+    ensures: not ScrollEffect.created(policy: policy, kind: snap_to_last_index)
 }
 
 rule MountHeightChangeSchedulesBottomCorrection {
@@ -423,6 +554,7 @@ rule LiveConversationChangeResetsSessionAtomically {
     ensures: policy.gesture_mode = idle
     ensures: policy.at_bottom = true
     ensures: policy.unread = false
+    ensures: policy.navigation_pending = false
     ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
 }
 
@@ -436,6 +568,7 @@ rule MountConversationChangeStopsRescueAndResetsSession {
     ensures: policy.gesture_mode = idle
     ensures: policy.at_bottom = true
     ensures: policy.unread = false
+    ensures: policy.navigation_pending = false
     ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
     ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
 }
@@ -446,6 +579,7 @@ rule UnreadyConversationChangeResetsIdentity {
     requires: policy.conversation_id != conversation_id
     ensures: policy.conversation_id = conversation_id
     ensures: policy.lifecycle = unmeasured
+    ensures: policy.navigation_pending = false
 }
 
 invariant OnlyExplicitTailReturnReleasesReading {

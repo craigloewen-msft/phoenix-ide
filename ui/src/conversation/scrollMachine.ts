@@ -13,6 +13,7 @@ export type TailActivity = 'none' | 'active';
 export type FollowMode =
   | { kind: 'following' }
   | { kind: 'reading' }
+  | { kind: 'navigating'; phase: 'positioning' | 'user-returning' }
   | { kind: 'returning-to-tail' };
 
 export type Gesture =
@@ -40,8 +41,8 @@ interface MeasuredSession {
 }
 
 type UnreadySession =
-  | { kind: 'unmeasured'; conversationId: string | undefined }
-  | { kind: 'measured-empty'; conversationId: string | undefined };
+  | { kind: 'unmeasured'; conversationId: string | undefined; navigationPending: boolean }
+  | { kind: 'measured-empty'; conversationId: string | undefined; navigationPending: boolean };
 
 type ReadySession =
   | (MeasuredSession & { kind: 'mount-rescue'; deadlineMs: number })
@@ -100,8 +101,16 @@ const FOLLOWING: FollowMode = { kind: 'following' };
 const READING: FollowMode = { kind: 'reading' };
 const RETURNING: FollowMode = { kind: 'returning-to-tail' };
 
+function navigationMode(): FollowMode {
+  return { kind: 'navigating', phase: 'positioning' };
+}
+
 function isReady(state: ScrollMachineState): state is ReadySession {
   return state.kind === 'mount-rescue' || state.kind === 'live';
+}
+
+function snapshotIsPinned(snapshot: ScrollSnapshot): boolean {
+  return snapshot.scrollHeight - snapshot.scrollTop - snapshot.clientHeight <= PIN_TO_BOTTOM_THRESHOLD;
 }
 
 function geometryFrom(snapshot: ScrollSnapshot | null, totalHeight: number): ScrollGeometry {
@@ -131,7 +140,7 @@ function updateGeometry(
 export function initialScrollMachineState(
   conversationId?: string,
 ): ScrollMachineState {
-  return { kind: 'unmeasured', conversationId };
+  return { kind: 'unmeasured', conversationId, navigationPending: false };
 }
 
 function unreadEffects(wasUnread: boolean, unread: boolean): ScrollEffect[] {
@@ -212,7 +221,7 @@ function advanceTail(
   state: ReadySession,
 ): Reduction {
   const blocked =
-    (state.kind === 'live' && state.follow.kind === 'reading') ||
+    (state.kind === 'live' && (state.follow.kind === 'reading' || state.follow.kind === 'navigating')) ||
     (state.gesture.kind === 'touch' && state.gesture.moved);
   const unread = blocked;
   if (state.kind === 'mount-rescue') {
@@ -294,8 +303,21 @@ export function reduceScrollMachine(
       if (event.unitCount === 0 || event.snapshot === null) {
         return {
           state: event.unitCount === 0
-            ? { kind: 'measured-empty', conversationId: event.conversationId }
+            ? { kind: 'measured-empty', conversationId: event.conversationId, navigationPending: state.navigationPending }
             : state,
+          effects: [],
+        };
+      }
+      if (state.navigationPending) {
+        return {
+          state: {
+            kind: 'live',
+            conversationId: event.conversationId,
+            follow: { kind: 'navigating', phase: 'positioning' },
+            geometry: { ...geometryFrom(event.snapshot, event.totalHeight), atBottom: snapshotIsPinned(event.snapshot) },
+            gesture: IDLE,
+            unread: false,
+          },
           effects: [],
         };
       }
@@ -327,17 +349,25 @@ export function reduceScrollMachine(
 
     case 'viewportPinnedChanged': {
       if (!isReady(state)) return { state, effects: [] };
-      const next = {
-        ...state,
-        geometry: { ...state.geometry, atBottom: event.atBottom },
-        gesture: state.gesture.kind === 'touch' && !event.atBottom
-          ? { ...state.gesture, departedBottom: true }
-          : state.gesture,
-      };
+      const geometry = { ...state.geometry, atBottom: event.atBottom };
+      const gesture = state.gesture.kind === 'touch' && !event.atBottom
+        ? { ...state.gesture, departedBottom: true }
+        : state.gesture;
+      const next: ReadySession = state.kind === 'live'
+        ? {
+            ...state,
+            geometry,
+            gesture,
+            follow: state.follow,
+          }
+        : { ...state, geometry, gesture };
       if (!event.atBottom || next.kind === 'mount-rescue') {
         return { state: next, effects: [] };
       }
-      if (next.gesture.kind === 'touch' && next.gesture.moved) {
+      if (
+        (next.kind === 'live' && next.follow.kind === 'navigating' && next.follow.phase === 'positioning') ||
+        (next.gesture.kind === 'touch' && next.gesture.moved)
+      ) {
         return { state: next, effects: [] };
       }
       return confirmTailReturn(next);
@@ -345,6 +375,13 @@ export function reduceScrollMachine(
 
     case 'interactionStarted':
       if (state.kind === 'mount-rescue') return exitMountRescue(state, FOLLOWING);
+      if (state.kind === 'live' && state.follow.kind === 'navigating') {
+        if (state.geometry.atBottom) return confirmTailReturn(state);
+        return {
+          state: { ...state, follow: { kind: 'navigating', phase: 'user-returning' } },
+          effects: [],
+        };
+      }
       return { state, effects: [] };
 
     case 'touchStarted': {
@@ -388,12 +425,23 @@ export function reduceScrollMachine(
       return resolveTouch(state, event.remainingTouches);
 
     case 'upwardIntent':
-    case 'navigationJumped':
       if (!isReady(state)) return { state, effects: [] };
-      return takeUserOwnership(
-        state,
-        event.type === 'upwardIntent' ? event.snapshot : undefined,
-      );
+      if (state.kind === 'live' && state.follow.kind === 'navigating') {
+        return {
+          state: {
+            ...state,
+            geometry: event.snapshot ? updateGeometry(state.geometry, event.snapshot) : state.geometry,
+            follow: state.follow,
+          },
+          effects: [],
+        };
+      }
+      return takeUserOwnership(state, event.snapshot);
+
+    case 'navigationJumped':
+      if (!isReady(state)) return { state: { ...state, navigationPending: true }, effects: [] };
+      if (state.kind === 'mount-rescue') return exitMountRescue(state, navigationMode());
+      return { state: { ...state, follow: navigationMode() }, effects: [] };
 
     case 'downwardMovement':
       if (!isReady(state)) return { state, effects: [] };
@@ -419,7 +467,11 @@ export function reduceScrollMachine(
       if (state.kind === 'mount-rescue') {
         return { state: nextState, effects: [{ type: 'scheduleDomBottomWrite' }] };
       }
-      if (state.follow.kind !== 'reading' && !(state.gesture.kind === 'touch' && state.gesture.moved)) {
+      if (
+        state.follow.kind !== 'reading' &&
+        state.follow.kind !== 'navigating' &&
+        !(state.gesture.kind === 'touch' && state.gesture.moved)
+      ) {
         return {
           state: { ...nextState, unread: false },
           effects: [
