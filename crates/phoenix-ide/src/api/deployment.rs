@@ -10,6 +10,11 @@
 //! yields current values.
 
 use super::AppState;
+use crate::api::process_sample::{
+    group_member_identities_for_sampling, process_identity_for_sampling,
+    sample_process_observations, session_member_identities_for_sampling, ProcessIdentity,
+    ProcessObservation,
+};
 use axum::{
     extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
@@ -73,7 +78,6 @@ pub struct DeploymentConfig {
 pub struct DeploymentInfo {
     pub build: BuildInfo,
     pub network: NetworkInfo,
-    pub resources: ResourceUsage,
     pub log: LogInfo,
     /// Whether the requesting browser is on the server host, and so may use
     /// host-local actions like revealing a path in the OS file manager. False
@@ -136,19 +140,79 @@ impl TlsInfo {
     }
 }
 
-/// Live process + system resource usage. Each field is `None` when the metric
-/// cannot be sampled on the host — never a misleading `0`.
 #[derive(Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
-pub struct ResourceUsage {
-    /// Resident set size of this process, in bytes.
-    pub process_memory_bytes: Option<u64>,
-    /// CPU utilization of this process, as a percent (may exceed 100 on
-    /// multi-core hosts).
-    pub process_cpu_percent: Option<f32>,
-    pub system_total_memory_bytes: Option<u64>,
-    pub system_available_memory_bytes: Option<u64>,
+pub struct AboutResourcesSnapshot {
+    pub sampled_at: DateTime<Utc>,
+    pub host: HostResources,
+    pub managed_total: ManagedResourceTotals,
+    pub categories: Vec<ManagedResourceCategory>,
+}
+
+#[derive(Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct HostResources {
     pub logical_cpu_count: Option<u32>,
+    pub cpu_busy_percent: Option<f32>,
+    pub cpu_system_percent: Option<f32>,
+    pub cpu_idle_percent: Option<f32>,
+    pub total_memory_bytes: Option<u64>,
+    pub available_memory_bytes: Option<u64>,
+    pub used_memory_bytes: Option<u64>,
+    pub load_average_one: Option<f64>,
+    pub load_average_five: Option<f64>,
+    pub load_average_fifteen: Option<f64>,
+}
+
+#[derive(Serialize, TS, Clone, Default)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ManagedResourceTotals {
+    pub cpu_percent: Option<f32>,
+    pub memory_bytes: Option<u64>,
+    pub process_count: u32,
+    pub deduplicated_pid_count: u32,
+}
+
+#[derive(Serialize, TS, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ManagedResourceCategoryKind {
+    Api,
+    Bash,
+    Browser,
+    TmuxTerminal,
+    Mcp,
+}
+
+#[derive(Serialize, TS, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ManagedResourceAttribution {
+    Available,
+    Unavailable,
+}
+
+#[derive(Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ManagedResourceCategory {
+    pub kind: ManagedResourceCategoryKind,
+    pub label: String,
+    pub attribution: ManagedResourceAttribution,
+    pub reason: Option<String>,
+    pub totals: ManagedResourceTotals,
+    pub processes: Vec<ManagedProcessRow>,
+}
+
+#[derive(Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ManagedProcessRow {
+    pub name: String,
+    pub category: ManagedResourceCategoryKind,
+    pub pid: u32,
+    pub cpu_percent: Option<f32>,
+    pub memory_bytes: Option<u64>,
+    pub thread_count: Option<u32>,
+    pub cpu_time_seconds: Option<f64>,
 }
 
 #[derive(Serialize, TS)]
@@ -272,12 +336,9 @@ pub async fn deployment_info(
         tls: cfg.tls.clone(),
     };
 
-    let resources = sample_resources().await;
-
     Json(DeploymentInfo {
         build,
         network,
-        resources,
         log: cfg.log.clone(),
         local_access: super::local_reveal::client_is_local(peer.ip(), &headers),
         sampled_at: Utc::now(),
@@ -286,6 +347,10 @@ pub async fn deployment_info(
 
 pub async fn deployment_disk(State(state): State<AppState>) -> impl IntoResponse {
     Json(build_disk_info(&state).await)
+}
+
+pub async fn about_resources(State(state): State<AppState>) -> impl IntoResponse {
+    Json(sample_about_resources(&state).await)
 }
 
 pub async fn cleanup_managed_worktree(
@@ -866,41 +931,351 @@ pub fn absolutize(path: &Path) -> PathBuf {
     }
 }
 
-/// Sample live process and system resource usage. Returns `None` for any metric
-/// the host does not expose rather than a misleading zero.
-async fn sample_resources() -> ResourceUsage {
-    use sysinfo::{ProcessesToUpdate, System};
+async fn sample_about_resources(state: &AppState) -> AboutResourcesSnapshot {
+    sample_about_resources_inner(Some(state)).await
+}
 
-    let mut sys = System::new();
-    sys.refresh_memory();
-    let system_total_memory_bytes = Some(sys.total_memory());
-    let system_available_memory_bytes = Some(sys.available_memory());
-
-    // Host logical CPU count from the system sampler — not
-    // `available_parallelism()`, which reflects the process's CPU
-    // affinity/quota rather than the machine total this field labels.
-    sys.refresh_cpu_all();
-    let cpu_len = sys.cpus().len();
-    let logical_cpu_count = (cpu_len > 0).then(|| u32::try_from(cpu_len).unwrap_or(u32::MAX));
-
-    let (process_memory_bytes, process_cpu_percent) = match sysinfo::get_current_pid() {
-        Ok(pid) => {
-            // CPU usage needs two samples separated by the minimum interval.
-            sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-            tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
-            sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-            sys.process(pid)
-                .map_or((None, None), |p| (Some(p.memory()), Some(p.cpu_usage())))
-        }
-        Err(_) => (None, None),
+async fn sample_about_resources_inner(state: Option<&AppState>) -> AboutResourcesSnapshot {
+    let api_identity = sysinfo::get_current_pid()
+        .ok()
+        .map(sysinfo::Pid::as_u32)
+        .and_then(|pid| process_identity_for_sampling(pid).map(|identity| (pid, identity)));
+    let api_identities = api_identity.into_iter().collect::<BTreeMap<_, _>>();
+    let api_snapshot = if api_identities.is_empty() {
+        BashPidSnapshot::Unavailable
+    } else {
+        BashPidSnapshot::Available(api_identities.clone())
+    };
+    let bash_pid_snapshot = match state {
+        Some(state) => snapshot_bash_pids(state).await,
+        None => BashPidSnapshot::Available(BTreeMap::new()),
     };
 
-    ResourceUsage {
-        process_memory_bytes,
-        process_cpu_percent,
-        system_total_memory_bytes,
-        system_available_memory_bytes,
+    let terminal_pid_snapshot = state.map(snapshot_terminal_pids);
+    let mut all_identities = api_identities;
+    if let BashPidSnapshot::Available(bash_identities) = &bash_pid_snapshot {
+        all_identities.extend(bash_identities);
+    }
+    if let Some(BashPidSnapshot::Available(terminal_identities)) = &terminal_pid_snapshot {
+        all_identities.extend(terminal_identities);
+    }
+    let all_pids = all_identities.keys().copied().collect::<BTreeSet<_>>();
+
+    let (host, observed_rows) = tokio::join!(
+        sample_host_resources(),
+        sample_process_observations(&all_identities)
+    );
+    let observed_rows_by_pid: BTreeMap<u32, ProcessObservation> = observed_rows
+        .into_iter()
+        .map(|row| (row.pid, row))
+        .collect();
+
+    let mut categories = Vec::new();
+    categories.push(build_api_category(&api_snapshot, &observed_rows_by_pid));
+
+    if let Some(state) = state {
+        categories.push(build_bash_category(
+            &bash_pid_snapshot,
+            &observed_rows_by_pid,
+        ));
+
+        categories.push(unavailable_category(
+            ManagedResourceCategoryKind::Browser,
+            "Browser",
+            "browser sessions do not currently expose native process identity",
+        ));
+        categories.push(build_terminal_category(
+            terminal_pid_snapshot
+                .as_ref()
+                .expect("terminal snapshot exists with app state"),
+            &observed_rows_by_pid,
+        ));
+
+        let has_mcp = !state.mcp_manager.status().await.is_empty();
+        if has_mcp {
+            tracing::debug!(
+                "about resources: MCP servers present but native process identity unavailable"
+            );
+        }
+        categories.push(unavailable_category(
+            ManagedResourceCategoryKind::Mcp,
+            "MCP",
+            if has_mcp {
+                "MCP servers are configured or connected, but Phoenix does not currently surface native process identity for attribution"
+            } else {
+                "no MCP server identities available"
+            },
+        ));
+    } else {
+        categories.push(build_bash_category(
+            &bash_pid_snapshot,
+            &observed_rows_by_pid,
+        ));
+        categories.push(unavailable_category(
+            ManagedResourceCategoryKind::Browser,
+            "Browser",
+            "browser sessions were not sampled in this context",
+        ));
+        categories.push(unavailable_category(
+            ManagedResourceCategoryKind::TmuxTerminal,
+            "tmux/terminal",
+            "tmux and terminal resources were not sampled in this context",
+        ));
+        categories.push(unavailable_category(
+            ManagedResourceCategoryKind::Mcp,
+            "MCP",
+            "MCP resources were not sampled in this context",
+        ));
+    }
+
+    let managed_total = totals_from_observations(&all_pids, &observed_rows_by_pid);
+    AboutResourcesSnapshot {
+        sampled_at: Utc::now(),
+        host,
+        managed_total,
+        categories,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BashPidSnapshot {
+    Available(BTreeMap<u32, ProcessIdentity>),
+    Unavailable,
+}
+
+async fn snapshot_bash_pids(state: &AppState) -> BashPidSnapshot {
+    let pgids = state
+        .runtime
+        .bash_handles()
+        .snapshot_live_pgids()
+        .await
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    match group_member_identities_for_sampling(&pgids) {
+        Some(member_identities) => BashPidSnapshot::Available(member_identities),
+        None => BashPidSnapshot::Unavailable,
+    }
+}
+
+fn snapshot_terminal_pids(state: &AppState) -> BashPidSnapshot {
+    let session_ids = state
+        .terminals
+        .snapshot_shell_session_ids()
+        .into_iter()
+        .collect();
+    match session_member_identities_for_sampling(&session_ids) {
+        Some(member_identities) => BashPidSnapshot::Available(member_identities),
+        None => BashPidSnapshot::Unavailable,
+    }
+}
+
+fn build_api_category(
+    snapshot: &BashPidSnapshot,
+    observed_rows_by_pid: &BTreeMap<u32, ProcessObservation>,
+) -> ManagedResourceCategory {
+    match snapshot {
+        BashPidSnapshot::Available(identities) => build_category_from_observations(
+            ManagedResourceCategoryKind::Api,
+            "API",
+            ManagedResourceAttribution::Available,
+            None,
+            &identities.keys().copied().collect(),
+            observed_rows_by_pid,
+        ),
+        BashPidSnapshot::Unavailable => unavailable_category(
+            ManagedResourceCategoryKind::Api,
+            "API",
+            "Phoenix API native process identity unavailable",
+        ),
+    }
+}
+
+fn build_terminal_category(
+    snapshot: &BashPidSnapshot,
+    observed_rows_by_pid: &BTreeMap<u32, ProcessObservation>,
+) -> ManagedResourceCategory {
+    match snapshot {
+        BashPidSnapshot::Available(identities) => build_category_from_observations(
+            ManagedResourceCategoryKind::TmuxTerminal,
+            "tmux/terminal",
+            ManagedResourceAttribution::Available,
+            Some("shell-mode terminals are attributed; tmux server identity remains unavailable".to_string()),
+            &identities.keys().copied().collect(),
+            observed_rows_by_pid,
+        ),
+        BashPidSnapshot::Unavailable => unavailable_category(
+            ManagedResourceCategoryKind::TmuxTerminal,
+            "tmux/terminal",
+            "shell terminals exist, but native process enumeration failed; tmux server identity remains unavailable",
+        ),
+    }
+}
+
+fn build_bash_category(
+    snapshot: &BashPidSnapshot,
+    observed_rows_by_pid: &BTreeMap<u32, ProcessObservation>,
+) -> ManagedResourceCategory {
+    match snapshot {
+        BashPidSnapshot::Available(identities) => build_category_from_observations(
+            ManagedResourceCategoryKind::Bash,
+            "Bash",
+            ManagedResourceAttribution::Available,
+            None,
+            &identities.keys().copied().collect(),
+            observed_rows_by_pid,
+        ),
+        BashPidSnapshot::Unavailable => unavailable_category(
+            ManagedResourceCategoryKind::Bash,
+            "Bash",
+            "live bash process groups exist, but native process enumeration failed",
+        ),
+    }
+}
+
+#[derive(Default)]
+struct HostCpuBreakdown {
+    logical_cpu_count: Option<u32>,
+    busy_percent: Option<f32>,
+    system_percent: Option<f32>,
+    idle_percent: Option<f32>,
+}
+
+async fn sample_host_cpu_breakdown() -> HostCpuBreakdown {
+    use sysinfo::System;
+
+    let mut sys = System::new();
+    sys.refresh_cpu_all();
+    tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
+    sys.refresh_cpu_all();
+
+    let logical_cpu_count =
+        (!sys.cpus().is_empty()).then(|| u32::try_from(sys.cpus().len()).unwrap_or(u32::MAX));
+    let busy = sys.global_cpu_usage().clamp(0.0, 100.0);
+
+    HostCpuBreakdown {
         logical_cpu_count,
+        busy_percent: Some(busy),
+        system_percent: None,
+        idle_percent: Some((100.0_f32 - busy).max(0.0)),
+    }
+}
+
+fn build_category_from_observations(
+    kind: ManagedResourceCategoryKind,
+    label: &str,
+    attribution: ManagedResourceAttribution,
+    reason: Option<String>,
+    pids: &BTreeSet<u32>,
+    observed_rows_by_pid: &BTreeMap<u32, ProcessObservation>,
+) -> ManagedResourceCategory {
+    let processes: Vec<ManagedProcessRow> = pids
+        .iter()
+        .filter_map(|pid| observed_rows_by_pid.get(pid))
+        .map(|row| ManagedProcessRow {
+            name: row.name.clone(),
+            category: kind,
+            pid: row.pid,
+            cpu_percent: row.cpu_percent,
+            memory_bytes: row.memory_bytes,
+            thread_count: row.thread_count,
+            cpu_time_seconds: row.cpu_time_seconds,
+        })
+        .collect();
+    let totals = totals_from_rows(&processes);
+    ManagedResourceCategory {
+        kind,
+        label: label.to_string(),
+        attribution,
+        reason,
+        totals,
+        processes,
+    }
+}
+
+fn unavailable_category(
+    kind: ManagedResourceCategoryKind,
+    label: &str,
+    reason: &str,
+) -> ManagedResourceCategory {
+    tracing::debug!(category = ?kind, reason, "about resources: attribution unavailable");
+    ManagedResourceCategory {
+        kind,
+        label: label.to_string(),
+        attribution: ManagedResourceAttribution::Unavailable,
+        reason: Some(reason.to_string()),
+        totals: ManagedResourceTotals::default(),
+        processes: Vec::new(),
+    }
+}
+
+fn totals_from_observations(
+    expected_pids: &BTreeSet<u32>,
+    observed_rows_by_pid: &BTreeMap<u32, ProcessObservation>,
+) -> ManagedResourceTotals {
+    let processes: Vec<ManagedProcessRow> = expected_pids
+        .iter()
+        .filter_map(|pid| observed_rows_by_pid.get(pid))
+        .map(|row| ManagedProcessRow {
+            name: row.name.clone(),
+            category: ManagedResourceCategoryKind::Api,
+            pid: row.pid,
+            cpu_percent: row.cpu_percent,
+            memory_bytes: row.memory_bytes,
+            thread_count: row.thread_count,
+            cpu_time_seconds: row.cpu_time_seconds,
+        })
+        .collect();
+    totals_from_rows(&processes)
+}
+
+fn totals_from_rows(processes: &[ManagedProcessRow]) -> ManagedResourceTotals {
+    let mut cpu_total = 0.0_f32;
+    let mut cpu_seen = false;
+    let memory_bytes = if processes.is_empty() {
+        None
+    } else {
+        processes.iter().try_fold(0_u64, |total, row| {
+            row.memory_bytes.map(|memory| total.saturating_add(memory))
+        })
+    };
+    for row in processes {
+        if let Some(cpu) = row.cpu_percent {
+            cpu_total += cpu;
+            cpu_seen = true;
+        }
+    }
+    ManagedResourceTotals {
+        cpu_percent: cpu_seen.then_some(cpu_total),
+        memory_bytes,
+        process_count: u32::try_from(processes.len()).unwrap_or(u32::MAX),
+        deduplicated_pid_count: u32::try_from(processes.len()).unwrap_or(u32::MAX),
+    }
+}
+
+async fn sample_host_resources() -> HostResources {
+    use sysinfo::System;
+
+    let cpu = sample_host_cpu_breakdown().await;
+    let mut sys = System::new();
+    sys.refresh_memory();
+
+    let total_memory_bytes = Some(sys.total_memory());
+    let available_memory_bytes = Some(sys.available_memory());
+    let used_memory_bytes = total_memory_bytes
+        .zip(available_memory_bytes)
+        .map(|(t, a)| t.saturating_sub(a));
+    let load = System::load_average();
+    HostResources {
+        logical_cpu_count: cpu.logical_cpu_count,
+        cpu_busy_percent: cpu.busy_percent,
+        cpu_system_percent: cpu.system_percent,
+        cpu_idle_percent: cpu.idle_percent,
+        total_memory_bytes,
+        available_memory_bytes,
+        used_memory_bytes,
+        load_average_one: Some(load.one),
+        load_average_five: Some(load.five),
+        load_average_fifteen: Some(load.fifteen),
     }
 }
 
@@ -1368,12 +1743,148 @@ mod tests {
         assert_eq!(abs, cwd.join("phoenix.db"));
     }
 
+    #[test]
+    fn unavailable_api_snapshot_preserves_capability_failure() {
+        let category = build_api_category(&BashPidSnapshot::Unavailable, &BTreeMap::new());
+
+        assert_eq!(
+            category.attribution,
+            ManagedResourceAttribution::Unavailable
+        );
+        assert!(category.reason.is_some());
+        assert!(category.processes.is_empty());
+    }
+
+    #[test]
+    fn unavailable_bash_snapshot_preserves_capability_failure() {
+        let category = build_bash_category(&BashPidSnapshot::Unavailable, &BTreeMap::new());
+
+        assert_eq!(
+            category.attribution,
+            ManagedResourceAttribution::Unavailable
+        );
+        assert!(category.reason.is_some());
+        assert!(category.processes.is_empty());
+        assert_eq!(category.totals.cpu_percent, None);
+        assert_eq!(category.totals.memory_bytes, None);
+        assert_eq!(category.totals.process_count, 0);
+        assert_eq!(category.totals.deduplicated_pid_count, 0);
+    }
+
+    #[test]
+    fn unavailable_category_carries_reason_and_zero_totals() {
+        let category = unavailable_category(
+            ManagedResourceCategoryKind::Browser,
+            "Browser",
+            "native process identity unavailable",
+        );
+
+        assert_eq!(category.kind, ManagedResourceCategoryKind::Browser);
+        assert_eq!(
+            category.attribution,
+            ManagedResourceAttribution::Unavailable
+        );
+        assert_eq!(
+            category.reason.as_deref(),
+            Some("native process identity unavailable")
+        );
+        assert_eq!(category.totals.process_count, 0);
+        assert_eq!(category.totals.deduplicated_pid_count, 0);
+        assert!(category.totals.cpu_percent.is_none());
+        assert!(category.totals.memory_bytes.is_none());
+        assert!(category.processes.is_empty());
+    }
+
+    #[test]
+    fn totals_require_memory_for_every_process() {
+        let complete = ManagedProcessRow {
+            name: "api".to_string(),
+            category: ManagedResourceCategoryKind::Api,
+            pid: 1,
+            cpu_percent: Some(1.0),
+            memory_bytes: Some(1024),
+            thread_count: None,
+            cpu_time_seconds: None,
+        };
+        let missing = ManagedProcessRow {
+            name: "bash".to_string(),
+            category: ManagedResourceCategoryKind::Bash,
+            pid: 2,
+            cpu_percent: Some(2.0),
+            memory_bytes: None,
+            thread_count: None,
+            cpu_time_seconds: None,
+        };
+
+        assert_eq!(
+            totals_from_rows(std::slice::from_ref(&complete)).memory_bytes,
+            Some(1024)
+        );
+        assert_eq!(totals_from_rows(&[complete, missing]).memory_bytes, None);
+    }
+
+    #[test]
+    fn managed_total_requires_memory_for_every_deduplicated_process() {
+        let expected_pids = BTreeSet::from([1, 2]);
+        let observations = BTreeMap::from([
+            (
+                1,
+                ProcessObservation {
+                    pid: 1,
+                    name: "api".to_string(),
+                    cpu_percent: Some(1.0),
+                    memory_bytes: Some(1024),
+                    thread_count: None,
+                    cpu_time_seconds: None,
+                },
+            ),
+            (
+                2,
+                ProcessObservation {
+                    pid: 2,
+                    name: "bash".to_string(),
+                    cpu_percent: Some(2.0),
+                    memory_bytes: None,
+                    thread_count: None,
+                    cpu_time_seconds: None,
+                },
+            ),
+        ]);
+
+        let totals = totals_from_observations(&expected_pids, &observations);
+
+        assert_eq!(totals.memory_bytes, None);
+        assert_eq!(totals.process_count, 2);
+        assert_eq!(totals.deduplicated_pid_count, 2);
+    }
+
+    #[test]
+    fn managed_process_row_category_round_trips_requested_kind() {
+        let row = ManagedProcessRow {
+            name: "bash".to_string(),
+            category: ManagedResourceCategoryKind::Bash,
+            pid: 42,
+            cpu_percent: Some(12.5),
+            memory_bytes: Some(1024),
+            thread_count: Some(3),
+            cpu_time_seconds: Some(1.5),
+        };
+
+        assert_eq!(row.category, ManagedResourceCategoryKind::Bash);
+    }
+
     #[tokio::test]
-    async fn sample_resources_completes_with_system_metrics() {
-        let usage = sample_resources().await;
-        // System totals are always populated on supported hosts; the call must
-        // complete (including its CPU-sample window) without panicking.
-        assert!(usage.system_total_memory_bytes.is_some());
-        assert!(usage.system_available_memory_bytes.is_some());
+    async fn host_cpu_breakdown_preserves_idle_plus_busy_budget() {
+        let cpu = sample_host_cpu_breakdown().await;
+
+        if let (Some(busy), Some(idle)) = (cpu.busy_percent, cpu.idle_percent) {
+            assert!(
+                (busy + idle) <= 100.5,
+                "busy + idle should stay near 100%, got {}",
+                busy + idle
+            );
+            assert!(busy >= 0.0);
+            assert!(idle >= 0.0);
+        }
     }
 }
