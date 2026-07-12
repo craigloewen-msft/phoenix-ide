@@ -3361,21 +3361,26 @@ _RUST_NONCRATE_FILES = ("Cargo.toml", "Cargo.lock")
 _workspace_metadata_memo: list = []
 
 
-def _workspace_metadata():
-    """Parsed `cargo metadata --format-version 1 --no-deps` for the workspace,
-    memoized for the lifetime of the invocation. Returns None on any failure
-    (callers fall back to full-workspace behaviour)."""
-    if not _workspace_metadata_memo:
-        try:
-            out = subprocess.run(
-                ["cargo", "metadata", "--format-version", "1", "--no-deps"],
-                cwd=ROOT, capture_output=True, text=True, timeout=60,
-            )
-            meta = json.loads(out.stdout) if out.returncode == 0 else None
-        except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
-            meta = None
+def _workspace_metadata(env=None):
+    """Parsed `cargo metadata --format-version 1 --no-deps` for the workspace.
+
+    Ambient-environment calls are memoized for workspace checks. An explicit
+    environment bypasses that memo so Cargo configuration such as
+    `CARGO_TARGET_DIR` matches the command being prepared.
+    """
+    if env is None and _workspace_metadata_memo:
+        return _workspace_metadata_memo[0]
+    try:
+        out = subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+            cwd=ROOT, capture_output=True, text=True, timeout=60, env=env,
+        )
+        meta = json.loads(out.stdout) if out.returncode == 0 else None
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+        meta = None
+    if env is None:
         _workspace_metadata_memo.append(meta)
-    return _workspace_metadata_memo[0]
+    return meta
 
 
 def _ts_export_crates():
@@ -5008,6 +5013,24 @@ def cmd_tasks_fix() -> bool:
     summary = result.summary()
     print(f"✓ {summary}")
     return True
+
+
+def cmd_drive_turn(drive_turn_args: list[str]) -> None:
+    """Build and exec drive-turn with the normal Phoenix development env."""
+    env = _resolved_phoenix_env()
+    build = subprocess.run(
+        ["cargo", "build", "-p", "phoenix-drive-turn"],
+        cwd=ROOT,
+        env=env,
+    )
+    if build.returncode != 0:
+        sys.exit(build.returncode)
+
+    metadata = _workspace_metadata(env=env)
+    if metadata is None:
+        die("cargo metadata failed after building drive-turn")
+    binary = Path(metadata["target_directory"]) / "debug" / "drive-turn"
+    os.execve(binary, [str(binary), *drive_turn_args], env)
 
 
 def cmd_taskmd(taskmd_args: list[str]) -> None:
@@ -7406,12 +7429,13 @@ def _bootstrap_rich() -> None:
 
 
 def main():
-    # `taskmd` is a verbatim passthrough to the bundled taskmd CLI — intercept
-    # it before argparse so flags like `--version` / `--help` reach taskmd
-    # rather than dev.py's own parser (argparse.REMAINDER doesn't handle a
-    # leading optional cleanly).
+    # Verbatim passthrough commands are intercepted before argparse so their
+    # flags (especially --help) reach the underlying CLI unchanged.
     if len(sys.argv) >= 2 and sys.argv[1] == "taskmd":
         cmd_taskmd(sys.argv[2:])
+        return
+    if len(sys.argv) >= 2 and sys.argv[1] == "drive-turn":
+        cmd_drive_turn(sys.argv[2:])
         return
 
     parser = argparse.ArgumentParser(prog="dev.py", description="Phoenix development tasks")
@@ -7587,6 +7611,13 @@ def main():
     tasks_sub = tasks_parser.add_subparsers(dest="tasks_command", required=True)
     tasks_sub.add_parser("validate", help="Validate task filenames and check for duplicate IDs")
     tasks_sub.add_parser("fix", help="Migrate legacy IDs and renumber duplicate task IDs")
+
+    # drive-turn — verbatim passthrough, intercepted before argparse.
+    sub.add_parser(
+        "drive-turn",
+        help="Build and run one production-runtime turn with the development env",
+        add_help=False,
+    )
 
     # taskmd — passthrough to the bundled taskmd CLI (intercepted above before
     # argparse runs; this entry exists only so it shows up in `./dev.py --help`)
