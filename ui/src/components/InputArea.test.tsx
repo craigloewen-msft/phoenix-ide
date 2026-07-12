@@ -3,6 +3,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { useRef } from 'react';
 import { InputArea } from './InputArea';
 import { AgentMessage } from './MessageComponents';
+import { VoicePermission } from './VoiceInput/VoicePermission';
 import type { InputAreaHandle } from './InputArea';
 import type { ConversationState, Message, SkillEntry } from '../api';
 import { api } from '../api';
@@ -16,6 +17,7 @@ interface InputAreaTestProps {
   draft?: string;
   onDraftChange?: (text: string) => void;
   onCancel?: () => void;
+  onSend?: (text: string) => void;
   focusToken?: number;
 }
 
@@ -26,6 +28,7 @@ function renderInput({
   draft = '',
   onDraftChange = () => {},
   onCancel = () => {},
+  onSend = () => {},
   focusToken,
 }: InputAreaTestProps) {
   const focusProps = focusToken === undefined ? {} : { focusToken };
@@ -41,12 +44,30 @@ function renderInput({
       draft={draft}
       onDraftChange={onDraftChange}
       {...focusProps}
-      onSend={() => {}}
+      onSend={onSend}
       onCancel={onCancel}
       onRetry={() => {}}
     />,
   );
 }
+
+describe('VoicePermission form safety', () => {
+  it('marks every dialog action as a non-submit button', () => {
+    render(
+      <form>
+        <VoicePermission
+          error={{ type: 'permission', message: 'Allow microphone', recoverable: true }}
+          onRetry={() => {}}
+          onDismiss={() => {}}
+        />
+      </form>,
+    );
+
+    for (const button of screen.getAllByRole('button')) {
+      expect(button).toHaveAttribute('type', 'button');
+    }
+  });
+});
 
 describe('InputArea controlled-draft contract', () => {
   it('renders the draft prop and re-renders when the prop changes', () => {
@@ -90,9 +111,9 @@ describe('InputArea controlled-draft contract', () => {
     vi.spyOn(api, 'listProjectSkills').mockResolvedValue({ skills });
 
     let currentDraft = '';
-    const onDraftChange = (text: string) => {
+    const onDraftChange = vi.fn((text: string) => {
       currentDraft = text;
-    };
+    });
 
     const { rerender } = renderInput({
       cwd: '/repo',
@@ -120,6 +141,9 @@ describe('InputArea controlled-draft contract', () => {
       />,
     );
     expect(await screen.findByRole('listbox', { name: '/ autocomplete' })).toBeInTheDocument();
+
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter', isComposing: true });
+    expect(onDraftChange).not.toHaveBeenCalledWith('/review ');
 
     fireEvent.click(screen.getByRole('option', { name: /review/ }));
     expect(screen.getByText('<path>')).toBeInTheDocument();
@@ -238,16 +262,53 @@ describe('InputArea focusToken contract', () => {
 });
 
 describe('InputArea cancellation affordance', () => {
-  it('shows Stop and calls onCancel for cancellable working states', () => {
+  it('keeps Stop and steering Queue independently available while working', () => {
     const onCancel = vi.fn();
+    const onSend = vi.fn();
     renderInput({
       cwd: 'conv-cancel',
       convState: { type: 'llm_requesting', attempt: 1 },
+      draft: 'change direction',
       onCancel,
+      onSend,
     });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
+    const stop = screen.getByRole('button', { name: 'Stop' });
+    const queue = screen.getByRole('button', { name: 'Queue follow-up' });
+    expect(queue).toHaveAttribute('title', 'Queue follow-up (Enter)');
+
+    fireEvent.click(queue);
+    expect(onSend).toHaveBeenCalledWith('change direction', [], []);
+    expect(onCancel).not.toHaveBeenCalled();
+
+    fireEvent.click(stop);
     expect(onCancel).toHaveBeenCalledOnce();
+  });
+
+  it('queues a steering message with Enter while working', () => {
+    const onSend = vi.fn();
+    renderInput({
+      cwd: 'conv-steer',
+      convState: { type: 'tool_executing', current_tool: { id: 't', name: 'bash', input: {} }, remaining_tools: [] },
+      draft: 'try the other approach',
+      onSend,
+    });
+
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+    expect(onSend).toHaveBeenCalledWith('try the other approach', [], []);
+  });
+
+  it('submits Enter but preserves Shift+Enter and IME composition', () => {
+    const onSend = vi.fn();
+    renderInput({ cwd: 'conv-keys', draft: 'hello', onSend });
+    const textarea = screen.getByRole('textbox');
+
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: true });
+    fireEvent.keyDown(textarea, { key: 'Enter', isComposing: true });
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+    expect(onSend).toHaveBeenCalledWith('hello', [], []);
   });
 
   it('renders continuation progress without a Stop button', () => {
@@ -282,14 +343,12 @@ describe('InputArea cancellation affordance', () => {
       />,
     );
 
-    const send = screen.getByRole('button', { name: 'Send' });
-    expect(send).toBeDisabled();
-    fireEvent.click(send);
+    expect(screen.queryByRole('button', { name: /send|queue/i })).not.toBeInTheDocument();
     fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  it('keeps Stopping disabled and blocks sends while cancellation is pending', () => {
+  it('keeps Stopping disabled while allowing a queued follow-up during tool cancellation', () => {
     const onSend = vi.fn();
     render(
       <InputArea
@@ -309,9 +368,9 @@ describe('InputArea cancellation affordance', () => {
     );
 
     expect(screen.getByRole('button', { name: 'Stopping...' })).toBeDisabled();
-    expect(screen.queryByRole('button', { name: 'Send' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Queue follow-up' })).toBeEnabled();
     fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
-    expect(onSend).not.toHaveBeenCalled();
+    expect(onSend).toHaveBeenCalledWith('do not send', [], []);
   });
 
   it('blocks sends while the first send is still optimistic', () => {
@@ -333,7 +392,27 @@ describe('InputArea cancellation affordance', () => {
       />,
     );
 
-    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: /send|queue/i })).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { type: 'awaiting_task_approval', title: 'Plan', priority: 'p1', plan: 'Do it' },
+    { type: 'awaiting_commission_review_approval', brief: 'Review', scope: undefined },
+    { type: 'awaiting_user_response', questions: [] },
+    { type: 'awaiting_recovery', message: 'Recover', recovery_kind: 'credential', resume: { type: 'conversation_turn' } },
+    { type: 'context_exhausted', summary: 'Done' },
+    { type: 'handed_off', successor_conv_id: 'next' },
+    { type: 'terminal' },
+    { type: 'provisioning' },
+    { type: 'creation_failed' },
+    { type: 'creation_cancelled' },
+  ] satisfies ConversationState[])('hides chat submission in $type', (convState) => {
+    const onSend = vi.fn();
+    renderInput({ cwd: 'conv-blocked', convState, draft: 'must not send', onSend });
+
+    expect(screen.queryByRole('button', { name: /send|queue/i })).not.toBeInTheDocument();
     fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
     expect(onSend).not.toHaveBeenCalled();
   });

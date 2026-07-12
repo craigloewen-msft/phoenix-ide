@@ -87,6 +87,13 @@ THE SYSTEM SHALL send the message
 WHEN user presses Shift+Enter
 THE SYSTEM SHALL insert a newline
 
+WHEN the agent is busy and accepts steering messages
+THE SYSTEM SHALL display a message action that queues the composed message as a follow-up
+AND keep cancellation independently accessible when cancellation is also available
+
+WHEN composer controls are displayed at any supported responsive width
+THE SYSTEM SHALL keep every control outside the editable and selectable text region
+
 **Rationale:** Users expect standard text input behavior. Draft persistence prevents frustrating message loss.
 
 ---
@@ -200,13 +207,15 @@ THE SYSTEM SHALL NOT show the activity indicator
 
 ### REQ-CONV-008: Cancellation
 
-WHEN agent is working
-THE SYSTEM SHALL show Cancel button instead of Send
+WHEN agent is working and cancellation is available
+THE SYSTEM SHALL show a Stop action
 AND enable user to cancel the current operation
+AND keep the follow-up Queue action available when the current state accepts steering messages
 
 WHEN cancellation is in progress
-THE SYSTEM SHALL show "Cancelling..." state
-AND disable further cancel attempts
+THE SYSTEM SHALL show "Stopping..." state
+AND disable further stop attempts
+AND keep the follow-up Queue action available when the cancellation state accepts steering messages
 
 **Rationale:** Users need escape hatch for runaway operations or mistakes.
 
