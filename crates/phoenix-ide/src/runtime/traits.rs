@@ -228,7 +228,7 @@ pub trait LlmClient: Send + Sync {
     async fn complete_streaming(
         &self,
         request: &LlmRequest,
-        chunk_tx: &tokio::sync::broadcast::Sender<phoenix_llm::TokenChunk>,
+        chunk_tx: &tokio::sync::mpsc::Sender<phoenix_llm::TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         let _ = chunk_tx;
         self.complete(request).await
@@ -512,7 +512,7 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
     async fn complete_streaming(
         &self,
         request: &LlmRequest,
-        chunk_tx: &tokio::sync::broadcast::Sender<phoenix_llm::TokenChunk>,
+        chunk_tx: &tokio::sync::mpsc::Sender<phoenix_llm::TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         (**self).complete_streaming(request, chunk_tx).await
     }
@@ -867,7 +867,7 @@ impl LlmClient for RegistryLlmClient {
     async fn complete_streaming(
         &self,
         request: &LlmRequest,
-        chunk_tx: &tokio::sync::broadcast::Sender<phoenix_llm::TokenChunk>,
+        chunk_tx: &tokio::sync::mpsc::Sender<phoenix_llm::TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         let llm = self.registry.get(&self.model_id).ok_or_else(|| {
             LlmError::network(format!(

@@ -24,6 +24,96 @@
 
 pub use phoenix_core::domain::quota_details::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
 use reqwest::header::HeaderMap;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct CodexRateLimitEventWindow {
+    used_percent: f64,
+    window_minutes: Option<i64>,
+    reset_at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexRateLimitEventDetails {
+    primary: Option<CodexRateLimitEventWindow>,
+    secondary: Option<CodexRateLimitEventWindow>,
+    plan_type: Option<String>,
+    credits: Option<CodexRateLimitEventCredits>,
+    metered_limit_name: Option<String>,
+    limit_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CodexRateLimitEventCredits {
+    has_credits: bool,
+    unlimited: bool,
+    balance: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexRateLimitEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    plan_type: Option<String>,
+    rate_limits: Option<CodexRateLimitEventDetails>,
+    credits: Option<CodexRateLimitEventCredits>,
+    metered_limit_name: Option<String>,
+    limit_name: Option<String>,
+}
+
+/// Normalize the complete `codex.rate_limits` WebSocket event. Its plan,
+/// credits, and active limit live beside the nested window details.
+#[must_use]
+pub fn quota_from_codex_rate_limit_event(value: &serde_json::Value) -> Option<QuotaDetails> {
+    let event: CodexRateLimitEvent = serde_json::from_value(value.clone()).ok()?;
+    if event.kind != "codex.rate_limits" {
+        return None;
+    }
+    let details = event.rate_limits;
+    let (primary, secondary) = details.as_ref().map_or((None, None), |details| {
+        (
+            details.primary.as_ref().map(|window| RateLimitWindow {
+                used_percent: window.used_percent,
+                window_minutes: window.window_minutes,
+                resets_at: window.reset_at,
+            }),
+            details.secondary.as_ref().map(|window| RateLimitWindow {
+                used_percent: window.used_percent,
+                window_minutes: window.window_minutes,
+                resets_at: window.reset_at,
+            }),
+        )
+    });
+    let plan_type = event
+        .plan_type
+        .or_else(|| details.as_ref()?.plan_type.clone());
+    let credits = event
+        .credits
+        .or_else(|| details.as_ref()?.credits.clone())
+        .map(|credits| CreditsSnapshot {
+            has_credits: credits.has_credits,
+            unlimited: credits.unlimited,
+            balance: credits.balance,
+        });
+    let limit_id = event
+        .metered_limit_name
+        .or(event.limit_name)
+        .or_else(|| details.as_ref()?.metered_limit_name.clone())
+        .or_else(|| details.as_ref()?.limit_name.clone())
+        .unwrap_or_else(|| "codex".to_string())
+        .to_ascii_lowercase()
+        .replace('_', "-");
+    Some(QuotaDetails {
+        plan_type,
+        resets_at: None,
+        limit_id: Some(limit_id),
+        limit_name: None,
+        primary,
+        secondary,
+        credits,
+        promo_message: None,
+    })
+}
 
 const ACTIVE_LIMIT_HEADER: &str = "x-codex-active-limit";
 const PROMO_MESSAGE_HEADER: &str = "x-codex-promo-message";
@@ -265,6 +355,61 @@ mod tests {
             parse_promo_message(&headers).as_deref(),
             Some("Upgrade to Pro")
         );
+    }
+
+    #[test]
+    // Parsed percentages are exact, representable values from the fixture.
+    #[allow(clippy::float_cmp)]
+    fn full_websocket_event_preserves_top_level_metadata_and_reset_at() {
+        let quota = quota_from_codex_rate_limit_event(&serde_json::json!({
+            "type": "codex.rate_limits",
+            "plan_type": "pro",
+            "metered_limit_name": "codex_other",
+            "rate_limits": {
+                "primary": {"used_percent": 75.5, "window_minutes": 300, "reset_at": 1_738_888_888},
+                "secondary": {"used_percent": 20.0, "window_minutes": 10_080, "reset_at": 1_739_999_999}
+            },
+            "credits": {"has_credits": true, "unlimited": false, "balance": "42.5"}
+        }))
+        .expect("rate-limit event");
+        assert_eq!(quota.plan_type.as_deref(), Some("pro"));
+        assert_eq!(quota.limit_id.as_deref(), Some("codex-other"));
+        assert_eq!(
+            quota.primary.as_ref().and_then(|w| w.resets_at),
+            Some(1_738_888_888)
+        );
+        assert_eq!(
+            quota.secondary.as_ref().and_then(|w| w.resets_at),
+            Some(1_739_999_999)
+        );
+        let credits = quota.credits.expect("credits");
+        assert!(credits.has_credits);
+        assert!(!credits.unlimited);
+        assert_eq!(credits.balance.as_deref(), Some("42.5"));
+    }
+
+    #[test]
+    // Parsed percentages are exact, representable values from the fixture.
+    #[allow(clippy::float_cmp)]
+    fn nested_websocket_event_preserves_metadata() {
+        let quota = quota_from_codex_rate_limit_event(&serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {
+                "plan_type": "plus",
+                "metered_limit_name": "codex_mini",
+                "primary": {"used_percent": 90.0, "window_minutes": 300, "reset_at": 1_738_888_888},
+                "credits": {"has_credits": true, "unlimited": false, "balance": "7"}
+            }
+        }))
+        .expect("nested event");
+        assert_eq!(quota.plan_type.as_deref(), Some("plus"));
+        assert_eq!(quota.limit_id.as_deref(), Some("codex-mini"));
+        assert_eq!(quota.primary.as_ref().map(|w| w.used_percent), Some(90.0));
+        assert_eq!(
+            quota.primary.as_ref().and_then(|w| w.resets_at),
+            Some(1_738_888_888)
+        );
+        assert_eq!(quota.credits.and_then(|c| c.balance).as_deref(), Some("7"));
     }
 
     #[test]

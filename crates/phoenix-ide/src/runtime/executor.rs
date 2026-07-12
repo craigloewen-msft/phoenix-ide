@@ -38,13 +38,21 @@ use phoenix_llm::{
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 const COMMISSION_REVIEW_DIRTY_WORKTREE: &str = "commission_review refused dirty working tree. Commit or stash changes before requesting review; commission_review only reviews committed changes against the approved origin base branch.";
 const COMMISSION_REVIEW_MISSING_ORIGIN_HEAD: &str = "commission_review is unavailable: this conversation does not have a fetched origin default branch ref (`origin/HEAD`) for a committed branch diff. Fetch origin before requesting review.";
 const COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE: &str = "commission_review is unavailable: git status could not inspect the review target working tree.";
+
+struct AbortTaskOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 fn refresh_commission_review_approval_for_outcome(
     context: &mut ConvContext,
@@ -4348,7 +4356,7 @@ where
         // trailing Token could land on the SSE channel after its
         // Message, producing a phantom streaming buffer on the
         // client (the "repeated message" bug).
-        let (chunk_tx, chunk_rx) = broadcast::channel::<phoenix_llm::TokenChunk>(256);
+        let (chunk_tx, chunk_rx) = mpsc::channel::<phoenix_llm::TokenChunk>(256);
         let request_id = uuid::Uuid::new_v4().to_string();
 
         let broadcast_tx_for_tokens = self.broadcast_tx.clone();
@@ -4368,7 +4376,7 @@ where
             let mut first_text_seen = false;
             loop {
                 match rx.recv().await {
-                    Ok(phoenix_llm::TokenChunk::Text(text)) => {
+                    Some(phoenix_llm::TokenChunk::Text(text)) => {
                         if !first_text_seen {
                             first_text_seen = true;
                             let observed_at = Utc::now();
@@ -4386,22 +4394,24 @@ where
                             request_id: request_id_for_fwd.clone(),
                         });
                     }
-                    Ok(phoenix_llm::TokenChunk::RateLimitSnapshot(snapshot)) => {
+                    Some(phoenix_llm::TokenChunk::RateLimitSnapshot(snapshot)) => {
                         let _ =
                             broadcast_tx_for_tokens.send_seq(|seq| SseEvent::RateLimitSnapshot {
                                 sequence_id: seq,
                                 snapshot: snapshot.clone(),
                             });
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::debug!(n, "Token forwarding lagged — some tokens dropped");
-                    }
+                    None => break,
                 }
             }
         });
 
+        let forwarder_abort = forwarder_handle.abort_handle();
         let handle = tokio::spawn(async move {
+            // Tokio cancellation is not recursive. Aborting the request must
+            // also stop its forwarder before buffered chunks reach a later turn.
+            let _forwarder_abort = AbortTaskOnDrop(forwarder_abort);
+
             if is_sub_agent {
                 tracing::info!(
                     conv_id = %conv_id,
@@ -4532,7 +4542,7 @@ where
             // same store to render reset/credits/promo alongside the
             // plan-aware message.
             if let LlmOutcome::UsageLimitReached { ref details, .. } = llm_outcome {
-                let _ = chunk_tx.send(phoenix_llm::TokenChunk::RateLimitSnapshot(details.clone()));
+                let _ = chunk_tx.send(phoenix_llm::TokenChunk::RateLimitSnapshot(details.clone())).await;
             }
 
             // Happens-before barrier for task 24683: close the chunk

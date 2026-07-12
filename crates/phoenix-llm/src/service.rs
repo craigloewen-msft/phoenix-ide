@@ -9,7 +9,7 @@ use super::{
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{mpsc, Mutex};
 
 /// Empty placeholder used when no tags should be forwarded — keeps the
 /// provider-call signatures uniform without allocating per request.
@@ -44,6 +44,9 @@ pub struct LlmServiceImpl {
     /// `codex login` against a different account during the session reaches
     /// the wire instead of being pinned at registry build time.
     pub codex_credential: Option<Arc<CodexCredential>>,
+    /// WebSocket continuation is shared by all calls through this service and
+    /// isolated by the caller's prompt-cache cohort.
+    pub(crate) codex_ws_sessions: Arc<Mutex<openai::CodexWsSessions>>,
 }
 
 impl LlmServiceImpl {
@@ -66,6 +69,7 @@ impl LlmServiceImpl {
             request_tags,
             use_codex_backend: false,
             codex_credential: None,
+            codex_ws_sessions: Arc::new(Mutex::new(openai::CodexWsSessions::default())),
         }
     }
 
@@ -90,6 +94,7 @@ impl LlmServiceImpl {
             request_tags: BTreeMap::new(),
             use_codex_backend: true,
             codex_credential: Some(codex_credential),
+            codex_ws_sessions: Arc::new(Mutex::new(openai::CodexWsSessions::default())),
         }
     }
 
@@ -133,7 +138,7 @@ impl LlmService for LlmServiceImpl {
     async fn complete_streaming(
         &self,
         request: &LlmRequest,
-        chunk_tx: &broadcast::Sender<TokenChunk>,
+        chunk_tx: &mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         let result = self.complete_streaming_inner(request, chunk_tx).await;
 
@@ -161,7 +166,9 @@ impl LlmService for LlmServiceImpl {
     }
 
     fn continuation_request_limits(&self) -> super::ContinuationRequestLimits {
-        if self.use_codex_backend {
+        if self.use_codex_backend && self.spec.api_name.starts_with("gpt-5.6") {
+            super::ContinuationRequestLimits::codex_responses_lite()
+        } else if self.use_codex_backend {
             super::ContinuationRequestLimits::codex_bridge()
         } else {
             super::ContinuationRequestLimits::TokenWindowOnly
@@ -263,7 +270,7 @@ impl LlmServiceImpl {
     async fn complete_streaming_inner(
         &self,
         request: &LlmRequest,
-        chunk_tx: &broadcast::Sender<TokenChunk>,
+        chunk_tx: &mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         match self.spec.backend.api_format() {
             ApiFormat::Anthropic => {
@@ -292,6 +299,7 @@ impl LlmServiceImpl {
                     request,
                     chunk_tx,
                     self.use_codex_backend,
+                    Some(&self.codex_ws_sessions),
                 )
                 .await
             }

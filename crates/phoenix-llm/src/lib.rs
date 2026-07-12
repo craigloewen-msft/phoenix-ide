@@ -80,7 +80,7 @@ pub use phoenix_core::domain::llm_types::{self as types, *};
 
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tracing::Instrument;
 
 /// Chunks emitted during streaming. Only text deltas are forwarded to the UI;
@@ -100,9 +100,13 @@ pub enum TokenChunk {
 pub enum ContinuationRequestLimits {
     /// The route has no known request-shape limit beyond its token window.
     TokenWindowOnly,
-    /// The route accepts at most this many total provider input items, including
-    /// the final continuation prompt.
-    MaxInputItems(std::num::NonZeroUsize),
+    /// The route accepts at most `total` provider input items. `prefix_items`
+    /// are provider-owned items inserted after history planning and are
+    /// therefore subtracted structurally rather than by caller convention.
+    MaxInputItems {
+        total: std::num::NonZeroUsize,
+        prefix_items: usize,
+    },
 }
 
 impl ContinuationRequestLimits {
@@ -111,22 +115,43 @@ impl ContinuationRequestLimits {
     /// appended continuation prompt.
     #[must_use]
     pub const fn codex_bridge() -> Self {
-        Self::MaxInputItems(std::num::NonZeroUsize::MIN.saturating_add(900))
+        Self::MaxInputItems {
+            total: std::num::NonZeroUsize::MIN.saturating_add(900),
+            prefix_items: 0,
+        }
+    }
+
+    /// GPT-5.6 Responses Lite prepends additional-tools and developer-
+    /// instructions items after continuation history has been planned.
+    #[must_use]
+    pub const fn codex_responses_lite() -> Self {
+        Self::MaxInputItems {
+            total: std::num::NonZeroUsize::MIN.saturating_add(900),
+            prefix_items: 2,
+        }
     }
 
     #[must_use]
     pub const fn max_input_items(self) -> Option<usize> {
         match self {
             Self::TokenWindowOnly => None,
-            Self::MaxInputItems(max) => Some(max.get()),
+            Self::MaxInputItems { total, .. } => Some(total.get()),
         }
     }
 
     #[must_use]
     pub const fn max_history_messages(self, reserved_input_items: usize) -> Option<usize> {
-        match self.max_input_items() {
-            Some(max) => Some(max.saturating_sub(reserved_input_items)),
-            None => None,
+        match self {
+            Self::MaxInputItems {
+                total,
+                prefix_items,
+            } => Some(
+                total
+                    .get()
+                    .saturating_sub(prefix_items)
+                    .saturating_sub(reserved_input_items),
+            ),
+            Self::TokenWindowOnly => None,
         }
     }
 }
@@ -143,7 +168,7 @@ pub trait LlmService: Send + Sync {
     async fn complete_streaming(
         &self,
         request: &LlmRequest,
-        chunk_tx: &broadcast::Sender<TokenChunk>,
+        chunk_tx: &mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         // Default: ignore chunk_tx, fall back to non-streaming
         let _ = chunk_tx;
@@ -261,44 +286,16 @@ impl LlmService for LoggingService {
     async fn complete_streaming(
         &self,
         request: &LlmRequest,
-        chunk_tx: &broadcast::Sender<TokenChunk>,
+        chunk_tx: &mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         let span = self.request_span(true);
         let start = std::time::Instant::now();
-
-        // Best-effort time-to-first-token: watch the broadcast channel from a
-        // side task and record the elapsed time when the first text chunk
-        // lands. Subscribing is side-effect free (providers ignore send
-        // errors, so an extra receiver changes nothing). The task is aborted
-        // once the request resolves so its span clone cannot hold the span
-        // open past the request. On Lagged the first token is long gone —
-        // skip recording rather than fabricate a late value.
-        let ttft_watch = {
-            let span = span.clone();
-            let mut rx = chunk_tx.subscribe();
-            tokio::spawn(async move {
-                loop {
-                    match rx.recv().await {
-                        Ok(TokenChunk::Text(_)) => {
-                            span.record(
-                                "time_to_first_token_ms",
-                                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-                            );
-                            break;
-                        }
-                        Ok(_) => {}
-                        Err(_) => break,
-                    }
-                }
-            })
-        };
 
         let result = self
             .inner
             .complete_streaming(request, chunk_tx)
             .instrument(span.clone())
             .await;
-        ttft_watch.abort();
         let duration = start.elapsed();
         Self::record_outcome(&span, &result);
 
