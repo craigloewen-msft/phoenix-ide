@@ -1225,14 +1225,13 @@ mod existing_message_recovery_tests {
 #[allow(clippy::items_after_test_module)]
 mod repository_lock_tests {
     use super::RepositoryMutationLock;
-    use std::process::Command;
     use std::sync::mpsc;
     use std::time::Duration;
 
     #[test]
     fn repository_mutation_lock_serializes_live_holders() {
         let repo = tempfile::tempdir().unwrap();
-        let status = Command::new("git")
+        let status = phoenix_core::git::command()
             .args(["init", "--quiet"])
             .current_dir(repo.path())
             .status()

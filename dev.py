@@ -3687,6 +3687,48 @@ def _make_reporter(pretty: bool, active: set, skipped: dict):
     return _PlainReporter()
 
 
+def _is_valid_git_config_key(key):
+    """Match Git's section[.subsection].name shape without restricting subsections."""
+    import re
+
+    first_dot = key.find(".")
+    last_dot = key.rfind(".")
+    if first_dot <= 0 or last_dot == len(key) - 1 or "\0" in key or "\n" in key:
+        return False
+    component = re.compile(r"^[A-Za-z][A-Za-z0-9-]*$")
+    return bool(component.fullmatch(key[:first_dot]) and component.fullmatch(key[last_dot + 1:]))
+
+
+def _append_git_config_override(key, value, environ=None):
+    """Append a complete process-level Git config entry, resetting malformed input."""
+    env = os.environ if environ is None else environ
+    parameters = env.get("GIT_CONFIG_PARAMETERS", "").strip()
+    env["GIT_CONFIG_PARAMETERS"] = f"{parameters} 'commit.gpgsign=false'".strip()
+    try:
+        count = int(env.get("GIT_CONFIG_COUNT", "0"))
+        if count < 0:
+            raise ValueError
+        if any(
+            f"GIT_CONFIG_KEY_{index}" not in env
+            or f"GIT_CONFIG_VALUE_{index}" not in env
+            or not _is_valid_git_config_key(env[f"GIT_CONFIG_KEY_{index}"])
+            for index in range(count)
+        ):
+            raise ValueError
+    except ValueError:
+        for name in list(env):
+            if name == "GIT_CONFIG_COUNT" or name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+                env.pop(name, None)
+        count = 0
+
+    if key != "commit.gpgsign" or value != "false":
+        env[f"GIT_CONFIG_KEY_{count}"] = key
+        env[f"GIT_CONFIG_VALUE_{count}"] = value
+        env["GIT_CONFIG_COUNT"] = str(count + 1)
+    else:
+        env["GIT_CONFIG_COUNT"] = str(count)
+
+
 def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False):
     """Run lint, format check, tests, and task validation in parallel.
 
@@ -4321,7 +4363,8 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         # SCCACHE_CACHE_SIZE before invoking dev.py.
         os.environ.setdefault("SCCACHE_CACHE_SIZE", "20G")
 
-    # Env classification + signing probe only matter when a cargo lane runs.
+    # Environment classification and Git subprocess safety only matter when a
+    # cargo lane runs.
     if cargo_active:
         # Classify the environment up front so the Rust suite skips the
         # classes of tests that would otherwise produce env-noise failures.
@@ -4339,33 +4382,11 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         _classify_browser_env()
         _classify_network_env()
 
-        # Probe for working commit signing. Some envs configure a custom
-        # `gpg.ssh.program` (e.g. cloud sandboxes intercepting commits) that
-        # rejects unrecognised callers, breaking any test that runs `git commit`.
-        # If a probe commit fails, override `commit.gpgsign=false` for child
-        # processes via GIT_CONFIG_COUNT/KEY/VALUE — affects subprocesses only,
-        # not the developer's actual git config.
-        #
-        # Per the print-only-on-behavior-change rule above, the success
-        # branch is silent and only the override branch prints.
-        import tempfile as _tempfile
-        try:
-            with _tempfile.TemporaryDirectory() as _td:
-                subprocess.run(["git", "init", "--quiet"], cwd=_td, check=True,
-                               capture_output=True, timeout=5)
-                subprocess.run(
-                    ["git", "-c", "user.email=probe@test", "-c", "user.name=probe",
-                     "commit", "--allow-empty", "-m", "probe"],
-                    cwd=_td, check=True, capture_output=True, timeout=10,
-                )
-            _signing_ok = True
-        except Exception:
-            _signing_ok = False
-        if not _signing_ok:
-            os.environ["GIT_CONFIG_COUNT"] = "1"
-            os.environ["GIT_CONFIG_KEY_0"] = "commit.gpgsign"
-            os.environ["GIT_CONFIG_VALUE_0"] = "false"
-            reporter.info("commit signing probe failed — disabling commit.gpgsign for tests")
+        # Tests create temporary commits and must never consult an interactive
+        # signing agent. Add a process-only override without probing the signer
+        # or modifying any Git config file. Append so caller-provided config
+        # entries remain intact while this final entry takes precedence.
+        _append_git_config_override("commit.gpgsign", "false")
 
     # nextest probe, thread sizing, and codegen command shapes are rust-only.
     if "rust" in active:

@@ -1581,17 +1581,13 @@ mod tests {
     use crate::tools::mcp::McpClientManager;
     use phoenix_llm::ModelRegistry;
     use std::path::PathBuf;
-    use std::process::Command;
     use std::sync::Arc;
     use tempfile::TempDir;
 
     fn git(repo: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = phoenix_core::git::command()
             .args(args)
             .current_dir(repo)
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-            .env("GIT_CONFIG_VALUE_0", "false")
             .output()
             .unwrap();
         assert!(

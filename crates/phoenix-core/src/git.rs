@@ -7,12 +7,106 @@
 
 use std::path::Path;
 
+/// Construct a Git subprocess with Phoenix's process-level safety defaults.
+///
+/// The environment override takes precedence over system, global, and local
+/// Git configuration without modifying any of them. Every statically spawned
+/// Git process in Phoenix goes through this constructor so even repository
+/// setup in tests cannot invoke an interactive signing agent.
+#[must_use]
+pub fn command() -> std::process::Command {
+    command_with_config(&[])
+}
+
+/// Construct a safe Git subprocess with additional process-level configuration.
+///
+/// Valid inherited `GIT_CONFIG_*` entries are preserved. Additional entries and
+/// `commit.gpgsign=false` are applied as command-line `-c` arguments, which take
+/// precedence over inherited `GIT_CONFIG_PARAMETERS` without discarding unrelated
+/// parameters. Malformed inherited indexed configuration is discarded as a unit.
+#[must_use]
+pub fn command_with_config(config: &[(&str, &str)]) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    let inherited = inherited_config_count();
+
+    if inherited.is_none() {
+        clear_inherited_config(&mut command);
+    }
+
+    if let Some(count) = inherited.filter(|count| *count > 0) {
+        command.env("GIT_CONFIG_COUNT", count.to_string());
+    }
+    for &(key, value) in config
+        .iter()
+        .chain(std::iter::once(&("commit.gpgsign", "false")))
+    {
+        command.arg("-c").arg(format!("{key}={value}"));
+    }
+    command
+}
+
+fn inherited_config_count() -> Option<usize> {
+    let Some(raw_count) = std::env::var_os("GIT_CONFIG_COUNT") else {
+        return Some(0);
+    };
+    let count = raw_count.to_str()?.parse::<usize>().ok()?;
+    (0..count)
+        .all(|index| {
+            std::env::var(format!("GIT_CONFIG_KEY_{index}"))
+                .ok()
+                .is_some_and(|key| is_valid_config_key(&key))
+                && std::env::var_os(format!("GIT_CONFIG_VALUE_{index}")).is_some()
+        })
+        .then_some(count)
+}
+
+fn is_valid_config_key(key: &str) -> bool {
+    let Some(first_dot) = key.find('.') else {
+        return false;
+    };
+    let Some(last_dot) = key.rfind('.') else {
+        return false;
+    };
+    let Some(section) = key.get(..first_dot) else {
+        return false;
+    };
+    let Some(name) = key.get(last_dot + 1..) else {
+        return false;
+    };
+    let valid_component = |component: &str| {
+        !component.is_empty()
+            && component
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    };
+
+    section
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+        && valid_component(section)
+        && name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && valid_component(name)
+        && !key.contains(['\0', '\n'])
+}
+
+fn clear_inherited_config(command: &mut std::process::Command) {
+    command.env_remove("GIT_CONFIG_COUNT");
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(|name| {
+            name.starts_with("GIT_CONFIG_KEY_") || name.starts_with("GIT_CONFIG_VALUE_")
+        }) {
+            command.env_remove(name);
+        }
+    }
+}
+
 /// Detect the git repository root for a given directory path.
 ///
 /// Returns `None` if the path is not inside a git repository.
 #[must_use]
 pub fn detect_git_repo_root(path: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = command()
         .arg("rev-parse")
         .arg("--show-toplevel")
         .current_dir(path)
@@ -68,14 +162,82 @@ pub fn resolve_remote_default_branch(path: &Path) -> Option<String> {
 
 /// Run `git <args>` in `path`, returning trimmed stdout on success.
 fn git_capture(path: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(path)
-        .output()
-        .ok()?;
+    let output = command().args(args).current_dir(path).output().ok()?;
     if output.status.success() {
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn config_key_validation_rejects_keys_git_cannot_parse() {
+        assert!(is_valid_config_key("commit.gpgsign"));
+        assert!(is_valid_config_key("http.https://example.com.proxy"));
+        assert!(!is_valid_config_key("bad key"));
+        assert!(!is_valid_config_key("nosection"));
+        assert!(!is_valid_config_key("section.9name"));
+        assert!(!is_valid_config_key("section.name\nother.value"));
+    }
+
+    #[test]
+    fn command_preserves_config_parameters_and_overrides_signing_on_command_line() {
+        let command = command();
+        assert!(!command
+            .get_envs()
+            .any(|(key, _)| key == "GIT_CONFIG_PARAMETERS"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["-c", "commit.gpgsign=false"]
+        );
+    }
+
+    #[test]
+    fn additional_config_is_preserved_and_signing_override_has_final_precedence() {
+        let command = command_with_config(&[("fetch.prune", "true"), ("commit.gpgsign", "true")]);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "-c",
+                "fetch.prune=true",
+                "-c",
+                "commit.gpgsign=true",
+                "-c",
+                "commit.gpgsign=false",
+            ]
+        );
+    }
+
+    #[test]
+    fn command_disables_hostile_commit_signing_configuration() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let output = command()
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        run(&["init", "--quiet"]);
+        run(&["config", "user.email", "test@phoenix"]);
+        run(&["config", "user.name", "Phoenix Test"]);
+        run(&["config", "commit.gpgsign", "true"]);
+        run(&["config", "gpg.format", "ssh"]);
+        run(&[
+            "config",
+            "gpg.ssh.program",
+            "signing-program-must-never-run",
+        ]);
+        run(&["commit", "--allow-empty", "--quiet", "-m", "unsigned"]);
     }
 }

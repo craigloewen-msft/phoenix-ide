@@ -233,16 +233,13 @@ mod tests {
     use tempfile::TempDir;
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+        let out = phoenix_core::git::command()
             .current_dir(dir)
             .args(args)
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@t")
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-            .env("GIT_CONFIG_VALUE_0", "false")
             .output()
             .unwrap();
         assert!(

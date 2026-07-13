@@ -365,21 +365,15 @@ fn materialize_skill_files(repo_root: &Path, reference: &str) -> SkillsView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
+        let out = phoenix_core::git::command()
             .current_dir(dir)
             .args(args)
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@t")
-            // Disable commit signing — the host may set commit.gpgsign globally,
-            // which would fail in the sandbox without a signing key.
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-            .env("GIT_CONFIG_VALUE_0", "false")
             .output()
             .unwrap();
         assert!(
