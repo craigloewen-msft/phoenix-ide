@@ -5,6 +5,15 @@ import type { ReactNode } from 'react';
 export type ViewerMode = 'overlay' | 'inline' | 'takeover';
 
 interface ViewerShellProps {
+  /** When false, shell-level Escape handling stands down so an inner surface
+   *  (for example viewer find) can consume Escape first. */
+  closeOnEscape?: boolean | undefined;
+  /** Called when Escape should dismiss inner viewer chrome (for example an open
+   *  find bar) before the shell itself closes. */
+  onInnerEscape?: (() => void) | undefined;
+  /** When true, suppresses the close button's default mousedown focus transfer so
+   *  nested affordances can restore focus to their own opener instead. */
+  suppressCloseButtonFocus?: boolean | undefined;
   mode: ViewerMode;
   /** ARIA label for the dialog/region — used by screen readers and
    *  test queries (e.g. `getByRole('dialog', { name: 'Worktree diff' })`). */
@@ -76,6 +85,9 @@ export function ViewerShell({
   dialog,
   confirm,
   bodyScroll = 'shell',
+  closeOnEscape = true,
+  onInnerEscape,
+  suppressCloseButtonFocus = false,
 }: ViewerShellProps) {
   // Esc closes (deferring to caller — they may guard with a confirm).
   // Registered in capture phase with stopPropagation so this shell
@@ -84,14 +96,20 @@ export function ViewerShell({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
-      // If a dialog or confirm is rendered, let those handle Esc first.
+      // If a dialog/confirm is rendered, let the inner surface own Esc first.
       if (dialog || confirm) return;
+      if (!closeOnEscape) {
+        if (!onInnerEscape) return;
+        e.stopPropagation();
+        onInnerEscape();
+        return;
+      }
       e.stopPropagation();
       onClose();
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [onClose, dialog, confirm]);
+  }, [onClose, dialog, confirm, closeOnEscape, onInnerEscape]);
 
   const modal = mode !== 'inline';
   const className = mode === 'inline'
@@ -110,6 +128,7 @@ export function ViewerShell({
       <div className="viewer-shell-header">
         <button
           className="viewer-shell-btn"
+          onMouseDown={suppressCloseButtonFocus ? (event) => event.preventDefault() : undefined}
           onClick={onClose}
           aria-label="Close viewer"
         >

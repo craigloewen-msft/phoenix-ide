@@ -21,6 +21,7 @@ import { MessageSquarePlus } from 'lucide-react';
 import { CodeView } from '@pierre/diffs/react';
 import type { CodeViewHandle, CodeViewItem } from '@pierre/diffs/react';
 import type { AnnotationSide, CodeViewOptions, FileDiffMetadata } from '@pierre/diffs';
+import type { DiffSearchMatchTarget } from '../viewer-find';
 import type { DiffSection, ReviewNote } from '../../contexts/ReviewNotesContext';
 import { useTheme } from '../../hooks/useTheme';
 import type { LineAnnotateTarget } from './useDiffReviewNotes';
@@ -42,6 +43,8 @@ export interface PhoenixDiffCodeViewProps {
   committedDiff: string;
   uncommittedDiff: string;
   diffStyle: 'unified' | 'split';
+  findMatches?: readonly DiffSearchMatchTarget[] | undefined;
+  activeFindMatch?: DiffSearchMatchTarget | null | undefined;
   /** Diff-scoped review notes (committed + uncommitted), already filtered to
    *  diff anchors by the caller. */
   notes: readonly ReviewNote[];
@@ -55,13 +58,14 @@ export interface PhoenixDiffCodeViewHandle {
   /** Scroll to (and the caller then flashes) the note's anchored line/file via
    *  Pierre's typed scroll target — never DOM lookup. */
   scrollToNote: (note: ReviewNote) => void;
+  scrollToFindTarget: (target: DiffSearchMatchTarget) => void;
 }
 
 type Meta = PhoenixDiffAnnotationMeta;
 
 export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, PhoenixDiffCodeViewProps>(
   function PhoenixDiffCodeView(
-    { committedDiff, uncommittedDiff, diffStyle, notes, highlightedNoteId, onAnnotateLine, onAnnotateFile },
+    { committedDiff, uncommittedDiff, diffStyle, findMatches = [], activeFindMatch = null, notes, highlightedNoteId, onAnnotateLine, onAnnotateFile },
     ref,
   ) {
     const { theme } = useTheme();
@@ -80,6 +84,26 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
     const committed = useMemo(() => buildSectionItems('committed', committedDiff), [committedDiff]);
     const uncommitted = useMemo(() => buildSectionItems('uncommitted', uncommittedDiff), [uncommittedDiff]);
 
+    const matchedFindHeaderItemIds = useMemo(() => new Set(
+      findMatches
+        .filter((match): match is DiffSearchMatchTarget & { kind: 'diff-file-header' } => match.kind === 'diff-file-header')
+        .map((match) => match.itemId),
+    ), [findMatches]);
+    const activeFindHeaderMatch = activeFindMatch?.kind === 'diff-file-header'
+      ? activeFindMatch
+      : null;
+    const isMatchedFindHeaderItem = useCallback(
+      (itemId: string) => matchedFindHeaderItemIds.has(itemId),
+      [matchedFindHeaderItemIds],
+    );
+    const isActiveFindHeaderItem = useCallback(
+      (itemId: string) => activeFindHeaderMatch?.itemId === itemId,
+      [activeFindHeaderMatch],
+    );
+    const activeFindHeaderKey = activeFindHeaderMatch
+      ? `${activeFindHeaderMatch.itemId}:${activeFindHeaderMatch.startColumn}:${activeFindHeaderMatch.endColumn}`
+      : null;
+
     const items = useMemo<PhoenixDiffItem[]>(() => {
       const vmap = itemVersions.current;
       const attach = (built: PhoenixDiffItem[]): PhoenixDiffItem[] =>
@@ -90,14 +114,16 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
           // Bump the controlled-item version whenever this item's rendered
           // content changes, so Pierre reconciles instead of keeping a stale
           // annotation/flash/header-count record.
-          const sig = itemRenderSignature(it.fileDiff, notes, section, highlightedNoteId);
+          const sig = `${itemRenderSignature(it.fileDiff, notes, section, highlightedNoteId)}|find:${isMatchedFindHeaderItem(it.id) ? (isActiveFindHeaderItem(it.id) ? activeFindHeaderKey : 'matched') : ''}`;
           const prev = vmap.get(it.id);
           const version = prev && prev.sig === sig ? prev.version : (prev?.version ?? 0) + 1;
           if (!prev || prev.sig !== sig) vmap.set(it.id, { sig, version });
           return anns.length > 0 ? { ...it, annotations: anns, version } : { ...it, version };
         });
       return [...attach(committed.items), ...attach(uncommitted.items)];
-    }, [committed.items, uncommitted.items, notes, highlightedNoteId]);
+    }, [committed.items, uncommitted.items, notes, highlightedNoteId, activeFindHeaderKey, isActiveFindHeaderItem, isMatchedFindHeaderItem]);
+
+    const findLineDecorationCss = useMemo(() => diffFindDecorationCSS(findMatches, activeFindMatch), [findMatches, activeFindMatch]);
 
     const annotateLine = useCallback(
       (section: DiffSection, fileDiff: FileDiffMetadata, side: AnnotationSide, lineNumber: number) => {
@@ -118,6 +144,7 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
         diffStyle,
         stickyHeaders: true,
         enableGutterUtility: true,
+        unsafeCSS: findLineDecorationCss,
         // All items are diff items; the file overload never fires at runtime.
         // The option callback is an overload intersection (file + diff); we
         // implement the diff case and narrow on context.type, casting through
@@ -135,7 +162,7 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
           annotateLine(section, context.item.fileDiff, props.annotationSide, props.lineNumber);
         }) as unknown as NonNullable<CodeViewOptions<Meta>['onLineClick']>,
       }),
-      [theme, diffStyle, annotateLine],
+      [theme, diffStyle, findLineDecorationCss, annotateLine],
     );
 
     // Touch long-press → annotate the line under the finger. Pierre fires
@@ -215,12 +242,21 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
     const renderHeaderPrefix = useCallback((item: CodeViewItem<Meta>) => {
       const section = sectionFromItemId(item.id);
       if (!section) return null;
-      return (
-        <span className={`phoenix-diff-section-badge phoenix-diff-section-badge--${section}`}>
-          {section}
-        </span>
-      );
-    }, []);
+        const matched = isMatchedFindHeaderItem(item.id);
+        const active = isActiveFindHeaderItem(item.id);
+        return (
+          <span
+            className={[
+              `phoenix-diff-section-badge phoenix-diff-section-badge--${section}`,
+              matched && 'phoenix-diff-section-badge--find-match',
+              active && 'phoenix-diff-section-badge--find-active',
+            ].filter(Boolean).join(' ')}
+          >
+            {section}
+          </span>
+        );
+
+    }, [isActiveFindHeaderItem, isMatchedFindHeaderItem]);
 
     const renderHeaderMetadata = useCallback(
       (item: CodeViewItem<Meta>) => {
@@ -236,7 +272,12 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
         return (
           <button
             type="button"
-            className={`phoenix-diff-file-note-btn${flash ? ' phoenix-diff-file-note-btn--flash' : ''}`}
+            className={[
+              'phoenix-diff-file-note-btn',
+              flash && 'phoenix-diff-file-note-btn--flash',
+              isMatchedFindHeaderItem(item.id) && 'phoenix-diff-file-note-btn--find-match',
+              isActiveFindHeaderItem(item.id) && 'phoenix-diff-file-note-btn--find-active',
+            ].filter(Boolean).join(' ')}
             onClick={() => onAnnotateFile(section, filePath)}
             aria-label={`Add file-level note to ${filePath}`}
             title="Add file-level note"
@@ -246,7 +287,7 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
           </button>
         );
       },
-      [notes, highlightedNoteId, onAnnotateFile],
+      [notes, highlightedNoteId, isActiveFindHeaderItem, isMatchedFindHeaderItem, onAnnotateFile],
     );
 
     const renderGutterUtility = useCallback(
@@ -282,20 +323,18 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
       () => ({
         scrollToNote: (note: ReviewNote) => {
           const target = scrollTargetForNote(note);
-          const cv = codeViewRef.current;
-          if (!target || !cv) return;
-          if (target.line) {
-            cv.scrollTo({
-              type: 'line',
-              id: target.id,
-              lineNumber: target.line.lineNumber,
-              side: target.line.side,
-              align: 'center',
-              behavior: 'smooth',
+          if (!target) return;
+          scrollCodeViewToTarget(codeViewRef.current, target);
+        },
+        scrollToFindTarget: (target: DiffSearchMatchTarget) => {
+          if (target.kind === 'diff-line' && target.lineNumber && target.side) {
+            scrollCodeViewToTarget(codeViewRef.current, {
+              id: target.itemId,
+              line: { lineNumber: target.lineNumber, side: target.side },
             });
-          } else {
-            cv.scrollTo({ type: 'item', id: target.id, align: 'start', behavior: 'smooth' });
+            return;
           }
+          scrollCodeViewToTarget(codeViewRef.current, { id: target.itemId });
         },
       }),
       [],
@@ -334,3 +373,63 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
     );
   },
 );
+
+function scrollCodeViewToTarget(
+  codeView: CodeViewHandle<Meta> | null,
+  target: { id: string; line?: { lineNumber: number; side: AnnotationSide } },
+) {
+  if (!codeView) return;
+  if (target.line) {
+    codeView.scrollTo({
+      type: 'line',
+      id: target.id,
+      lineNumber: target.line.lineNumber,
+      side: target.line.side,
+      align: 'center',
+      behavior: 'smooth',
+    });
+    return;
+  }
+  codeView.scrollTo({ type: 'item', id: target.id, align: 'start', behavior: 'smooth' });
+}
+
+/**
+ * Pierre exposes diff-line annotations plus whole-row CSS injection (`unsafeCSS`),
+ * but no typed substring-decoration API on rendered diff rows. We therefore use
+ * the strongest supported primitive here: decorate every matched rendered line,
+ * and intensify the active line. File-header matches are surfaced via Phoenix's
+ * typed header slots instead of DOM scraping.
+ */
+function diffFindDecorationCSS(
+  matches: readonly DiffSearchMatchTarget[],
+  activeMatch: DiffSearchMatchTarget | null,
+): string {
+  const grouped = new Map<string, Set<number>>();
+  for (const match of matches) {
+    if (match.kind !== 'diff-line' || match.lineNumber === undefined) continue;
+    const key = `${match.itemId}:${match.side ?? 'additions'}`;
+    const lines = grouped.get(key) ?? new Set<number>();
+    lines.add(match.lineNumber);
+    grouped.set(key, lines);
+  }
+  const rules: string[] = [];
+  for (const [key, lines] of grouped) {
+    const divider = key.lastIndexOf(':');
+    const itemId = key.slice(0, divider);
+    const side = key.slice(divider + 1);
+    const lineSelector = [...lines].sort((a, b) => a - b).map((line) => lineSelectorFor(itemId, side, line)).join(',');
+    if (lineSelector) rules.push(`${lineSelector}{background:var(--viewer-modified-line-bg);}`);
+  }
+  if (activeMatch?.kind === 'diff-line' && activeMatch.lineNumber !== undefined) {
+    rules.push(`${lineSelectorFor(activeMatch.itemId, activeMatch.side ?? 'additions', activeMatch.lineNumber)}{background:var(--viewer-highlight-line-bg);}`);
+  }
+  return rules.join('\n');
+}
+
+function lineSelectorFor(itemId: string, side: string, line: number): string {
+  return `[data-item-id="${cssEscape(itemId)}"] [data-${side}=""] [data-line="${line}"]`;
+}
+
+function cssEscape(value: string): string {
+  return value.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
+}

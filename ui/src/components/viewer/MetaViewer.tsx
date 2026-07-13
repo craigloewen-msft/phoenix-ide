@@ -17,6 +17,8 @@ import { createPortal } from 'react-dom';
 import { Maximize2, Minimize2 } from 'lucide-react';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
 import { ViewerShell } from './ViewerShell';
+import { FindBar, buildFileSearchProjection, useViewerFind, useViewerFindKeyboardShortcut } from '../viewer-find';
+import type { FileSearchProjection } from '../viewer-find';
 import { NotesPanel } from './NotesPanel';
 import { AnnotationDialog } from './AnnotationDialog';
 import { CopyButton } from '../CopyButton';
@@ -52,12 +54,18 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
 
   const [htmlViewMode, setHtmlViewMode] = useState<HtmlViewMode>('source');
   const [imageTakeover, setImageTakeover] = useState(false);
+  const findButtonRef = useRef<HTMLButtonElement>(null);
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
   const contentRef = useRef<HTMLDivElement>(null);
   const scrollRestoredRef = useRef(false);
   const lastScrollTopRef = useRef(0);
+  const findPreviousFocusRef = useRef<HTMLElement | null>(null);
 
   const scrollKey = useMemo(() => `phoenix:prose-scroll:${absolutePath}`, [absolutePath]);
+  const findResetKey = useMemo(
+    () => (textLike ? `${absolutePath}\u0000${payload.kind}\u0000${content}` : absolutePath),
+    [absolutePath, content, payload.kind, textLike],
+  );
 
   const registerLineRef = useCallback((lineNumber: number, el: HTMLElement | null) => {
     if (el) lineRefs.current.set(lineNumber, el);
@@ -220,6 +228,29 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     [absolutePath, highlight, closePanel, usePierreCode],
   );
 
+  // The plain-text fallback never applies to HTML preview: preview renders an
+  // iframe (no per-line DOM cost), so a large HTML file must still reach it
+  // rather than being stranded on the raw <pre>.
+  const htmlPreview = payload.kind === 'html' && htmlViewMode === 'preview';
+  const largeFallback = textLike && !usePierreCode && payload.renderMode === 'plainLargeText' && !htmlPreview;
+
+  const findEligible = (textLike && !htmlPreview) || largeFallback;
+  const findSourceText = findEligible ? content : '';
+  const find = useViewerFind({ text: '', resetKey: findResetKey });
+  const shouldProjectFind = findEligible && find.isOpen && find.query.length > 0;
+  const findProjection = useMemo<FileSearchProjection>(
+    () => (shouldProjectFind ? buildFileSearchProjection(findSourceText, find.query) : { sources: [], matches: [] }),
+    [find.query, findSourceText, shouldProjectFind],
+  );
+  const activeFindIndex = findProjection.matches.length === 0
+    ? -1
+    : Math.min(Math.max(find.requestedActiveIndex, 0), findProjection.matches.length - 1);
+  const activeFindMatch = find.isOpen && activeFindIndex >= 0 ? findProjection.matches[activeFindIndex]?.target ?? null : null;
+  const findMatchTargets = useMemo(
+    () => (find.isOpen ? findProjection.matches.map((match) => match.target) : []),
+    [find.isOpen, findProjection.matches],
+  );
+
   const modifiedLines = patchContext?.modifiedLines ?? EMPTY_SET;
   const bodyProps: ViewerBodyProps = {
     content,
@@ -227,17 +258,94 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     highlightedLine: notes.highlightedLine,
     onAnnotate: notes.startAnnotate,
     registerLineRef,
+    findQuery: find.isOpen ? find.query : '',
+    activeFindOccurrence: find.isOpen ? activeFindIndex : null,
   };
-
-  // The plain-text fallback never applies to HTML preview: preview renders an
-  // iframe (no per-line DOM cost), so a large HTML file must still reach it
-  // rather than being stranded on the raw <pre>.
-  const htmlPreview = payload.kind === 'html' && htmlViewMode === 'preview';
-  const largeFallback = textLike && !usePierreCode && payload.renderMode === 'plainLargeText' && !htmlPreview;
   const body = usePierreCode ? null : renderBody(payload, bodyProps, htmlViewMode, imageTakeover ? 'takeover' : 'pane');
+
+  useEffect(() => {
+    if (!find.isOpen || !activeFindMatch) return;
+    if (usePierreCode) {
+      fileCodeRef.current?.scrollToFindTarget(activeFindMatch);
+      return;
+    }
+    const selector = `[data-find-occurrence="${activeFindIndex}"]`;
+    const matchEl = contentRef.current?.querySelector<HTMLElement>(selector);
+    if (matchEl) {
+      matchEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+    const lineEl = lineRefs.current.get(activeFindMatch.lineNumber);
+    lineEl?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [activeFindIndex, activeFindMatch, find.isOpen, usePierreCode]);
+
+  const openFind = useCallback(() => {
+    findPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    find.open();
+  }, [find]);
+
+  const closeFind = useCallback(() => {
+    find.close();
+    const restoreTarget = findPreviousFocusRef.current;
+    queueMicrotask(() => (restoreTarget ?? findButtonRef.current)?.focus());
+  }, [find]);
+
+  useViewerFindKeyboardShortcut({
+    scopeId: 'file-viewer',
+    onOpen: openFind,
+    enabled: findEligible,
+    dialogOpen: notes.annotating !== null,
+  });
+
+  useEffect(() => {
+    if (findEligible || !find.isOpen) return;
+    find.close();
+  }, [find, find.isOpen, findEligible]);
+
+  const handleFindQueryChange = useCallback((query: string) => {
+    find.setQuery(query);
+    const nextProjection = findEligible ? buildFileSearchProjection(findSourceText, query) : { matches: [] };
+    const target = nextProjection.matches[0]?.target;
+    if (!target) return;
+    if (usePierreCode) {
+      fileCodeRef.current?.scrollToFindTarget(target);
+      return;
+    }
+    queueMicrotask(() => {
+      contentRef.current?.querySelector<HTMLElement>('[data-find-occurrence="0"]')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  }, [find, findEligible, findSourceText, usePierreCode]);
+
+  const handleFindNext = useCallback(() => {
+    const nextIndex = findProjection.matches.length === 0
+      ? -1
+      : activeFindIndex < 0 ? 0 : (activeFindIndex + 1) % findProjection.matches.length;
+    find.setActiveIndex(nextIndex);
+  }, [activeFindIndex, find, findProjection.matches.length]);
+
+  const handleFindPrevious = useCallback(() => {
+    const nextIndex = findProjection.matches.length === 0
+      ? -1
+      : activeFindIndex < 0
+        ? findProjection.matches.length - 1
+        : (activeFindIndex - 1 + findProjection.matches.length) % findProjection.matches.length;
+    find.setActiveIndex(nextIndex);
+  }, [activeFindIndex, find, findProjection.matches.length]);
 
   const headerExtras: ReactNode = textLike ? (
     <>
+      {findEligible && (
+        <button
+          ref={findButtonRef}
+          type="button"
+          className="viewer-shell-btn"
+          onClick={openFind}
+          aria-label="Find in file"
+          title="Find in file"
+        >
+          Find
+        </button>
+      )}
       <CopyButton text={content} className="viewer-shell-copy-btn" title="Copy file contents" />
       {payload.kind === 'html' && (
         <>
@@ -286,7 +394,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   ) : null;
 
   const patchChangeCount = patchContext?.modifiedLines.size ?? 0;
-  const banner: ReactNode = largeFallback ? (
+  const viewerBanner: ReactNode = largeFallback ? (
     <span>
       Large file shown as plain text for responsiveness. Rich highlighting and line notes are disabled.
       {patchChangeCount > 0
@@ -299,10 +407,30 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
       {patchChangeCount !== 1 ? 's' : ''} from patch
     </span>
   ) : null;
+  const findIneligibleReason = payload.kind === 'image'
+    ? 'Find unavailable for images.'
+    : payload.kind === 'html' && htmlViewMode === 'preview'
+      ? 'Find unavailable in HTML preview; switch to source to search file contents.'
+      : null;
+  const banner: ReactNode = find.isOpen ? (
+    <FindBar
+      query={find.query}
+      activeIndex={activeFindIndex}
+      matchCount={findProjection.matches.length}
+      focusVersion={find.focusVersion}
+      onQueryChange={handleFindQueryChange}
+      onNext={handleFindNext}
+      onPrevious={handleFindPrevious}
+      onClose={closeFind}
+      autoFocus
+    />
+  ) : viewerBanner ?? (findIneligibleReason ? <span>{findIneligibleReason}</span> : null);
 
   const viewerMode = payload.kind === 'image' && imageTakeover ? 'takeover' : inline ? 'inline' : 'overlay';
   const shell = (
     <ViewerShell
+      closeOnEscape={!find.isOpen}
+      onInnerEscape={closeFind}
       mode={viewerMode}
       ariaLabel={`File viewer: ${title}`}
       title={title}
@@ -313,6 +441,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
       onSend={notes.send}
       banner={banner}
       onClose={onClose}
+      suppressCloseButtonFocus={find.isOpen}
       bodyScroll={usePierreCode ? 'children' : 'shell'}
       panel={
         notes.showPanel ? (
@@ -348,6 +477,8 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
           firstModifiedLine={patchContext?.firstModifiedLine ?? focusLine}
           scrollKey={scrollKey}
           onAnnotateLine={notes.startAnnotate}
+          findMatches={findMatchTargets}
+          activeFindMatch={activeFindMatch}
         />
       ) : (
         <div className={`viewer-content ${payload.kind === 'image' ? 'viewer-content--image' : ''}`} ref={contentRef}>

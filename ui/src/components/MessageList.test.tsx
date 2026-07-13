@@ -1,8 +1,9 @@
 import '../index.css';
 import { readFileSync } from 'node:fs';
 import { createRef, forwardRef, useImperativeHandle, useLayoutEffect, useRef } from 'react';
+import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScope';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, waitFor, act, fireEvent } from '@testing-library/react';
+import { render, waitFor, act, fireEvent, screen } from '@testing-library/react';
 import type { ConversationState, Message } from '../api';
 import { MessageList } from './MessageList';
 import { ConversationContext } from '../conversation/ConversationContext';
@@ -16,9 +17,18 @@ function withConvContext(ui: React.ReactElement): React.ReactElement {
   const store = new ConversationStore();
   return (
     <ConversationContext.Provider value={store}>
-      {ui}
+      <FocusScopeProvider>{ui}</FocusScopeProvider>
     </ConversationContext.Provider>
   );
+}
+
+function PushScopeOnMount({ scopeId, children }: { scopeId: string; children: React.ReactNode }) {
+  const { pushScope, popScope } = useFocusScopeCommands();
+  useLayoutEffect(() => {
+    pushScope(scopeId);
+    return () => popScope(scopeId);
+  }, [popScope, pushScope, scopeId]);
+  return <>{children}</>;
 }
 
 // Render counter for the AgentMessage mock. The mock is memo()d like the
@@ -43,7 +53,12 @@ vi.mock('./MessageComponents', async () => {
       agentMessageProps.push({ message, forceExpandedText, isLatestAgentMessage });
       return <div className="message agent" data-sequence-id={message.sequence_id}>agent</div>;
     }),
-    SubAgentStatus: () => null,
+    SubAgentStatus: ({ stateData }: { stateData: { pending: Array<{ task: string }>; completed_results: Array<{ task: string }> } }) => (
+      <div data-testid="subagent-status-mock">
+        {stateData.completed_results.map((agent, index) => <div key={`completed-${index}`}>{`completed ${agent.task}`}</div>)}
+        {stateData.pending.map((agent, index) => <div key={`pending-${index}`}>{`pending ${agent.task}`}</div>)}
+      </div>
+    ),
     SkillCommandText: ({ text }: { text: string }) => {
       const [token = '', ...rest] = text.split(/\s+/);
       return (
@@ -192,6 +207,266 @@ describe('latest assistant expansion in compact mode', () => {
 });
 
 describe('MessageList', () => {
+  it('claims find only while open, refocuses on repeat, and closes from transcript body', async () => {
+    render(withConvContext(
+      <MessageList
+        messages={[makeMessage(1)]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-find"
+      />,
+    ));
+
+    const transcript = screen.getByTestId('mock-virtuoso');
+    transcript.focus();
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+    expect(input).toHaveFocus();
+
+    transcript.focus();
+    expect(transcript).toHaveFocus();
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    await waitFor(() => expect(input).toHaveFocus());
+
+    transcript.focus();
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull();
+    await waitFor(() => expect(transcript).toHaveFocus());
+
+    const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+    window.dispatchEvent(escape);
+    expect(escape.defaultPrevented).toBe(false);
+  });
+
+  it('steps from the normalized transcript match index after results shrink', async () => {
+    const initialMessages: Message[] = [
+      { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'alpha one' }] },
+      { ...makeMessage(2, 'agent'), content: [{ type: 'text', text: 'alpha two' }] },
+      { ...makeMessage(3, 'agent'), content: [{ type: 'text', text: 'alpha three' }] },
+    ];
+    const { rerender } = render(withConvContext(
+      <MessageList
+        messages={initialMessages}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-find-normalized"
+      />,
+    ));
+
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha' } });
+    expect(screen.getByText('1 of 3')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('3 of 3')).toBeInTheDocument();
+
+    rerender(withConvContext(
+      <MessageList
+        messages={initialMessages.slice(0, 2)}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-find-normalized"
+      />,
+    ));
+    expect(screen.getByText('2 of 2')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('1 of 2')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Previous' }));
+    expect(screen.getByText('2 of 2')).toBeInTheDocument();
+  });
+
+  it('searches expanded system prompt text when visible in the transcript header', async () => {
+    render(withConvContext(
+      <MessageList
+        messages={[makeMessage(1)]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-system-prompt-find"
+        systemPrompt="alpha directive\nsecond line"
+      />,
+    ));
+
+    fireEvent.click(document.querySelector('.system-prompt-header') as HTMLElement);
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha directive' } });
+
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+  });
+
+  it('reveals and highlights the expanded system prompt header match instead of scrolling to a row', async () => {
+    render(withConvContext(
+      <MessageList
+        messages={[makeMessage(1)]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-system-prompt-target"
+        systemPrompt="alpha directive\nsecond line"
+      />,
+    ));
+
+    fireEvent.click(document.querySelector('.system-prompt-header') as HTMLElement);
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha directive' } });
+
+    const header = document.querySelector('.system-prompt-content') as HTMLElement;
+    await waitFor(() => expect(header).toHaveClass('viewer-find-row-match--active'));
+  });
+
+  it('does not re-scroll the active transcript match on unrelated streaming-buffer ticks', async () => {
+    const store = new ConversationStore();
+    const messages = [
+      { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'alpha earlier match' }] },
+      { ...makeMessage(2, 'user'), content: { text: 'later row' } },
+    ] as Message[];
+
+    render(
+      <ConversationContext.Provider value={store}>
+        <FocusScopeProvider>
+          <MessageList
+            slug="conv-stream-find"
+            messages={messages}
+            pendingMessages={[]}
+            convState={idleState}
+            onRetry={vi.fn()}
+            onOpenFile={undefined}
+            conversationId="conv-stream-find"
+          />
+        </FocusScopeProvider>
+      </ConversationContext.Provider>,
+    );
+
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
+
+    const activeRow = document.querySelector('[data-render-unit-key="msg-1"]') as HTMLElement;
+    expect(activeRow).not.toBeNull();
+    activeRow.scrollIntoView = vi.fn();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+    activeRow.scrollIntoView = vi.fn();
+
+    act(() => {
+      store.dispatch('conv-stream-find', {
+        type: 'sse_token',
+        sequenceId: 99,
+        requestId: 'req-1',
+        delta: 'token',
+      });
+    });
+
+    expect(activeRow.scrollIntoView).not.toHaveBeenCalled();
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+  });
+
+  it('does not build transcript matches while find is closed or queryless', async () => {
+    render(withConvContext(
+      <MessageList
+        messages={[makeMessage(1)]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-lazy-find"
+        systemPrompt="alpha directive"
+      />,
+    ));
+
+    fireEvent.click(document.querySelector('.system-prompt-header') as HTMLElement);
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    expect(screen.getByRole('textbox', { name: 'Find in viewer' })).toHaveValue('');
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+  });
+
+  it('renders overlay scope without opening transcript find shortcuts', () => {
+    render(withConvContext(
+      <PushScopeOnMount scopeId="overlay-scope">
+        <MessageList
+          messages={[makeMessage(1)]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-escape-scope"
+        />
+      </PushScopeOnMount>,
+    ));
+
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull();
+  });
+
+  it('renders skill rows using the same visible trigger, source, and snippet fields users see', () => {
+    const skillMessage = {
+      ...makeMessage(7, 'skill'),
+      content: {
+        name: 'dogfood',
+        trigger: '/dogfood alpha --trace',
+        args: 'alpha --trace',
+        source: '/skills/dogfood/SKILL.md',
+        snippet: 'Alpha walkthrough',
+      },
+    } as unknown as Message;
+
+    render(withConvContext(
+      <MessageList
+        messages={[skillMessage]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-skill-find"
+      />,
+    ));
+
+    expect(screen.getByText('dogfood')).toBeInTheDocument();
+    expect(screen.getByText('alpha --trace')).toBeInTheDocument();
+  });
+
+  it('renders sub-agent rows in completed-then-pending order', () => {
+    const awaitingState: ConversationState = {
+      type: 'awaiting_sub_agents',
+      pending: [{ agent_id: 'p1', task: 'shared alpha pending' }],
+      completed_results: [{ agent_id: 'c1', task: 'shared alpha completed', outcome: { type: 'success', result: 'done' } }],
+    } as ConversationState;
+
+    render(withConvContext(
+      <MessageList
+        messages={[]}
+        pendingMessages={[]}
+        convState={awaitingState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-subagent-find"
+      />,
+    ));
+
+    const text = screen.getByTestId('subagent-status-mock').textContent;
+    expect(text?.indexOf('completed shared alpha completed')).toBeLessThan(text?.indexOf('pending shared alpha pending') ?? -1);
+  });
+
   it('renders skill invocations as inline slash-command user messages with attachments', () => {
     const skillMessage = {
       ...makeMessage(7, 'skill'),
@@ -1562,3 +1837,5 @@ describe('handleTotalListHeightChanged', () => {
     expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
   });
 });
+
+

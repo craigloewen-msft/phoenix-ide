@@ -1,6 +1,7 @@
-import { render, screen, fireEvent, within, act } from '@testing-library/react';
+import { render, screen, fireEvent, within, act, waitFor } from '@testing-library/react';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { DiffView } from './DiffView';
+import * as searchProjectionModule from '../viewer-find/searchProjections';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
 import { codeViewMockState, itemVersion, resetCodeViewMock } from './__testutils__/codeViewMock';
 
@@ -56,10 +57,322 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     expect(addNoteButton).toHaveAttribute('data-utility-button');
   });
 
+  it('reuses the memoized diff projection when a new query navigates to its first match', async () => {
+    const spy = vi.spyOn(searchProjectionModule, 'buildDiffSearchProjection');
+    renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'hello' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 2')).toBeInTheDocument());
+    expect(spy).toHaveBeenCalledTimes(1);
+    spy.mockRestore();
+  });
+
   it('lets DiffView opt out of shell-owned scrolling so CodeView owns the scroll container', () => {
     const { container } = renderDiff();
     expect(container.querySelector('.viewer-shell-body--scroll-children')).toBeTruthy();
     expect(container.querySelector('.diff-viewer-body .phoenix-diff-codeview')).toBeTruthy();
+  });
+
+  it('counts and navigates visible commit-log matches in diff find', async () => {
+    render(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog="abc123 add hello context"
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'hello' } });
+
+    expect(screen.getByText('1 of 2')).toBeInTheDocument();
+
+    const commitLine = document.getElementById('commit-log:0');
+    const scrollIntoView = vi.fn();
+    if (commitLine) commitLine.scrollIntoView = scrollIntoView;
+
+    expect(commitLine?.querySelectorAll('[data-find-occurrence]').length).toBe(1);
+    expect(commitLine).toHaveClass('viewer-find-row-match', 'viewer-find-row-match--active');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Previous' }));
+    expect(screen.getByText('2 of 2')).toBeInTheDocument();
+    expect(commitLine).toHaveClass('viewer-find-row-match');
+    expect(commitLine).not.toHaveClass('viewer-find-row-match--active');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('1 of 2')).toBeInTheDocument();
+    expect(commitLine).toHaveClass('viewer-find-row-match', 'viewer-find-row-match--active');
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'center', behavior: 'smooth' });
+  });
+
+  it('wraps diff navigation from the clamped active match when results shrink', async () => {
+    render(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={[
+            'diff --git a/foo.txt b/foo.txt',
+            'index 0000000..1111111 100644',
+            '--- a/foo.txt',
+            '+++ b/foo.txt',
+            '@@ -0,0 +1,3 @@',
+            '+alpha one',
+            '+alpha two',
+            '+alpha three',
+          ].join('\n')}
+          uncommittedDiff=""
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('3 of 3')).toBeInTheDocument();
+
+    fireEvent.change(input, { target: { value: 'three' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+  });
+
+  it('keeps diff find inert until open with a non-empty query', () => {
+    renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
+
+    expect(screen.queryByText('1 of 1')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    expect(screen.getByRole('textbox', { name: 'Find in viewer' })).toHaveValue('');
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'bar' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+  });
+
+  it('does not register diff find shortcuts while a closed diff remains mounted', () => {
+    render(
+      <ReviewNotesProvider>
+        <DiffView
+          open={false}
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.keyDown(window, { key: 'f', metaKey: true, bubbles: true, cancelable: true });
+    expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull();
+  });
+
+  it('opens shared viewer find for diff-viewer scope and navigates header then line matches via typed scroll targets', async () => {
+    renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'bar' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
+
+    fireEvent.change(input, { target: { value: 'hello' } });
+    await waitFor(() => expect(screen.getByText('1 of 2')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    await waitFor(() => expect(codeViewMockState.scrollToCalls.at(-1)).toEqual({
+      type: 'line',
+      id: 'committed:foo.txt',
+      lineNumber: 1,
+      side: 'additions',
+      align: 'center',
+      behavior: 'smooth',
+    }));
+  });
+
+  it('marks non-active diff header matches distinctly while keeping the exact colon-containing header active', () => {
+    const committed = [
+      'diff --git a/foo b/foo',
+      'index 0000000..1111111 100644',
+      '--- a/foo',
+      '+++ b/foo',
+      '@@ -0,0 +1,1 @@',
+      '+plain file',
+      'diff --git a/foo:bar b/foo:bar',
+      'index 2222222..3333333 100644',
+      '--- a/foo:bar',
+      '+++ b/foo:bar',
+      '@@ -0,0 +1,1 @@',
+      '+colon file',
+    ].join('\n');
+
+    renderDiff(committed, '');
+
+    const fooVersionBefore = itemVersion('committed:foo') ?? 0;
+    const fooBarVersionBefore = itemVersion('committed:foo:bar') ?? 0;
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'foo' } });
+
+    const fooHeader = screen.getByTestId('mock-header-committed:foo');
+    const fooBarHeader = screen.getByTestId('mock-header-committed:foo:bar');
+    expect(fooHeader.querySelector('.phoenix-diff-section-badge--find-active')).not.toBeNull();
+    expect(fooHeader.querySelector('.phoenix-diff-file-note-btn--find-active')).not.toBeNull();
+    expect(fooBarHeader.querySelector('.phoenix-diff-section-badge--find-match')).not.toBeNull();
+    expect(fooBarHeader.querySelector('.phoenix-diff-file-note-btn--find-match')).not.toBeNull();
+    expect(fooBarHeader.querySelector('.phoenix-diff-section-badge--find-active')).toBeNull();
+    expect(fooBarHeader.querySelector('.phoenix-diff-file-note-btn--find-active')).toBeNull();
+
+    expect((itemVersion('committed:foo') ?? 0)).toBeGreaterThan(fooVersionBefore);
+    expect((itemVersion('committed:foo:bar') ?? 0)).toBeGreaterThan(fooBarVersionBefore);
+  });
+
+  it('decorates matched diff lines with unsafeCSS and clears decorations when the find bar closes', () => {
+    renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+
+    fireEvent.change(input, { target: { value: 'hello' } });
+    expect(codeViewMockState.lastUnsafeCss).toContain('[data-item-id="committed:foo.txt"] [data-additions=""] [data-line="1"]');
+
+    fireEvent.change(input, { target: { value: 'bar' } });
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(codeViewMockState.lastUnsafeCss).toBe('');
+  });
+
+  it('lets shell Escape close an open find bar after focus returns to the viewer body', async () => {
+    renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'hello' } });
+
+    const bodyLine = screen.getByTestId('mock-line-el-committed:foo.txt');
+    bodyLine.focus();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(codeViewMockState.lastUnsafeCss).toBe('');
+  });
+
+  it('restores diff find focus to the actual opener when closed from body Escape', async () => {
+    renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
+
+    const bodyLine = screen.getByTestId('mock-line-el-committed:foo.txt');
+    const findButton = screen.getByRole('button', { name: 'Find in diff' });
+    bodyLine.tabIndex = 0;
+    bodyLine.focus();
+    fireEvent.click(findButton);
+
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'hello' } });
+
+    bodyLine.focus();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(bodyLine).toHaveFocus();
+  });
+
+  it('lets find Escape close the find bar before the shell closes the viewer', () => {
+    const onClose = vi.fn();
+    render(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          onClose={onClose}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).not.toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears diff find state when open transitions false on the same mounted viewer', async () => {
+    const { rerender } = render(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'hello' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+
+    rerender(
+      <ReviewNotesProvider>
+        <DiffView
+          open={false}
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    rerender(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(screen.queryByText('1 of 1')).not.toBeInTheDocument();
+  });
+
+  it('does not open find behind an annotation dialog', () => {
+    renderDiff(COMMITTED, '');
+    fireEvent.click(screen.getByTestId('mock-line-click-committed:foo.txt'));
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+
+    fireEvent.keyDown(screen.getByRole('button', { name: 'Cancel' }), { key: 'f', metaKey: true });
+    expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull();
   });
 
   it('adds a line note via the gutter affordance and surfaces it in the badge, panel, and inline annotation', () => {

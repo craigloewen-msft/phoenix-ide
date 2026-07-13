@@ -2,6 +2,7 @@ import mermaid from 'mermaid';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { MetaViewer } from './MetaViewer';
+import * as viewerFindModule from '../viewer-find/useViewerFind';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
 import type { MetaViewerPayload } from './metaViewerTypes';
 import { resetCodeViewMock } from './__testutils__/codeViewMock';
@@ -91,6 +92,23 @@ function fireWheel(surface: HTMLElement, deltaY: number) {
 
 const textCommon = { ...common, filePath: 'thing', rootDir: '/tmp/project' };
 describe('MetaViewer payload routing', () => {
+  it('keeps useViewerFind in state-only mode while projection drives file matching', async () => {
+    const spy = vi.spyOn(viewerFindModule, 'useViewerFind');
+    renderViewer({
+      ...textCommon,
+      kind: 'text',
+      content: 'alpha\nbeta',
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
+    expect(spy).toHaveBeenCalled();
+    expect(spy.mock.calls.at(-1)?.[0]).toMatchObject({ text: '' });
+    spy.mockRestore();
+  });
+
   beforeEach(() => resetCodeViewMock());
 
   it('routes a markdown payload to rendered markdown', () => {
@@ -130,6 +148,115 @@ describe('MetaViewer payload routing', () => {
     const { container } = renderViewer({ ...textCommon, kind: 'text', content: 'plain line' });
     expect(container.querySelector('.phoenix-file-codeview')).not.toBeNull();
     expect(container.querySelector('.viewer-text')).toBeNull();
+  });
+
+  it('reopens find by refocusing the existing bar after body focus leaves the input', async () => {
+    renderViewer({ ...textCommon, kind: 'text', content: 'alpha\nbeta alpha' });
+
+    const findButton = screen.getByRole('button', { name: 'Find in file' });
+    fireEvent.click(findButton);
+
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha' } });
+
+    const bodyLine = document.querySelector('[data-line="1"]') as HTMLElement;
+    bodyLine.focus();
+    expect(bodyLine).toHaveFocus();
+
+    fireEvent.click(findButton);
+
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Find in viewer' })).toHaveFocus());
+    expect((screen.getByRole('textbox', { name: 'Find in viewer' }) as HTMLInputElement).value).toBe('alpha');
+  });
+
+  it('opens shared find for Pierre-backed files and restores focus to the opener on Escape', async () => {
+    renderViewer({ ...textCommon, kind: 'text', content: 'alpha\nbeta alpha' });
+
+    const findButton = screen.getByRole('button', { name: 'Find in file' });
+    findButton.focus();
+    fireEvent.click(findButton);
+
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha' } });
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(findButton).toHaveFocus();
+  });
+
+  it('clears Pierre file decorations when shell Escape closes an open find bar after body focus', async () => {
+    renderViewer({ ...textCommon, kind: 'text', content: 'alpha\nbeta alpha' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    const bodyLine = document.querySelector('[data-line="1"]') as HTMLElement;
+    bodyLine.focus();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(document.querySelector('[data-find-occurrence]')).toBeNull();
+  });
+
+  it('restores large-text find focus to the body opener instead of the toolbar', async () => {
+    renderViewer({
+      ...textCommon,
+      kind: 'html',
+      language: 'html',
+      content: '<p>alpha</p>\n<p>beta alpha</p>',
+      renderMode: 'plainLargeText',
+      previewUrl: '/preview/tmp/project/thing',
+    });
+
+    const largeTextBody = screen.getByTestId('viewer-large-text-fallback');
+    const findButton = screen.getByRole('button', { name: 'Find in file' });
+    largeTextBody.focus();
+    fireEvent.click(findButton);
+
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha' } });
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(largeTextBody).toHaveFocus();
+  });
+
+  it('clears large-text fallback marks when closing find from the toolbar', async () => {
+    renderViewer({
+      ...textCommon,
+      kind: 'html',
+      language: 'html',
+      content: '<p>alpha</p>\n<p>beta alpha</p>',
+      renderMode: 'plainLargeText',
+      previewUrl: '/preview/tmp/project/thing',
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(document.querySelectorAll('[data-find-occurrence]').length).toBe(2);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(document.querySelector('[data-find-occurrence]')).toBeNull();
+  });
+
+  it('highlights and counts exact occurrences in large text fallback DOM source', async () => {
+    renderViewer({
+      ...textCommon,
+      kind: 'html',
+      language: 'html',
+      content: '<p>alpha</p>\n<p>beta alpha</p>',
+      renderMode: 'plainLargeText',
+      previewUrl: '/preview/tmp/project/thing',
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    expect(screen.getByText('1 of 2')).toBeInTheDocument();
+    expect(document.querySelectorAll('[data-find-occurrence]').length).toBe(2);
+    expect(document.querySelector('.viewer-find-match--active')).toHaveTextContent('alpha');
   });
 
   it('lets a large HTML file still toggle to the sandboxed preview (fallback only gates source)', () => {
@@ -251,6 +378,193 @@ describe('MetaViewer payload routing', () => {
     // Security: sandbox must stay allow-same-origin only (no allow-scripts).
     expect(iframe).toHaveAttribute('sandbox', 'allow-same-origin');
     expect(iframe).toHaveAttribute('src', '/preview/tmp/project/thing');
+  });
+
+  it('defers file search projection work until find is open with a query', async () => {
+    const searchProjectionModule = await import('../viewer-find/searchProjections');
+    const buildProjectionSpy = vi.spyOn(searchProjectionModule, 'buildFileSearchProjection');
+
+    renderViewer({ ...textCommon, kind: 'text', content: 'alpha\nbeta' });
+    expect(buildProjectionSpy).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    expect(buildProjectionSpy).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(buildProjectionSpy).toHaveBeenCalledWith('alpha\nbeta', 'alpha');
+  });
+
+  it('skips large-text line-fragment rendering when the active occurrence is negative', () => {
+    renderViewer({
+      ...textCommon,
+      kind: 'html',
+      language: 'html',
+      content: '<p>alpha</p>\n<p>beta</p>',
+      renderMode: 'plainLargeText',
+      previewUrl: '/preview/tmp/project/thing',
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'missing' } });
+
+    expect(screen.getByText('0 results')).toBeInTheDocument();
+    expect(document.querySelector('[data-find-line]')).toBeNull();
+    expect(document.querySelector('[data-find-occurrence]')).toBeNull();
+  });
+
+  it('keeps image payloads out of file find and does not show false counts', () => {
+    renderViewer({
+      ...common,
+      kind: 'image',
+      url: '/preview/tmp/project/thing.png',
+      mimeType: 'image/png',
+      fileName: 'thing.png',
+    });
+
+    expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
+    expect(screen.queryByText(/of \d+/)).toBeNull();
+  });
+
+  it('keeps HTML preview ineligible but allows source-like markdown and HTML source find', () => {
+    const { unmount } = render(
+      <ReviewNotesProvider>
+        <MetaViewer
+          payload={{
+            ...textCommon,
+            kind: 'html',
+            language: 'html',
+            content: '<p>alpha</p>',
+            previewUrl: '/preview/tmp/project/thing',
+          }}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    expect(screen.getByRole('button', { name: 'Find in file' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
+    expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
+
+    unmount();
+    render(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...textCommon, kind: 'markdown', content: '# alpha' }} />
+      </ReviewNotesProvider>,
+    );
+    expect(screen.getByRole('button', { name: 'Find in file' })).toBeInTheDocument();
+  });
+
+  it('closes file find when switching HTML source to preview', async () => {
+    renderViewer({
+      ...textCommon,
+      kind: 'html',
+      language: 'html',
+      content: '<p>alpha</p>',
+      previewUrl: '/preview/tmp/project/thing',
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+  });
+
+  it('falls back to line reveal for markdown source matches without explicit marks', async () => {
+    renderViewer({
+      ...textCommon,
+      kind: 'markdown',
+      content: '# alpha heading\n\nBody text',
+    });
+
+    const line = document.querySelector('[data-line="1"]') as HTMLElement;
+    line.scrollIntoView = vi.fn();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha heading' } });
+
+    await waitFor(() => expect(line.scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' }));
+  });
+
+  it('falls back to line reveal for HTML source matches without explicit marks', async () => {
+    renderViewer({
+      ...textCommon,
+      kind: 'html',
+      language: 'html',
+      content: '<p>alpha</p>',
+      previewUrl: '/preview/tmp/project/thing',
+    });
+
+    const line = document.querySelector('[data-line="1"]') as HTMLElement;
+    line.scrollIntoView = vi.fn();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    await waitFor(() => expect(line.scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' }));
+  });
+
+  it('resets find state when the viewed absolutePath changes', async () => {
+    const { rerender } = render(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...textCommon, kind: 'text', content: 'alpha\nbeta' }} />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+
+    rerender(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...textCommon, absolutePath: '/tmp/project/other', kind: 'text', content: 'alpha\nbeta' }} />
+      </ReviewNotesProvider>,
+    );
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+  });
+
+  it('resets find state when the viewed content identity changes under the same path', async () => {
+    const { rerender } = render(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...textCommon, kind: 'text', content: 'alpha\nbeta' }} />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+
+    rerender(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...textCommon, kind: 'text', content: 'gamma\ndelta' }} />
+      </ReviewNotesProvider>,
+    );
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+  });
+
+  it('falls back to line reveal for HTML source matches without explicit marks', async () => {
+    renderViewer({
+      ...textCommon,
+      kind: 'html',
+      language: 'html',
+      content: '<p>alpha</p>',
+      previewUrl: '/preview/tmp/project/thing',
+    });
+
+    const line = document.querySelector('[data-line="1"]') as HTMLElement;
+    line.scrollIntoView = vi.fn();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    await waitFor(() => expect(line.scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' }));
   });
 });
 

@@ -1,4 +1,7 @@
 import { memo, useState, useRef, useCallback, useMemo, useEffect, forwardRef, useImperativeHandle } from 'react';
+import { useDensity } from '../hooks/useDensity';
+import { FindBar, buildConversationSearchProjection, useViewerFindKeyboardShortcut } from './viewer-find';
+import { useFocusScope, useFocusScopeCommands } from '../hooks/useFocusScope';
 import { Virtuoso, type VirtuosoHandle, type VirtuosoProps, type ListRange } from 'react-virtuoso';
 import type { Message, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
@@ -14,7 +17,7 @@ import { StreamingMessage } from './StreamingMessage';
 import { RenderProfiler } from '../dev/renderProfiler';
 import { MessageContextMenu } from './MessageContextMenu';
 import { FilePathContextMenu } from './FilePathContextMenu';
-import { useStreamingRequestId } from '../conversation/useConversationAtom';
+import { useStreamingBuffer, useStreamingRequestId } from '../conversation/useConversationAtom';
 import {
   buildHistoricalUnits,
   buildTailUnits,
@@ -229,12 +232,14 @@ interface SystemPromptHeaderProps {
   systemPrompt: string;
   expanded: boolean;
   onToggle: () => void;
+  contentRef: React.RefObject<HTMLPreElement>;
 }
 
 const SystemPromptHeader = memo(function SystemPromptHeader({
   systemPrompt,
   expanded,
   onToggle,
+  contentRef,
 }: SystemPromptHeaderProps) {
   return (
     <div className="virtuoso-row">
@@ -246,7 +251,7 @@ const SystemPromptHeader = memo(function SystemPromptHeader({
             {expanded ? ' hide' : ' show'}
           </span>
         </div>
-        {expanded && <pre className="system-prompt-content">{systemPrompt}</pre>}
+        {expanded && <pre ref={contentRef} className="system-prompt-content">{systemPrompt}</pre>}
       </div>
     </div>
   );
@@ -259,6 +264,7 @@ interface MessageListContext {
   systemPrompt: string | undefined;
   systemPromptExpanded: boolean;
   toggleSystemPrompt: () => void;
+  systemPromptRef: React.RefObject<HTMLPreElement>;
 }
 
 // Virtuoso slot component types are defined once at module scope so their
@@ -275,6 +281,7 @@ function VirtuosoHeaderSlot({ context }: { context?: MessageListContext }) {
       systemPrompt={context.systemPrompt}
       expanded={context.systemPromptExpanded}
       onToggle={context.toggleSystemPrompt}
+      contentRef={context.systemPromptRef}
     />
   );
 }
@@ -299,6 +306,12 @@ const VIRTUOSO_COMPONENTS: NonNullable<
   EmptyPlaceholder: VirtuosoEmptySlot,
 };
 
+function OpenFindStreamingBuffer({ slug, onChange }: { slug: string; onChange: (buffer: import('../conversation/atom').StreamingBuffer | null) => void }) {
+  const buffer = useStreamingBuffer(slug);
+  useEffect(() => onChange(buffer), [buffer, onChange]);
+  return null;
+}
+
 function MessageListImpl({
   messages,
   pendingMessages,
@@ -316,7 +329,18 @@ function MessageListImpl({
   onChaptersChange,
   targetMessageId,
 }: MessageListProps, ref: React.ForwardedRef<MessageListHandle>) {
+  const findScopeId = `conversation-transcript:${conversationId ?? 'empty'}`;
+  const { activeScope } = useFocusScope();
+  const { pushScope, popScope } = useFocusScopeCommands();
+  const { density } = useDensity();
+  const [findOpen, setFindOpen] = useState(false);
+  const [findFocusVersion, setFindFocusVersion] = useState(0);
+  const [findQuery, setFindQuery] = useState('');
+  const [findActiveIndex, setFindActiveIndex] = useState(0);
+  const [findStreamingBuffer, setFindStreamingBuffer] = useState<import('../conversation/atom').StreamingBuffer | null>(null);
+  const findPreviousFocusRef = useRef<HTMLElement | null>(null);
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
+  const systemPromptRef = useRef<HTMLPreElement | null>(null);
   const [hasUnreadTailContent, setHasUnreadTailContent] = useState(false);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const scrollerRef = useRef<HTMLElement | null>(null);
@@ -354,6 +378,103 @@ function MessageListImpl({
     () => [...historicalUnits, ...tailUnits],
     [historicalUnits, tailUnits],
   );
+
+  const latestAgentKey = useMemo(() => {
+    for (let i = historicalUnits.length - 1; i >= 0; i -= 1) {
+      const unit = historicalUnits[i];
+      if (unit?.kind === 'agent_turn') return unit.key;
+    }
+    return null;
+  }, [historicalUnits]);
+
+  const findProjection = useMemo(
+    () => (findOpen && findQuery.length > 0
+      ? buildConversationSearchProjection(allUnits, findQuery, {
+          density,
+          latestAgentKey,
+          streamingBuffer: findStreamingBuffer,
+          systemPrompt: systemPrompt ?? null,
+          systemPromptExpanded,
+        })
+      : { sources: [], matches: [] }),
+    [allUnits, density, findOpen, findQuery, findStreamingBuffer, latestAgentKey, systemPrompt, systemPromptExpanded],
+  );
+  const findMatches = findProjection.matches;
+  const normalizedFindIndex = findMatches.length === 0 ? -1 : Math.min(findActiveIndex, findMatches.length - 1);
+  const activeFindMatch = findOpen && normalizedFindIndex >= 0 ? findMatches[normalizedFindIndex] ?? null : null;
+  const activeFindMatchRef = useRef(activeFindMatch);
+  activeFindMatchRef.current = activeFindMatch;
+  const activeFindMatchKey = activeFindMatch
+    ? `${activeFindMatch.target.kind}:${activeFindMatch.target.sourceId}:${activeFindMatch.start}:${activeFindMatch.end}`
+    : null;
+  const findRowByKey = useCallback((key: string): Element | null => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return null;
+    try {
+      return scroller.querySelector(`[data-render-unit-key="${CSS.escape(key)}"]`);
+    } catch {
+      return null;
+    }
+  }, []);
+  const openFind = useCallback(() => {
+    findPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setFindOpen(true);
+    setFindFocusVersion((version) => version + 1);
+  }, []);
+  const closeFind = useCallback(() => {
+    setFindOpen(false);
+    requestAnimationFrame(() => findPreviousFocusRef.current?.focus());
+  }, []);
+
+  useEffect(() => {
+    if (!findOpen) return undefined;
+    pushScope(findScopeId);
+    return () => popScope(findScopeId);
+  }, [findOpen, findScopeId, popScope, pushScope]);
+  useViewerFindKeyboardShortcut({
+    scopeId: findScopeId,
+    onOpen: openFind,
+    allowWhenNoActiveScope: true,
+  });
+  useEffect(() => {
+    if (!findOpen) return undefined;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (activeScope !== findScopeId) return;
+      const target = event.target as HTMLElement | null;
+      const isBodyFindInput = target instanceof HTMLElement && target.dataset['viewerFindInput'] === 'true';
+      if (isBodyFindInput) return;
+      event.preventDefault();
+      event.stopPropagation();
+      closeFind();
+    };
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
+  }, [activeScope, closeFind, findOpen, findScopeId]);
+  const findConversationRef = useRef(conversationId);
+  useEffect(() => {
+    if (findConversationRef.current === conversationId) return;
+    findConversationRef.current = conversationId;
+    if (findOpen) setFindOpen(false);
+    if (findQuery) setFindQuery('');
+    if (findActiveIndex !== 0) setFindActiveIndex(0);
+  }, [conversationId, findActiveIndex, findOpen, findQuery]);
+  const changeFindQuery = useCallback((query: string) => {
+    setFindQuery(query);
+    setFindActiveIndex(0);
+  }, []);
+  const nextFindMatch = useCallback(() => {
+    setFindActiveIndex(() => {
+      if (findMatches.length === 0) return 0;
+      return (normalizedFindIndex + 1) % findMatches.length;
+    });
+  }, [findMatches.length, normalizedFindIndex]);
+  const previousFindMatch = useCallback(() => {
+    setFindActiveIndex(() => {
+      if (findMatches.length === 0) return 0;
+      return (normalizedFindIndex - 1 + findMatches.length) % findMatches.length;
+    });
+  }, [findMatches.length, normalizedFindIndex]);
 
   // Chapters are derived here, not in a parent, so they share the exact
   // `historicalUnits` array virtuoso renders — a chapter's `unitIndex` is
@@ -695,6 +816,42 @@ function MessageListImpl({
 
   useImperativeHandle(ref, () => ({ scrollToUnitIndex, scrollToMessageId }), [scrollToMessageId, scrollToUnitIndex]);
 
+  useEffect(() => {
+    scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
+      .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
+    const match = activeFindMatchRef.current;
+    if (!match) return undefined;
+    dispatchScrollEvent({ type: 'navigationJumped' });
+    if (match.target.kind === 'header-text') {
+      const timers = [0, 80, 220].map((delay) => window.setTimeout(() => {
+        const header = systemPromptRef.current;
+        if (!header) return;
+        scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
+          .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
+        header.classList.add('viewer-find-row-match', 'viewer-find-row-match--active');
+        header.scrollIntoView({ block: 'center' });
+      }, delay));
+      return () => timers.forEach(clearTimeout);
+    }
+    const unitMatch = match.target;
+    virtuosoRef.current?.scrollToIndex({ index: unitMatch.unitIndex, align: 'center', behavior: 'smooth' });
+    const timers = [80, 220, 500].map((delay) => window.setTimeout(() => {
+      const row = findRowByKey(unitMatch.unitKey);
+      if (!row) return;
+      scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
+        .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
+      row.classList.add('viewer-find-row-match', 'viewer-find-row-match--active');
+      row.scrollIntoView({ block: 'center' });
+    }, delay));
+    return () => timers.forEach(clearTimeout);
+  }, [activeFindMatchKey, dispatchScrollEvent, findRowByKey]);
+
+  useEffect(() => {
+    if (findOpen || activeScope !== findScopeId) return;
+    scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
+      .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
+  }, [activeScope, findOpen, findScopeId]);
+
   const handleRangeChanged = useCallback((range: ListRange) => {
     onVisibleRangeChange?.(range);
   }, [onVisibleRangeChange]);
@@ -707,17 +864,9 @@ function MessageListImpl({
   // (`VIRTUOSO_COMPONENTS`). Only its *reference* changes when expansion
   // toggles — the slot types do not, so no slot remount / list-height recompute.
   const virtuosoContext = useMemo<MessageListContext>(
-    () => ({ systemPrompt, systemPromptExpanded, toggleSystemPrompt }),
+    () => ({ systemPrompt, systemPromptExpanded, toggleSystemPrompt, systemPromptRef }),
     [systemPrompt, systemPromptExpanded, toggleSystemPrompt],
   );
-
-  const latestAgentKey = useMemo(() => {
-    for (let i = historicalUnits.length - 1; i >= 0; i -= 1) {
-      const unit = historicalUnits[i];
-      if (unit?.kind === 'agent_turn') return unit.key;
-    }
-    return null;
-  }, [historicalUnits]);
 
   const itemContent = useCallback(
     (_index: number, unit: RenderUnit) => (
@@ -739,6 +888,21 @@ function MessageListImpl({
 
   return (
     <main id="main-area" className="chat-main-area">
+      {findOpen && (
+        <>
+          {slug && <OpenFindStreamingBuffer slug={slug} onChange={setFindStreamingBuffer} />}
+          <FindBar
+            query={findQuery}
+            activeIndex={normalizedFindIndex}
+            matchCount={findMatches.length}
+            focusVersion={findFocusVersion}
+            onQueryChange={changeFindQuery}
+            onNext={nextFindMatch}
+            onPrevious={previousFindMatch}
+            onClose={closeFind}
+          />
+        </>
+      )}
       <section id="chat-view" className="view active">
         <Virtuoso
           key={conversationId ?? '__empty__'}

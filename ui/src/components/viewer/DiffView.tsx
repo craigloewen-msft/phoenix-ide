@@ -10,10 +10,17 @@
  * drops the entire pile. Jump-to-line uses Pierre's typed scroll target.
  */
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Columns2, Rows3 } from 'lucide-react';
 import type { DiffSection, ReviewNote } from '../../contexts/ReviewNotesContext';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
+import {
+  FindBar,
+  buildDiffSearchProjection,
+  useViewerFind,
+  useViewerFindKeyboardShortcut,
+  type DiffSearchMatchTarget,
+} from '../viewer-find';
 import { ViewerShell } from './ViewerShell';
 import { NotesPanel } from './NotesPanel';
 import { AnnotationDialog } from './AnnotationDialog';
@@ -67,11 +74,55 @@ export function DiffView({
   inline = false,
   takeover = false,
 }: DiffViewProps) {
-  useRegisterFocusScope('diff-viewer');
+  useRegisterFocusScope(open ? 'diff-viewer' : null);
   const notes = useDiffReviewNotes(onSendNotes);
   const codeViewRef = useRef<PhoenixDiffCodeViewHandle>(null);
+  const findButtonRef = useRef<HTMLButtonElement>(null);
+  const findPreviousFocusRef = useRef<HTMLElement | null>(null);
 
   const [diffStyle, setDiffStyle] = useState<DiffStyle>(initialDiffStyle);
+  const find = useViewerFind({ text: '' });
+  const resetFind = find.reset;
+
+  const openFind = useCallback(() => {
+    findPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    find.open();
+  }, [find]);
+
+  const closeFind = useCallback(() => {
+    find.close();
+    const restoreTarget = findPreviousFocusRef.current;
+    queueMicrotask(() => (restoreTarget ?? findButtonRef.current)?.focus());
+  }, [find]);
+
+  useEffect(() => {
+    if (open) return;
+    resetFind();
+    findPreviousFocusRef.current = null;
+  }, [open, resetFind]);
+
+  useViewerFindKeyboardShortcut({
+    scopeId: 'diff-viewer',
+    onOpen: openFind,
+    dialogOpen: !open || notes.annotating !== null,
+  });
+  const findProjection = useMemo(
+    () => (find.isOpen && find.query.length > 0
+      ? buildDiffSearchProjection(committedDiff, uncommittedDiff, find.query, commitLog)
+      : { sources: [], matches: [] }),
+    [commitLog, committedDiff, find.isOpen, uncommittedDiff, find.query],
+  );
+  const activeFindIndex = findProjection.matches.length === 0
+    ? -1
+    : Math.min(Math.max(find.requestedActiveIndex, 0), findProjection.matches.length - 1);
+  const activeFindMatchTarget = find.isOpen && activeFindIndex >= 0
+    ? findProjection.matches[activeFindIndex]?.target ?? null
+    : null;
+  const findMatchTargets = useMemo(
+    () => (find.isOpen ? findProjection.matches.map((match) => match.target) : []),
+    [find.isOpen, findProjection.matches],
+  );
+
   const toggleDiffStyle = useCallback(() => {
     setDiffStyle((prev) => {
       const next = prev === 'unified' ? 'split' : 'unified';
@@ -95,12 +146,54 @@ export function DiffView({
     [highlight, closePanel],
   );
 
+  const navigateFindTarget = useCallback((target: DiffSearchMatchTarget) => {
+    if (target.kind === 'commit-log-line') {
+      document.getElementById(target.itemId)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      return;
+    }
+    codeViewRef.current?.scrollToFindTarget(target);
+  }, []);
+
+  const handleFindQueryChange = useCallback((query: string) => {
+    find.setQuery(query);
+  }, [find]);
+
+  useEffect(() => {
+    if (!find.isOpen || find.query.length === 0) return;
+    const target = findProjection.matches[0]?.target;
+    if (target) navigateFindTarget(target);
+  }, [find.isOpen, find.query, findProjection.matches, navigateFindTarget]);
+
+  const handleFindNext = useCallback(() => {
+    const nextIndex = findProjection.matches.length === 0
+      ? -1
+      : activeFindIndex < 0
+        ? 0
+        : (activeFindIndex + 1) % findProjection.matches.length;
+    find.setActiveIndex(nextIndex);
+    const target = nextIndex >= 0 ? findProjection.matches[nextIndex]?.target : null;
+    if (target) navigateFindTarget(target);
+  }, [activeFindIndex, find, findProjection.matches, navigateFindTarget]);
+
+  const handleFindPrevious = useCallback(() => {
+    const nextIndex = findProjection.matches.length === 0
+      ? -1
+      : activeFindIndex < 0
+        ? Math.max(findProjection.matches.length - 1, 0)
+        : (activeFindIndex - 1 + findProjection.matches.length) % findProjection.matches.length;
+    find.setActiveIndex(nextIndex);
+    const target = nextIndex >= 0 ? findProjection.matches[nextIndex]?.target : null;
+    if (target) navigateFindTarget(target);
+  }, [activeFindIndex, find, findProjection.matches, navigateFindTarget]);
+
   if (!open) return null;
 
   const empty = !commitLog.trim() && !committedDiff.trim() && !uncommittedDiff.trim();
 
   return (
     <ViewerShell
+      closeOnEscape={!find.isOpen}
+      onInnerEscape={closeFind}
       mode={inline ? 'inline' : takeover ? 'takeover' : 'overlay'}
       ariaLabel="Worktree diff"
       title={
@@ -109,15 +202,40 @@ export function DiffView({
         </span>
       }
       headerExtras={
-        <button
-          className="viewer-shell-btn"
-          onClick={toggleDiffStyle}
-          aria-label={diffStyle === 'unified' ? 'Switch to split view' : 'Switch to unified view'}
-          title={diffStyle === 'unified' ? 'Split view' : 'Unified view'}
-        >
-          {diffStyle === 'unified' ? <Columns2 size={18} /> : <Rows3 size={18} />}
-        </button>
+        <>
+          <button
+            className="viewer-shell-btn"
+            type="button"
+            ref={findButtonRef}
+            onClick={openFind}
+            aria-label="Find in diff"
+            title="Find in diff"
+          >
+            Find
+          </button>
+          <button
+            className="viewer-shell-btn"
+            onClick={toggleDiffStyle}
+            aria-label={diffStyle === 'unified' ? 'Switch to split view' : 'Switch to unified view'}
+            title={diffStyle === 'unified' ? 'Split view' : 'Unified view'}
+          >
+            {diffStyle === 'unified' ? <Columns2 size={18} /> : <Rows3 size={18} />}
+          </button>
+        </>
       }
+      banner={find.isOpen ? (
+        <FindBar
+          query={find.query}
+          activeIndex={activeFindIndex}
+          matchCount={findProjection.matches.length}
+          focusVersion={find.focusVersion}
+          onQueryChange={handleFindQueryChange}
+          onNext={handleFindNext}
+          onPrevious={handleFindPrevious}
+          onClose={closeFind}
+          autoFocus
+        />
+      ) : undefined}
       noteCount={diffNotes.length}
       onToggleNotes={notes.togglePanel}
       onSend={notes.send}
@@ -156,7 +274,14 @@ export function DiffView({
           </div>
         ) : (
           <>
-            {commitLog.trim() && <CommitLogSection commitLog={commitLog} />}
+            {commitLog.trim() && (
+              <CommitLogSection
+                commitLog={commitLog}
+                matches={findProjection.matches}
+                activeMatchIndex={activeFindIndex}
+                findOpen={find.isOpen}
+              />
+            )}
             <DiffSummaryBar
               comparator={comparator}
               committedDiff={committedDiff}
@@ -171,6 +296,8 @@ export function DiffView({
               committedDiff={committedDiff}
               uncommittedDiff={uncommittedDiff}
               diffStyle={diffStyle}
+              findMatches={findMatchTargets}
+              activeFindMatch={activeFindMatchTarget}
               notes={diffNotes}
               highlightedNoteId={notes.highlightedNoteId}
               onAnnotateLine={notes.startAnnotateLine}
@@ -183,19 +310,81 @@ export function DiffView({
   );
 }
 
-function CommitLogSection({ commitLog }: { commitLog: string }) {
+function CommitLogSection({
+  commitLog,
+  matches,
+  activeMatchIndex,
+  findOpen,
+}: {
+  commitLog: string;
+  matches: readonly { target: DiffSearchMatchTarget; start: number; end: number }[];
+  activeMatchIndex: number;
+  findOpen: boolean;
+}) {
+  const matchesByLine = new Map<number, Array<{ start: number; end: number; occurrenceIndex: number }>>();
+  matches.forEach((match, occurrenceIndex) => {
+    if (match.target.kind !== 'commit-log-line') return;
+    const lineNumber = Number.parseInt(match.target.itemId.replace('commit-log:', ''), 10);
+    if (Number.isNaN(lineNumber)) return;
+    const lineMatches = matchesByLine.get(lineNumber) ?? [];
+    lineMatches.push({ start: match.start, end: match.end, occurrenceIndex });
+    matchesByLine.set(lineNumber, lineMatches);
+  });
+
   return (
     <section className="diff-section">
       <h3 className="diff-section-title">Commits</h3>
       <div className="diff-pre diff-pre-log">
-        {commitLog.split('\n').map((line, i) => (
-          <div key={i} className="diff-line">
-            {line || ' '}
-          </div>
-        ))}
+        {commitLog.split('\n').map((line, i) => {
+          const lineMatches = findOpen ? matchesByLine.get(i) ?? [] : [];
+          const isActive = lineMatches.some((match) => match.occurrenceIndex === activeMatchIndex);
+          const hasMatch = lineMatches.length > 0;
+          return (
+            <div
+              id={`commit-log:${i}`}
+              key={i}
+              className={[
+                'diff-line',
+                hasMatch && 'viewer-find-row-match',
+                isActive && 'viewer-find-row-match--active',
+              ].filter(Boolean).join(' ')}
+            >
+              {lineMatches.length === 0 ? (line || ' ') : renderCommitLogFindFragments(line, lineMatches, activeMatchIndex)}
+            </div>
+          );
+        })}
       </div>
     </section>
   );
+}
+
+function renderCommitLogFindFragments(
+  text: string,
+  matches: readonly { start: number; end: number; occurrenceIndex: number }[],
+  activeOccurrence: number,
+): React.ReactNode[] {
+  if (matches.length === 0) return [text || ' '];
+  const fragments: React.ReactNode[] = [];
+  let cursor = 0;
+  matches.forEach((match) => {
+    const start = Math.max(match.start, cursor);
+    const end = Math.max(match.end, start);
+    if (start > cursor) fragments.push(text.slice(cursor, start));
+    if (end > start) {
+      fragments.push(
+        <mark
+          key={`${match.start}-${match.end}-${match.occurrenceIndex}`}
+          className={match.occurrenceIndex === activeOccurrence ? 'viewer-find-match viewer-find-match--active' : 'viewer-find-match'}
+          data-find-occurrence={match.occurrenceIndex}
+        >
+          {text.slice(start, end)}
+        </mark>,
+      );
+    }
+    cursor = Math.max(cursor, end);
+  });
+  if (cursor < text.length) fragments.push(text.slice(cursor));
+  return fragments.length > 0 ? fragments : [' '];
 }
 
 interface DiffSummaryBarProps {

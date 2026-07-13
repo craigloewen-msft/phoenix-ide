@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { TaskApprovalReader } from './TaskApprovalReader';
 import type { TaskApprovalReaderProps } from './TaskApprovalReader';
@@ -38,7 +38,7 @@ describe('TaskApprovalReader markdown rendering', () => {
       '```',
     ].join('\n'));
 
-    expect(await screen.findByTestId('mermaid-diagram')).toBeInTheDocument();
+    expect(container.querySelector('[data-testid="mermaid-diagram"]')).not.toBeNull();
     expect(container.querySelector('code.language-mermaid')).not.toBeInTheDocument();
   });
 });
@@ -160,5 +160,180 @@ describe('TaskApprovalReader feedback action emphasis', () => {
     expect(screen.queryByText('Approving...')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Approve and start here' })).toBeEnabled();
     expect(screen.getByRole('button', { name: 'Approve and start a new continuation conversation' })).toBeEnabled();
+  });
+});
+
+
+describe('TaskApprovalReader shared find integration', () => {
+  it('opens shared find and restores focus to the opener on Escape', async () => {
+    renderTaskApprovalReader('# Plan\n\nalpha\nbeta alpha');
+
+    const findButton = screen.getByRole('button', { name: 'Find in task approval' });
+    findButton.focus();
+    fireEvent.click(findButton);
+
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha' } });
+
+    await waitFor(() => expect(input).toHaveValue('alpha'));
+
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(findButton).toHaveFocus();
+  });
+
+  it('preserves original task text when overlapping find fragments are highlighted', async () => {
+    renderTaskApprovalReader('# Plan\n\nbanana');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'ana' } });
+
+    await waitFor(() => expect(screen.getByText('banana')).toBeInTheDocument());
+    await waitFor(() => expect(document.querySelectorAll('mark').length).toBe(1));
+  });
+
+  it('lets find Escape close the find bar without dismissing the approval reader or note dialog precedence', () => {
+    renderTaskApprovalReader('# Plan\n\nalpha');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    expect(screen.getByRole('textbox', { name: 'Find in viewer' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /add note to line 1/i }));
+    expect(screen.getByPlaceholderText('Add your note...')).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.getByRole('textbox', { name: 'Find in viewer' })).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText('Add your note...')).not.toBeInTheDocument();
+    expect(screen.getByText('Review task')).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).not.toBeInTheDocument();
+    expect(screen.getByText('Review task')).toBeInTheDocument();
+  });
+
+  it('leaves repeated Ctrl/Cmd+F routed to the existing task find input', async () => {
+    renderTaskApprovalReader('# Plan\n\nalpha\nbeta alpha');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha' } });
+
+    expect(input).toHaveFocus();
+    fireEvent.keyDown(window, { key: 'f', ctrlKey: true, bubbles: true, cancelable: true });
+    await waitFor(() => expect(input).toHaveFocus());
+    expect((input as HTMLInputElement).selectionStart).toBe((input as HTMLInputElement).selectionEnd);
+  });
+
+  it('does not open find behind task-approval dialogs', () => {
+    renderTaskApprovalReader('# Plan\n\nalpha');
+
+    fireEvent.click(screen.getByRole('button', { name: /add note to line 1/i }));
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    fireEvent.keyDown(cancel, { key: 'f', ctrlKey: true, bubbles: true, cancelable: true });
+    expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull();
+  });
+
+  it('clears task-plan marks when find closes', async () => {
+    renderTaskApprovalReader('# Plan\n\nbanana');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'ana' } });
+    await waitFor(() => expect(document.querySelectorAll('mark').length).toBe(1));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(document.querySelector('mark')).toBeNull();
+  });
+
+  it('resets task find state when the plan content changes under the same mounted reader', async () => {
+    const { rerender } = renderTaskApprovalReader('# Plan\n\nalpha');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
+
+    rerender(
+      <TaskApprovalReader
+        title="Task"
+        priority="high"
+        plan="# Plan\n\nbeta"
+        onApprove={vi.fn()}
+        onReject={vi.fn()}
+        onSendFeedback={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(screen.queryByText('1 of 1')).not.toBeInTheDocument();
+  });
+
+  it('renders inline-code and fenced-code text visibly in the task plan surface', () => {
+    renderTaskApprovalReader([
+      '# Plan',
+      '',
+      'Use `alpha` inline and [alpha link](https://example.com).',
+      '',
+      '```ts',
+      'const alpha = true;',
+      '```',
+    ].join('\n'));
+
+    expect(screen.getByText('alpha link')).toBeInTheDocument();
+    expect(screen.getByText('const')).toBeInTheDocument();
+    expect(screen.getByText('true')).toBeInTheDocument();
+  });
+
+  it('drives task find counts and active navigation from projected markdown blocks', async () => {
+    const originalScrollIntoView = HTMLElement.prototype.scrollIntoView;
+    const scrollIntoView = vi.fn();
+    HTMLElement.prototype.scrollIntoView = scrollIntoView;
+    try {
+    renderTaskApprovalReader([
+      '# Plan',
+      '',
+      'Use **alpha** in prose.',
+      '',
+      '```ts',
+      'const alpha = true;',
+      '```',
+    ].join('\n'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 2')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('2 of 2')).toBeInTheDocument();
+    await waitFor(() => expect(scrollIntoView).toHaveBeenCalled());
+    } finally {
+      HTMLElement.prototype.scrollIntoView = originalScrollIntoView;
+    }
+  });
+
+  it('preserves exact spacing offsets between projected task text and rendered highlights', async () => {
+    renderTaskApprovalReader('# Plan\n\nfoo  bar');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: '  b' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 1')).toBeInTheDocument());
+    const mark = document.querySelector('mark');
+    expect(mark).not.toBeNull();
+    expect(mark?.textContent).toBe('  b');
+    expect(screen.getByText((_, element) => element?.textContent === 'foo  bar')).toBeInTheDocument();
+  });
+
+  it('renders only one notes badge when notes exist', () => {
+    renderTaskApprovalReader('# Plan\n\nAdd the thing.');
+
+    fireEvent.click(screen.getByRole('button', { name: /add note to line 1/i }));
+    fireEvent.change(screen.getByPlaceholderText('Add your note...'), {
+      target: { value: 'Please adjust this plan.' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Add Note' }));
+
+    expect(screen.getAllByRole('button', { name: '1 notes' })).toHaveLength(1);
   });
 });
