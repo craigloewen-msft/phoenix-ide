@@ -452,7 +452,15 @@ async fn dispatch_with_spawn_mode(
             wait_seconds,
             read_args,
         } => run_wait(&handle_id, wait_seconds, read_args, &ctx).await,
-        BashRequest::Kill { handle_id, signal } => run_kill(&handle_id, signal, &ctx).await,
+        BashRequest::Kill { handle_id, signal } => {
+            run_kill(
+                &handle_id,
+                signal,
+                Duration::from_secs(KILL_RESPONSE_TIMEOUT_SECONDS),
+                &ctx,
+            )
+            .await
+        }
     }
 }
 
@@ -934,7 +942,12 @@ async fn run_wait(
 // Kill
 // ---------------------------------------------------------------------------
 
-async fn run_kill(handle_id: &str, signal: KillSignal, ctx: &ToolContext) -> ToolOutput {
+async fn run_kill(
+    handle_id: &str,
+    signal: KillSignal,
+    kill_response_timeout: Duration,
+    ctx: &ToolContext,
+) -> ToolOutput {
     let handle = match lookup_handle(ctx, handle_id).await {
         Ok(h) => h,
         Err(e) => return e.into_tool_output(),
@@ -986,7 +999,7 @@ async fn run_kill(handle_id: &str, signal: KillSignal, ctx: &ToolContext) -> Too
             )
             .await
         }
-        () = tokio::time::sleep(Duration::from_secs(KILL_RESPONSE_TIMEOUT_SECONDS)) => {
+        () = tokio::time::sleep(kill_response_timeout) => {
             // Mark kill_pending_kernel via the foundation helper.
             // The waiter task remains alive — a late exit will eventually
             // demote the handle to tombstoned.
@@ -1674,8 +1687,15 @@ mod tests {
             None,
         );
 
+        // The `trap '' TERM` sets SIGTERM to SIG_IGN, inherited by the child
+        // `sleep`, so the whole process group ignores TERM. The kill below
+        // must arrive AFTER the trap builtin has run, or SIGTERM hits a
+        // group with the default disposition and kills it — producing a fast
+        // exit and a `Terminal` edge instead of `KillPendingKernel`. Announce
+        // readiness on stdout after installing the trap and wait for the
+        // marker rather than betting on a fixed sleep (which races under load).
         let run = run_run(
-            "trap '' TERM; sleep 3600",
+            "trap '' TERM; echo trap-installed; sleep 3600",
             None,
             0,
             ReadArgs::default(),
@@ -1689,12 +1709,50 @@ mod tests {
         let spawned = rx.recv().await.expect("spawned event");
         assert_eq!(spawned.phase, BashLifecyclePhase::Spawned);
         assert_eq!(spawned.work_scope, ctx.work_scope);
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
+        // Wait for the trap-installed marker to appear in the ring. Deterministic
+        // proof the trap is in place; no wall-clock assumption about bash startup.
+        let ready_handle = lookup_handle(&ctx, &handle_id)
+            .await
+            .expect("lookup handle for readiness");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                {
+                    let state = ready_handle.state().await;
+                    if let HandleState::Live(live) = state.as_ref() {
+                        let ring = live.ring.lock().await;
+                        if ring
+                            .since(0)
+                            .lines
+                            .iter()
+                            .any(|l| l.bytes == b"trap-installed")
+                        {
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("trap-installed marker did not appear within 10s");
+
+        // The process ignores TERM, so `exit_rx` can never fire on this kill —
+        // the kill-response timeout branch always wins. A short timeout drives
+        // it to `KillPendingKernel` in milliseconds instead of the production
+        // 30s, with no loss of determinism (nothing races the timeout here).
         let kill_task = tokio::spawn({
             let ctx = ctx.clone();
             let handle_id = handle_id.clone();
-            async move { run_kill(&handle_id, KillSignal::Term, &ctx).await }
+            async move {
+                run_kill(
+                    &handle_id,
+                    KillSignal::Term,
+                    Duration::from_millis(500),
+                    &ctx,
+                )
+                .await
+            }
         });
 
         let kill_pending = rx.recv().await.expect("kill-pending event");
@@ -1716,7 +1774,16 @@ mod tests {
         let live_state = handle.state().await;
         assert!(matches!(live_state.as_ref(), HandleState::Live(_)));
 
-        let _ = run_kill(&handle_id, KillSignal::Kill, &ctx).await;
+        // SIGKILL cannot be ignored, so the process exits and the `exited`
+        // branch wins well before any timeout — keep the production timeout so
+        // this call never emits a spurious KillPendingKernel ahead of Terminal.
+        let _ = run_kill(
+            &handle_id,
+            KillSignal::Kill,
+            Duration::from_secs(KILL_RESPONSE_TIMEOUT_SECONDS),
+            &ctx,
+        )
+        .await;
         let terminal = rx.recv().await.expect("terminal event");
         assert_eq!(terminal.phase, BashLifecyclePhase::Terminal);
         assert!(terminal.phase.schedules_reconciliation());
