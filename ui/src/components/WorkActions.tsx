@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { requestActivePrSelectorOpen } from './activePrSelectorIntent';
 import { api } from '../api';
 import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatus';
 import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
@@ -113,11 +114,36 @@ export function WorkControlBar({
   const [markingMerged, setMarkingMerged] = useState(false);
   const [abandoning, setAbandoning] = useState(false);
   const [capturing, setCapturing] = useState(false);
+  const [openSelectorAfterRefresh, setOpenSelectorAfterRefresh] = useState(false);
   const isLoading = markingMerged || abandoning;
   const { openDiffFullscreen } = useViewerSlotCommands();
 
   const prLoading = prStatusHandle.state.status === 'loading';
   const prStatus = prStatusHandle.state.status === 'ready' ? prStatusHandle.state.prStatus : null;
+  const activePr = prStatusHandle.activePrSummary;
+  const legacyActivePrNumber = !prStatusHandle.activeSelection && prStatus?.found
+    ? (prStatus.number ?? prStatus.pr?.number ?? null)
+    : null;
+  const activePrNumber = activePr?.pr_number ?? legacyActivePrNumber;
+  const activePrLabel = activePrNumber ? `PR #${activePrNumber}` : 'PR';
+  const selection = prStatusHandle.activeSelection;
+  const prSpecificActionsEnabled = activePrNumber !== null && !prStatusHandle.ambiguous;
+  const canShowPrDiff = !!activePr && prSpecificActionsEnabled;
+  const associatedPrs = useMemo(() => selection?.associated_prs ?? [], [selection?.associated_prs]);
+  const actionablePrs = useMemo(
+    () => associatedPrs.filter((pr) => pr.display_state === 'open' || pr.display_state === 'draft'),
+    [associatedPrs],
+  );
+  const diffLabel = useMemo(
+    () => (canShowPrDiff ? `${activePrLabel} Diff` : 'Workspace Diff'),
+    [activePrLabel, canShowPrDiff],
+  );
+  const cleanupBlockedByAmbiguity = prStatusHandle.ambiguous && actionablePrs.length > 1 && !activePr;
+  useEffect(() => {
+    if (!openSelectorAfterRefresh || !prStatusHandle.ambiguous) return;
+    requestActivePrSelectorOpen();
+    setOpenSelectorAfterRefresh(false);
+  }, [openSelectorAfterRefresh, prStatusHandle.ambiguous]);
   const disposition = deriveWorkDisposition({
     convModeLabel,
     phaseType,
@@ -127,7 +153,6 @@ export function WorkControlBar({
     canSendMessage: !!onSendMessage,
     workChange: prStatus?.work_change ?? null,
   });
-  if (!disposition.visible) return null;
 
   const isBranch = convModeLabel === 'Branch';
   const primaryClass = (role: 'review' | 'resolve' | 'clean_up' | 'abandon') =>
@@ -150,7 +175,39 @@ export function WorkControlBar({
     }
   };
 
+  const mixedAssociatedStateSummary = useMemo(() => {
+    if (associatedPrs.length < 2) return null;
+    const states = new Set(associatedPrs.map((pr) => pr.display_state));
+    if (states.size < 2) return null;
+    const labels = [
+      actionablePrs.length > 0 ? `${actionablePrs.length} open/draft` : null,
+      associatedPrs.some((pr) => pr.display_state === 'merged') ? `${associatedPrs.filter((pr) => pr.display_state === 'merged').length} merged` : null,
+      associatedPrs.some((pr) => pr.display_state === 'closed') ? `${associatedPrs.filter((pr) => pr.display_state === 'closed').length} closed` : null,
+    ].filter(Boolean);
+    return labels.length > 1 ? `Associated PRs: ${labels.join(' · ')}. Cleanup still applies only to this task branch.` : null;
+  }, [actionablePrs, associatedPrs]);
+
+  if (!disposition.visible) return null;
+
+  const terminalActionStillSafe = async (): Promise<boolean> => {
+    const latest = await prStatusHandle.refresh();
+    if (!latest) return false;
+    const actionable = (latest.associated_prs ?? []).filter(
+      (pr) => pr.display_state === 'open' || pr.display_state === 'draft',
+    );
+    if (actionable.length > 1 && !latest.active_pr) {
+      setOpenSelectorAfterRefresh(true);
+      setError('Select an active PR before cleaning up or abandoning this task.');
+      return false;
+    }
+    return true;
+  };
+
   const note = disposition.note;
+  const addressFeedbackLabel = capturing ? `Capturing ${activePrLabel}…` : `Address ${activePrLabel} feedback`;
+  const addressFeedbackAriaLabel = canShowPrDiff
+    ? `${addressFeedbackLabel}. Review ${activePrLabel} diff separately if needed.`
+    : addressFeedbackLabel;
 
   return (
     <div className="work-actions-bar">
@@ -161,36 +218,49 @@ export function WorkControlBar({
         <button
           className={`work-actions-btn work-actions-view-diff${primaryClass('review')}`}
           data-testid="view-diff-button"
-          onClick={() => openDiffFullscreen()}
+          onClick={() => openDiffFullscreen('workspace')}
         >
-          View Diff
+          Workspace Diff
         </button>
+        {canShowPrDiff && (
+          <button
+            className="work-actions-btn work-actions-view-diff"
+            data-testid="view-active-pr-diff-button"
+            aria-label={`View ${activePrLabel} diff compared with its base branch`}
+            onClick={() => openDiffFullscreen('active_pr')}
+          >
+            {diffLabel}
+          </button>
+        )}
       </div>
 
       {/* RESOLVE zone — only when the disposition pushes forward (idle). */}
       {disposition.primary === 'resolve' && disposition.resolve && (
         <div className="work-actions-zone work-actions-zone--resolve">
-          {disposition.resolve.kind === 'address_feedback' && (
+          {disposition.resolve.kind === 'address_feedback' && prSpecificActionsEnabled && (
             <button
               type="button"
               className={`work-actions-btn work-actions-address${primaryClass('resolve')}`}
               data-testid="address-feedback-button"
+              aria-label={addressFeedbackAriaLabel}
               disabled={capturing}
               onClick={handleAddressFeedback}
             >
-              {capturing ? 'Capturing...' : 'Address feedback'}
+              <span className="work-actions-address-copy">{addressFeedbackLabel}</span>
               {freshnessLabel && <span className="work-actions-pr-freshness">{freshnessLabel}</span>}
               <CoverageMarker marker={coverageMarker} />
             </button>
           )}
-          {(disposition.resolve.kind === 'merge_pr' ||
-            disposition.resolve.kind === 'open_pr' ||
-            disposition.resolve.kind === 'create_pr') && (
-            <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
-          )}
+          {!prStatusHandle.ambiguous &&
+            (disposition.resolve.kind === 'merge_pr' ||
+              disposition.resolve.kind === 'open_pr' ||
+              disposition.resolve.kind === 'create_pr') && (
+              <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
+            )}
           {/* Non-glowing secondary link-out beside the Address-feedback primary
               (e.g. Merge on a passing PR). REQ-WAB-003: never a second primary. */}
-          {disposition.secondaryResolve &&
+          {!prStatusHandle.ambiguous &&
+            disposition.secondaryResolve &&
             (disposition.secondaryResolve.kind === 'merge_pr' ||
               disposition.secondaryResolve.kind === 'open_pr') && (
               <ResolveLink
@@ -204,7 +274,7 @@ export function WorkControlBar({
 
       {/* FINISH zone */}
       <div className="work-actions-zone work-actions-zone--finish">
-        {disposition.showCleanUp && (
+        {!cleanupBlockedByAmbiguity && disposition.showCleanUp && (
           <>
             <button
               className={`work-actions-btn work-actions-clean-up${primaryClass('clean_up')}`}
@@ -214,6 +284,7 @@ export function WorkControlBar({
                 setError(null);
                 setMarkingMerged(true);
                 try {
+                  if (!(await terminalActionStillSafe())) return;
                   await api.markMerged(conversationId);
                 } catch (err) {
                   setError(err instanceof Error ? err.message : 'Failed to mark as merged');
@@ -227,7 +298,7 @@ export function WorkControlBar({
             <InfoHint text={cleanUpHintText(isBranch)} />
           </>
         )}
-        {disposition.showAbandon && (
+        {!cleanupBlockedByAmbiguity && disposition.showAbandon && (
           <>
             <button
               className={`work-actions-btn work-actions-abandon${primaryClass('abandon')}`}
@@ -241,6 +312,7 @@ export function WorkControlBar({
                 setError(null);
                 setAbandoning(true);
                 try {
+                  if (!(await terminalActionStillSafe())) return;
                   await api.abandonTask(conversationId);
                 } catch (err) {
                   setError(err instanceof Error ? err.message : 'Failed to abandon task');
@@ -270,6 +342,19 @@ export function WorkControlBar({
         <span className="work-actions-pr-note">{note.text}</span>
       )}
 
+      {prStatusHandle.ambiguous && selection && (
+        <button
+          type="button"
+          className="work-actions-pr-note work-actions-pr-note--warning work-actions-pr-note-button"
+          data-testid="active-pr-ambiguity-note"
+          onClick={() => requestActivePrSelectorOpen()}
+        >
+          Multiple actionable PRs are associated with this work. Select one before PR-specific actions.
+        </button>
+      )}
+      {mixedAssociatedStateSummary && (
+        <span className="work-actions-pr-note" data-testid="mixed-associated-pr-summary">{mixedAssociatedStateSummary}</span>
+      )}
       {error && <div className="work-actions-error">{error}</div>}
     </div>
   );

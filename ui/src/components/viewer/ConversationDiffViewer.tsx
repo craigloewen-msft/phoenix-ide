@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { AlertCircle, Loader2 } from 'lucide-react';
 import { api } from '../../api';
 import { ViewerShell } from './ViewerShell';
@@ -22,6 +22,8 @@ interface ConversationDiffViewerProps {
   onSendNotes: (notes: string) => void;
   inline?: boolean | undefined;
   takeover?: boolean | undefined;
+  target?: 'workspace' | 'active_pr' | undefined;
+  activePrIdentity?: string | null | undefined;
 }
 
 /**
@@ -37,22 +39,29 @@ export function ConversationDiffViewer({
   onSendNotes,
   inline,
   takeover,
+  target = 'workspace',
+  activePrIdentity = null,
 }: ConversationDiffViewerProps) {
   const [state, setState] = useState<LoadState>({ status: 'loading' });
 
+  const loadDiff = useCallback(() => {
+    setState({ status: 'loading' });
+    return (target === 'active_pr'
+      ? api.getActivePrDiff(conversationId)
+      : api.getConversationDiff(conversationId))
+      .then((payload) => ({ ok: true as const, payload }))
+      .catch((err: unknown) => ({ ok: false as const, message: err instanceof Error ? err.message : 'Failed to load diff' }));
+  }, [conversationId, target]);
+
   useEffect(() => {
     let cancelled = false;
-    setState({ status: 'loading' });
-    api
-      .getConversationDiff(conversationId)
-      .then((payload) => { if (!cancelled) setState({ status: 'ready', payload, conversationId }); })
-      .catch((err: unknown) => {
-        if (!cancelled) {
-          setState({ status: 'error', message: err instanceof Error ? err.message : 'Failed to load diff', conversationId });
-        }
-      });
+    void loadDiff().then((result) => {
+      if (cancelled) return;
+      if (result.ok) setState({ status: 'ready', payload: result.payload, conversationId });
+      else setState({ status: 'error', message: result.message, conversationId });
+    });
     return () => { cancelled = true; };
-  }, [conversationId]);
+  }, [conversationId, activePrIdentity, loadDiff]);
 
   // Treat a resolved state from a previous conversation as still-loading until
   // the effect refetches for the current conversationId.
@@ -64,6 +73,7 @@ export function ConversationDiffViewer({
       <DiffView
         open
         comparator={p.comparator}
+        label={p.label ?? (target === 'active_pr' ? 'PR Diff' : 'Workspace Diff')}
         commitLog={p.commit_log}
         committedDiff={p.committed_diff}
         committedTruncatedKib={p.committed_truncated_kib}
@@ -82,8 +92,8 @@ export function ConversationDiffViewer({
   return (
     <ViewerShell
       mode={inline ? 'inline' : takeover ? 'takeover' : 'overlay'}
-      ariaLabel="Worktree diff"
-      title="Diff"
+      ariaLabel={target === 'active_pr' ? 'Pull request diff' : 'Worktree diff'}
+      title={target === 'active_pr' ? 'PR Diff' : 'Workspace Diff'}
       noteCount={0}
       onToggleNotes={() => undefined}
       onSend={() => undefined}
@@ -94,7 +104,14 @@ export function ConversationDiffViewer({
           <div className="viewer-error">
             <AlertCircle size={32} />
             <span>{state.message}</span>
-            <button onClick={onClose}>Close</button>
+            {target === 'active_pr' && <span>Compare against the selected PR base branch when available.</span>}
+            <div className="viewer-error-actions">
+              <button onClick={() => { void loadDiff().then((result) => {
+                if (result.ok) setState({ status: 'ready', payload: result.payload, conversationId });
+                else setState({ status: 'error', message: result.message, conversationId });
+              }); }}>Retry</button>
+              <button onClick={onClose}>Close</button>
+            </div>
           </div>
         ) : (
           <div className="viewer-loading">

@@ -73,8 +73,13 @@ struct GhFailure {
 
 trait GhClient {
     fn pr_list_for_head(&self, branch: &str) -> Result<Vec<GhPrListItem>, GhFailure>;
-    fn pr_view(&self, number: u64) -> Result<GhPrListItem, GhFailure>;
-    fn pr_checks(&self, number: u64) -> Result<Vec<GhPrCheck>, GhFailure>;
+    fn pr_list_for_head_in_repo(
+        &self,
+        repository_identity: &str,
+        branch: &str,
+    ) -> Result<Vec<GhPrListItem>, GhFailure>;
+    fn pr_view(&self, target: &GhPrTarget) -> Result<GhPrListItem, GhFailure>;
+    fn pr_checks(&self, target: &GhPrTarget) -> Result<Vec<GhPrCheck>, GhFailure>;
     fn repo_view(&self) -> Result<GhRepoView, GhFailure>;
     fn issue_comments(
         &self,
@@ -101,13 +106,29 @@ trait GhClient {
         repo: &GhRepoView,
         number: u64,
     ) -> Result<PrFeedbackStatus, GhFailure>;
-    fn failed_log_snippet(&self, check: &GhPrCheck)
-        -> Result<Option<PrCheckLogSnippet>, GhFailure>;
+    fn failed_log_snippet(
+        &self,
+        target: &GhPrTarget,
+        check: &GhPrCheck,
+    ) -> Result<Option<PrCheckLogSnippet>, GhFailure>;
 }
 
 struct ShellGhClient<'a> {
     cwd: &'a Path,
     deadline: Option<Instant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GhPrTarget {
+    repo_owner: String,
+    repo_name: String,
+    pr_number: u64,
+}
+
+impl GhPrTarget {
+    fn repo_arg(&self) -> String {
+        format!("{}/{}", self.repo_owner, self.repo_name)
+    }
 }
 
 impl<'a> ShellGhClient<'a> {
@@ -216,13 +237,40 @@ impl GhClient for ShellGhClient<'_> {
         )
     }
 
-    fn pr_view(&self, number: u64) -> Result<GhPrListItem, GhFailure> {
-        let number = number.to_string();
+    fn pr_list_for_head_in_repo(
+        &self,
+        repository_identity: &str,
+        branch: &str,
+    ) -> Result<Vec<GhPrListItem>, GhFailure> {
+        self.run_json(
+            &[
+                "pr",
+                "list",
+                "--repo",
+                repository_identity,
+                "--head",
+                branch,
+                "--state",
+                "all",
+                "--limit",
+                "20",
+                "--json",
+                "number,title,url,state,isDraft,baseRefName,headRefName,updatedAt",
+            ],
+            "repository-qualified PR list",
+        )
+    }
+
+    fn pr_view(&self, target: &GhPrTarget) -> Result<GhPrListItem, GhFailure> {
+        let number = target.pr_number.to_string();
+        let repo = target.repo_arg();
         self.run_json(
             &[
                 "pr",
                 "view",
                 &number,
+                "--repo",
+                &repo,
                 "--json",
                 "number,title,url,state,isDraft,baseRefName,headRefName,updatedAt",
             ],
@@ -230,14 +278,17 @@ impl GhClient for ShellGhClient<'_> {
         )
     }
 
-    fn pr_checks(&self, number: u64) -> Result<Vec<GhPrCheck>, GhFailure> {
-        let number = number.to_string();
+    fn pr_checks(&self, target: &GhPrTarget) -> Result<Vec<GhPrCheck>, GhFailure> {
+        let number = target.pr_number.to_string();
+        let repo = target.repo_arg();
         let out = run_gh_raw_with_deadline(
             self.cwd,
             &[
                 "pr",
                 "checks",
                 &number,
+                "--repo",
+                &repo,
                 "--json",
                 "name,state,bucket,link,description,workflow,startedAt,completedAt",
                 "--watch=false",
@@ -386,6 +437,7 @@ impl GhClient for ShellGhClient<'_> {
 
     fn failed_log_snippet(
         &self,
+        target: &GhPrTarget,
         check: &GhPrCheck,
     ) -> Result<Option<PrCheckLogSnippet>, GhFailure> {
         if classify_check(check) != CheckBucket::Failing {
@@ -417,9 +469,19 @@ impl GhClient for ShellGhClient<'_> {
         // record *why* at debug, so a logless bundle is diagnosable (bad job id,
         // permissions, expired logs) rather than silently indistinguishable from
         // an intentional URL-only provider.
+        let repo = target.repo_arg();
         match run_gh_raw_with_deadline(
             self.cwd,
-            &["run", "view", &run_id, "--job", &job_id, "--log-failed"],
+            &[
+                "run",
+                "view",
+                &run_id,
+                "--repo",
+                &repo,
+                "--job",
+                &job_id,
+                "--log-failed",
+            ],
             Some(job_deadline),
         ) {
             Ok(out) if out.status.success() && !out.stdout.trim().is_empty() => {
@@ -534,6 +596,48 @@ pub(crate) fn get_pr_status_for_branch(cwd: &Path, branch_name: &str) -> PrStatu
     }
     get_pr_status_with_client(&ShellGhClient::new(cwd), branch_name)
 }
+pub(crate) fn get_pr_status_for_repo_branch(
+    cwd: &Path,
+    repository_identity: &str,
+    branch_name: &str,
+) -> PrStatusRefresh {
+    get_pr_status_for_repo_branch_with_client(
+        &ShellGhClient::new(cwd),
+        repository_identity,
+        branch_name,
+    )
+}
+
+fn get_pr_status_for_repo_branch_with_client(
+    client: &dyn GhClient,
+    repository_identity: &str,
+    branch_name: &str,
+) -> PrStatusRefresh {
+    let attempted_at = Utc::now().to_rfc3339();
+    let prs = match client.pr_list_for_head_in_repo(repository_identity, branch_name) {
+        Ok(prs) => prs,
+        Err(error) => {
+            return PrStatusRefresh {
+                response: unavailable_at(error.kind.unavailable_reason(), attempted_at),
+                observations: Vec::new(),
+            };
+        }
+    };
+    let requested_repo = GhRepoView {
+        owner: GhRepoOwner {
+            login: repository_identity
+                .split_once('/')
+                .map_or("", |(owner, _)| owner)
+                .to_string(),
+        },
+        name: repository_identity
+            .split_once('/')
+            .map_or("", |(_, repo)| repo)
+            .to_string(),
+    };
+    let canonical_repo = client.repo_view().unwrap_or(requested_repo);
+    status_refresh_from_prs(client, prs, &canonical_repo, attempted_at)
+}
 
 pub(crate) fn get_pr_status_for_branch_with_deadline(
     cwd: &Path,
@@ -547,6 +651,108 @@ pub(crate) fn get_pr_status_for_branch_with_deadline(
         };
     }
     get_pr_status_with_client(&ShellGhClient::with_deadline(cwd, deadline), branch_name)
+}
+
+pub(crate) fn get_pr_status_for_pr(
+    cwd: &Path,
+    repo_owner: &str,
+    repo_name: &str,
+    pr_number: u64,
+) -> PrStatusRefresh {
+    if run_git(cwd, &["rev-parse", "--is-inside-work-tree"]).is_err() {
+        return PrStatusRefresh {
+            response: PrStatusResponse::unavailable(PrUnavailableReason::NotGitRepo),
+            observations: Vec::new(),
+        };
+    }
+    get_pr_status_for_target_with_client(
+        &ShellGhClient::new(cwd),
+        &GhPrTarget {
+            repo_owner: repo_owner.to_string(),
+            repo_name: repo_name.to_string(),
+            pr_number,
+        },
+    )
+}
+
+fn get_pr_status_for_target_with_client(
+    client: &dyn GhClient,
+    target: &GhPrTarget,
+) -> PrStatusRefresh {
+    let attempted_at = Utc::now().to_rfc3339();
+    let pr = match client.pr_view(target) {
+        Ok(pr) => pr,
+        Err(e) => {
+            tracing::debug!(repo = %target.repo_arg(), pr = target.pr_number, error = %e.message, "gh pr view failed");
+            return PrStatusRefresh {
+                response: unavailable_at(e.kind.unavailable_reason(), attempted_at),
+                observations: Vec::new(),
+            };
+        }
+    };
+    let display_state = normalize_pr_display_state(&pr.state, pr.is_draft);
+    let checks = if matches!(display_state, PrDisplayState::Open) {
+        match client.pr_checks(target) {
+            Ok(checks) => capture_checks(&checks, capture_log_snippets(client, target, &checks)),
+            Err(e) => {
+                tracing::debug!(pr = target.pr_number, error = %e.message, "gh pr checks could not run");
+                unknown_checks()
+            }
+        }
+    } else {
+        unknown_checks()
+    };
+    let observations = vec![WorkScopePrObservation {
+        repo_owner: target.repo_owner.clone(),
+        repo_name: target.repo_name.clone(),
+        pr_number: pr.number,
+        title: pr.title.clone(),
+        url: pr.url.clone(),
+        state: pr.state.clone(),
+        draft: pr.is_draft,
+        display_state,
+        base: pr.base_ref_name.clone(),
+        head: pr.head_ref_name.clone(),
+        github_updated_at: pr.updated_at.clone(),
+    }];
+    PrStatusRefresh {
+        response: fresh_response(gh_pr_to_identity(&pr), checks, attempted_at),
+        observations,
+    }
+}
+
+fn status_refresh_from_prs(
+    client: &dyn GhClient,
+    prs: Vec<GhPrListItem>,
+    repo: &GhRepoView,
+    attempted_at: String,
+) -> PrStatusRefresh {
+    let Some(pr) = choose_pr(prs.clone()) else {
+        return PrStatusRefresh {
+            response: not_found_at(attempted_at),
+            observations: Vec::new(),
+        };
+    };
+    let display_state = normalize_pr_display_state(&pr.state, pr.is_draft);
+    let checks = if matches!(display_state, PrDisplayState::Open) {
+        match client.pr_checks(&gh_pr_target(repo, pr.number)) {
+            Ok(checks) => capture_checks(&checks, Vec::new()),
+            Err(error) => {
+                tracing::debug!(pr = pr.number, error = %error.message, "gh pr checks could not run");
+                unknown_checks()
+            }
+        }
+    } else {
+        unknown_checks()
+    };
+    let observations = prs
+        .into_iter()
+        .map(|pr| gh_pr_to_observation(repo, pr))
+        .collect();
+    PrStatusRefresh {
+        response: fresh_response(gh_pr_to_identity(&pr), checks, attempted_at),
+        observations,
+    }
 }
 
 fn get_pr_status_with_client(client: &dyn GhClient, branch_name: &str) -> PrStatusRefresh {
@@ -568,9 +774,14 @@ fn get_pr_status_with_client(client: &dyn GhClient, branch_name: &str) -> PrStat
             observations: Vec::new(),
         };
     };
+    let repo = client.repo_view();
     let display_state = normalize_pr_display_state(&pr.state, pr.is_draft);
     let checks = if matches!(display_state, PrDisplayState::Open) {
-        match client.pr_checks(pr.number) {
+        let checks_result = match repo.as_ref() {
+            Ok(repo) => client.pr_checks(&gh_pr_target(repo, pr.number)),
+            Err(error) => Err((*error).clone()),
+        };
+        match checks_result {
             Ok(checks) => capture_checks(&checks, Vec::new()),
             Err(e) => {
                 tracing::debug!(pr = pr.number, error = %e.message, "gh pr checks could not run");
@@ -581,7 +792,7 @@ fn get_pr_status_with_client(client: &dyn GhClient, branch_name: &str) -> PrStat
         unknown_checks()
     };
 
-    let observations: Vec<_> = match client.repo_view() {
+    let observations: Vec<_> = match repo {
         Ok(repo) => prs
             .iter()
             .cloned()
@@ -609,6 +820,8 @@ pub(crate) struct PrAutoFixCapture {
 
 pub(crate) fn fetch_pr_feedback_for_pr(
     worktree: &Path,
+    repo_owner: &str,
+    repo_name: &str,
     pr_number: u64,
 ) -> Result<PrFeedbackSummary, PrMonitorError> {
     if !worktree.is_dir() || run_git(worktree, &["rev-parse", "--is-inside-work-tree"]).is_err() {
@@ -616,11 +829,20 @@ pub(crate) fn fetch_pr_feedback_for_pr(
             "Conversation worktree is not a git repository".to_string(),
         ));
     }
-    Ok(fetch_pr_feedback(&ShellGhClient::new(worktree), pr_number))
+    Ok(fetch_pr_feedback(
+        &ShellGhClient::new(worktree),
+        &GhPrTarget {
+            repo_owner: repo_owner.to_string(),
+            repo_name: repo_name.to_string(),
+            pr_number,
+        },
+    ))
 }
 
 pub(crate) fn fetch_pr_feedback_status_for_pr(
     worktree: &Path,
+    repo_owner: &str,
+    repo_name: &str,
     pr_number: u64,
 ) -> Result<PrFeedbackStatus, PrMonitorError> {
     if !worktree.is_dir() || run_git(worktree, &["rev-parse", "--is-inside-work-tree"]).is_err() {
@@ -629,9 +851,12 @@ pub(crate) fn fetch_pr_feedback_status_for_pr(
         ));
     }
     let client = ShellGhClient::new(worktree);
-    let repo = client
-        .repo_view()
-        .map_err(|e| PrMonitorError::BadRequest(e.message))?;
+    let repo = GhRepoView {
+        owner: GhRepoOwner {
+            login: repo_owner.to_string(),
+        },
+        name: repo_name.to_string(),
+    };
     client
         .reaction_status(&repo, pr_number)
         .map_err(|e| PrMonitorError::BadRequest(e.message))
@@ -639,6 +864,8 @@ pub(crate) fn fetch_pr_feedback_status_for_pr(
 
 pub(crate) fn capture_pr_auto_fix_context_for_pr(
     worktree: &Path,
+    repo_owner: &str,
+    repo_name: &str,
     pr_number: u64,
     llm_language: phoenix_core::llm_language::LlmLanguage,
 ) -> Result<PrAutoFixCapture, PrMonitorError> {
@@ -648,25 +875,27 @@ pub(crate) fn capture_pr_auto_fix_context_for_pr(
         ));
     }
     let client = ShellGhClient::new(worktree);
-    let pr = client.pr_view(pr_number).map_err(|e| {
+    let repo = GhRepoView {
+        owner: GhRepoOwner {
+            login: repo_owner.to_string(),
+        },
+        name: repo_name.to_string(),
+    };
+    let target = gh_pr_target(&repo, pr_number);
+    let pr = client.pr_view(&target).map_err(|e| {
         let reason = e.kind.unavailable_reason();
         PrMonitorError::BadRequest(format!(
             "PR context unavailable: {}",
             unavailable_reason_message(&reason)
         ))
     })?;
-    let observation = match client.repo_view() {
-        Ok(repo) => Some(gh_pr_to_observation(&repo, pr.clone())),
-        Err(e) => {
-            tracing::debug!(pr = pr_number, error = %e.message, "gh repo view failed; associated PR auto-fix will not persist observation");
-            None
-        }
-    };
+    let observation = Some(gh_pr_to_observation(&repo, pr.clone()));
     let CapturedPrAutoFixContext {
         response,
         baseline,
         feedback_status,
-    } = match capture_pr_auto_fix_context_for_pr_item(worktree, pr, &client, llm_language) {
+    } = match capture_pr_auto_fix_context_for_pr_item(worktree, &target, pr, &client, llm_language)
+    {
         Ok(captured) => captured,
         Err(PrMonitorError::BadRequest(message)) => {
             if let Some(observation) = observation {
@@ -687,24 +916,7 @@ pub(crate) fn capture_pr_auto_fix_context_for_pr(
     })
 }
 
-pub(crate) fn capture_pr_auto_fix_context_for_branch(
-    worktree: &Path,
-    branch_name: &str,
-    llm_language: phoenix_core::llm_language::LlmLanguage,
-) -> Result<PrAutoFixCapture, PrMonitorError> {
-    if !worktree.is_dir() || run_git(worktree, &["rev-parse", "--is-inside-work-tree"]).is_err() {
-        return Err(PrMonitorError::BadRequest(
-            "Conversation worktree is not a git repository".to_string(),
-        ));
-    }
-    capture_pr_auto_fix_context_for_branch_with_client(
-        worktree,
-        branch_name,
-        &ShellGhClient::new(worktree),
-        llm_language,
-    )
-}
-
+#[cfg(test)]
 fn capture_pr_auto_fix_context_for_branch_with_client(
     worktree: &Path,
     branch_name: &str,
@@ -738,24 +950,34 @@ fn capture_pr_auto_fix_context_for_branch_with_client(
     let pr = choose_pr(prs).ok_or_else(|| {
         PrMonitorError::BadRequest("No pull request found for this branch".to_string())
     })?;
+    let target = repo.as_ref().map(|repo| gh_pr_target(repo, pr.number));
     let CapturedPrAutoFixContext {
         response,
         baseline,
         feedback_status,
-    } = capture_pr_auto_fix_context_for_pr_item(worktree, pr, client, llm_language).map_err(
-        |err| {
-            if let PrMonitorError::BadRequest(message) = err {
-                if !observations.is_empty() {
-                    return PrMonitorError::BadRequestWithObservations {
-                        message,
-                        observations: observations.clone(),
-                    };
-                }
-                return PrMonitorError::BadRequest(message);
+    } = capture_pr_auto_fix_context_for_pr_item(
+        worktree,
+        target.as_ref().ok_or_else(|| {
+            PrMonitorError::BadRequest(
+                "PR context unavailable: repository owner/name discovery failed".to_string(),
+            )
+        })?,
+        pr,
+        client,
+        llm_language,
+    )
+    .map_err(|err| {
+        if let PrMonitorError::BadRequest(message) = err {
+            if !observations.is_empty() {
+                return PrMonitorError::BadRequestWithObservations {
+                    message,
+                    observations: observations.clone(),
+                };
             }
-            err
-        },
-    )?;
+            return PrMonitorError::BadRequest(message);
+        }
+        err
+    })?;
     Ok(PrAutoFixCapture {
         response,
         observations,
@@ -772,6 +994,7 @@ struct CapturedPrAutoFixContext {
 
 fn capture_pr_auto_fix_context_for_pr_item(
     worktree: &Path,
+    target: &GhPrTarget,
     pr: GhPrListItem,
     client: &dyn GhClient,
     llm_language: phoenix_core::llm_language::LlmLanguage,
@@ -784,16 +1007,16 @@ fn capture_pr_auto_fix_context_for_pr_item(
     }
     let pr_updated_at = pr.updated_at.clone();
 
-    let raw_checks = match client.pr_checks(pr.number) {
+    let raw_checks = match client.pr_checks(target) {
         Ok(checks) => checks,
         Err(e) => {
             tracing::debug!(pr = pr.number, error = %e.message, "failed to capture PR checks for context");
             Vec::new()
         }
     };
-    let snippets = capture_log_snippets(client, &raw_checks);
+    let snippets = capture_log_snippets(client, target, &raw_checks);
     let checks = capture_checks(&raw_checks, snippets);
-    let feedback = fetch_pr_feedback(client, pr.number);
+    let feedback = fetch_pr_feedback(client, target);
     let feedback_status = feedback.feedback_status;
     let actionable_items: Vec<_> = feedback
         .items
@@ -805,6 +1028,8 @@ fn capture_pr_auto_fix_context_for_pr_item(
     let artifact = PrAutoFixContextArtifact {
         manifest_version: ARTIFACT_VERSION,
         fetched_at: fetched_at.clone(),
+        repo_owner: target.repo_owner.clone(),
+        repo_name: target.repo_name.clone(),
         pr: PrArtifactMetadata {
             number: pr.number,
             title: pr.title,
@@ -835,8 +1060,9 @@ fn capture_pr_auto_fix_context_for_pr_item(
         PrMonitorError::Internal(format!("Failed to create PR context directory: {e}"))
     })?;
     let safe_ts = fetched_at.replace([':', '.'], "-");
+    let repo_slug = pr_context_repo_slug(&target.repo_owner, &target.repo_name);
     let rel_path = format!(
-        ".phoenix/pr-context/pr-{}-{safe_ts}.json",
+        ".phoenix/pr-context/pr-{repo_slug}-{}-{safe_ts}.json",
         artifact.pr.number
     );
     let path = worktree.join(&rel_path);
@@ -845,7 +1071,7 @@ fn capture_pr_auto_fix_context_for_pr_item(
     std::fs::write(&path, body).map_err(|e| {
         PrMonitorError::Internal(format!("Failed to write PR context artifact: {e}"))
     })?;
-    prune_pr_context_bundles(&dir, artifact.pr.number, PR_CONTEXT_RETAIN);
+    prune_pr_context_bundles(&dir, &repo_slug, artifact.pr.number, PR_CONTEXT_RETAIN);
 
     let message = phoenix_core::llm_language::pr_auto_fix_instruction(llm_language, &rel_path);
     let baseline = artifact.baseline();
@@ -853,6 +1079,8 @@ fn capture_pr_auto_fix_context_for_pr_item(
         response: PrAutoFixContextResponse {
             artifact_path: rel_path,
             pr_number: artifact.pr.number,
+            repo_owner: target.repo_owner.clone(),
+            repo_name: target.repo_name.clone(),
             message,
         },
         baseline,
@@ -867,14 +1095,70 @@ fn capture_pr_auto_fix_context_for_pr_item(
 /// accumulate unbounded — one bundle per "Address PR feedback & CI" click.
 const PR_CONTEXT_RETAIN: usize = 3;
 
-/// Delete all but the newest `keep` context bundles for `pr_number` in `dir`.
-/// Bundles are named `pr-{n}-{ts}.json` with a lexicographically-sortable
-/// timestamp, so filename order is chronological order. The `pr-{n}-` prefix
-/// (trailing dash) keeps `pr-1-` from matching `pr-12-`. Best-effort: an
-/// unreadable directory or a failed unlink is logged at debug and skipped —
-/// pruning is hygiene, never load-bearing for the capture that triggered it.
-fn prune_pr_context_bundles(dir: &Path, pr_number: u64, keep: usize) {
-    let prefix = format!("pr-{pr_number}-");
+#[cfg(test)]
+mod pr_context_repo_slug_tests {
+    use super::pr_context_repo_slug;
+
+    #[test]
+    fn slugifies_repository_identity_for_filenames() {
+        assert!(pr_context_repo_slug("Scott.Opell", "phoenix_ide")
+            .starts_with("scott-opell--phoenix-ide-"));
+        assert!(pr_context_repo_slug("", "Repo").starts_with("repo-"));
+        assert!(pr_context_repo_slug("", "").starts_with("unknown-repo-"));
+        assert_ne!(
+            pr_context_repo_slug("a.b", "repo"),
+            pr_context_repo_slug("a-b", "repo")
+        );
+    }
+}
+
+use std::hash::{Hash, Hasher};
+
+fn pr_context_repo_slug(repo_owner: &str, repo_name: &str) -> String {
+    fn sanitize(part: &str) -> String {
+        let mut out = String::with_capacity(part.len());
+        let mut last_was_sep = false;
+        for ch in part.chars() {
+            let safe = if ch.is_ascii_alphanumeric() {
+                last_was_sep = false;
+                Some(ch.to_ascii_lowercase())
+            } else if !last_was_sep {
+                last_was_sep = true;
+                Some('-')
+            } else {
+                None
+            };
+            if let Some(ch) = safe {
+                out.push(ch);
+            }
+        }
+        out.trim_matches('-').to_string()
+    }
+
+    let owner = sanitize(repo_owner);
+    let name = sanitize(repo_name);
+    let readable = match (owner.is_empty(), name.is_empty()) {
+        (false, false) => format!("{owner}--{name}"),
+        (false, true) => owner,
+        (true, false) => name,
+        (true, true) => "unknown-repo".to_string(),
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    repo_owner.to_ascii_lowercase().hash(&mut hasher);
+    "/".hash(&mut hasher);
+    repo_name.to_ascii_lowercase().hash(&mut hasher);
+    format!("{readable}-{:016x}", hasher.finish())
+}
+
+/// Delete all but the newest `keep` context bundles for `repo_slug` + `pr_number` in `dir`.
+/// Bundles are named `pr-{repo}-{n}-{ts}.json` with a lexicographically-sortable
+/// timestamp, so filename order is chronological order. The `pr-{repo}-{n}-`
+/// prefix (trailing dash) keeps neighboring repo/PR combinations distinct.
+/// Best-effort: an unreadable directory or a failed unlink is logged at debug
+/// and skipped — pruning is hygiene, never load-bearing for the capture that
+/// triggered it.
+fn prune_pr_context_bundles(dir: &Path, repo_slug: &str, pr_number: u64, keep: usize) {
+    let prefix = format!("pr-{repo_slug}-{pr_number}-");
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -908,6 +1192,11 @@ fn fresh_response(
         found: true,
         unavailable_reason: None,
         number: Some(pr.number),
+        selection: crate::api::types::AssociatedPrStatusEnvelope {
+            associated_prs: Vec::new(),
+            active_pr: None,
+            latest_observed_branch: None,
+        },
         title: Some(pr.title.clone()),
         url: Some(pr.url.clone()),
         state: Some(pr.state.clone()),
@@ -987,6 +1276,11 @@ pub(crate) fn stale_response_with_refresh_state(
         found: true,
         unavailable_reason: legacy_unavailable_reason,
         number: Some(identity.number),
+        selection: crate::api::types::AssociatedPrStatusEnvelope {
+            associated_prs: Vec::new(),
+            active_pr: None,
+            latest_observed_branch: None,
+        },
         title: Some(identity.title.clone()),
         url: Some(identity.url.clone()),
         state: Some(identity.state.clone()),
@@ -1013,6 +1307,7 @@ pub(crate) fn stale_response_with_refresh_state(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn stale_primary_response_with_refresh_state(
     pr: &WorkScopePrAssociation,
     refresh_state: PrRefreshState,
@@ -1046,6 +1341,11 @@ pub(crate) fn persisted_primary_response(
         found: true,
         unavailable_reason: refresh.reason.clone(),
         number: Some(identity.number),
+        selection: crate::api::types::AssociatedPrStatusEnvelope {
+            associated_prs: Vec::new(),
+            active_pr: None,
+            latest_observed_branch: None,
+        },
         title: Some(identity.title.clone()),
         url: Some(identity.url.clone()),
         state: Some(identity.state.clone()),
@@ -1063,6 +1363,14 @@ pub(crate) fn persisted_primary_response(
         work_change: crate::api::types::WorkChangeSummary::Loading,
         pr: Some(identity),
         refresh,
+    }
+}
+
+fn gh_pr_target(repo: &GhRepoView, pr_number: u64) -> GhPrTarget {
+    GhPrTarget {
+        repo_owner: repo.owner.login.clone(),
+        repo_name: repo.name.clone(),
+        pr_number,
     }
 }
 
@@ -1119,7 +1427,11 @@ fn unavailable_reason_message(reason: &PrUnavailableReason) -> &'static str {
     }
 }
 
-fn capture_log_snippets(client: &dyn GhClient, checks: &[GhPrCheck]) -> Vec<PrCheckLogSnippet> {
+fn capture_log_snippets(
+    client: &dyn GhClient,
+    target: &GhPrTarget,
+    checks: &[GhPrCheck],
+) -> Vec<PrCheckLogSnippet> {
     let mut snippets = Vec::new();
     let mut fetches = 0usize;
     for check in checks {
@@ -1135,7 +1447,7 @@ fn capture_log_snippets(client: &dyn GhClient, checks: &[GhPrCheck]) -> Vec<PrCh
             continue;
         }
         fetches += 1;
-        match client.failed_log_snippet(check) {
+        match client.failed_log_snippet(target, check) {
             Ok(Some(snippet)) => snippets.push(limit_log_snippet(snippet)),
             Ok(None) => {}
             Err(e) => {
@@ -1165,6 +1477,11 @@ fn limit_log_snippet(mut snippet: PrCheckLogSnippet) -> PrCheckLogSnippet {
 pub(crate) struct PrAutoFixContextArtifact {
     manifest_version: u32,
     fetched_at: String,
+    // owned: legacy artifacts predate repository-qualified PR identity.
+    #[serde(default)]
+    repo_owner: String,
+    #[serde(default)]
+    repo_name: String,
     pr: PrArtifactMetadata,
     checks: PrArtifactChecks,
     feedback: PrFeedbackSummary,
@@ -1196,6 +1513,8 @@ fn next_page_cursor(value: &serde_json::Value, connection_pointer: &str) -> Opti
 impl PrAutoFixContextArtifact {
     pub(crate) fn baseline(&self) -> WorkScopePrFeedbackBaselineInput {
         WorkScopePrFeedbackBaselineInput {
+            repo_owner: self.repo_owner.clone(),
+            repo_name: self.repo_name.clone(),
             pr_number: self.pr.number,
             captured_at: self.fetched_at.clone(),
             github_updated_at: self.pr.updated_at.clone(),
@@ -1210,6 +1529,18 @@ impl PrAutoFixContextArtifact {
                 .into_iter()
                 .collect(),
         }
+    }
+    pub(crate) fn baseline_for_repository(
+        &self,
+        repo_owner: &str,
+        repo_name: &str,
+    ) -> WorkScopePrFeedbackBaselineInput {
+        let mut baseline = self.baseline();
+        if baseline.repo_owner.is_empty() && baseline.repo_name.is_empty() {
+            baseline.repo_owner = repo_owner.to_string();
+            baseline.repo_name = repo_name.to_string();
+        }
+        baseline
     }
 }
 
@@ -1376,30 +1707,17 @@ fn classify_check(check: &GhPrCheck) -> CheckBucket {
     }
 }
 
-fn fetch_pr_feedback(client: &dyn GhClient, number: u64) -> PrFeedbackSummary {
+fn fetch_pr_feedback(client: &dyn GhClient, target: &GhPrTarget) -> PrFeedbackSummary {
     let mut items = Vec::new();
     let mut coverage = Vec::new();
-    let repo = match client.repo_view() {
-        Ok(repo) => repo,
-        Err(e) => {
-            for surface in PrFeedbackCoverageSurface::all() {
-                coverage.push(PrFeedbackCoverage {
-                    surface,
-                    status: e.kind.coverage_status(),
-                    detail: Some("repository owner/name discovery failed".to_string()),
-                });
-            }
-            return PrFeedbackSummary {
-                total: 0,
-                unresolved: 0,
-                feedback_status: None,
-                items,
-                coverage,
-            };
-        }
+    let repo = GhRepoView {
+        owner: GhRepoOwner {
+            login: target.repo_owner.clone(),
+        },
+        name: target.repo_name.clone(),
     };
 
-    match client.issue_comments(&repo, number) {
+    match client.issue_comments(&repo, target.pr_number) {
         Ok(comments) => {
             items.extend(comments.into_iter().map(PrFeedbackItem::from));
             push_fetched_coverage(&mut coverage, PrFeedbackCoverageSurface::IssueComments);
@@ -1412,7 +1730,7 @@ fn fetch_pr_feedback(client: &dyn GhClient, number: u64) -> PrFeedbackSummary {
             );
         }
     }
-    match client.review_comments(&repo, number) {
+    match client.review_comments(&repo, target.pr_number) {
         Ok(comments) => {
             items.extend(comments.into_iter().map(PrFeedbackItem::from));
             push_fetched_coverage(&mut coverage, PrFeedbackCoverageSurface::ReviewComments);
@@ -1423,7 +1741,7 @@ fn fetch_pr_feedback(client: &dyn GhClient, number: u64) -> PrFeedbackSummary {
             &err,
         ),
     }
-    match client.review_summaries(&repo, number) {
+    match client.review_summaries(&repo, target.pr_number) {
         Ok(reviews) => {
             items.extend(
                 reviews
@@ -1444,15 +1762,15 @@ fn fetch_pr_feedback(client: &dyn GhClient, number: u64) -> PrFeedbackSummary {
         &mut coverage,
         PrFeedbackCoverageSurface::ReviewThreads,
         client
-            .review_threads(&repo, number)
+            .review_threads(&repo, target.pr_number)
             .map(review_threads_to_items),
     );
 
     let items = dedupe_feedback(items);
-    let feedback_status = match client.reaction_status(&repo, number) {
+    let feedback_status = match client.reaction_status(&repo, target.pr_number) {
         Ok(status) => Some(status),
         Err(err) => {
-            tracing::debug!(pr = number, error = %err.message, "failed to fetch root pull request reactions");
+            tracing::debug!(pr = target.pr_number, error = %err.message, "failed to fetch root pull request reactions");
             None
         }
     };
@@ -2076,17 +2394,6 @@ struct GhGraphqlAuthor {
     login: String,
 }
 
-impl PrFeedbackCoverageSurface {
-    fn all() -> [Self; 4] {
-        [
-            Self::IssueComments,
-            Self::ReviewComments,
-            Self::ReviewSummaries,
-            Self::ReviewThreads,
-        ]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2096,6 +2403,8 @@ mod tests {
         prs: Result<Vec<GhPrListItem>, GhFailure>,
         checks: Result<Vec<GhPrCheck>, GhFailure>,
         repo: Result<GhRepoView, GhFailure>,
+        pr_view_targets: std::sync::Mutex<Vec<GhPrTarget>>,
+        pr_check_targets: std::sync::Mutex<Vec<GhPrTarget>>,
         issue_comments: Result<Vec<GhIssueComment>, GhFailure>,
         review_comments: Result<Vec<GhReviewComment>, GhFailure>,
         review_summaries: Result<Vec<GhReviewSummary>, GhFailure>,
@@ -2109,6 +2418,8 @@ mod tests {
                 prs: Ok(Vec::new()),
                 checks: Ok(Vec::new()),
                 repo: Err(GhFailure::default()),
+                pr_view_targets: std::sync::Mutex::new(Vec::new()),
+                pr_check_targets: std::sync::Mutex::new(Vec::new()),
                 issue_comments: Ok(Vec::new()),
                 review_comments: Ok(Vec::new()),
                 review_summaries: Ok(Vec::new()),
@@ -2122,17 +2433,33 @@ mod tests {
         fn pr_list_for_head(&self, _: &str) -> Result<Vec<GhPrListItem>, GhFailure> {
             self.prs.clone()
         }
-        fn pr_view(&self, number: u64) -> Result<GhPrListItem, GhFailure> {
+
+        fn pr_list_for_head_in_repo(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<GhPrListItem>, GhFailure> {
+            self.prs.clone()
+        }
+        fn pr_view(&self, target: &GhPrTarget) -> Result<GhPrListItem, GhFailure> {
+            self.pr_view_targets
+                .lock()
+                .expect("pr_view_targets")
+                .push(target.clone());
             self.prs
                 .clone()?
                 .into_iter()
-                .find(|pr| pr.number == number)
+                .find(|pr| pr.number == target.pr_number)
                 .ok_or_else(|| GhFailure {
                     kind: GhFailureKind::CommandFailed,
                     message: "not found".to_string(),
                 })
         }
-        fn pr_checks(&self, _: u64) -> Result<Vec<GhPrCheck>, GhFailure> {
+        fn pr_checks(&self, target: &GhPrTarget) -> Result<Vec<GhPrCheck>, GhFailure> {
+            self.pr_check_targets
+                .lock()
+                .expect("pr_check_targets")
+                .push(target.clone());
             self.checks.clone()
         }
         fn repo_view(&self) -> Result<GhRepoView, GhFailure> {
@@ -2163,8 +2490,10 @@ mod tests {
         }
         fn failed_log_snippet(
             &self,
+            target: &GhPrTarget,
             check: &GhPrCheck,
         ) -> Result<Option<PrCheckLogSnippet>, GhFailure> {
+            let _ = target;
             Ok(
                 (classify_check(check) == CheckBucket::Failing).then(|| PrCheckLogSnippet {
                     check_name: check.name.clone().unwrap(),
@@ -2210,11 +2539,15 @@ mod tests {
     }
 
     fn repo() -> GhRepoView {
+        repo_named("owner", "repo")
+    }
+
+    fn repo_named(owner: &str, name: &str) -> GhRepoView {
         GhRepoView {
             owner: GhRepoOwner {
-                login: "owner".to_string(),
+                login: owner.to_string(),
             },
-            name: "repo".to_string(),
+            name: name.to_string(),
         }
     }
 
@@ -2288,11 +2621,90 @@ mod tests {
     }
 
     #[test]
+    fn capture_auto_fix_context_targets_explicit_cross_repo_identity() {
+        let gh = FakeGh {
+            prs: Ok(vec![pr(7, "OPEN", false, "2026-01-01")]),
+            checks: Ok(vec![check("ok", "SUCCESS", "pass")]),
+            repo: Ok(repo_named("fork-owner", "fork-repo")),
+            ..FakeGh::default()
+        };
+
+        let capture = capture_pr_auto_fix_context_for_branch_with_client(
+            Path::new("."),
+            "branch",
+            &gh,
+            phoenix_core::llm_language::LlmLanguage::PhoenixNative,
+        )
+        .expect("capture");
+
+        assert_eq!(capture.observations.len(), 1);
+        assert_eq!(capture.observations[0].repo_owner, "fork-owner");
+        assert_eq!(capture.observations[0].repo_name, "fork-repo");
+        assert_eq!(
+            gh.pr_check_targets
+                .lock()
+                .expect("pr_check_targets")
+                .clone(),
+            vec![GhPrTarget {
+                repo_owner: "fork-owner".to_string(),
+                repo_name: "fork-repo".to_string(),
+                pr_number: 7,
+            }]
+        );
+        assert!(
+            gh.pr_view_targets
+                .lock()
+                .expect("pr_view_targets")
+                .is_empty(),
+            "branch capture should not relabel after a default-repo PR refetch"
+        );
+    }
+
+    #[test]
+    fn repo_branch_refresh_persists_canonical_repo_identity() {
+        let gh = FakeGh {
+            prs: Ok(vec![pr(7, "OPEN", false, "2026-01-01")]),
+            repo: Ok(repo_named("CanonicalOwner", "CanonicalRepo")),
+            ..FakeGh::default()
+        };
+        let refresh = get_pr_status_for_repo_branch_with_client(
+            &gh,
+            "requestedowner/requestedrepo",
+            "feature",
+        );
+        assert_eq!(refresh.observations.len(), 1);
+        assert_eq!(refresh.observations[0].repo_owner, "CanonicalOwner");
+        assert_eq!(refresh.observations[0].repo_name, "CanonicalRepo");
+    }
+
+    #[test]
+    fn target_status_persists_observation_under_target_repo_identity() {
+        let gh = FakeGh {
+            prs: Ok(vec![pr(7, "OPEN", false, "2026-01-01")]),
+            checks: Ok(vec![check("ok", "SUCCESS", "pass")]),
+            repo: Ok(repo_named("cwd-owner", "cwd-repo")),
+            ..FakeGh::default()
+        };
+        let status = get_pr_status_for_target_with_client(
+            &gh,
+            &GhPrTarget {
+                repo_owner: "target-owner".to_string(),
+                repo_name: "target-repo".to_string(),
+                pr_number: 7,
+            },
+        );
+
+        assert_eq!(status.observations.len(), 1);
+        assert_eq!(status.observations[0].repo_owner, "target-owner");
+        assert_eq!(status.observations[0].repo_name, "target-repo");
+    }
+
+    #[test]
     fn status_poll_does_not_fetch_feedback() {
         let gh = FakeGh {
             prs: Ok(vec![pr(7, "OPEN", false, "2026-01-01")]),
             checks: Ok(vec![check("ok", "SUCCESS", "pass")]),
-            repo: Err(GhFailure::default()),
+            repo: Ok(repo()),
             ..FakeGh::default()
         };
         let status = get_pr_status_with_client(&gh, "branch");
@@ -2328,7 +2740,7 @@ mod tests {
             review_threads: Err(GhFailure::default()),
             ..FakeGh::default()
         };
-        let feedback = fetch_pr_feedback(&gh, 7);
+        let feedback = fetch_pr_feedback(&gh, &gh_pr_target(&repo(), 7));
         assert_eq!(feedback.total, 1);
         assert!(feedback
             .coverage
@@ -2388,7 +2800,7 @@ mod tests {
             ..FakeGh::default()
         };
 
-        let feedback = fetch_pr_feedback(&gh, 7);
+        let feedback = fetch_pr_feedback(&gh, &gh_pr_target(&repo(), 7));
 
         assert_eq!(feedback.total, 1);
         assert_eq!(feedback.unresolved, 0);
@@ -2489,7 +2901,7 @@ mod tests {
             ..FakeGh::default()
         };
 
-        let feedback = fetch_pr_feedback(&gh, 7);
+        let feedback = fetch_pr_feedback(&gh, &gh_pr_target(&repo(), 7));
 
         assert_eq!(feedback.items.len(), 2);
         assert_eq!(feedback.feedback_status, Some(PrFeedbackStatus::Open));
@@ -2499,6 +2911,8 @@ mod tests {
     fn feedback_freshness_counts_unseen_actionable_identities() {
         let baseline = WorkScopePrFeedbackBaseline {
             work_scope_id: 1,
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
             pr_number: 7,
             captured_at: "2026-01-01T00:00:00Z".to_string(),
             github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
@@ -2518,6 +2932,8 @@ mod tests {
     fn coverage_degradation_alone_yields_no_content_freshness() {
         let baseline = WorkScopePrFeedbackBaseline {
             work_scope_id: 1,
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
             pr_number: 7,
             captured_at: "2026-01-01T00:00:00Z".to_string(),
             github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
@@ -2539,6 +2955,8 @@ mod tests {
     fn feedback_freshness_marks_existing_actionable_feedback_edits_as_edited() {
         let baseline = WorkScopePrFeedbackBaseline {
             work_scope_id: 1,
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
             pr_number: 7,
             captured_at: "2026-01-01T00:00:00Z".to_string(),
             github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
@@ -2555,6 +2973,8 @@ mod tests {
     fn resolved_only_transition_yields_no_freshness() {
         let baseline = WorkScopePrFeedbackBaseline {
             work_scope_id: 1,
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
             pr_number: 7,
             captured_at: "2026-01-01T00:00:00Z".to_string(),
             github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
@@ -2573,6 +2993,8 @@ mod tests {
     fn resolved_is_excluded_from_actionable_content_fingerprint() {
         let baseline = WorkScopePrFeedbackBaseline {
             work_scope_id: 1,
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
             pr_number: 7,
             captured_at: "2026-01-01T00:00:00Z".to_string(),
             github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
@@ -2591,6 +3013,8 @@ mod tests {
     fn legacy_resolution_fingerprint_still_matches_unchanged_actionable_feedback() {
         let baseline = WorkScopePrFeedbackBaseline {
             work_scope_id: 1,
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
             pr_number: 7,
             captured_at: "2026-01-01T00:00:00Z".to_string(),
             github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
@@ -2610,6 +3034,8 @@ mod tests {
         let artifact = PrAutoFixContextArtifact {
             manifest_version: ARTIFACT_VERSION,
             fetched_at: "2026-01-02T00:00:00Z".to_string(),
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
             pr: PrArtifactMetadata {
                 number: 7,
                 title: "PR".to_string(),
@@ -2714,6 +3140,8 @@ mod tests {
     fn no_feedback_to_compare_yields_no_freshness() {
         let baseline = WorkScopePrFeedbackBaseline {
             work_scope_id: 1,
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
             pr_number: 7,
             captured_at: "2026-01-01T00:00:00Z".to_string(),
             github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
@@ -2844,6 +3272,10 @@ mod tests {
             &std::fs::read_to_string(temp.path().join(&response.artifact_path)).unwrap(),
         )
         .unwrap();
+        assert!(
+            response.artifact_path.contains("pr-owner--repo-")
+                && response.artifact_path.contains("-7-")
+        );
         assert_eq!(artifact["manifest_version"], ARTIFACT_VERSION);
         assert_eq!(artifact["pr"]["number"], 7);
         assert_eq!(
@@ -2871,17 +3303,16 @@ mod tests {
     }
 
     #[test]
-    fn prune_keeps_newest_n_per_pr_and_ignores_other_prs() {
+    fn prune_keeps_newest_n_per_repo_and_pr_and_ignores_other_bundles() {
         let temp = TempDir::new().unwrap();
         let dir = temp.path();
-        // pr-12 has four bundles (ascending timestamps); pr-1 has one. The
-        // `pr-1-` prefix must not be pruned by a pr-12 pass and vice versa.
         for ts in ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"] {
-            std::fs::write(dir.join(format!("pr-12-{ts}.json")), "x").unwrap();
+            std::fs::write(dir.join(format!("pr-owner--repo-12-{ts}.json")), "x").unwrap();
         }
-        std::fs::write(dir.join("pr-1-2026-01-01.json"), "x").unwrap();
+        std::fs::write(dir.join("pr-owner--repo-1-2026-01-01.json"), "x").unwrap();
+        std::fs::write(dir.join("pr-other--repo-12-2026-01-04.json"), "x").unwrap();
 
-        prune_pr_context_bundles(dir, 12, 2);
+        prune_pr_context_bundles(dir, "owner--repo", 12, 2);
 
         let mut remaining: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
@@ -2891,9 +3322,10 @@ mod tests {
         assert_eq!(
             remaining,
             vec![
-                "pr-1-2026-01-01.json".to_string(),
-                "pr-12-2026-01-03.json".to_string(),
-                "pr-12-2026-01-04.json".to_string(),
+                "pr-other--repo-12-2026-01-04.json".to_string(),
+                "pr-owner--repo-1-2026-01-01.json".to_string(),
+                "pr-owner--repo-12-2026-01-03.json".to_string(),
+                "pr-owner--repo-12-2026-01-04.json".to_string(),
             ]
         );
     }
@@ -2902,7 +3334,7 @@ mod tests {
     fn prune_on_missing_dir_is_a_noop() {
         let temp = TempDir::new().unwrap();
         // Must not panic when the directory does not exist.
-        prune_pr_context_bundles(&temp.path().join("nope"), 1, 3);
+        prune_pr_context_bundles(&temp.path().join("nope"), "owner--repo", 1, 3);
     }
 
     #[test]

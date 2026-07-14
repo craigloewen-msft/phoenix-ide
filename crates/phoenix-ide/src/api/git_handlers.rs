@@ -4,7 +4,10 @@
 
 use super::handlers::AppError;
 use super::types::{
-    ConversationDiffResponse, GitBranchEntry, GitBranchesQuery, GitBranchesResponse,
+    ActivePrIdentityResponse, ActivePrSelectionMutationResponse,
+    ActivePrSelectionProvenanceResponse, ActivePrSelectionResponse, AssociatedPrStatusEnvelope,
+    AssociatedPrSummaryResponse, ConversationDiffResponse, GitBranchEntry, GitBranchesQuery,
+    GitBranchesResponse, ObservedBranchSummaryResponse, PinAssociatedPrRequest,
     PrAutoFixContextResponse, PrFeedbackStatus, PrStatusResponse, PrUnavailableReason,
     WorkChangeNeedsReviewReason, WorkChangeSummary,
 };
@@ -12,12 +15,296 @@ use super::AppState;
 use crate::db::ConvMode;
 use crate::git_ops::{capture_branch_diff, run_git};
 
+use axum::http::StatusCode;
 use axum::{
     extract::{Path, Query, State},
     Json,
 };
 use std::fmt::Write as _;
 use std::path::{Path as FsPath, PathBuf};
+
+fn build_diff_response(
+    captured: crate::git_ops::CapturedDiff,
+    label: String,
+    kind: &str,
+    pr_number: Option<u64>,
+) -> ConversationDiffResponse {
+    ConversationDiffResponse {
+        comparator: captured.comparator,
+        label,
+        kind: kind.to_string(),
+        pr_number,
+        commit_log: captured.commit_log,
+        committed_truncated_kib: truncated_kib(
+            &captured.committed_diff,
+            captured.committed_total_bytes,
+            captured.committed_saturated,
+        ),
+        committed_saturated: captured.committed_saturated,
+        committed_diff: captured.committed_diff,
+        uncommitted_truncated_kib: truncated_kib(
+            &captured.uncommitted_diff,
+            captured.uncommitted_total_bytes,
+            captured.uncommitted_saturated,
+        ),
+        uncommitted_saturated: captured.uncommitted_saturated,
+        uncommitted_diff: captured.uncommitted_diff,
+    }
+}
+
+fn active_pr_selection_response(
+    selection: phoenix_core::domain::active_pr_selection::ActivePrSelection,
+) -> ActivePrSelectionResponse {
+    ActivePrSelectionResponse {
+        pr: ActivePrIdentityResponse {
+            repo_owner: selection.pr.repo_owner,
+            repo_name: selection.pr.repo_name,
+            pr_number: selection.pr.pr_number,
+        },
+        provenance: match selection.provenance {
+            phoenix_core::domain::active_pr_selection::ActivePrSelectionProvenance::Inferred => {
+                ActivePrSelectionProvenanceResponse::Inferred
+            }
+            phoenix_core::domain::active_pr_selection::ActivePrSelectionProvenance::Pinned => {
+                ActivePrSelectionProvenanceResponse::Pinned
+            }
+        },
+    }
+}
+
+fn github_repo_identifier_from_worktree(path: &FsPath) -> Option<String> {
+    crate::runtime::pr_status_poll::github_repo_identifier(path)
+}
+
+fn github_repo_identity_eq(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+fn active_pr_diff_repo_mismatch_reason(
+    worktree_repo_identity: Option<&str>,
+    selected_repo_identity: &str,
+) -> Option<String> {
+    match worktree_repo_identity {
+        Some(worktree_repo_identity)
+            if github_repo_identity_eq(worktree_repo_identity, selected_repo_identity) => None,
+        Some(repo) => Some(format!(
+            "PR-specific diff unavailable for selected repository {selected_repo_identity}; local worktree is attached to {repo}"
+        )),
+        None => Some(format!(
+            "PR-specific diff unavailable for selected repository {selected_repo_identity}; local worktree origin is not a GitHub repository"
+        )),
+    }
+}
+
+fn capture_active_pr_diff(
+    worktree_path: &FsPath,
+    active_pr: &crate::db::WorkScopePrAssociation,
+    max_diff_bytes: usize,
+) -> Result<crate::git_ops::CapturedDiff, AppError> {
+    capture_active_pr_diff_for_repo_identity(
+        worktree_path,
+        github_repo_identifier_from_worktree(worktree_path).as_deref(),
+        active_pr,
+        max_diff_bytes,
+    )
+}
+
+fn capture_active_pr_diff_for_repo_identity(
+    worktree_path: &FsPath,
+    worktree_repo_identity: Option<&str>,
+    active_pr: &crate::db::WorkScopePrAssociation,
+    max_diff_bytes: usize,
+) -> Result<crate::git_ops::CapturedDiff, AppError> {
+    let selected_repo_identity = format!("{}/{}", active_pr.repo_owner, active_pr.repo_name);
+    if let Some(reason) =
+        active_pr_diff_repo_mismatch_reason(worktree_repo_identity, &selected_repo_identity)
+    {
+        return Err(AppError::BadRequest(reason));
+    }
+    let checked_out_branch = run_git(
+        worktree_path,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )
+    .ok()
+    .map(|branch| branch.trim().to_string());
+    if checked_out_branch.as_deref() != Some(active_pr.head.as_str()) {
+        return Err(AppError::BadRequest(format!(
+            "PR-specific diff unavailable until selected head {} is checked out; current branch is {}",
+            active_pr.head,
+            checked_out_branch.as_deref().unwrap_or("detached or unborn")
+        )));
+    }
+    Ok(capture_branch_diff(
+        worktree_path,
+        &active_pr.base,
+        max_diff_bytes,
+    ))
+}
+
+fn associated_pr_summary_response(
+    pr: crate::db::WorkScopePrAssociation,
+) -> AssociatedPrSummaryResponse {
+    AssociatedPrSummaryResponse {
+        repo_owner: pr.repo_owner,
+        repo_name: pr.repo_name,
+        pr_number: pr.pr_number,
+        title: pr.title,
+        url: pr.url,
+        state: pr.state,
+        draft: pr.draft,
+        display_state: pr.display_state,
+        base: pr.base,
+        head: pr.head,
+        github_updated_at: pr.github_updated_at,
+        feedback_status: pr.feedback_status,
+    }
+}
+
+async fn selection_envelope_for_scope(
+    db: &crate::db::Database,
+    work_scope: &crate::work_scope::WorkScope,
+) -> Result<AssociatedPrStatusEnvelope, AppError> {
+    Ok(selection_envelope_for_scope_from_snapshot(
+        db.list_work_scope_pr_associations(work_scope)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?,
+        db.active_work_scope_pr_selection(work_scope)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?,
+        db.list_work_scope_observed_branches(work_scope)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?,
+    ))
+}
+
+fn selection_envelope_for_scope_from_snapshot(
+    associated: Vec<crate::db::WorkScopePrAssociation>,
+    active: Option<phoenix_core::domain::active_pr_selection::ActivePrSelectionState>,
+    observed: Vec<crate::db::WorkScopeObservedBranch>,
+) -> AssociatedPrStatusEnvelope {
+    let associated_prs = associated
+        .into_iter()
+        .map(associated_pr_summary_response)
+        .collect();
+    let active_pr = active
+        .and_then(|state| state.selection)
+        .map(active_pr_selection_response);
+    let latest_observed_branch =
+        observed
+            .into_iter()
+            .next()
+            .map(|branch| ObservedBranchSummaryResponse {
+                repository_identity: branch.repository_identity,
+                branch_name: branch.branch_name,
+            });
+    AssociatedPrStatusEnvelope {
+        associated_prs,
+        active_pr,
+        latest_observed_branch,
+    }
+}
+
+fn response_identity_matches_association(
+    response: &PrStatusResponse,
+    observations: &[crate::db::WorkScopePrObservation],
+    association: &crate::db::WorkScopePrAssociation,
+) -> bool {
+    response.number == Some(association.pr_number)
+        && observations.iter().any(|pr| {
+            pr.repo_owner == association.repo_owner
+                && pr.repo_name == association.repo_name
+                && pr.pr_number == association.pr_number
+        })
+}
+
+fn refreshed_pr_association(
+    response: &PrStatusResponse,
+    observations: &[crate::db::WorkScopePrObservation],
+    associations: &[crate::db::WorkScopePrAssociation],
+) -> Option<crate::db::WorkScopePrAssociation> {
+    observations
+        .iter()
+        .find(|observation| response.number == Some(observation.pr_number))
+        .and_then(|observation| {
+            associations.iter().find(|association| {
+                association
+                    .repo_owner
+                    .eq_ignore_ascii_case(&observation.repo_owner)
+                    && association
+                        .repo_name
+                        .eq_ignore_ascii_case(&observation.repo_name)
+                    && association.pr_number == observation.pr_number
+            })
+        })
+        .cloned()
+}
+
+fn association_for_artifact_baseline<'a>(
+    associations: &'a [crate::db::WorkScopePrAssociation],
+    baseline: &crate::db::WorkScopePrFeedbackBaselineInput,
+) -> Result<&'a crate::db::WorkScopePrAssociation, AppError> {
+    let legacy_identity = baseline.repo_owner.is_empty() && baseline.repo_name.is_empty();
+    if baseline.repo_owner.is_empty() != baseline.repo_name.is_empty() {
+        return Err(AppError::BadRequest(
+            "PR context artifact has an incomplete repository identity".to_string(),
+        ));
+    }
+
+    let matches = associations
+        .iter()
+        .filter(|association| {
+            association.pr_number == baseline.pr_number
+                && (legacy_identity
+                    || (association
+                        .repo_owner
+                        .eq_ignore_ascii_case(&baseline.repo_owner)
+                        && association
+                            .repo_name
+                            .eq_ignore_ascii_case(&baseline.repo_name)))
+        })
+        .collect::<Vec<_>>();
+
+    if legacy_identity {
+        return match matches.as_slice() {
+            [association] => Ok(*association),
+            [] => Err(AppError::BadRequest(
+                "PR context artifact no longer matches an associated PR".to_string(),
+            )),
+            _ => Err(AppError::BadRequest(
+                "Legacy PR context artifact is ambiguous across associated repositories"
+                    .to_string(),
+            )),
+        };
+    }
+
+    matches.into_iter().next().ok_or_else(|| {
+        AppError::BadRequest("PR context artifact no longer matches an associated PR".to_string())
+    })
+}
+
+async fn active_selection_target_for_scope(
+    db: &crate::db::Database,
+    work_scope: &crate::work_scope::WorkScope,
+) -> Result<Option<crate::db::WorkScopePrAssociation>, AppError> {
+    let Some(selection) = db
+        .active_work_scope_pr_selection(work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .and_then(|state| state.selection)
+    else {
+        return Ok(None);
+    };
+    Ok(db
+        .list_work_scope_pr_associations(work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .into_iter()
+        .find(|pr| {
+            pr.repo_owner == selection.pr.repo_owner
+                && pr.repo_name == selection.pr.repo_name
+                && pr.pr_number == selection.pr.pr_number
+        }))
+}
 
 pub(crate) async fn list_git_branches(
     State(state): State<AppState>,
@@ -473,42 +760,72 @@ pub(crate) fn summarize_work_change(
         base_branch: base_branch.to_string(),
     }
 }
-fn stale_primary_response_with_work_change(
-    primary: &crate::db::WorkScopePrAssociation,
-    refresh: crate::api::pr_monitoring::PrStatusRefresh,
-) -> PrStatusResponse {
-    let mut response = crate::api::pr_monitoring::stale_primary_response_with_refresh_state(
-        primary,
-        refresh.response.refresh.state,
-        refresh.response.refresh.reason.clone(),
-        refresh.response.refresh.last_attempted_at,
-    );
-    response.work_change = refresh.response.work_change;
-    response
-}
-
 async fn pr_status_response_for_missing_worktree(
     state: &AppState,
     work_scope: &crate::work_scope::WorkScope,
 ) -> Result<PrStatusResponse, AppError> {
     let attempted_at = chrono::Utc::now().to_rfc3339();
-    let mut response = match state
+    let associated = state
+        .runtime
+        .db()
+        .list_work_scope_pr_associations(work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let active = state
+        .runtime
+        .db()
+        .active_work_scope_pr_selection(work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let observed = state
+        .runtime
+        .db()
+        .list_work_scope_observed_branches(work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let envelope =
+        selection_envelope_for_scope_from_snapshot(associated.clone(), active.clone(), observed);
+    let compatibility_primary = state
         .runtime
         .db()
         .primary_work_scope_pr_association(work_scope)
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-    {
-        Some(pr) => crate::api::pr_monitoring::stale_response(
-            pr,
-            PrUnavailableReason::NotGitRepo,
-            attempted_at,
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let mut response = match active.and_then(|state| state.selection) {
+        Some(selection) => {
+            let Some(pr) = associated.into_iter().find(|pr| {
+                pr.repo_owner == selection.pr.repo_owner
+                    && pr.repo_name == selection.pr.repo_name
+                    && pr.pr_number == selection.pr.pr_number
+            }) else {
+                let mut response = PrStatusResponse::unavailable(PrUnavailableReason::NotGitRepo);
+                response.selection = envelope.clone();
+                response.work_change = WorkChangeSummary::Unavailable {
+                    reason: "worktree path is not a directory".to_string(),
+                };
+                return Ok(response);
+            };
+            crate::api::pr_monitoring::stale_response(
+                pr,
+                PrUnavailableReason::NotGitRepo,
+                attempted_at,
+            )
+        }
+        None => compatibility_primary.map_or_else(
+            || PrStatusResponse::unavailable(PrUnavailableReason::NotGitRepo),
+            |pr| {
+                crate::api::pr_monitoring::stale_response(
+                    pr,
+                    PrUnavailableReason::NotGitRepo,
+                    attempted_at,
+                )
+            },
         ),
-        None => PrStatusResponse::unavailable(PrUnavailableReason::NotGitRepo),
     };
     response.work_change = WorkChangeSummary::Unavailable {
         reason: "worktree path is not a directory".to_string(),
     };
+    response.selection = envelope;
     Ok(response)
 }
 
@@ -519,6 +836,7 @@ fn effective_feedback_status_for_cache(
     (Some(fetched), previous != Some(fetched))
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn get_conversation_pr_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -568,6 +886,11 @@ pub(crate) async fn get_conversation_pr_status(
 
     let db = state.runtime.db().clone();
     let cwd_for_status = cwd.clone();
+    let refresh_generation = db
+        .active_work_scope_pr_selection(&work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .map_or(0, |state| state.inference_generation);
     let cwd_for_change = cwd.clone();
     let branch_name_for_status = branch_name.clone();
     let branch_name_for_change = branch_name.clone();
@@ -593,34 +916,222 @@ pub(crate) async fn get_conversation_pr_status(
             .map_err(|e| AppError::Internal(e.to_string()))?;
     }
 
-    if let Some(primary) = db
-        .primary_work_scope_pr_association(&work_scope)
+    let latest_branch = db
+        .list_work_scope_observed_branches(&work_scope)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
-    {
-        if refresh.response.refresh.state != crate::api::types::PrRefreshState::Fresh {
-            return Ok(Json(stale_primary_response_with_work_change(
-                &primary, refresh,
-            )));
-        }
+        .into_iter()
+        .next()
+        .map(
+            |branch| phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                repository_identity: branch.repository_identity,
+                branch_name: branch.branch_name,
+            },
+        );
+    db.derive_active_work_scope_pr_selection(
+        &work_scope,
+        &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+            latest_observed_branch: latest_branch,
+        },
+        Some(refresh_generation),
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+    let mut associated_snapshot = db
+        .list_work_scope_pr_associations(&work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let mut active_snapshot = db
+        .active_work_scope_pr_selection(&work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let mut observed_snapshot = db
+        .list_work_scope_observed_branches(&work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let selection = active_snapshot
+        .clone()
+        .and_then(|state| state.selection)
+        .and_then(|selection| {
+            associated_snapshot
+                .iter()
+                .find(|pr| {
+                    pr.repo_owner == selection.pr.repo_owner
+                        && pr.repo_name == selection.pr.repo_name
+                        && pr.pr_number == selection.pr.pr_number
+                })
+                .cloned()
+        });
 
-        if refresh.response.number != Some(primary.pr_number) {
-            return Ok(Json(stale_primary_response_with_work_change(
-                &primary, refresh,
-            )));
+    let mut response = if let Some(active_pr) = selection {
+        let needs_direct_active_refresh = refresh.response.refresh.state
+            != crate::api::types::PrRefreshState::Fresh
+            || refresh.response.refresh.stale
+            || !response_identity_matches_association(
+                &refresh.response,
+                &refresh.observations,
+                &active_pr,
+            );
+        if needs_direct_active_refresh {
+            let active_refresh = tokio::task::spawn_blocking({
+                let cwd = cwd.clone();
+                let repo_owner = active_pr.repo_owner.clone();
+                let repo_name = active_pr.repo_name.clone();
+                let pr_number = active_pr.pr_number;
+                move || {
+                    crate::api::pr_monitoring::get_pr_status_for_pr(
+                        &cwd,
+                        &repo_owner,
+                        &repo_name,
+                        pr_number,
+                    )
+                }
+            })
+            .await
+            .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+            if !active_refresh.observations.is_empty() {
+                db.upsert_work_scope_pr_observations(&work_scope, &active_refresh.observations)
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                observed_snapshot = db
+                    .list_work_scope_observed_branches(&work_scope)
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                let latest_branch = observed_snapshot.first().map(|branch| {
+                    phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                        repository_identity: branch.repository_identity.clone(),
+                        branch_name: branch.branch_name.clone(),
+                    }
+                });
+                db.derive_active_work_scope_pr_selection(
+                    &work_scope,
+                    &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                        latest_observed_branch: latest_branch,
+                    },
+                    None,
+                )
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+                associated_snapshot = db
+                    .list_work_scope_pr_associations(&work_scope)
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                active_snapshot = db
+                    .active_work_scope_pr_selection(&work_scope)
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                observed_snapshot = db
+                    .list_work_scope_observed_branches(&work_scope)
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+            }
+            let refreshed_active_pr = active_snapshot
+                .clone()
+                .and_then(|state| state.selection)
+                .and_then(|selection| {
+                    associated_snapshot
+                        .iter()
+                        .find(|pr| {
+                            pr.repo_owner == selection.pr.repo_owner
+                                && pr.repo_name == selection.pr.repo_name
+                                && pr.pr_number == selection.pr.pr_number
+                        })
+                        .cloned()
+                })
+                .unwrap_or_else(|| active_pr.clone());
+            let refreshed_identity_changed = !refreshed_active_pr
+                .repo_owner
+                .eq_ignore_ascii_case(&active_pr.repo_owner)
+                || !refreshed_active_pr
+                    .repo_name
+                    .eq_ignore_ascii_case(&active_pr.repo_name)
+                || refreshed_active_pr.pr_number != active_pr.pr_number;
+            if refreshed_identity_changed {
+                let retargeted_refresh = tokio::task::spawn_blocking({
+                    let cwd = cwd.clone();
+                    let repo_owner = refreshed_active_pr.repo_owner.clone();
+                    let repo_name = refreshed_active_pr.repo_name.clone();
+                    let pr_number = refreshed_active_pr.pr_number;
+                    move || {
+                        crate::api::pr_monitoring::get_pr_status_for_pr(
+                            &cwd,
+                            &repo_owner,
+                            &repo_name,
+                            pr_number,
+                        )
+                    }
+                })
+                .await
+                .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+                if !retargeted_refresh.observations.is_empty() {
+                    db.upsert_work_scope_pr_observations(
+                        &work_scope,
+                        &retargeted_refresh.observations,
+                    )
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                    associated_snapshot = db
+                        .list_work_scope_pr_associations(&work_scope)
+                        .await
+                        .map_err(|e| AppError::Internal(e.to_string()))?;
+                    active_snapshot = db
+                        .active_work_scope_pr_selection(&work_scope)
+                        .await
+                        .map_err(|e| AppError::Internal(e.to_string()))?;
+                    observed_snapshot = db
+                        .list_work_scope_observed_branches(&work_scope)
+                        .await
+                        .map_err(|e| AppError::Internal(e.to_string()))?;
+                }
+                attach_pr_feedback_freshness(
+                    retargeted_refresh.response,
+                    &db,
+                    &work_scope,
+                    &cwd,
+                    &refreshed_active_pr,
+                )
+                .await?
+            } else if active_refresh.response.refresh.state
+                == crate::api::types::PrRefreshState::Fresh
+            {
+                attach_pr_feedback_freshness(
+                    active_refresh.response,
+                    &db,
+                    &work_scope,
+                    &cwd,
+                    &refreshed_active_pr,
+                )
+                .await?
+            } else {
+                crate::api::pr_monitoring::persisted_primary_response(
+                    &refreshed_active_pr,
+                    active_refresh.response.refresh,
+                    true,
+                )
+            }
+        } else {
+            attach_pr_feedback_freshness(refresh.response, &db, &work_scope, &cwd, &active_pr)
+                .await?
         }
-    }
-
-    let response = attach_pr_feedback_freshness(refresh.response, &db, &work_scope, &cwd).await?;
+    } else {
+        refresh.response
+    };
+    response.selection = selection_envelope_for_scope_from_snapshot(
+        associated_snapshot,
+        active_snapshot,
+        observed_snapshot,
+    );
 
     Ok(Json(response))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn attach_pr_feedback_freshness(
     mut response: PrStatusResponse,
     db: &crate::db::Database,
     work_scope: &crate::work_scope::WorkScope,
     cwd: &FsPath,
+    active_pr: &crate::db::WorkScopePrAssociation,
 ) -> Result<PrStatusResponse, AppError> {
     let response_pr_number = response.number;
     let response_updated_at = response.updated_at.clone();
@@ -633,15 +1144,16 @@ async fn attach_pr_feedback_freshness(
         return Ok(response);
     };
 
-    let previous_feedback_status = db
-        .primary_work_scope_pr_association(work_scope)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .filter(|pr| pr.pr_number == pr_number)
-        .map(|pr| pr.feedback_status);
+    let previous_feedback_status =
+        (active_pr.pr_number == pr_number).then_some(active_pr.feedback_status);
 
     let baseline = db
-        .work_scope_pr_feedback_baseline(work_scope, pr_number)
+        .work_scope_pr_feedback_baseline(
+            work_scope,
+            &active_pr.repo_owner,
+            &active_pr.repo_name,
+            pr_number,
+        )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -649,8 +1161,15 @@ async fn attach_pr_feedback_freshness(
         crate::api::pr_monitoring::pr_updated_after_baseline(baseline, updated_at)
     }) {
         let cwd_for_feedback = cwd.to_path_buf();
+        let repo_owner = active_pr.repo_owner.clone();
+        let repo_name = active_pr.repo_name.clone();
         let feedback = tokio::task::spawn_blocking(move || {
-            crate::api::pr_monitoring::fetch_pr_feedback_for_pr(&cwd_for_feedback, pr_number)
+            crate::api::pr_monitoring::fetch_pr_feedback_for_pr(
+                &cwd_for_feedback,
+                &repo_owner,
+                &repo_name,
+                pr_number,
+            )
         })
         .await
         .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
@@ -666,6 +1185,8 @@ async fn attach_pr_feedback_freshness(
                     if should_update_cache {
                         db.update_work_scope_pr_feedback_status(
                             work_scope,
+                            &active_pr.repo_owner,
+                            &active_pr.repo_name,
                             pr_number,
                             fetched_status,
                         )
@@ -688,8 +1209,15 @@ async fn attach_pr_feedback_freshness(
         }
     } else {
         let cwd_for_status = cwd.to_path_buf();
+        let repo_owner = active_pr.repo_owner.clone();
+        let repo_name = active_pr.repo_name.clone();
         let status = tokio::task::spawn_blocking(move || {
-            crate::api::pr_monitoring::fetch_pr_feedback_status_for_pr(&cwd_for_status, pr_number)
+            crate::api::pr_monitoring::fetch_pr_feedback_status_for_pr(
+                &cwd_for_status,
+                &repo_owner,
+                &repo_name,
+                pr_number,
+            )
         })
         .await
         .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
@@ -697,9 +1225,15 @@ async fn attach_pr_feedback_freshness(
             Ok(status) => {
                 response.feedback_status = Some(status);
                 if Some(status) != previous_feedback_status {
-                    db.update_work_scope_pr_feedback_status(work_scope, pr_number, status)
-                        .await
-                        .map_err(|e| AppError::Internal(e.to_string()))?;
+                    db.update_work_scope_pr_feedback_status(
+                        work_scope,
+                        &active_pr.repo_owner,
+                        &active_pr.repo_name,
+                        pr_number,
+                        status,
+                    )
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
                 }
             }
             Err(err) => {
@@ -711,6 +1245,7 @@ async fn attach_pr_feedback_freshness(
     Ok(response)
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn create_pr_auto_fix_context(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -748,26 +1283,55 @@ pub(crate) async fn create_pr_auto_fix_context(
     };
 
     let db = state.runtime.db().clone();
-    let associated_pr = db
-        .primary_work_scope_pr_association(&work_scope)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let active_pr =
+        if let Some(active_pr) = active_selection_target_for_scope(&db, &work_scope).await? {
+            active_pr
+        } else {
+            let worktree = PathBuf::from(&worktree_path);
+            let refresh = tokio::task::spawn_blocking({
+                let branch_name = branch_name.clone();
+                move || crate::api::pr_monitoring::get_pr_status_for_branch(&worktree, &branch_name)
+            })
+            .await
+            .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+            if !refresh.observations.is_empty() {
+                db.upsert_work_scope_pr_observations(&work_scope, &refresh.observations)
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+            }
+            let associations = db
+                .list_work_scope_pr_associations(&work_scope)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let discovered =
+                refreshed_pr_association(&refresh.response, &refresh.observations, &associations);
+            match discovered {
+                Some(pr) => pr,
+                None => db
+                    .primary_work_scope_pr_association(&work_scope)
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?
+                    .ok_or_else(|| {
+                        AppError::BadRequest(
+                            "PR-specific action unavailable until a PR is associated with this work"
+                                .to_string(),
+                        )
+                    })?,
+            }
+        };
 
+    let target_repo_owner = active_pr.repo_owner.clone();
+    let target_repo_name = active_pr.repo_name.clone();
+    let target_pr_number = active_pr.pr_number;
     let result = tokio::task::spawn_blocking(move || {
         let worktree = PathBuf::from(worktree_path);
-        if let Some(pr) = associated_pr {
-            crate::api::pr_monitoring::capture_pr_auto_fix_context_for_pr(
-                &worktree,
-                pr.pr_number,
-                conv.llm_language,
-            )
-        } else {
-            crate::api::pr_monitoring::capture_pr_auto_fix_context_for_branch(
-                &worktree,
-                &branch_name,
-                conv.llm_language,
-            )
-        }
+        crate::api::pr_monitoring::capture_pr_auto_fix_context_for_pr(
+            &worktree,
+            &target_repo_owner,
+            &target_repo_name,
+            target_pr_number,
+            conv.llm_language,
+        )
     })
     .await
     .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
@@ -798,9 +1362,15 @@ pub(crate) async fn create_pr_auto_fix_context(
     }
 
     if let (Ok(response), Some(feedback_status)) = (&response, feedback_status) {
-        db.update_work_scope_pr_feedback_status(&work_scope, response.pr_number, feedback_status)
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
+        db.update_work_scope_pr_feedback_status(
+            &work_scope,
+            &response.repo_owner,
+            &response.repo_name,
+            response.pr_number,
+            feedback_status,
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     }
 
     Ok(Json(response?))
@@ -884,16 +1454,190 @@ pub(crate) async fn record_pr_auto_fix_context_baseline(
         &pr_auto_fix_artifact_path(&conv, artifact_path)?,
     )
     .map_err(|e| AppError::Internal(e.to_string()))?;
-    let baseline = artifact.baseline();
+    let artifact_baseline = artifact.baseline();
+    let associations = db
+        .list_work_scope_pr_associations(&work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let association = association_for_artifact_baseline(&associations, &artifact_baseline)?;
+    let baseline =
+        artifact.baseline_for_repository(&association.repo_owner, &association.repo_name);
     db.upsert_work_scope_pr_feedback_baseline(&work_scope, &baseline)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(())
 }
 
+pub(crate) async fn pin_associated_pr(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<PinAssociatedPrRequest>,
+) -> Result<(StatusCode, Json<ActivePrSelectionMutationResponse>), AppError> {
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    let work_scope = match &conv.conv_mode {
+        ConvMode::Work { worktree_path, .. } | ConvMode::Branch { worktree_path, .. } => {
+            crate::work_scope::WorkScope::resolve(
+                &id,
+                Some(std::path::Path::new(worktree_path.as_str())),
+            )
+        }
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation is not in Work or Branch mode".to_string(),
+            ));
+        }
+    };
+    let active = state
+        .runtime
+        .db()
+        .pin_active_work_scope_pr_selection(
+            &work_scope,
+            &phoenix_core::domain::active_pr_selection::ActivePrIdentity {
+                repo_owner: request.repo_owner,
+                repo_name: request.repo_name,
+                pr_number: request.pr_number,
+            },
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let latest = selection_envelope_for_scope(state.runtime.db(), &work_scope).await?;
+    Ok((
+        StatusCode::OK,
+        Json(ActivePrSelectionMutationResponse {
+            active_pr: active.selection.map(active_pr_selection_response),
+            latest_observed_branch: latest.latest_observed_branch,
+        }),
+    ))
+}
+
+pub(crate) async fn resume_associated_pr_inference(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<ActivePrSelectionMutationResponse>), AppError> {
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    let work_scope = match &conv.conv_mode {
+        ConvMode::Work { worktree_path, .. } | ConvMode::Branch { worktree_path, .. } => {
+            crate::work_scope::WorkScope::resolve(
+                &id,
+                Some(std::path::Path::new(worktree_path.as_str())),
+            )
+        }
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation is not in Work or Branch mode".to_string(),
+            ));
+        }
+    };
+    let latest_durable_branch = state
+        .runtime
+        .db()
+        .list_work_scope_observed_branches(&work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .into_iter()
+        .next()
+        .map(
+            |branch| phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                repository_identity: branch.repository_identity,
+                branch_name: branch.branch_name,
+            },
+        );
+    let active = state
+        .runtime
+        .db()
+        .clear_active_work_scope_pr_pin(
+            &work_scope,
+            &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                latest_observed_branch: latest_durable_branch,
+            },
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let latest = selection_envelope_for_scope(state.runtime.db(), &work_scope).await?;
+    Ok((
+        StatusCode::OK,
+        Json(ActivePrSelectionMutationResponse {
+            active_pr: active
+                .and_then(|state| state.selection)
+                .map(active_pr_selection_response),
+            latest_observed_branch: latest.latest_observed_branch,
+        }),
+    ))
+}
+
+/// `GET /api/conversations/:id/active-pr/diff` — committed and uncommitted changes
+/// in the conversation's worktree, compared against the explicit active PR's
+/// actual base branch. Read-only; used by the PR-specific diff action.
+pub(crate) async fn get_active_pr_diff(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ConversationDiffResponse>, AppError> {
+    const MAX_DIFF_BYTES: usize = 256 * 1024;
+
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let worktree_path = match &conv.conv_mode {
+        ConvMode::Work { worktree_path, .. } | ConvMode::Branch { worktree_path, .. } => {
+            worktree_path.to_string()
+        }
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation is not in Work or Branch mode (no worktree to diff)".to_string(),
+            ));
+        }
+    };
+    let work_scope = crate::work_scope::WorkScope::resolve(
+        &id,
+        Some(std::path::Path::new(worktree_path.as_str())),
+    );
+    let active_pr = active_selection_target_for_scope(state.runtime.db(), &work_scope)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "PR-specific diff unavailable until an active PR is selected".to_string(),
+            )
+        })?;
+    let pr_number = active_pr.pr_number;
+
+    tokio::task::spawn_blocking(move || {
+        let wt = PathBuf::from(&worktree_path);
+        if !wt.exists() {
+            return Err(AppError::NotFound(format!(
+                "Worktree no longer exists: {worktree_path}"
+            )));
+        }
+
+        let captured = capture_active_pr_diff(&wt, &active_pr, MAX_DIFF_BYTES)?;
+        Ok(build_diff_response(
+            captured,
+            format!("PR #{pr_number} Diff"),
+            "active_pr",
+            Some(pr_number),
+        ))
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?
+    .map(Json)
+}
+
 /// `GET /api/conversations/:id/diff` — committed and uncommitted changes
 /// in the conversation's worktree, vs the base branch. Read-only; used by
-/// the Work/Branch-mode "View diff" action so users can review before
+/// the Work/Branch-mode workspace diff action so users can review before
 /// deciding to merge or abandon.
 ///
 /// Requires the conversation to be in Work or Branch mode (anything else
@@ -943,24 +1687,12 @@ pub(crate) async fn get_conversation_diff(
 
         let captured = capture_branch_diff(&wt, &base_branch, MAX_DIFF_BYTES);
 
-        Ok(ConversationDiffResponse {
-            comparator: captured.comparator,
-            commit_log: captured.commit_log,
-            committed_truncated_kib: truncated_kib(
-                &captured.committed_diff,
-                captured.committed_total_bytes,
-                captured.committed_saturated,
-            ),
-            committed_saturated: captured.committed_saturated,
-            committed_diff: captured.committed_diff,
-            uncommitted_truncated_kib: truncated_kib(
-                &captured.uncommitted_diff,
-                captured.uncommitted_total_bytes,
-                captured.uncommitted_saturated,
-            ),
-            uncommitted_saturated: captured.uncommitted_saturated,
-            uncommitted_diff: captured.uncommitted_diff,
-        })
+        Ok(build_diff_response(
+            captured,
+            "Workspace Diff".to_string(),
+            "workspace",
+            None,
+        ))
     })
     .await
     .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?
@@ -1018,6 +1750,115 @@ mod tests {
         let fetched = Some(PrFeedbackStatus::Open);
 
         assert_eq!(fetched.or(previous), Some(PrFeedbackStatus::Open));
+    }
+
+    fn association(owner: &str, repo: &str, number: u64) -> crate::db::WorkScopePrAssociation {
+        crate::db::WorkScopePrAssociation {
+            work_scope_id: 1,
+            repo_owner: owner.to_string(),
+            repo_name: repo.to_string(),
+            pr_number: number,
+            title: format!("PR {number}"),
+            url: format!("https://example.test/{owner}/{repo}/{number}"),
+            state: "OPEN".to_string(),
+            draft: false,
+            display_state: crate::api::types::PrDisplayState::Open,
+            base: "main".to_string(),
+            head: format!("feature/{number}"),
+            github_updated_at: None,
+            feedback_status: PrFeedbackStatus::Open,
+            first_seen_at: "2024-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn observation(owner: &str, repo: &str, number: u64) -> crate::db::WorkScopePrObservation {
+        crate::db::WorkScopePrObservation {
+            repo_owner: owner.to_string(),
+            repo_name: repo.to_string(),
+            pr_number: number,
+            title: format!("PR {number}"),
+            url: format!("https://example.test/{owner}/{repo}/{number}"),
+            state: "OPEN".to_string(),
+            draft: false,
+            display_state: crate::api::types::PrDisplayState::Open,
+            base: "main".to_string(),
+            head: format!("feature/{number}"),
+            github_updated_at: None,
+        }
+    }
+
+    fn baseline(
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> crate::db::WorkScopePrFeedbackBaselineInput {
+        crate::db::WorkScopePrFeedbackBaselineInput {
+            repo_owner: owner.to_string(),
+            repo_name: repo.to_string(),
+            pr_number: number,
+            captured_at: "2024-01-01T00:00:00Z".to_string(),
+            github_updated_at: None,
+            feedback_identities: Vec::new(),
+            feedback_fingerprints: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn refreshed_pr_precedes_older_ranked_primary_association() {
+        let mut response = PrStatusResponse::not_found();
+        response.number = Some(22);
+        let associations = vec![
+            association("acme", "old", 11),
+            association("Acme", "New", 22),
+        ];
+        let observations = vec![observation("acme", "new", 22)];
+
+        let selected = refreshed_pr_association(&response, &observations, &associations).unwrap();
+
+        assert_eq!(
+            (selected.repo_name.as_str(), selected.pr_number),
+            ("New", 22)
+        );
+    }
+
+    #[test]
+    fn complete_artifact_identity_selects_exact_repository_case_insensitively() {
+        let associations = vec![
+            association("other", "repo", 7),
+            association("Acme", "App", 7),
+        ];
+
+        let selected =
+            association_for_artifact_baseline(&associations, &baseline("acme", "app", 7)).unwrap();
+
+        assert_eq!(
+            (selected.repo_owner.as_str(), selected.repo_name.as_str()),
+            ("Acme", "App")
+        );
+    }
+
+    #[test]
+    fn legacy_artifact_identity_selects_unique_number_without_active_selection() {
+        let associations = vec![association("acme", "app", 7), association("acme", "app", 8)];
+
+        let selected =
+            association_for_artifact_baseline(&associations, &baseline("", "", 7)).unwrap();
+
+        assert_eq!(selected.pr_number, 7);
+    }
+
+    #[test]
+    fn legacy_artifact_identity_rejects_same_number_across_repositories() {
+        let associations = vec![
+            association("acme", "app", 7),
+            association("other", "repo", 7),
+        ];
+
+        let error =
+            association_for_artifact_baseline(&associations, &baseline("", "", 7)).unwrap_err();
+
+        assert!(matches!(error, AppError::BadRequest(message) if message.contains("ambiguous")));
     }
 
     fn conversation_with_mode(
@@ -1343,6 +2184,316 @@ mod tests {
                 "expected {artifact_path} to be rejected",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn selection_envelope_reports_active_pr_plural_and_latest_branch() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let scope = crate::work_scope::WorkScope::Worktree("/tmp/ws-envelope".to_string());
+        db.upsert_work_scope_pr_observations(
+            &scope,
+            &[
+                crate::db::WorkScopePrObservation {
+                    repo_owner: "acme".to_string(),
+                    repo_name: "repo".to_string(),
+                    pr_number: 11,
+                    title: "A".to_string(),
+                    url: "https://example.test/acme/repo/11".to_string(),
+                    state: "OPEN".to_string(),
+                    draft: false,
+                    display_state: crate::api::types::PrDisplayState::Open,
+                    base: "main".to_string(),
+                    head: "feature/a".to_string(),
+                    github_updated_at: Some("2024-01-01T00:00:00Z".to_string()),
+                },
+                crate::db::WorkScopePrObservation {
+                    repo_owner: "acme".to_string(),
+                    repo_name: "repo".to_string(),
+                    pr_number: 22,
+                    title: "B".to_string(),
+                    url: "https://example.test/acme/repo/22".to_string(),
+                    state: "OPEN".to_string(),
+                    draft: false,
+                    display_state: crate::api::types::PrDisplayState::Open,
+                    base: "main".to_string(),
+                    head: "feature/b".to_string(),
+                    github_updated_at: Some("2024-01-02T00:00:00Z".to_string()),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        db.upsert_work_scope_observed_branch(
+            &scope,
+            &crate::db::WorkScopeObservedBranchUpsert {
+                repository_identity: "acme/repo".to_string(),
+                branch_name: "feature/b".to_string(),
+                head_oid: "bbbb".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        db.pin_active_work_scope_pr_selection(
+            &scope,
+            &phoenix_core::domain::active_pr_selection::ActivePrIdentity {
+                repo_owner: "acme".to_string(),
+                repo_name: "repo".to_string(),
+                pr_number: 22,
+            },
+        )
+        .await
+        .unwrap();
+
+        let envelope = selection_envelope_for_scope(&db, &scope).await.unwrap();
+        assert_eq!(envelope.associated_prs.len(), 2);
+        assert_eq!(envelope.active_pr.unwrap().pr.pr_number, 22);
+        assert_eq!(
+            envelope.latest_observed_branch.unwrap().branch_name,
+            "feature/b"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_worktree_response_retains_full_selection_envelope() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let scope = crate::work_scope::WorkScope::Worktree("/tmp/ws-missing".to_string());
+        db.upsert_work_scope_pr_observations(
+            &scope,
+            &[crate::db::WorkScopePrObservation {
+                repo_owner: "acme".to_string(),
+                repo_name: "repo".to_string(),
+                pr_number: 22,
+                title: "open".to_string(),
+                url: "https://example.test/acme/repo/22".to_string(),
+                state: "OPEN".to_string(),
+                draft: false,
+                display_state: crate::api::types::PrDisplayState::Open,
+                base: "main".to_string(),
+                head: "feature/b".to_string(),
+                github_updated_at: Some("2024-01-02T00:00:00Z".to_string()),
+            }],
+        )
+        .await
+        .unwrap();
+        db.upsert_work_scope_observed_branch(
+            &scope,
+            &crate::db::WorkScopeObservedBranchUpsert {
+                repository_identity: "acme/repo".to_string(),
+                branch_name: "feature/b".to_string(),
+                head_oid: "bbbb".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        db.pin_active_work_scope_pr_selection(
+            &scope,
+            &phoenix_core::domain::active_pr_selection::ActivePrIdentity {
+                repo_owner: "acme".to_string(),
+                repo_name: "repo".to_string(),
+                pr_number: 22,
+            },
+        )
+        .await
+        .unwrap();
+
+        let active_selection = active_selection_target_for_scope(&db, &scope)
+            .await
+            .unwrap()
+            .expect("selected PR");
+        let mut response = crate::api::pr_monitoring::stale_response(
+            active_selection,
+            PrUnavailableReason::NotGitRepo,
+            "2026-01-01T00:00:00Z".to_string(),
+        );
+        response.selection = selection_envelope_for_scope(&db, &scope).await.unwrap();
+        response.work_change = WorkChangeSummary::Unavailable {
+            reason: "worktree path is not a directory".to_string(),
+        };
+        assert_eq!(response.number, Some(22));
+        assert_eq!(response.selection.associated_prs.len(), 1);
+        let active = response.selection.active_pr.expect("active selection");
+        assert_eq!(active.pr.repo_owner, "acme");
+        assert_eq!(active.pr.repo_name, "repo");
+        assert_eq!(active.pr.pr_number, 22);
+        let observed = response
+            .selection
+            .latest_observed_branch
+            .expect("observed branch");
+        assert_eq!(observed.repository_identity, "acme/repo");
+        assert_eq!(observed.branch_name, "feature/b");
+    }
+
+    #[tokio::test]
+    async fn active_selection_target_uses_explicit_selection_not_ranked_primary() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let scope = crate::work_scope::WorkScope::Worktree("/tmp/ws-active-target".to_string());
+        db.upsert_work_scope_pr_observations(
+            &scope,
+            &[
+                crate::db::WorkScopePrObservation {
+                    repo_owner: "acme".to_string(),
+                    repo_name: "repo".to_string(),
+                    pr_number: 11,
+                    title: "merged".to_string(),
+                    url: "https://example.test/acme/repo/11".to_string(),
+                    state: "MERGED".to_string(),
+                    draft: false,
+                    display_state: crate::api::types::PrDisplayState::Merged,
+                    base: "main".to_string(),
+                    head: "feature/a".to_string(),
+                    github_updated_at: Some("2024-01-03T00:00:00Z".to_string()),
+                },
+                crate::db::WorkScopePrObservation {
+                    repo_owner: "acme".to_string(),
+                    repo_name: "repo".to_string(),
+                    pr_number: 22,
+                    title: "open".to_string(),
+                    url: "https://example.test/acme/repo/22".to_string(),
+                    state: "OPEN".to_string(),
+                    draft: false,
+                    display_state: crate::api::types::PrDisplayState::Open,
+                    base: "main".to_string(),
+                    head: "feature/b".to_string(),
+                    github_updated_at: Some("2024-01-02T00:00:00Z".to_string()),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        db.pin_active_work_scope_pr_selection(
+            &scope,
+            &phoenix_core::domain::active_pr_selection::ActivePrIdentity {
+                repo_owner: "acme".to_string(),
+                repo_name: "repo".to_string(),
+                pr_number: 22,
+            },
+        )
+        .await
+        .unwrap();
+
+        let selected = active_selection_target_for_scope(&db, &scope)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.pr_number, 22);
+    }
+
+    #[test]
+    fn active_pr_diff_rejects_cross_repo_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        init_repo(temp.path());
+        run_git(
+            temp.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/repo.git",
+            ],
+        )
+        .unwrap();
+        let selected = crate::db::WorkScopePrAssociation {
+            work_scope_id: 1,
+            repo_owner: "fork".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number: 42,
+            title: "fork change".to_string(),
+            url: "https://example.test/fork/repo/42".to_string(),
+            state: "OPEN".to_string(),
+            draft: false,
+            display_state: crate::api::types::PrDisplayState::Open,
+            base: "main".to_string(),
+            head: "feature/fork".to_string(),
+            github_updated_at: None,
+            feedback_status: phoenix_core::domain::pr_feedback_status::PrFeedbackStatus::Open,
+            first_seen_at: "2024-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        let err = capture_active_pr_diff(temp.path(), &selected, 256 * 1024)
+            .err()
+            .expect("cross-repo selection should be rejected");
+        match err {
+            AppError::BadRequest(message) => {
+                assert!(message.contains("selected repository fork/repo"));
+                assert!(message.contains("attached to acme/repo"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn active_pr_diff_rejects_selected_head_that_is_not_checked_out() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        run_git(repo.path(), &["checkout", "-q", "-b", "feature/other"]).unwrap();
+        let selected = crate::db::WorkScopePrAssociation {
+            work_scope_id: 1,
+            repo_owner: "acme".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number: 77,
+            title: "selected".to_string(),
+            url: "https://example.test/acme/repo/77".to_string(),
+            state: "OPEN".to_string(),
+            draft: false,
+            display_state: crate::api::types::PrDisplayState::Open,
+            base: "main".to_string(),
+            head: "feature/selected".to_string(),
+            github_updated_at: None,
+            feedback_status: phoenix_core::domain::pr_feedback_status::PrFeedbackStatus::Open,
+            first_seen_at: "2024-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        let err = capture_active_pr_diff_for_repo_identity(
+            repo.path(),
+            Some("acme/repo"),
+            &selected,
+            256 * 1024,
+        )
+        .err()
+        .expect("mismatched head should be rejected");
+        assert!(
+            matches!(err, AppError::BadRequest(message) if message.contains("selected head feature/selected") && message.contains("feature/other"))
+        );
+    }
+
+    #[test]
+    fn active_pr_diff_same_repo_uses_selected_pr_base_for_stacked_diff() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        run_git(repo.path(), &["checkout", "-q", "-b", "feature/base"]).unwrap();
+        commit_file(repo.path(), "base.txt", "base", "base commit");
+        run_git(repo.path(), &["checkout", "-q", "-b", "feature/top"]).unwrap();
+        commit_file(repo.path(), "top.txt", "top", "top commit");
+
+        let selected = crate::db::WorkScopePrAssociation {
+            work_scope_id: 1,
+            repo_owner: "acme".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number: 77,
+            title: "stacked".to_string(),
+            url: "https://example.test/acme/repo/77".to_string(),
+            state: "OPEN".to_string(),
+            draft: false,
+            display_state: crate::api::types::PrDisplayState::Open,
+            base: "feature/base".to_string(),
+            head: "feature/top".to_string(),
+            github_updated_at: None,
+            feedback_status: phoenix_core::domain::pr_feedback_status::PrFeedbackStatus::Open,
+            first_seen_at: "2024-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        let captured = capture_active_pr_diff_for_repo_identity(
+            repo.path(),
+            Some("acme/repo"),
+            &selected,
+            256 * 1024,
+        )
+        .unwrap();
+        assert_eq!(captured.comparator, "feature/base");
+        assert!(captured.commit_log.contains("top commit"));
+        assert!(!captured.commit_log.contains("base commit"));
     }
 
     #[test]

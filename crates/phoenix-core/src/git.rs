@@ -101,6 +101,8 @@ fn clear_inherited_config(command: &mut std::process::Command) {
     }
 }
 
+use crate::domain::observed_branch::LocalGitHeadObservation;
+
 /// Detect the git repository root for a given directory path.
 ///
 /// Returns `None` if the path is not inside a git repository.
@@ -158,6 +160,80 @@ pub fn resolve_remote_default_branch(path: &Path) -> Option<String> {
         return None;
     }
     Some(branch.to_string())
+}
+
+/// Observe the authoritative local Git HEAD state for a repository worktree.
+///
+/// Distinguishes a named branch from detached HEAD, unborn HEAD, and
+/// unavailable/error states without parsing shell command intent.
+#[must_use]
+pub fn observe_local_git_head(path: &Path) -> LocalGitHeadObservation {
+    const MAX_ATTEMPTS: usize = 6;
+
+    let repo_root = detect_git_repo_root(path);
+    let Some(repository_identity) = repo_root else {
+        return LocalGitHeadObservation::Unavailable {
+            repository_identity: None,
+            error: "not a git repository".to_string(),
+        };
+    };
+
+    let mut known_unborn_branch_name = None;
+    for _ in 0..MAX_ATTEMPTS {
+        if let Some(full_ref) =
+            git_capture(path, &["symbolic-ref", "--quiet", "HEAD"]).filter(|name| !name.is_empty())
+        {
+            let branch_name = full_ref
+                .strip_prefix("refs/heads/")
+                .unwrap_or(&full_ref)
+                .to_string();
+            known_unborn_branch_name = Some(branch_name.clone());
+            let ref_commit = git_capture(path, &["rev-parse", &format!("{full_ref}^{{commit}}")]);
+            if git_capture(path, &["symbolic-ref", "--quiet", "HEAD"]).as_deref()
+                != Some(full_ref.as_str())
+            {
+                continue;
+            }
+            if let Some(head_oid) = ref_commit.filter(|oid| !oid.is_empty()) {
+                return LocalGitHeadObservation::NamedBranch {
+                    repository_identity,
+                    branch_name,
+                    head_oid,
+                };
+            }
+            if git_capture(path, &["rev-parse", "--verify", "HEAD"]).is_none() {
+                return LocalGitHeadObservation::Unborn {
+                    repository_identity,
+                    branch_name: Some(branch_name),
+                };
+            }
+            continue;
+        }
+
+        let first_oid = git_capture(path, &["rev-parse", "HEAD^{commit}"]);
+        let second_oid = git_capture(path, &["rev-parse", "HEAD^{commit}"]);
+        if git_capture(path, &["symbolic-ref", "--quiet", "HEAD"]).is_none() {
+            if let Some(head_oid) = first_oid.filter(|oid| Some(oid) == second_oid.as_ref()) {
+                return LocalGitHeadObservation::Detached {
+                    repository_identity,
+                    head_oid,
+                };
+            }
+        }
+    }
+
+    let branch_name = known_unborn_branch_name;
+    if git_capture(path, &["rev-parse", "--verify", "HEAD"]).is_none() {
+        return LocalGitHeadObservation::Unborn {
+            repository_identity,
+            branch_name,
+        };
+    }
+
+    LocalGitHeadObservation::Unavailable {
+        repository_identity: Some(repository_identity),
+        error: "unable to resolve HEAD state".to_string(),
+    }
 }
 
 /// Run `git <args>` in `path`, returning trimmed stdout on success.
@@ -239,5 +315,180 @@ mod command_tests {
             "signing-program-must-never-run",
         ]);
         run(&["commit", "--allow-empty", "--quiet", "-m", "unsigned"]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(path: &std::path::Path, args: &[&str]) {
+        let status = command()
+            .args(args)
+            .current_dir(path)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn git_out(path: &std::path::Path, args: &[&str]) -> String {
+        let output = command()
+            .args(args)
+            .current_dir(path)
+            .output()
+            .expect("git runs");
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
+    fn init_repo() -> tempfile::TempDir {
+        let dir = temp_dir();
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["config", "user.name", "Phoenix Test"]);
+        git(dir.path(), &["config", "user.email", "phoenix@example.com"]);
+        dir
+    }
+
+    fn commit_file(path: &std::path::Path, name: &str, body: &str) -> String {
+        std::fs::write(path.join(name), body).expect("write file");
+        git(path, &["add", name]);
+        git(path, &["commit", "-m", "commit"]);
+        git_out(path, &["rev-parse", "HEAD^{commit}"])
+    }
+
+    #[test]
+    fn observe_local_git_head_reports_named_branch_and_head_oid() {
+        let repo = init_repo();
+        let head_oid = commit_file(repo.path(), "f.txt", "hi");
+
+        let observed = observe_local_git_head(repo.path());
+        assert_eq!(
+            observed,
+            LocalGitHeadObservation::NamedBranch {
+                repository_identity: std::fs::canonicalize(repo.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                branch_name: "main".to_string(),
+                head_oid,
+            }
+        );
+    }
+
+    #[test]
+    fn observe_local_git_head_reports_detached_head() {
+        let repo = init_repo();
+        let head_oid = commit_file(repo.path(), "f.txt", "hi");
+        git(repo.path(), &["checkout", "--detach", "HEAD"]);
+
+        let observed = observe_local_git_head(repo.path());
+        assert_eq!(
+            observed,
+            LocalGitHeadObservation::Detached {
+                repository_identity: std::fs::canonicalize(repo.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                head_oid,
+            }
+        );
+    }
+
+    #[test]
+    fn observe_local_git_head_reports_unborn_head() {
+        let repo = init_repo();
+
+        let observed = observe_local_git_head(repo.path());
+        assert_eq!(
+            observed,
+            LocalGitHeadObservation::Unborn {
+                repository_identity: std::fs::canonicalize(repo.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                branch_name: Some("main".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn observe_local_git_head_reports_unavailable_for_non_repo() {
+        let dir = temp_dir();
+
+        let observed = observe_local_git_head(dir.path());
+        assert_eq!(
+            observed,
+            LocalGitHeadObservation::Unavailable {
+                repository_identity: None,
+                error: "not a git repository".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn observe_local_git_head_preserves_known_unborn_branch_name() {
+        let repo = temp_dir();
+        git(repo.path(), &["init"]);
+        git(repo.path(), &["symbolic-ref", "HEAD", "refs/heads/topic"]);
+
+        let observed = observe_local_git_head(repo.path());
+        assert_eq!(
+            observed,
+            LocalGitHeadObservation::Unborn {
+                repository_identity: std::fs::canonicalize(repo.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                branch_name: Some("topic".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn observe_local_git_head_eventually_reports_consistent_snapshot_during_checkout() {
+        let repo = init_repo();
+        commit_file(repo.path(), "base.txt", "base");
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        let feature_oid = commit_file(repo.path(), "feature.txt", "feature");
+        git(repo.path(), &["checkout", "main"]);
+        let main_oid = git_out(repo.path(), &["rev-parse", "HEAD^{commit}"]);
+
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                for _ in 0..200 {
+                    git(repo.path(), &["checkout", "feature"]);
+                    git(repo.path(), &["checkout", "main"]);
+                }
+            });
+
+            for _ in 0..200 {
+                match observe_local_git_head(repo.path()) {
+                    LocalGitHeadObservation::NamedBranch {
+                        branch_name,
+                        head_oid,
+                        ..
+                    } => {
+                        if branch_name == "main" {
+                            assert_eq!(head_oid, main_oid);
+                        } else if branch_name == "feature" {
+                            assert_eq!(head_oid, feature_oid);
+                        } else {
+                            panic!("unexpected branch snapshot: {branch_name} {head_oid}");
+                        }
+                    }
+                    LocalGitHeadObservation::Detached { head_oid, .. } => {
+                        assert!(head_oid == main_oid || head_oid == feature_oid);
+                    }
+                    LocalGitHeadObservation::Unborn { .. }
+                    | LocalGitHeadObservation::Unavailable { .. } => {}
+                }
+            }
+
+            handle.join().unwrap();
+        });
     }
 }

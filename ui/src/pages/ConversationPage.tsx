@@ -36,6 +36,7 @@ import { WorkControlBar } from '../components/WorkActions';
 import {
   useConversationEventCursorRef,
   useConversationView,
+  useWorkScope,
   useCreateConversationWithStore,
   readCreateIntent,
   clearCreateIntent,
@@ -202,6 +203,7 @@ function ConversationPageContent() {
   // read by <StreamingMessage>/<MessageList> via their own slice selectors;
   // the heartbeat clock by <ConnectedStateBar> via useLastSseEventAt.
   const [atom, dispatch] = useConversationView(slug!);
+  const workScopeInventory = useWorkScope(slug!);
 
   // Derived from atom
   const conversationId = atom.conversationId ?? undefined;
@@ -220,6 +222,19 @@ function ConversationPageContent() {
     branchName: conversation?.branch_name,
     cachedPr: conversation?.cached_pr,
   });
+  const refreshPrStatus = prStatusHandle.refresh;
+  const activePrIdentity = prStatusHandle.activeSelection?.active_pr
+    ? `${prStatusHandle.activeSelection.active_pr.pr.repo_owner}/${prStatusHandle.activeSelection.active_pr.pr.repo_name}#${prStatusHandle.activeSelection.active_pr.pr.pr_number}`
+    : null;
+
+  const observedWorkScopeRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!workScopeInventory) return;
+    const previousScope = observedWorkScopeRef.current;
+    observedWorkScopeRef.current = workScopeInventory.scope_key;
+    if (previousScope !== workScopeInventory.scope_key || !confirmedLive) return;
+    void refreshPrStatus();
+  }, [workScopeInventory, confirmedLive, refreshPrStatus]);
 
   useEffect(() => {
     setConversationReadiness({
@@ -245,7 +260,9 @@ function ConversationPageContent() {
   const viewerSlot = useViewerSlot();
   const slotKind = viewerSlot.slot.kind;
   const rawDiffPresentation = viewerSlot.slot.kind === 'diff' ? viewerSlot.slot.presentation : null;
+  const rawDiffTarget = viewerSlot.slot.kind === 'diff' ? viewerSlot.slot.target : 'workspace';
   const diffPresentation = isArchived ? null : rawDiffPresentation;
+  const diffTarget = isArchived ? 'workspace' : rawDiffTarget;
   const fullscreenDiffOpen = diffPresentation === 'fullscreen';
   const paneDiffOpen = diffPresentation === 'pane';
   const browserOpen = slotKind === 'browser';
@@ -1438,6 +1455,8 @@ function ConversationPageContent() {
           <Suspense fallback={null}>
             <ConversationDiffViewer
               conversationId={conversationId}
+              target={diffTarget}
+              activePrIdentity={activePrIdentity}
               onClose={handleCloseDiff}
               onSendNotes={handleSendNotes}
               inline
@@ -2037,7 +2056,7 @@ function ConversationPageContent() {
         firstByteRequestId={atom.firstByteRequestId}
         turnRetryContext={atom.turnRetryContext}
         onOpenFiles={isDesktop || !fileRootPath ? undefined : handleOpenFiles}
-        prStatusState={prStatusHandle.state}
+        prStatusHandle={prStatusHandle}
       />
       </RenderProfiler>
       </div>
@@ -2119,6 +2138,8 @@ function ConversationPageContent() {
         <Suspense fallback={null}>
           <ConversationDiffViewer
             conversationId={conversationId}
+            target={diffTarget}
+            activePrIdentity={activePrIdentity}
             onClose={handleCloseDiff}
             onSendNotes={handleSendNotes}
             takeover
@@ -2129,6 +2150,8 @@ function ConversationPageContent() {
         <Suspense fallback={null}>
           <ConversationDiffViewer
             conversationId={conversationId}
+            target={diffTarget}
+            activePrIdentity={activePrIdentity}
             onClose={handleCloseDiff}
             onSendNotes={handleSendNotes}
           />
@@ -2211,6 +2234,8 @@ function ConversationPageContent() {
               {paneDiffOpen && conversationId ? (
                 <ConversationDiffViewer
                   conversationId={conversationId}
+                  target={diffTarget}
+                  activePrIdentity={activePrIdentity}
                   onClose={handleCloseDiff}
                   onSendNotes={handleSendNotes}
                   inline

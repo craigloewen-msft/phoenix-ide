@@ -2,6 +2,7 @@
 //! db, state-machine, llm and tools layers. Lives in the base crate so those
 //! layers depend *down* onto a common vocabulary instead of onto each other.
 
+pub mod active_pr_selection;
 pub mod bash_types;
 pub mod creation_protocol;
 pub mod db_schema;
@@ -10,6 +11,7 @@ pub mod llm_error_kind;
 pub mod llm_types;
 pub mod message_text;
 pub mod mode_context;
+pub mod observed_branch;
 pub mod patch_types;
 pub mod pr_display_state;
 pub mod pr_feedback_status;

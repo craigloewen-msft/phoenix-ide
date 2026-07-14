@@ -516,7 +516,10 @@ async fn run_run(
                 // work-scope state-transition signal (REQ-WSUI-007). The
                 // detached waiter started below carries the sink so it can
                 // emit the terminal edge off-thread.
-                registry.emit_lifecycle(&ctx.work_scope);
+                registry.emit_lifecycle(
+                    &ctx.work_scope,
+                    crate::bash::registry::BashLifecyclePhase::Spawned,
+                );
                 start_io_tasks(
                     &inserted,
                     child,
@@ -786,6 +789,7 @@ async fn run_waiter(
         if let Some(sink) = &lifecycle_sink {
             if let Err(e) = sink.send(crate::bash::registry::BashLifecycleEvent {
                 work_scope: handle.work_scope.clone(),
+                phase: crate::bash::registry::BashLifecyclePhase::Terminal,
             }) {
                 tracing::debug!(
                     work_scope = %handle.work_scope,
@@ -990,9 +994,10 @@ async fn run_kill(handle_id: &str, signal: KillSignal, ctx: &ToolContext) -> Too
                 .mark_kill_pending_kernel(signal, SystemTime::now())
                 .await;
             // Kill edge: the handle moved running -> kill_pending_kernel, a
-            // state the inventory reflects (REQ-WSUI-007). Emit now; the
-            // later tombstone transition emits again from the waiter.
-            ctx.bash_handle_registry().emit_lifecycle(&ctx.work_scope);
+            // state the inventory reflects (REQ-WSUI-007). Emit a non-
+            // reconciling lifecycle phase now; the later true terminal
+            // transition still emits from the waiter after final I/O drains.
+            ctx.bash_handle_registry().emit_lifecycle(&ctx.work_scope, crate::bash::registry::BashLifecyclePhase::KillPendingKernel);
             shape_handle_response(
                 &handle,
                 &ReadArgs::default(),
@@ -1483,6 +1488,7 @@ fn display_label(handle: &Arc<Handle>, kind: ResponseKind) -> String {
 mod tests {
     use super::*;
     use crate::bash::handle::{Handle, HandleId};
+    use crate::bash::registry::BashLifecyclePhase;
     use crate::bash::ring::{RingBuffer, PARTIAL_IDLE_FLUSH_SECONDS, RING_BUFFER_BYTES};
     use phoenix_core::work_scope::WorkScope;
     use std::pin::Pin;
@@ -1647,5 +1653,72 @@ mod tests {
         }
 
         task.abort();
+    }
+    #[tokio::test]
+    async fn kill_pending_emits_non_reconciling_phase_before_true_terminal() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let socket_dir = tempfile::tempdir().expect("socket dir");
+        let registry =
+            Arc::new(crate::bash::registry::BashHandleRegistry::with_lifecycle_sink(Some(tx)));
+        let ctx = crate::ToolContext::new(
+            tokio_util::sync::CancellationToken::new(),
+            "conv-kill-pending".to_string(),
+            std::env::current_dir().expect("cwd"),
+            crate::browser::session::BrowserSessionManager::new(),
+            registry,
+            Arc::new(crate::NoLlm),
+            phoenix_terminal::ActiveTerminals::default(),
+            Arc::new(crate::tmux::registry::TmuxRegistry::with_socket_dir(
+                socket_dir.path().to_path_buf(),
+            )),
+            None,
+        );
+
+        let run = run_run(
+            "trap '' TERM; sleep 3600",
+            None,
+            0,
+            ReadArgs::default(),
+            &ctx,
+            BashSpawnMode::Direct,
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(run.output()).expect("run json");
+        let handle_id = value["handle"].as_str().expect("handle id").to_string();
+
+        let spawned = rx.recv().await.expect("spawned event");
+        assert_eq!(spawned.phase, BashLifecyclePhase::Spawned);
+        assert_eq!(spawned.work_scope, ctx.work_scope);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let kill_task = tokio::spawn({
+            let ctx = ctx.clone();
+            let handle_id = handle_id.clone();
+            async move { run_kill(&handle_id, KillSignal::Term, &ctx).await }
+        });
+
+        let kill_pending = rx.recv().await.expect("kill-pending event");
+        assert_eq!(kill_pending.phase, BashLifecyclePhase::KillPendingKernel);
+        assert_eq!(kill_pending.work_scope, ctx.work_scope);
+        assert!(
+            !kill_pending.phase.schedules_reconciliation(),
+            "kill_pending must not trigger terminal reconciliation"
+        );
+
+        let kill_output = kill_task.await.expect("kill task");
+        let kill_value: serde_json::Value =
+            serde_json::from_str(kill_output.output()).expect("kill json");
+        assert_eq!(kill_value["status"], "kill_pending_kernel");
+
+        let handle = lookup_handle(&ctx, &handle_id)
+            .await
+            .expect("lookup handle");
+        let live_state = handle.state().await;
+        assert!(matches!(live_state.as_ref(), HandleState::Live(_)));
+
+        let _ = run_kill(&handle_id, KillSignal::Kill, &ctx).await;
+        let terminal = rx.recv().await.expect("terminal event");
+        assert_eq!(terminal.phase, BashLifecyclePhase::Terminal);
+        assert!(terminal.phase.schedules_reconciliation());
     }
 }

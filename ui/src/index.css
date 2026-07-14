@@ -9251,6 +9251,10 @@ html * {
   gap: 6px;
 }
 
+.work-actions-address-copy {
+  min-width: 0;
+}
+
 /* Clean up button — neutral green (same weight as the old "complete" action). */
 .work-actions-clean-up {
   color: var(--accent-green, #3fb950);
@@ -9330,6 +9334,20 @@ html * {
 
 .work-actions-pr-note--warning {
   color: var(--accent-yellow, #eab308);
+}
+
+.work-actions-pr-note-button {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+}
+
+.work-actions-pr-note-button:hover,
+.work-actions-pr-note-button:focus-visible {
+  text-decoration: underline;
+  outline: none;
 }
 
 .work-actions-abandon {

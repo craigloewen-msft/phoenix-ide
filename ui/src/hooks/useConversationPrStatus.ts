@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, type CachedPrSummary, type PrStatusResponse } from '../api';
+import {
+  api,
+  type ActivePrSelectionResponse,
+  type AssociatedPrStatusEnvelope,
+  type AssociatedPrSummaryResponse,
+  type CachedPrSummary,
+  type PinAssociatedPrRequest,
+  type PrStatusResponse,
+} from '../api';
 
 export type ConversationPrStatusState =
   | { status: 'disabled'; prStatus: null }
@@ -10,7 +18,12 @@ type InternalConversationPrStatusState = ConversationPrStatusState & { scopeKey:
 
 export interface ConversationPrStatusHandle {
   state: ConversationPrStatusState;
-  refresh: () => Promise<void>;
+  refresh: () => Promise<PrStatusResponse | undefined>;
+  activeSelection?: AssociatedPrStatusEnvelope | null;
+  activePrSummary?: AssociatedPrSummaryResponse | null;
+  ambiguous?: boolean;
+  pinActivePr?: (request: PinAssociatedPrRequest) => Promise<void>;
+  resumeInference?: () => Promise<void>;
 }
 
 function displayStateToGhState(displayState: CachedPrSummary['display_state']): string {
@@ -63,6 +76,43 @@ function cachedSeedMatchesStatus(cachedSeed: PrStatusResponse, prStatus: PrStatu
     && (prStatus.head ?? prStatus.pr?.head) === cachedSeed.head;
 }
 
+function isActionablePr(pr: AssociatedPrSummaryResponse): boolean {
+  return pr.display_state === 'open' || pr.display_state === 'draft';
+}
+
+function samePrIdentity(
+  activePr: ActivePrSelectionResponse | undefined,
+  pr: AssociatedPrSummaryResponse,
+): boolean {
+  return activePr?.pr.repo_owner === pr.repo_owner
+    && activePr?.pr.repo_name === pr.repo_name
+    && activePr?.pr.pr_number === pr.pr_number;
+}
+
+function selectionFromPrStatus(prStatus: PrStatusResponse): AssociatedPrStatusEnvelope | null {
+  if (prStatus.selection) return prStatus.selection;
+  if (prStatus.associated_prs) {
+    return {
+      associated_prs: prStatus.associated_prs,
+      ...(prStatus.active_pr ? { active_pr: prStatus.active_pr } : {}),
+      ...(prStatus.latest_observed_branch
+        ? { latest_observed_branch: prStatus.latest_observed_branch }
+        : {}),
+    };
+  }
+  return null;
+}
+
+function activePrSummaryFromSelection(selection: AssociatedPrStatusEnvelope | null): AssociatedPrSummaryResponse | null {
+  if (!selection) return null;
+  return selection.associated_prs.find((pr) => samePrIdentity(selection.active_pr, pr)) ?? null;
+}
+
+function isSelectionAmbiguous(selection: AssociatedPrStatusEnvelope | null): boolean {
+  if (!selection || selection.active_pr) return false;
+  return selection.associated_prs.filter(isActionablePr).length > 1;
+}
+
 function shouldShowCachedSeed(
   internalState: InternalConversationPrStatusState,
   cachedSeed: PrStatusResponse | null,
@@ -82,7 +132,24 @@ function publicStateForScope(
 ): ConversationPrStatusState {
   if (!scopeKey) return { status: 'disabled', prStatus: null };
   if (internalState.scopeKey === scopeKey) {
-    if (shouldShowCachedSeed(internalState, cachedSeed)) return { status: 'ready', prStatus: cachedSeed };
+    if (shouldShowCachedSeed(internalState, cachedSeed) && cachedSeed) {
+      const liveSelection = internalState.status === 'ready'
+        ? selectionFromPrStatus(internalState.prStatus)
+        : null;
+      return {
+        status: 'ready',
+        prStatus: liveSelection
+          ? {
+              ...cachedSeed,
+              associated_prs: liveSelection.associated_prs,
+              ...(liveSelection.active_pr ? { active_pr: liveSelection.active_pr } : {}),
+              ...(liveSelection.latest_observed_branch
+                ? { latest_observed_branch: liveSelection.latest_observed_branch }
+                : {}),
+            }
+          : cachedSeed,
+      };
+    }
     return internalState;
   }
   if (cachedSeed) return { status: 'ready', prStatus: cachedSeed };
@@ -109,6 +176,7 @@ export function useConversationPrStatus({
     () => (scopeKey && cachedPr ? cachedPrToStatus(cachedPr) : null),
     [cachedPr, scopeKey],
   );
+  const cachedSelection: AssociatedPrStatusEnvelope | null = null;
   const cachedSeedRef = useRef<PrStatusResponse | null>(null);
   cachedSeedRef.current = cachedSeed;
   const [internalState, setInternalState] = useState<InternalConversationPrStatusState>(() => (
@@ -118,49 +186,45 @@ export function useConversationPrStatus({
   ));
 
   const refresh = useCallback(async () => {
-    if (!scopeKey || !conversationId) return;
-    if (activeScopeRef.current !== scopeKey) return;
+    if (!scopeKey || !conversationId) return undefined;
+    if (activeScopeRef.current !== scopeKey) return undefined;
     const seq = ++latestSeqRef.current;
     try {
       const prStatus = await api.getPrStatus(conversationId);
-      if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return;
+      if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return undefined;
       setInternalState({ scopeKey, status: 'ready', prStatus });
+      return prStatus;
     } catch {
-      if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return;
+      if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return undefined;
       const fallback = cachedSeedRef.current;
       if (fallback) {
-        setInternalState({
-          scopeKey,
-          status: 'ready',
-          prStatus: {
-            ...fallback,
-            unavailable_reason: 'command_failed',
-            refresh: {
-              ...fallback.refresh,
-              state: 'unavailable',
-              reason: 'command_failed',
-              last_attempted_at: new Date().toISOString(),
-              stale: true,
-            },
-          },
-        });
-        return;
-      }
-      setInternalState({
-        scopeKey,
-        status: 'ready',
-        prStatus: {
-          found: false,
+        const unavailable: PrStatusResponse = {
+          ...fallback,
           unavailable_reason: 'command_failed',
           refresh: {
+            ...fallback.refresh,
             state: 'unavailable',
             reason: 'command_failed',
             last_attempted_at: new Date().toISOString(),
-            stale: false,
+            stale: true,
           },
-          work_change: { kind: 'unavailable', reason: 'command_failed' },
+        };
+        setInternalState({ scopeKey, status: 'ready', prStatus: unavailable });
+        return unavailable;
+      }
+      const unavailable: PrStatusResponse = {
+        found: false,
+        unavailable_reason: 'command_failed',
+        refresh: {
+          state: 'unavailable',
+          reason: 'command_failed',
+          last_attempted_at: new Date().toISOString(),
+          stale: false,
         },
-      });
+        work_change: { kind: 'unavailable', reason: 'command_failed' },
+      };
+      setInternalState({ scopeKey, status: 'ready', prStatus: unavailable });
+      return unavailable;
     }
   }, [conversationId, scopeKey]);
 
@@ -206,8 +270,33 @@ export function useConversationPrStatus({
     };
   }, [scopeKey, refresh]);
 
+  const publicState = publicStateForScope(internalState, scopeKey, cachedSeed);
+  const liveSelection = internalState.scopeKey === scopeKey && internalState.status === 'ready'
+    ? selectionFromPrStatus(internalState.prStatus)
+    : null;
+  const activeSelection = liveSelection ?? (publicState.status === 'ready'
+    ? (selectionFromPrStatus(publicState.prStatus) ?? cachedSelection)
+    : cachedSelection);
+
+  const pinActivePr = useCallback(async (request: PinAssociatedPrRequest) => {
+    if (!scopeKey || !conversationId) return;
+    await api.pinAssociatedPr(conversationId, request);
+    await refresh();
+  }, [conversationId, refresh, scopeKey]);
+
+  const resumeInference = useCallback(async () => {
+    if (!scopeKey || !conversationId) return;
+    await api.resumeAssociatedPrInference(conversationId);
+    await refresh();
+  }, [conversationId, refresh, scopeKey]);
+
   return {
-    state: publicStateForScope(internalState, scopeKey, cachedSeed),
+    state: publicState,
     refresh,
+    activeSelection,
+    activePrSummary: activePrSummaryFromSelection(activeSelection),
+    ambiguous: isSelectionAmbiguous(activeSelection),
+    pinActivePr,
+    resumeInference,
   };
 }

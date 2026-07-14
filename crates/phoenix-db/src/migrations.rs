@@ -216,6 +216,21 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_creation_cleanup_claims",
         sql: MIGRATION_040,
     },
+    Migration {
+        version: 41,
+        name: "create_work_scope_observed_branches",
+        sql: MIGRATION_041,
+    },
+    Migration {
+        version: 42,
+        name: "create_work_scope_active_pr_selection",
+        sql: MIGRATION_042,
+    },
+    Migration {
+        version: 43,
+        name: "normalize_pr_feedback_baselines_by_full_identity",
+        sql: MIGRATION_043,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -490,6 +505,73 @@ CREATE TABLE IF NOT EXISTS work_scope_pr_feedback_baselines (
     feedback_fingerprints TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (work_scope_id, pr_number)
 );
+";
+
+const MIGRATION_041: &str = r"
+CREATE TABLE IF NOT EXISTS work_scope_observed_branches (
+    work_scope_id INTEGER NOT NULL REFERENCES work_scopes(id) ON DELETE CASCADE,
+    repository_identity TEXT NOT NULL,
+    branch_name TEXT NOT NULL,
+    first_observed_head_oid TEXT NOT NULL,
+    last_observed_head_oid TEXT NOT NULL,
+    first_observed_at TEXT NOT NULL,
+    last_observed_at TEXT NOT NULL,
+    PRIMARY KEY (work_scope_id, repository_identity, branch_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_work_scope_observed_branches_last_seen
+ON work_scope_observed_branches(work_scope_id, last_observed_at);
+";
+const MIGRATION_042: &str = r"
+CREATE TABLE IF NOT EXISTS work_scope_active_pr_selection (
+    work_scope_id INTEGER PRIMARY KEY REFERENCES work_scopes(id) ON DELETE CASCADE,
+    repo_owner TEXT,
+    repo_name TEXT,
+    pr_number INTEGER,
+    provenance TEXT NOT NULL,
+    latest_observed_repository_identity TEXT,
+    latest_observed_branch_name TEXT,
+    inference_generation INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        (repo_owner IS NULL AND repo_name IS NULL AND pr_number IS NULL)
+        OR (repo_owner IS NOT NULL AND repo_name IS NOT NULL AND pr_number IS NOT NULL)
+    )
+);
+";
+
+const MIGRATION_043: &str = r"
+ALTER TABLE work_scope_pr_feedback_baselines RENAME TO work_scope_pr_feedback_baselines_old;
+
+CREATE TABLE work_scope_pr_feedback_baselines (
+    work_scope_id INTEGER NOT NULL REFERENCES work_scopes(id) ON DELETE CASCADE,
+    repo_owner TEXT NOT NULL,
+    repo_name TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    captured_at TEXT NOT NULL,
+    github_updated_at TEXT,
+    feedback_identities TEXT NOT NULL DEFAULT '[]',
+    feedback_fingerprints TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (work_scope_id, repo_owner, repo_name, pr_number)
+);
+
+INSERT INTO work_scope_pr_feedback_baselines (
+    work_scope_id, repo_owner, repo_name, pr_number, captured_at, github_updated_at,
+    feedback_identities, feedback_fingerprints
+)
+SELECT b.work_scope_id, a.repo_owner, a.repo_name, b.pr_number, b.captured_at, b.github_updated_at,
+       b.feedback_identities, b.feedback_fingerprints
+FROM work_scope_pr_feedback_baselines_old b
+JOIN work_scope_pr_associations a
+  ON a.work_scope_id = b.work_scope_id AND a.pr_number = b.pr_number
+WHERE 1 = (
+    SELECT COUNT(*)
+    FROM work_scope_pr_associations candidate
+    WHERE candidate.work_scope_id = b.work_scope_id
+      AND candidate.pr_number = b.pr_number
+);
+
+DROP TABLE work_scope_pr_feedback_baselines_old;
 ";
 
 const MIGRATION_014: &str = r"
