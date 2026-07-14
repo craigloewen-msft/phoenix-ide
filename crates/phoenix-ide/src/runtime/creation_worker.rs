@@ -1478,12 +1478,15 @@ fn app_error_to_kind(error: AppError) -> (String, ErrorKind) {
     match error {
         AppError::Conflict(response) => (response.error.clone(), ErrorKind::InvalidRequest),
         AppError::BadRequest(message)
+        | AppError::TypedBadRequest { message, .. }
         | AppError::UnprocessableEntity(crate::api::ExpansionErrorResponse {
             error: message,
             ..
         })
         | AppError::NotFound(message) => (message, ErrorKind::InvalidRequest),
-        AppError::Internal(message) => (message, ErrorKind::ServerError),
+        AppError::Internal(message) | AppError::TypedInternal { message, .. } => {
+            (message, ErrorKind::ServerError)
+        }
         AppError::Forbidden(message) => (message, ErrorKind::Auth),
     }
 }

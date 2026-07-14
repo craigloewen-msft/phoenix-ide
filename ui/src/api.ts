@@ -568,6 +568,7 @@ export interface ConversationMessageSliceResponse {
   tombstones: ConversationMessageTombstone[];
   transcript_generation: number;
   server_message_tail: number | null;
+  has_older_messages: boolean;
 }
 
 export interface ConversationMessageRangeResponse {
@@ -776,6 +777,13 @@ export class NotFoundError extends Error {
   constructor(message = 'Not found') {
     super(message);
     this.name = 'NotFoundError';
+  }
+}
+
+export class MessageSliceAlignmentError extends Error {
+  constructor(message = 'Aligned message slice exceeds the server response ceiling') {
+    super(message);
+    this.name = 'MessageSliceAlignmentError';
   }
 }
 
@@ -1499,6 +1507,15 @@ export const api = {
     return resp.json();
   },
 
+  async getConversationMeta(id: string): Promise<ConversationMetaResponse> {
+    const resp = await fetch(`/api/conversations/${encodeURIComponent(id)}/meta`);
+    if (!resp.ok) {
+      if (resp.status === 404) throw new Error('Conversation not found');
+      throw new Error('Failed to get conversation metadata');
+    }
+    return resp.json();
+  },
+
   async getConversationMetaBySlug(slug: string): Promise<ConversationMetaResponse> {
     const resp = await fetch(`/api/conversations/by-slug/${encodeURIComponent(slug)}/meta`);
     if (!resp.ok) {
@@ -1532,7 +1549,13 @@ export const api = {
     const resp = await fetch(
       `/api/conversations/${encodeURIComponent(id)}/messages/latest?${params}`,
     );
-    if (!resp.ok) throw new Error('Failed to fetch latest conversation messages');
+    if (!resp.ok) {
+      const error = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      if (error.error_type === 'message_slice_render_unit_ceiling_exceeded') {
+        throw new MessageSliceAlignmentError(error.error);
+      }
+      throw new Error(error.error ?? 'Failed to fetch latest conversation messages');
+    }
     return resp.json();
   },
 

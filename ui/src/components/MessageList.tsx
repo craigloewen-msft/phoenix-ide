@@ -1,8 +1,28 @@
-import { memo, useState, useRef, useCallback, useMemo, useEffect, forwardRef, useImperativeHandle } from 'react';
+import {
+  memo,
+  useState,
+  useRef,
+  useCallback,
+  useMemo,
+  useEffect,
+  useLayoutEffect,
+  forwardRef,
+  useImperativeHandle,
+} from 'react';
 import { useDensity } from '../hooks/useDensity';
-import { FindBar, buildConversationSearchProjection, useViewerFindKeyboardShortcut } from './viewer-find';
+import {
+  FindBar,
+  buildConversationSearchProjection,
+  useViewerFindKeyboardShortcut,
+} from './viewer-find';
 import { useFocusScope, useFocusScopeCommands } from '../hooks/useFocusScope';
-import { Virtuoso, type VirtuosoHandle, type VirtuosoProps, type ListRange } from 'react-virtuoso';
+import {
+  VirtualTranscript,
+  type VirtualTranscriptHandle,
+  type VirtualTranscriptPhysicalSnapshot,
+  type VirtualTranscriptRange,
+  type VirtualTranscriptRangeChange,
+} from './VirtualTranscript';
 import type { Message, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
 import {
@@ -20,6 +40,7 @@ import { FilePathContextMenu } from './FilePathContextMenu';
 import { useStreamingBuffer, useStreamingRequestId } from '../conversation/useConversationAtom';
 import {
   buildHistoricalUnits,
+  findHistoricalUnitIndexByMessageId,
   buildTailUnits,
   type HistoricalUnit,
   type TailUnit,
@@ -39,6 +60,14 @@ import {
   type ScrollSnapshot,
   type TailActivity,
 } from '../conversation/scrollMachine';
+import type { HistoryView, RestoreBasis } from '../conversation/historyExpansion';
+import {
+  initialTranscriptPositioningState,
+  reduceTranscriptPositioning,
+  type TranscriptPositioningEffect,
+  type TranscriptPositioningEvent,
+  type TranscriptPositioningInput,
+} from '../conversation/transcriptPositioning';
 
 const ChevronRight = () => (
   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -50,6 +79,23 @@ const ChevronDown = () => (
     <polyline points="6 9 12 15 18 9" />
   </svg>
 );
+
+const RESTORE_OFFSET_TOLERANCE_PX = 2;
+
+function historyViewKey(view: HistoryView): string {
+  return `${view.conversationId}:${view.generation}:${view.transcriptGeneration}`;
+}
+
+function scheduleDeferred(callback: () => void): () => void {
+  let cancelled = false;
+  queueMicrotask(() => {
+    if (!cancelled) callback();
+  });
+  return () => {
+    cancelled = true;
+  };
+}
+
 const MessageSquareIcon = () => (
   <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
     <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
@@ -69,26 +115,32 @@ interface MessageListProps {
   filePathRootDir?: string | undefined;
   workScopeKey?: string | undefined;
   enableMessageSidepanel?: boolean | undefined;
-  /** Scroll-spy: the inclusive range of `historicalUnits`/virtuoso item
-   *  indices currently rendered. Fired (debounced by virtuoso) as the user
-   *  scrolls. The conversation nav uses it to highlight the active chapter. */
-  onVisibleRangeChange?: ((range: ListRange) => void) | undefined;
+  /** Scroll-spy: the inclusive range of `historicalUnits`/virtual transcript item
+   *  indices currently rendered. Fired as the user scrolls. The conversation nav
+   *  uses it to highlight the active chapter. */
+  onVisibleRangeChange?: ((range: VirtualTranscriptRange) => void) | undefined;
   /** Conversation chapters derived from the SAME `historicalUnits` array this
-   *  list feeds to virtuoso. MessageList owns the build, so the chapter
-   *  `unitIndex` values are guaranteed to be in virtuoso's coordinate space —
-   *  no second `buildRenderUnits` pass to drift against. */
+   *  list feeds to the virtual transcript. MessageList owns the build, so the
+   *  chapter `unitIndex` values are guaranteed to be in virtual transcript
+   *  coordinate space — no second `buildRenderUnits` pass to drift against. */
   onChaptersChange?: ((chapters: Chapter[]) => void) | undefined;
-  targetMessageId?: string | undefined;
+  hasOlderMessages?: boolean | undefined;
+  onLoadOlderMessages?: ((restoreBasis?: RestoreBasis) => void) | undefined;
+  loadingOlderMessages?: boolean | undefined;
+  olderHistoryError?: string | null | undefined;
+  transcriptPositioning: TranscriptPositioningInput;
+  onHistoryScrollCommandHandled?: ((token: number, result: 'applied' | 'target_missing' | 'superseded', view: HistoryView) => void) | undefined;
 }
 
 /** Imperative surface exposed to the conversation nav strip. MessageList owns
- *  `virtuosoRef`; the nav can't reach it directly because off-screen rows are
- *  unmounted (react-virtuoso), so a querySelector jump would miss them. */
+ *  virtual transcript ref; the nav can't reach it directly because off-screen
+ *  rows are unmounted, so a querySelector jump would miss them. */
 export interface MessageListHandle {
   /** Scroll the render unit at `unitIndex` (a `historicalUnits` index, which
-   *  equals its virtuoso item index) into view and pulse it once mounted. */
+   *  equals its virtual transcript item index) into view and pulse it once mounted. */
   scrollToUnitIndex: (unitIndex: number) => void;
   scrollToMessageId: (messageId: string) => boolean;
+  captureHistoryRestoreBasis: () => RestoreBasis;
 }
 
 
@@ -242,7 +294,7 @@ const SystemPromptHeader = memo(function SystemPromptHeader({
   contentRef,
 }: SystemPromptHeaderProps) {
   return (
-    <div className="virtuoso-row">
+    <div className="virtual-transcript-row">
       <div className={`system-prompt-block${expanded ? ' expanded' : ''}`}>
         <div className="system-prompt-header" onClick={onToggle}>
           <span className="system-prompt-label">System prompt</span>
@@ -257,40 +309,7 @@ const SystemPromptHeader = memo(function SystemPromptHeader({
   );
 });
 
-// Per-conversation data the Virtuoso slot components need. Threaded through
-// virtuoso's `context` prop so the slot *component types* can stay stable —
-// see `VIRTUOSO_COMPONENTS`.
-interface MessageListContext {
-  systemPrompt: string | undefined;
-  systemPromptExpanded: boolean;
-  toggleSystemPrompt: () => void;
-  systemPromptRef: React.RefObject<HTMLPreElement>;
-}
-
-// Virtuoso slot component types are defined once at module scope so their
-// identity never changes across renders. A slot whose component *type* is
-// recreated per render (e.g. a closure built inside a render-time useMemo that
-// depends on system-prompt expansion) forces virtuoso to unmount/remount that
-// slot and recompute total list height — a visible scroll hitch. The
-// per-conversation data instead arrives via virtuoso's `context` prop, which
-// changes the slot's props without changing its type.
-function VirtuosoHeaderSlot({ context }: { context?: MessageListContext }) {
-  if (!context?.systemPrompt) return null;
-  return (
-    <SystemPromptHeader
-      systemPrompt={context.systemPrompt}
-      expanded={context.systemPromptExpanded}
-      onToggle={context.toggleSystemPrompt}
-      contentRef={context.systemPromptRef}
-    />
-  );
-}
-
-// Empty-state UI lives in virtuoso's `EmptyPlaceholder` slot rather than a
-// parallel branch, so that a systemPrompt (rendered as virtuoso's Header) stays
-// visible alongside the "Start a conversation" affordance for a freshly-opened
-// conversation with a system prompt and no messages yet.
-function VirtuosoEmptySlot() {
+function EmptyTranscriptState() {
   return (
     <div className="empty-state">
       <div className="empty-state-icon"><MessageSquareIcon /></div>
@@ -298,13 +317,6 @@ function VirtuosoEmptySlot() {
     </div>
   );
 }
-
-const VIRTUOSO_COMPONENTS: NonNullable<
-  VirtuosoProps<RenderUnit, MessageListContext>['components']
-> = {
-  Header: VirtuosoHeaderSlot,
-  EmptyPlaceholder: VirtuosoEmptySlot,
-};
 
 function OpenFindStreamingBuffer({ slug, onChange }: { slug: string; onChange: (buffer: import('../conversation/atom').StreamingBuffer | null) => void }) {
   const buffer = useStreamingBuffer(slug);
@@ -327,7 +339,12 @@ function MessageListImpl({
   enableMessageSidepanel = true,
   onVisibleRangeChange,
   onChaptersChange,
-  targetMessageId,
+  hasOlderMessages = false,
+  onLoadOlderMessages,
+  loadingOlderMessages = false,
+  olderHistoryError,
+  transcriptPositioning,
+  onHistoryScrollCommandHandled,
 }: MessageListProps, ref: React.ForwardedRef<MessageListHandle>) {
   const findScopeId = `conversation-transcript:${conversationId ?? 'empty'}`;
   const { activeScope } = useFocusScope();
@@ -342,7 +359,9 @@ function MessageListImpl({
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const systemPromptRef = useRef<HTMLPreElement | null>(null);
   const [hasUnreadTailContent, setHasUnreadTailContent] = useState(false);
-  const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const firstVisibleUnitIndexRef = useRef(0);
+  const continuityRestoreInFlightRef = useRef(false);
+  const transcriptRef = useRef<VirtualTranscriptHandle>(null);
   const scrollerRef = useRef<HTMLElement | null>(null);
   const scrollMachineRef = useRef(initialScrollMachineState(conversationId));
 
@@ -351,7 +370,7 @@ function MessageListImpl({
   // crates/phoenix-ide/src/state_machine/state.rs). Keying the streaming
   // unit by this value means the finalized `agent_turn` HistoricalUnit
   // arrives under the same render-unit key, and the transition is an
-  // in-place keyed update — virtuoso doesn't observe a key swap, the
+  // in-place keyed update — the virtual transcript doesn't observe a key swap, the
   // viewport doesn't drift. Symmetric to pending_user → user.
   const streamingRequestId = useStreamingRequestId(slug);
   const streamingHandle = useMemo(
@@ -477,8 +496,8 @@ function MessageListImpl({
   }, [findMatches.length, normalizedFindIndex]);
 
   // Chapters are derived here, not in a parent, so they share the exact
-  // `historicalUnits` array virtuoso renders — a chapter's `unitIndex` is
-  // therefore a valid `scrollToIndex` target with no second build to drift
+  // `historicalUnits` array the virtual transcript renders — a chapter's
+  // `unitIndex` is therefore a valid `scrollToIndex` target with no second build to drift
   // against. Reported up via callback for the nav strip above the list.
   const chapters = useMemo(
     () => buildConversationChapters(historicalUnits),
@@ -493,20 +512,34 @@ function MessageListImpl({
   const isEmpty = allUnits.length === 0;
   const activeToolUseId = activeToolUseIdFromState(convState);
 
-  const handleAtBottomStateChange = useCallback((atBottom: boolean) => {
-    dispatchScrollEventRef.current({ type: 'viewportPinnedChanged', atBottom });
-  }, []);
-
   const detachGestureListenersRef = useRef<(() => void) | null>(null);
   const settleSnapRafRef = useRef(0);
   const tailFollowRafRef = useRef(0);
   const settleWatchTimerRef = useRef(0);
   const dispatchScrollEventRef = useRef<(event: ScrollEvent) => void>(() => {});
+  const transcriptPositioningStateRef = useRef(initialTranscriptPositioningState(
+    transcriptPositioning.kind === 'idle' ? transcriptPositioning.view : transcriptPositioning.command.view,
+  ));
+  const dispatchTranscriptPositioningRef = useRef<(event: TranscriptPositioningEvent) => void>(() => {});
+  const lastPhysicalSnapshotRef = useRef<VirtualTranscriptPhysicalSnapshot | null>(null);
+  const transcriptPositioningViewKeyRef = useRef(historyViewKey(
+    transcriptPositioning.kind === 'idle' ? transcriptPositioning.view : transcriptPositioning.command.view,
+  ));
+  const executorAttachEpochRef = useRef(0);
+  const cancelPendingExecutorDetachRef = useRef<(() => void) | null>(null);
 
   const readScrollSnapshot = useCallback((): ScrollSnapshot | null => {
     const s = scrollerRef.current;
     return s ? { scrollHeight: s.scrollHeight, scrollTop: s.scrollTop, clientHeight: s.clientHeight } : null;
   }, []);
+
+  const handlePinnedStateChange = useCallback((pinned: boolean) => {
+    const snapshot = readScrollSnapshot();
+    const domAtBottom = snapshot
+      ? snapshot.scrollHeight - snapshot.scrollTop - snapshot.clientHeight <= PIN_TO_BOTTOM_THRESHOLD
+      : pinned;
+    dispatchScrollEventRef.current({ type: 'viewportPinnedChanged', atBottom: pinned || domAtBottom });
+  }, [readScrollSnapshot]);
 
   const scheduleDomBottomWrite = useCallback(() => {
     if (settleSnapRafRef.current !== 0) return;
@@ -530,7 +563,7 @@ function MessageListImpl({
         machine.follow.kind !== 'navigating' &&
         !(machine.gesture.kind === 'touch' && machine.gesture.moved);
       if (authorized) {
-        virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' });
+        transcriptRef.current?.scrollToTail();
       }
     });
   }, []);
@@ -562,7 +595,7 @@ function MessageListImpl({
     for (const effect of effects) {
       switch (effect.type) {
         case 'snapToLastIndex':
-          virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' });
+          transcriptRef.current?.scrollToTail();
           break;
         case 'scheduleTailFollow':
           scheduleTailFollow(effect.conversationId);
@@ -613,16 +646,35 @@ function MessageListImpl({
         type: 'scrollerAttached',
         snapshot: { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight },
       });
-      const onPointerDown = () => dispatchScrollEvent({ type: 'interactionStarted' });
-      const onTouchStart = () => dispatchScrollEvent({ type: 'touchStarted' });
+      const onPointerDown = () => {
+        dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
+        dispatchScrollEvent({ type: 'interactionStarted' });
+      };
+      const onTouchStart = () => {
+        dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
+        dispatchScrollEvent({ type: 'touchStarted' });
+      };
       const onTouchMove = () => dispatchScrollEvent({ type: 'touchMoved' });
       const onTouchEnd = (e: TouchEvent) => dispatchScrollEvent({ type: 'touchEnded', remainingTouches: e.touches.length });
       const onTouchCancel = (e: TouchEvent) => dispatchScrollEvent({ type: 'touchCancelled', remainingTouches: e.touches.length });
       const onWheel = (e: WheelEvent) => {
+        dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'interactionStarted' });
         if (e.deltaY < 0) dispatchScrollEvent({ type: 'upwardIntent' });
       };
       const onScroll = () => {
+        if (continuityRestoreInFlightRef.current) {
+          const active = transcriptPositioningStateRef.current.active;
+          const phase = transcriptPositioningStateRef.current.phase;
+          if (active?.command.kind === 'restore_after_prefix_expansion' && phase?.kind === 'awaiting_physical') {
+            const snapshot = transcriptRef.current?.physicalSnapshot(phase.targetIndex) ?? null;
+            const actualOffset = snapshot?.targetOffset ?? null;
+            if (actualOffset !== null && Math.abs(actualOffset - active.command.viewportStartOffset) > RESTORE_OFFSET_TOLERANCE_PX) {
+              dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
+            }
+          }
+          return;
+        }
         const snapshot = { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight };
         const machine = scrollMachineRef.current;
         const previousTop = machine.kind === 'live' || machine.kind === 'mount-rescue'
@@ -682,6 +734,7 @@ function MessageListImpl({
     prevPendingLengthRef.current = pendingMessages.length;
 
     if (conversationChanged) {
+      lastPhysicalSnapshotRef.current = null;
       dispatchScrollEvent({ type: 'conversationChanged', conversationId });
       return;
     }
@@ -721,12 +774,11 @@ function MessageListImpl({
     dispatchScrollEvent({ type: 'jumpToNewestRequested', unitCount: allUnitsLengthRef.current });
   }, [dispatchScrollEvent]);
 
-  // A navigation jump has one positioning owner: Virtuoso. The selected key
-  // remains pending until its virtualized row mounts, at which point the row
+  // A navigation jump has one positioning owner: VirtualTranscript. The selected
+  // key remains pending until its virtualized row mounts, at which point the row
   // ref applies presentation-only highlighting without moving the scroller.
   const pendingPulseRef = useRef<{ conversationId: string | undefined; key: string } | null>(null);
   const highlightedTargetRef = useRef<Element | null>(null);
-  const jumpedTargetMessageIdRef = useRef<string | null>(null);
   const pulseTimerRef = useRef(0);
 
   const clearHighlight = useCallback(() => {
@@ -768,6 +820,7 @@ function MessageListImpl({
     clearHighlight();
   }, [conversationId, clearHighlight]);
 
+
   const pulseIfMounted = useCallback((key: string) => {
     const row = Array.from(scrollerRef.current?.querySelectorAll<HTMLDivElement>('[data-render-unit-key]') ?? [])
       .find((candidate) => candidate.dataset['renderUnitKey'] === key);
@@ -780,21 +833,20 @@ function MessageListImpl({
     dispatchScrollEvent({ type: 'navigationJumped' });
     clearHighlight();
     pendingPulseRef.current = { conversationId, key: unit.key };
-    virtuosoRef.current?.scrollToIndex({
-      index: unitIndex,
-      align: 'start',
-      behavior: 'auto',
-    });
+    transcriptRef.current?.scrollToIndex(unitIndex, 'start');
     pulseIfMounted(unit.key);
   }, [historicalUnits, clearHighlight, conversationId, dispatchScrollEvent, pulseIfMounted]);
 
-  const findUnitIndexByMessageId = useCallback((messageId: string) => {
-    return historicalUnits.findIndex((unit) => {
-      if (unit.kind === 'agent_turn') return unit.agent.message_id === messageId;
-      if ('message' in unit && 'message_id' in unit.message) return unit.message.message_id === messageId;
-      return false;
-    });
-  }, [historicalUnits]);
+  const findUnitIndexByMessageId = useCallback(
+    (messageId: string) => findHistoricalUnitIndexByMessageId(historicalUnits, messageId),
+    [historicalUnits],
+  );
+
+  const messageIdForHistoricalUnit = useCallback((unit: HistoricalUnit): string | null => {
+    if (unit.kind === 'agent_turn') return unit.agent.message_id;
+    if ('message' in unit && 'message_id' in unit.message) return unit.message.message_id;
+    return null;
+  }, []);
 
   const scrollToMessageId = useCallback((messageId: string) => {
     const index = findUnitIndexByMessageId(messageId);
@@ -803,18 +855,120 @@ function MessageListImpl({
     return true;
   }, [findUnitIndexByMessageId, scrollToUnitIndex]);
 
-  useEffect(() => {
-    if (!targetMessageId) {
-      jumpedTargetMessageIdRef.current = null;
-      return;
+  const captureHistoryRestoreBasis = useCallback((): RestoreBasis => {
+    const machine = scrollMachineRef.current;
+    if (machine.kind === 'mount-rescue' || (machine.kind === 'live' && machine.follow.kind !== 'reading')) {
+      return { kind: 'following_tail' };
     }
-    if (jumpedTargetMessageIdRef.current === targetMessageId) return;
-    if (scrollToMessageId(targetMessageId)) {
-      jumpedTargetMessageIdRef.current = targetMessageId;
-    }
-  }, [scrollToMessageId, targetMessageId]);
+    const anchor = transcriptRef.current?.captureVisibleAnchor();
+    if (!anchor) return { kind: 'following_tail' };
+    const unit = historicalUnits[anchor.index];
+    if (!unit || unit.key !== anchor.key) return { kind: 'following_tail' };
+    const messageId = messageIdForHistoricalUnit(unit);
+    if (!messageId) return { kind: 'following_tail' };
+    return { kind: 'reader_anchor', messageId, viewportStartOffset: anchor.offset };
+  }, [historicalUnits, messageIdForHistoricalUnit]);
 
-  useImperativeHandle(ref, () => ({ scrollToUnitIndex, scrollToMessageId }), [scrollToMessageId, scrollToUnitIndex]);
+  useImperativeHandle(
+    ref,
+    () => ({ scrollToUnitIndex, scrollToMessageId, captureHistoryRestoreBasis }),
+    [captureHistoryRestoreBasis, scrollToMessageId, scrollToUnitIndex],
+  );
+
+  const applyTranscriptPositioningEffects = useCallback((effects: TranscriptPositioningEffect[]) => {
+    for (const effect of effects) {
+      switch (effect.type) {
+        case 'resolve_target': {
+          const targetIndex = findUnitIndexByMessageId(effect.targetMessageId);
+          dispatchTranscriptPositioningRef.current(
+            targetIndex < 0
+              ? { type: 'target_missing', commandKey: effect.commandKey }
+              : { type: 'target_resolved', commandKey: effect.commandKey, targetIndex },
+          );
+          break;
+        }
+        case 'position': {
+          const command = effect.command;
+          if (command.kind === 'jump_to_message') {
+            const unit = historicalUnits[effect.targetIndex];
+            if (unit) {
+              dispatchScrollEvent({ type: 'navigationJumped' });
+              clearHighlight();
+              pendingPulseRef.current = { conversationId, key: unit.key };
+              if (effect.viewportStartOffset === undefined) {
+                transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align);
+              } else {
+                transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align, effect.viewportStartOffset);
+              }
+              pulseIfMounted(unit.key);
+            }
+          } else {
+            continuityRestoreInFlightRef.current = true;
+            transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align, effect.viewportStartOffset);
+          }
+          const physicalSnapshot = transcriptRef.current?.physicalSnapshot(effect.targetIndex)
+            ?? lastPhysicalSnapshotRef.current
+            ?? { renderedRange: null, visibleRange: null, viewportTop: 0, layoutRevision: 0, targetIndex: effect.targetIndex, targetOffset: null };
+          lastPhysicalSnapshotRef.current = physicalSnapshot;
+          dispatchTranscriptPositioningRef.current({
+            type: 'position_issued',
+            commandKey: effect.commandKey,
+            targetIndex: effect.targetIndex,
+            layoutRevision: physicalSnapshot.layoutRevision,
+          });
+          dispatchTranscriptPositioningRef.current({
+            type: 'physical_observed',
+            commandKey: effect.commandKey,
+            range: physicalSnapshot.visibleRange,
+            actualOffset: command.kind === 'restore_after_prefix_expansion'
+              ? physicalSnapshot.targetOffset ?? null
+              : null,
+            layoutRevision: physicalSnapshot.layoutRevision,
+            targetMeasured: physicalSnapshot.targetMeasured ?? false,
+          });
+          break;
+        }
+        case 'finish':
+          if (effect.command.kind === 'restore_after_prefix_expansion') {
+            continuityRestoreInFlightRef.current = false;
+          }
+          onHistoryScrollCommandHandled?.(effect.command.token, effect.result, effect.command.view);
+          break;
+      }
+    }
+  }, [clearHighlight, conversationId, dispatchScrollEvent, findUnitIndexByMessageId, historicalUnits, onHistoryScrollCommandHandled, pulseIfMounted]);
+
+  const dispatchTranscriptPositioning = useCallback((event: TranscriptPositioningEvent) => {
+    const next = reduceTranscriptPositioning(transcriptPositioningStateRef.current, event);
+    transcriptPositioningStateRef.current = next.state;
+    applyTranscriptPositioningEffects(next.effects);
+  }, [applyTranscriptPositioningEffects]);
+  dispatchTranscriptPositioningRef.current = dispatchTranscriptPositioning;
+
+  useLayoutEffect(() => {
+    const attachEpoch = executorAttachEpochRef.current + 1;
+    executorAttachEpochRef.current = attachEpoch;
+    cancelPendingExecutorDetachRef.current?.();
+    cancelPendingExecutorDetachRef.current = null;
+    return () => {
+      const cancel = scheduleDeferred(() => {
+        if (executorAttachEpochRef.current !== attachEpoch) return;
+        cancelPendingExecutorDetachRef.current = null;
+        dispatchTranscriptPositioningRef.current({ type: 'executor_detached' });
+      });
+      cancelPendingExecutorDetachRef.current = cancel;
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    const nextView = transcriptPositioning.kind === 'idle' ? transcriptPositioning.view : transcriptPositioning.command.view;
+    const nextViewKey = historyViewKey(nextView);
+    if (transcriptPositioningViewKeyRef.current !== nextViewKey) {
+      lastPhysicalSnapshotRef.current = null;
+      transcriptPositioningViewKeyRef.current = nextViewKey;
+    }
+    dispatchTranscriptPositioning({ type: 'input_changed', input: transcriptPositioning });
+  }, [dispatchTranscriptPositioning, transcriptPositioning]);
 
   useEffect(() => {
     scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
@@ -834,7 +988,7 @@ function MessageListImpl({
       return () => timers.forEach(clearTimeout);
     }
     const unitMatch = match.target;
-    virtuosoRef.current?.scrollToIndex({ index: unitMatch.unitIndex, align: 'center', behavior: 'smooth' });
+    transcriptRef.current?.scrollToIndex(unitMatch.unitIndex, 'start');
     const timers = [80, 220, 500].map((delay) => window.setTimeout(() => {
       const row = findRowByKey(unitMatch.unitKey);
       if (!row) return;
@@ -852,26 +1006,39 @@ function MessageListImpl({
       .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
   }, [activeScope, findOpen, findScopeId]);
 
-  const handleRangeChanged = useCallback((range: ListRange) => {
-    onVisibleRangeChange?.(range);
+  const handleRangeChanged = useCallback((snapshot: VirtualTranscriptRangeChange) => {
+    const visibleRange = snapshot.visibleRange;
+    const renderedRange = snapshot.renderedRange;
+    lastPhysicalSnapshotRef.current = snapshot;
+    if (!visibleRange && !renderedRange) return;
+    firstVisibleUnitIndexRef.current = visibleRange?.startIndex ?? renderedRange!.startIndex;
+    const active = transcriptPositioningStateRef.current.active;
+    const phase = transcriptPositioningStateRef.current.phase;
+    if (active && phase?.kind === 'awaiting_physical') {
+      const physicalSnapshot = transcriptRef.current?.physicalSnapshot(phase.targetIndex) ?? snapshot;
+      dispatchTranscriptPositioningRef.current({
+        type: 'physical_observed',
+        commandKey: active.key,
+        range: physicalSnapshot.visibleRange,
+        actualOffset: active.command.kind === 'restore_after_prefix_expansion'
+          ? physicalSnapshot.targetOffset ?? null
+          : null,
+        layoutRevision: physicalSnapshot.layoutRevision,
+        targetMeasured: physicalSnapshot.targetMeasured ?? false,
+      });
+    }
+    if (visibleRange) onVisibleRangeChange?.(visibleRange);
   }, [onVisibleRangeChange]);
 
   const toggleSystemPrompt = useCallback(() => {
     setSystemPromptExpanded((v) => !v);
   }, []);
 
-  // Per-conversation data for the stable Virtuoso slot component types
-  // (`VIRTUOSO_COMPONENTS`). Only its *reference* changes when expansion
-  // toggles — the slot types do not, so no slot remount / list-height recompute.
-  const virtuosoContext = useMemo<MessageListContext>(
-    () => ({ systemPrompt, systemPromptExpanded, toggleSystemPrompt, systemPromptRef }),
-    [systemPrompt, systemPromptExpanded, toggleSystemPrompt],
-  );
 
   const itemContent = useCallback(
-    (_index: number, unit: RenderUnit) => (
+    (unit: RenderUnit) => (
       <div
-        className="virtuoso-row"
+        className="virtual-transcript-row"
         data-render-unit-key={unit.key}
         ref={(row) => pulseMountedRow(unit.key, row)}
       >
@@ -882,7 +1049,7 @@ function MessageListImpl({
   );
 
   const computeItemKey = useCallback(
-    (_index: number, unit: RenderUnit) => unit.key,
+    (unit: RenderUnit) => unit.key,
     [],
   );
 
@@ -904,32 +1071,49 @@ function MessageListImpl({
         </>
       )}
       <section id="chat-view" className="view active">
-        <Virtuoso
+        {(hasOlderMessages && onLoadOlderMessages) && (
+          <div>
+            <button
+              type="button"
+              className="btn-secondary"
+              disabled={loadingOlderMessages}
+              onClick={() => onLoadOlderMessages()}
+            >
+              {loadingOlderMessages
+                ? 'Loading earlier history…'
+                : olderHistoryError
+                  ? 'Retry loading earlier history'
+                  : 'Load earlier history'}
+            </button>
+          </div>
+        )}
+        {olderHistoryError && (
+          <div role="alert">Could not load earlier history: {olderHistoryError}</div>
+        )}
+        <VirtualTranscript
           key={conversationId ?? '__empty__'}
-          ref={virtuosoRef}
+          ref={transcriptRef}
+          scrollerId="messages"
           scrollerRef={handleScrollerRef}
-          data={allUnits}
-          context={virtuosoContext}
-          itemContent={itemContent}
-          computeItemKey={computeItemKey}
-          followOutput={false}
-          atBottomThreshold={PIN_TO_BOTTOM_THRESHOLD}
-          atBottomStateChange={handleAtBottomStateChange}
-          totalListHeightChanged={handleTotalListHeightChanged}
-          rangeChanged={handleRangeChanged}
-          // `'LAST'` is library-defined only when `data` has at least
-          // one item. When systemPrompt-only renders with empty data,
-          // omit this prop entirely — virtuoso's default (no initial
-          // index) is correct for that case. Index 0 would target a
-          // data item that doesn't exist (the Header slot is not a
-          // data item).
-          {...(allUnits.length > 0
-            ? { initialTopMostItemIndex: { index: 'LAST' as const, align: 'end' as const } }
-            : {})}
-          alignToBottom
-          increaseViewportBy={{ top: 600, bottom: 600 }}
-          components={VIRTUOSO_COMPONENTS}
-          className="message-virtuoso"
+          items={allUnits}
+          renderItem={itemContent}
+          getKey={computeItemKey}
+          initialTail={allUnits.length > 0}
+          estimatedExtent={120}
+          overscan={600}
+          onPinnedChange={handlePinnedStateChange}
+          onTotalExtentChange={handleTotalListHeightChanged}
+          onRangeChange={handleRangeChanged}
+          header={systemPrompt ? (
+            <SystemPromptHeader
+              systemPrompt={systemPrompt}
+              expanded={systemPromptExpanded}
+              onToggle={toggleSystemPrompt}
+              contentRef={systemPromptRef}
+            />
+          ) : null}
+          empty={<EmptyTranscriptState />}
+          className="message-virtual-transcript"
         />
       </section>
       {!isEmpty && hasUnreadTailContent && (

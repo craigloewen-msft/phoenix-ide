@@ -128,6 +128,7 @@ mod tests {
                 pending_events,
                 pending_truncated,
                 transcript_generation,
+                message_snapshot,
             } => {
                 let enriched_msgs: Vec<Value> =
                     messages.iter().map(enrich_message_for_api).collect();
@@ -144,6 +145,7 @@ mod tests {
                     "sequence_id": sequence_id,
                     "conversation": conversation,
                     "transcript_generation": transcript_generation,
+                    "message_snapshot": message_snapshot,
                     "messages": enriched_msgs,
                     "agent_working": agent_working,
                     "presentation_mode": presentation_mode,
@@ -167,6 +169,7 @@ mod tests {
             SseEvent::MessageUpdated {
                 sequence_id,
                 message_id,
+                transcript_generation,
                 display_data,
                 content,
                 duration_ms,
@@ -175,6 +178,7 @@ mod tests {
                     "type": "message_updated",
                     "sequence_id": sequence_id,
                     "message_id": message_id,
+                    "transcript_generation": transcript_generation,
                     "display_data": display_data,
                     "content": content,
                 });
@@ -448,6 +452,7 @@ mod tests {
             sequence_id: 42,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
+            message_snapshot: crate::runtime::MessageSnapshotMode::Full,
             messages: vec![fixture_user_message(), fixture_agent_message_with_bash()],
             agent_working: false,
             presentation_mode: "idle".to_string(),
@@ -496,6 +501,7 @@ mod tests {
             sequence_id: 45,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
+            message_snapshot: crate::runtime::MessageSnapshotMode::Full,
             messages: vec![fixture_user_message()],
             agent_working: true,
             presentation_mode: "working".to_string(),
@@ -541,6 +547,7 @@ mod tests {
             sequence_id: 99,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
+            message_snapshot: crate::runtime::MessageSnapshotMode::Full,
             messages: vec![fixture_user_message()],
             agent_working: false,
             presentation_mode: "idle".to_string(),
@@ -598,6 +605,7 @@ mod tests {
         let event = SseEvent::MessageUpdated {
             sequence_id: 7,
             message_id: "msg-abc".to_string(),
+            transcript_generation: Some(3),
             display_data: Some(json!({ "type": "subagent_summary", "results": [] })),
             content: None,
             duration_ms: None,
@@ -611,6 +619,7 @@ mod tests {
         let event = SseEvent::MessageUpdated {
             sequence_id: 9,
             message_id: "msg-def".to_string(),
+            transcript_generation: Some(4),
             display_data: None,
             content: Some(MessageContent::Agent(vec![ContentBlock::Text {
                 text: "updated".to_string(),
@@ -625,6 +634,7 @@ mod tests {
         let event = SseEvent::MessageUpdated {
             sequence_id: 11,
             message_id: "msg-xyz".to_string(),
+            transcript_generation: Some(5),
             display_data: None,
             content: None,
             duration_ms: None,
@@ -638,6 +648,7 @@ mod tests {
         let event = SseEvent::MessageUpdated {
             sequence_id: 12,
             message_id: "msg-tool-result".to_string(),
+            transcript_generation: Some(6),
             display_data: None,
             content: None,
             duration_ms: Some(1234),
@@ -649,6 +660,11 @@ mod tests {
             typed.get("duration_ms"),
             Some(&json!(1234)),
             "duration_ms must be present on the wire"
+        );
+        assert_eq!(
+            typed.get("transcript_generation"),
+            Some(&json!(6)),
+            "transcript_generation must be present on the wire"
         );
     }
 
@@ -918,6 +934,7 @@ mod tests {
             sequence_id: init_seq,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
+            message_snapshot: crate::runtime::MessageSnapshotMode::Full,
             messages: Vec::new(),
             agent_working: true,
             presentation_mode: "working".to_string(),
@@ -1015,6 +1032,7 @@ mod tests {
             sequence_id: init_seq,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
+            message_snapshot: crate::runtime::MessageSnapshotMode::Full,
             messages: Vec::new(),
             agent_working: false,
             presentation_mode: "idle".to_string(),
@@ -1038,6 +1056,7 @@ mod tests {
         let event = SseEvent::MessageUpdated {
             sequence_id: 42,
             message_id: "msg-abc".to_string(),
+            transcript_generation: Some(9),
             display_data: Some(json!({ "type": "subagent_summary", "results": [] })),
             content: None,
             duration_ms: None,

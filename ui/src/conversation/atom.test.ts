@@ -56,6 +56,7 @@ function makeInitPayload(overrides: Partial<InitPayload> = {}): InitPayload {
     pendingAnchorSequenceId: lastAppliedEventSeq,
     pendingEvents: [],
     pendingTruncated: false,
+    messageSnapshot: 'full',
     ...overrides,
   };
 }
@@ -78,6 +79,7 @@ describe('conversationReducer', () => {
       expect(next.conversationId).toBe('conv-1');
       expect(next.messages).toHaveLength(2);
       expect(next.lastAppliedEventSeq).toBe(5);
+      expect(next.transcriptCoverage).toBe('complete');
       expect(next.streamingBuffer).toBeNull();
     });
 
@@ -87,15 +89,38 @@ describe('conversationReducer', () => {
         ...createInitialAtom(),
         lastAppliedEventSeq: 3,
         messages: [existing],
+        transcriptGeneration: 1,
       };
       const newMsg = makeMessage(4);
-      const payload = makeInitPayload({ messages: [newMsg], lastAppliedEventSeq: 4 });
+      const payload = makeInitPayload({
+        messages: [newMsg],
+        lastAppliedEventSeq: 4,
+        messageSnapshot: 'suffix',
+      });
 
       const next = dispatch(atom, { type: 'sse_init', payload });
 
       expect(next.messages).toHaveLength(2);
       expect(next.messages[0]!.sequence_id).toBe(3);
       expect(next.messages[1]!.sequence_id).toBe(4);
+    });
+
+    it('replaces and sorts a full snapshot on reconnect', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastAppliedEventSeq: 10,
+        messages: [makeMessage(3), makeMessage(99)],
+        transcriptGeneration: 1,
+      };
+      const payload = makeInitPayload({
+        messages: [makeMessage(2), makeMessage(1)],
+        lastAppliedEventSeq: 10,
+        messageSnapshot: 'full',
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.messages.map((message) => message.sequence_id)).toEqual([1, 2]);
     });
 
     it('replaces messages on fresh connect (lastAppliedEventSeq = 0)', () => {
@@ -105,6 +130,135 @@ describe('conversationReducer', () => {
       const next = dispatch(atom, { type: 'sse_init', payload });
 
       expect(next.messages).toHaveLength(2);
+    });
+
+    it('merges a generation-matched suffix into a REST tail on first SSE connect', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [makeMessage(40), makeMessage(50)],
+        transcriptGeneration: 3,
+      };
+      const payload = makeInitPayload({
+        messages: [makeMessage(51)],
+        transcriptGeneration: 3,
+        messageSnapshot: 'suffix',
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.messages.map((message) => message.sequence_id)).toEqual([40, 50, 51]);
+    });
+
+    it('replaces a suffix snapshot when the local transcript generation is unknown', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [makeMessage(40), makeMessage(50)],
+        transcriptGeneration: null,
+      };
+      const payload = makeInitPayload({
+        messages: [makeMessage(51)],
+        transcriptGeneration: 3,
+        messageSnapshot: 'suffix',
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.messages.map((message) => message.sequence_id)).toEqual([51]);
+      expect(next.transcriptGeneration).toBe(3);
+      expect(next.transcriptCoverage).toBe('tail');
+    });
+
+    it('replaces a suffix snapshot on reconnect when local transcript generation is unknown', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastAppliedEventSeq: 7,
+        messages: [makeMessage(40), makeMessage(50)],
+        transcriptGeneration: null,
+      };
+      const payload = makeInitPayload({
+        messages: [makeMessage(51)],
+        transcriptGeneration: 3,
+        messageSnapshot: 'suffix',
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.messages.map((message) => message.sequence_id)).toEqual([51]);
+      expect(next.transcriptGeneration).toBe(3);
+      expect(next.transcriptCoverage).toBe('tail');
+    });
+
+    it('marks suffix init as tail after empty local state even when generation matches', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        transcriptGeneration: 3,
+        transcriptCoverage: 'complete',
+      };
+      const payload = makeInitPayload({
+        messages: [makeMessage(51)],
+        transcriptGeneration: 3,
+        messageSnapshot: 'suffix',
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.transcriptCoverage).toBe('tail');
+    });
+
+    it('marks full init as complete', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [makeMessage(40)],
+        transcriptGeneration: 3,
+        transcriptCoverage: 'tail',
+      };
+      const payload = makeInitPayload({
+        messages: [makeMessage(1), makeMessage(2)],
+        transcriptGeneration: 3,
+        messageSnapshot: 'full',
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.transcriptCoverage).toBe('complete');
+    });
+
+    it('preserves known complete coverage on reconnect suffix init', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastAppliedEventSeq: 7,
+        messages: [makeMessage(1), makeMessage(2)],
+        transcriptGeneration: 3,
+        transcriptCoverage: 'complete',
+      };
+      const payload = makeInitPayload({
+        messages: [makeMessage(3)],
+        transcriptGeneration: 3,
+        messageSnapshot: 'suffix',
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.messages.map((message) => message.sequence_id)).toEqual([1, 2, 3]);
+      expect(next.transcriptCoverage).toBe('complete');
+    });
+
+    it('replaces a REST tail when the SSE transcript generation changed', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [makeMessage(40), makeMessage(50)],
+        transcriptGeneration: 2,
+      };
+      const payload = makeInitPayload({
+        messages: [makeMessage(1)],
+        transcriptGeneration: 3,
+        messageSnapshot: 'full',
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.messages.map((message) => message.sequence_id)).toEqual([1]);
+      expect(next.transcriptCoverage).toBe('complete');
     });
 
     it('clears streaming buffer on init', () => {
@@ -809,12 +963,14 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 43,
         messageId: original.message_id,
+        transcriptGeneration: 3,
         displayData: summaryDisplayData,
       });
 
       expect(next.messages).toHaveLength(1);
       expect(next.messages[0]!.display_data).toEqual(summaryDisplayData);
       expect(next.lastAppliedEventSeq).toBe(43);
+      expect(next.transcriptGeneration).toBe(3);
     });
 
     it('stores a pending patch when message_id is unknown', () => {
@@ -828,6 +984,7 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 11,
         messageId: 'nonexistent-id',
+        transcriptGeneration: 7,
         displayData: { type: 'whatever' },
       });
 
@@ -839,6 +996,7 @@ describe('conversationReducer', () => {
         lastAppliedPatchEventSeq: 0,
         patches: [{ eventSeq: 11, displayData: { type: 'whatever' } }],
       });
+      expect(next.transcriptGeneration).toBe(7);
     });
 
     it('merges content and display_data independently', () => {
@@ -858,11 +1016,13 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 11,
         messageId: original.message_id,
+        transcriptGeneration: 8,
         displayData: { type: 'new_display' },
       });
 
       expect((next.messages[0]!.display_data as { type: string }).type).toBe('new_display');
       expect((next.messages[0]!.content as { text: string }).text).toBe('original content');
+      expect(next.transcriptGeneration).toBe(8);
     });
 
     // Task 02675 acceptance: duplicate message_updated events → state reflects
@@ -882,6 +1042,7 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 11,
         messageId: original.message_id,
+        transcriptGeneration: 9,
         displayData: { type: 'after' },
       });
       // Second delivery with the SAME sequenceId: the replay guard rejects it.
@@ -889,6 +1050,7 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 11,
         messageId: original.message_id,
+        transcriptGeneration: 9,
         displayData: { type: 'after' },
       });
 
@@ -910,6 +1072,7 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 11,
         messageId: original.message_id,
+        transcriptGeneration: 9,
         displayData: { type: 'after' },
       });
       // Second delivery with the SAME sequenceId: the replay guard rejects it.
@@ -917,6 +1080,7 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 11,
         messageId: original.message_id,
+        transcriptGeneration: 9,
         displayData: { type: 'after' },
       });
 
@@ -943,6 +1107,7 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 25,
         messageId: 'late-msg',
+        transcriptGeneration: 11,
         displayData: { type: 'deferred' },
         durationMs: 321,
       });
@@ -973,6 +1138,7 @@ describe('conversationReducer', () => {
         lastAppliedPatchEventSeq: 25,
         patches: [],
       });
+      expect(patched.transcriptGeneration).toBe(11);
     });
 
     it('stale pending/live patches are no-ops once a newer patch has already applied', () => {
@@ -994,6 +1160,7 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 35,
         messageId: 'msg-stale',
+        transcriptGeneration: 12,
         displayData: { type: 'newer' },
       });
       const created = dispatch(withPending, {
@@ -1027,6 +1194,30 @@ describe('conversationReducer', () => {
         lastAppliedPatchEventSeq: 35,
         patches: [],
       });
+      expect(withPending.transcriptGeneration).toBe(12);
+    });
+
+    it('replayed message_updated advances transcript generation', () => {
+      const target = makeMessage(1);
+      const payload = makeInitPayload({
+        messages: [target],
+        transcriptGeneration: 4,
+        lastAppliedEventSeq: 12,
+        pendingAnchorSequenceId: 11,
+        pendingEvents: [{
+          type: 'message_updated',
+          sequence_id: 12,
+          message_id: target.message_id,
+          transcript_generation: 5,
+          display_data: { replayed: true },
+          content: null,
+        }],
+      });
+
+      const next = dispatch(createInitialAtom(), { type: 'sse_init', payload });
+
+      expect(next.transcriptGeneration).toBe(5);
+      expect(next.messages[0]!.display_data).toEqual({ replayed: true });
     });
 
     it('merges durationMs into display_data, preserving existing keys', () => {
@@ -1046,6 +1237,7 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 21,
         messageId: original.message_id,
+        transcriptGeneration: 13,
         durationMs: 4567,
       });
 
@@ -1055,6 +1247,7 @@ describe('conversationReducer', () => {
       // existing keys survive
       expect(dd['bash']).toEqual([{ tool_use_id: 'abc', display: 'ls' }]);
       expect(next.lastAppliedEventSeq).toBe(21);
+      expect(next.transcriptGeneration).toBe(13);
     });
 
     it('durationMs update is gated by sequenceId (replay guard)', () => {
@@ -1075,11 +1268,36 @@ describe('conversationReducer', () => {
         type: 'sse_message_updated',
         sequenceId: 29,
         messageId: original.message_id,
+        transcriptGeneration: 14,
         durationMs: 9999,
       });
 
       expect(next).toBe(atom); // applyIfNewer returned unchanged
       expect(next.messages[0]!.display_data).toBeNull();
+      expect(next.transcriptGeneration).toBe(atom.transcriptGeneration);
+    });
+
+    it('preserves existing display-data markers for ephemeral updates without transcript generation', () => {
+      const original: Message = {
+        ...makeMessage(5),
+        display_data: { marker: 'keep' } as Record<string, unknown>,
+      };
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [original],
+        lastAppliedEventSeq: 30,
+        transcriptGeneration: 14,
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_message_updated',
+        sequenceId: 31,
+        messageId: original.message_id,
+        displayData: { marker: 'keep', ephemeral: true },
+      });
+
+      expect(next.messages[0]!.display_data).toEqual({ marker: 'keep', ephemeral: true });
+      expect(next.transcriptGeneration).toBe(14);
     });
   });
 
@@ -2055,6 +2273,37 @@ describe('conversationReducer', () => {
       expect(next.pendingMessagePatches).toEqual({});
     });
 
+    it('merge_conversation_data applies a deferred patch when history materializes its target', () => {
+      const target = makeMessage(1, { display_data: { base: true } });
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        pendingMessagePatches: {
+          [target.message_id]: {
+            lastAppliedPatchEventSeq: 0,
+            patches: [{ eventSeq: 9, displayData: { duration_ms: 321 } }],
+          },
+        },
+      };
+
+      const next = dispatch(atom, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [target],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        snapshotStartedAtEventSeq: 8,
+      });
+
+      expect(next.messages[0]!.display_data).toEqual({ base: true, duration_ms: 321 });
+      expect(next.pendingMessagePatches[target.message_id]).toEqual({
+        lastAppliedPatchEventSeq: 9,
+        patches: [],
+      });
+    });
+
     it('merge_conversation_data preserves live conversation metadata over older REST rows', () => {
       const atomAfterLiveUpdate = dispatch(
         {
@@ -2083,6 +2332,82 @@ describe('conversationReducer', () => {
       });
 
       expect(next.conversation?.cwd).toBe('/newer/live/cwd');
+    });
+
+    it('merge_conversation_data preserves existing tail coverage when transcriptCoverage is omitted', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [makeMessage(1)],
+        transcriptGeneration: 7,
+        transcriptCoverage: 'tail',
+      };
+
+      const next = dispatch(atom, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: { ...testConversation, transcript_generation: 8 },
+        messages: [makeMessage(1), makeMessage(2)],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        transcriptGeneration: 8,
+        snapshotStartedAtEventSeq: 0,
+      });
+
+      expect(next.transcriptGeneration).toBe(8);
+      expect(next.transcriptCoverage).toBe('tail');
+    });
+
+    it('merge_conversation_data preserves existing complete coverage when transcriptCoverage is omitted', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [makeMessage(1)],
+        transcriptGeneration: 7,
+        transcriptCoverage: 'complete',
+      };
+
+      const next = dispatch(atom, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: { ...testConversation, transcript_generation: 8 },
+        messages: [makeMessage(1), makeMessage(2)],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        transcriptGeneration: 8,
+        snapshotStartedAtEventSeq: 0,
+      });
+
+      expect(next.transcriptGeneration).toBe(8);
+      expect(next.transcriptCoverage).toBe('complete');
+    });
+
+    it('merge_conversation_data lets explicit transcriptCoverage override existing coverage', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [makeMessage(1)],
+        transcriptGeneration: 7,
+        transcriptCoverage: 'complete',
+      };
+
+      const next = dispatch(atom, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: { ...testConversation, transcript_generation: 8 },
+        messages: [makeMessage(1), makeMessage(2)],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        transcriptGeneration: 8,
+        transcriptCoverage: 'tail',
+        snapshotStartedAtEventSeq: 0,
+      });
+
+      expect(next.transcriptGeneration).toBe(8);
+      expect(next.transcriptCoverage).toBe('tail');
     });
 
     it('set_initial_data can reset a stale cached conversation to the fetched slug owner', () => {

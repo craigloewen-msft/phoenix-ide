@@ -62,6 +62,8 @@ export type ConversationPageView = Pick<
   | 'phaseStateUpdatedAt'
   | 'firstByteRequestId'
   | 'turnRetryContext'
+  | 'transcriptGeneration'
+  | 'transcriptCoverage'
 >;
 
 const PAGE_VIEW_KEYS: readonly (keyof ConversationPageView)[] = [
@@ -76,6 +78,8 @@ const PAGE_VIEW_KEYS: readonly (keyof ConversationPageView)[] = [
   'phaseStateUpdatedAt',
   'firstByteRequestId',
   'turnRetryContext',
+  'transcriptGeneration',
+  'transcriptCoverage',
 ];
 
 function pageViewsEqual(a: ConversationPageView, b: ConversationPageView): boolean {
@@ -122,6 +126,8 @@ export function useConversationView(
       phaseStateUpdatedAt: a.phaseStateUpdatedAt,
       firstByteRequestId: a.firstByteRequestId,
       turnRetryContext: a.turnRetryContext,
+      transcriptGeneration: a.transcriptGeneration,
+      transcriptCoverage: a.transcriptCoverage,
     };
     const prev = lastRef.current;
     if (prev && pageViewsEqual(prev, next)) return prev;
@@ -381,7 +387,7 @@ export function useStreamingBuffer(slug: string): StreamingBuffer | null {
  * event AND on the eventual `AssistantMessage.message_id`. Using it as
  * the streaming render unit's key means the streaming → sent transition
  * preserves key identity — the streaming `TailUnit` and the finalized
- * `agent_turn` `HistoricalUnit` share a key, so virtuoso (and the
+ * `agent_turn` `HistoricalUnit` share a key, so VirtualTranscript (and the
  * React reconciler in general) sees an in-place keyed update rather
  * than a cross-region key swap. Symmetric to REQ-MLRU-001's
  * pending_user → user pattern.

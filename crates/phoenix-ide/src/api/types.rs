@@ -177,6 +177,7 @@ pub struct ConversationMessageSliceResponse {
     pub tombstones: Vec<serde_json::Value>,
     pub transcript_generation: Option<i64>,
     pub server_message_tail: Option<i64>,
+    pub has_older_messages: bool,
 }
 
 /// Response for exact inclusive range fetches.
@@ -1274,12 +1275,22 @@ impl PrStatusResponse {
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
     pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
 }
 
 impl ErrorResponse {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             error: message.into(),
+            error_type: None,
+        }
+    }
+
+    pub fn typed(message: impl Into<String>, error_type: impl Into<String>) -> Self {
+        Self {
+            error: message.into(),
+            error_type: Some(error_type.into()),
         }
     }
 }

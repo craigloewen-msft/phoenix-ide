@@ -81,6 +81,7 @@ export interface ConversationAtom {
   contiguousMessageHighWater: number;
   messageRanges: MessageRange[];
   transcriptGeneration: number | null;
+  transcriptCoverage: 'tail' | 'complete';
   pendingMessagePatches: Record<string, PendingMessagePatchState>;
   streamingBuffer: StreamingBuffer | null;
   uiError: UIError | null;
@@ -188,6 +189,7 @@ export interface InitPayload {
     *  applied unseen events contiguously across the missing gap. */
 
   pendingTruncated: boolean;
+  messageSnapshot?: 'full' | 'suffix';
 }
 
 // Task 02675: every wire-originated SSE action carries a `sequenceId` from
@@ -213,6 +215,7 @@ export type SSEAction =
       type: 'sse_message_updated';
       sequenceId: number;
       messageId: string;
+      transcriptGeneration?: number;
       displayData?: Record<string, unknown>;
       content?: Message['content'];
       /** Typed tool-execution duration; present only for tool-result updates. */
@@ -334,6 +337,7 @@ export type SSEAction =
       phase: ConversationState;
       contextWindow: { used: number };
       transcriptGeneration?: number;
+      transcriptCoverage?: 'tail' | 'complete';
       eventCursorFloor?: number;
       reset?: boolean;
     }
@@ -345,6 +349,7 @@ export type SSEAction =
       phase: ConversationState;
       contextWindow: { used: number };
       transcriptGeneration?: number;
+      transcriptCoverage?: 'tail' | 'complete';
       eventCursorFloor?: number;
       snapshotStartedAtEventSeq: number;
     }
@@ -370,6 +375,7 @@ export function createInitialAtom(): ConversationAtom {
     contiguousMessageHighWater: 0,
     messageRanges: [],
     transcriptGeneration: null,
+    transcriptCoverage: 'tail',
     pendingMessagePatches: {},
     streamingBuffer: null,
     uiError: null,
@@ -568,6 +574,18 @@ function applyPendingMessagePatchesToMessage(
   };
 }
 
+function materializeMessages(atom: ConversationAtom, messages: Message[]): ConversationAtom {
+  let nextAtom = atom;
+  const materialized: Message[] = [];
+  for (const message of messages) {
+    let nextMessage = message;
+    ({ atom: nextAtom, message: nextMessage } = applyPendingMessagePatchesToMessage(nextAtom, nextMessage));
+    materialized.push(nextMessage);
+  }
+  materialized.sort((left, right) => left.sequence_id - right.sequence_id);
+  return withDerivedMessageSyncState(nextAtom, materialized);
+}
+
 function applyWireActionBody(atom: ConversationAtom, action: SSEAction): ConversationAtom {
   switch (action.type) {
     case 'sse_message': {
@@ -588,7 +606,13 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
         ...(action.durationMs !== undefined && { durationMs: action.durationMs }),
       };
       const idx = atom.messages.findIndex((m) => m.message_id === action.messageId);
-      if (idx < 0) return storePendingMessagePatch(atom, action.messageId, patch);
+      if (idx < 0) {
+        const next = storePendingMessagePatch(atom, action.messageId, patch);
+        return {
+          ...next,
+          transcriptGeneration: action.transcriptGeneration ?? atom.transcriptGeneration,
+        };
+      }
       const existingPending = atom.pendingMessagePatches[action.messageId] ?? {
         lastAppliedPatchEventSeq: 0,
         patches: [],
@@ -602,11 +626,20 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
         },
       };
       if (!applied.applied) {
-        return { ...atom, pendingMessagePatches: nextPendingMessagePatches };
+        return {
+          ...atom,
+          transcriptGeneration: action.transcriptGeneration ?? atom.transcriptGeneration,
+          pendingMessagePatches: nextPendingMessagePatches,
+        };
       }
       const newMessages = [...atom.messages];
       newMessages[idx] = applied.message;
-      return { ...atom, messages: newMessages, pendingMessagePatches: nextPendingMessagePatches };
+      return {
+        ...atom,
+        transcriptGeneration: action.transcriptGeneration ?? atom.transcriptGeneration,
+        messages: newMessages,
+        pendingMessagePatches: nextPendingMessagePatches,
+      };
     }
     case 'sse_state_change': {
       const phase =
@@ -871,6 +904,7 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
         type: 'sse_message_updated',
         sequenceId: data.sequence_id,
         messageId: data.message_id,
+        ...(data.transcript_generation != null && { transcriptGeneration: data.transcript_generation }),
         ...(data.display_data != null && { displayData: data.display_data as Record<string, unknown> }),
         ...(data.content != null && { content: data.content as Message['content'] }),
         ...(data.duration_ms != null && { durationMs: data.duration_ms }),
@@ -1051,17 +1085,21 @@ export function conversationReducer(
       // append genuinely new); fresh-connect replaces entirely. See
       // `SseInitReconnectMerge` / `SseInitFreshConnect` in
       // `specs/conversation_atom/conversation_atom.allium`.
+      const knownGenerationMatches = atom.transcriptGeneration !== null
+        && atom.transcriptGeneration === p.transcriptGeneration;
+      const hadMessagesBeforeInit = atom.messages.length > 0;
       const generationChanged = atom.transcriptGeneration !== null && atom.transcriptGeneration !== p.transcriptGeneration;
       const isFreshConnect = atom.lastAppliedEventSeq === 0 || generationChanged;
+      const snapshotIsSuffix = p.messageSnapshot === 'suffix';
+      const mergesMessageSuffix = snapshotIsSuffix && knownGenerationMatches;
+      const nextTranscriptCoverage: 'tail' | 'complete' = snapshotIsSuffix
+        ? (knownGenerationMatches && hadMessagesBeforeInit ? atom.transcriptCoverage : 'tail')
+        : 'complete';
       let mergedMessages: Message[];
-      if (!isFreshConnect) {
-        const incomingById = new Map(p.messages.map((m) => [m.message_id, m]));
-        const replaced = atom.messages.map((m) => incomingById.get(m.message_id) ?? m);
-        const existingIds = new Set(atom.messages.map((m) => m.message_id));
-        const appended = p.messages.filter((m) => !existingIds.has(m.message_id));
-        mergedMessages = [...replaced, ...appended];
+      if (mergesMessageSuffix) {
+        mergedMessages = mergeMessagesByIdentity(atom.messages, p.messages);
       } else {
-        mergedMessages = p.messages;
+        mergedMessages = [...p.messages].sort((left, right) => left.sequence_id - right.sequence_id);
       }
 
       const snapshotMessageAnchor = p.messages.reduce(
@@ -1104,6 +1142,7 @@ export function conversationReducer(
         bufferedEventEnvelopes: {},
         eventGap: null,
         transcriptGeneration: p.transcriptGeneration,
+        transcriptCoverage: nextTranscriptCoverage,
         pendingMessagePatches: isFreshConnect ? {} : atom.pendingMessagePatches,
         ...deriveMessageSyncState(mergedMessages),
         messages: mergedMessages,
@@ -1136,6 +1175,8 @@ export function conversationReducer(
         // re-stamps it.
         turnRetryContext: null,
       };
+
+      next = materializeMessages(next, mergedMessages);
 
       // Phase 2 — fold pending events through the reducer. Each entry is a
       // wire-format SseWireEvent; per-entry validation gates against the
@@ -1261,6 +1302,7 @@ export function conversationReducer(
         conversationLastAppliedEventSeq: 0,
         contextWindow: action.contextWindow,
         transcriptGeneration: action.transcriptGeneration ?? action.conversation.transcript_generation ?? 1,
+        transcriptCoverage: action.transcriptCoverage ?? 'tail',
         lastAppliedEventSeq: action.reset
           ? (action.eventCursorFloor ?? 0)
           : Math.max(atom.lastAppliedEventSeq, action.eventCursorFloor ?? 0),
@@ -1283,7 +1325,7 @@ export function conversationReducer(
       const conversation = atom.conversationLastAppliedEventSeq > action.snapshotStartedAtEventSeq && atom.conversation
         ? atom.conversation
         : action.conversation;
-      const merged: ConversationAtom = {
+      let merged: ConversationAtom = {
         ...atom,
         conversationId: action.conversationId,
         conversation,
@@ -1297,9 +1339,11 @@ export function conversationReducer(
         ),
         contextWindow: action.contextWindow,
         transcriptGeneration: action.transcriptGeneration ?? action.conversation.transcript_generation ?? atom.transcriptGeneration ?? 1,
+        transcriptCoverage: action.transcriptCoverage ?? atom.transcriptCoverage,
         lastAppliedEventSeq,
         ...deriveMessageSyncState(messages),
       };
+      merged = materializeMessages(merged, messages);
       return lastAppliedEventSeq > atom.lastAppliedEventSeq ? drainBufferedEventEnvelopes(merged) : merged;
     }
 

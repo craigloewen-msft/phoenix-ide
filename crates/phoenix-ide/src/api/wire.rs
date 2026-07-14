@@ -55,7 +55,8 @@ use ts_rs::TS;
 use crate::chain_runtime::ChainSseEvent;
 use crate::db::{ErrorKind, Message, MessageType, UsageData};
 use crate::runtime::{
-    user_facing_error::UserFacingError, ConversationMetadataUpdate, EnrichedConversation, SseEvent,
+    user_facing_error::UserFacingError, ConversationMetadataUpdate, EnrichedConversation,
+    MessageSnapshotMode, SseEvent,
 };
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -229,6 +230,7 @@ pub enum SseWireEvent {
         context_window_size: u64,
         project_name: Option<String>,
         transcript_generation: i64,
+        message_snapshot: MessageSnapshotMode,
         /// `ReplayRing` anchor: the seq of the last persisted Message at
         /// subscribe time. Every entry in `pending_events` has
         /// `sequence_id > pending_anchor_sequence_id`. See
@@ -278,6 +280,8 @@ pub enum SseWireEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         duration_ms: Option<u64>,
+        /// Conversation transcript generation after a persisted mutation commits.
+        transcript_generation: Option<i64>,
     },
     /// Conversation phase transition. `state` is opaque here — the UI has
     /// its own tagged-union validator (`parseConversationState`). States that
@@ -433,6 +437,7 @@ impl From<SseEvent> for SseWireEvent {
                 context_window_size,
                 project_name,
                 transcript_generation,
+                message_snapshot,
                 pending_anchor_sequence_id,
                 pending_events,
                 pending_truncated,
@@ -446,6 +451,7 @@ impl From<SseEvent> for SseWireEvent {
                 context_window_size,
                 project_name,
                 transcript_generation,
+                message_snapshot,
                 pending_anchor_sequence_id,
                 pending_events: pending_events.into_iter().map(SseWireEvent::from).collect(),
                 pending_truncated,
@@ -463,12 +469,14 @@ impl From<SseEvent> for SseWireEvent {
             SseEvent::MessageUpdated {
                 sequence_id,
                 message_id,
+                transcript_generation,
                 display_data,
                 content,
                 duration_ms,
             } => SseWireEvent::MessageUpdated {
                 sequence_id,
                 message_id,
+                transcript_generation,
                 display_data,
                 // `content` is `Option<MessageContent>` at the runtime layer
                 // and serializes to the same JSON shape as a Message's

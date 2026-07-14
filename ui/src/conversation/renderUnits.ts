@@ -8,9 +8,9 @@
 // for the REQ-MLRU-* requirements this module implements.
 //
 // The transform is the only place that decides which messages render and
-// how they group into turns. The MessageList feeds virtuoso exactly
+// how they group into turns. The MessageList feeds VirtualTranscript exactly
 // `[...historicalUnits, ...tailUnits]` with no filtering inside the render
-// loop, so a historical unit's array index is also its virtuoso item index
+// loop, so a historical unit's array index is also its VirtualTranscript item index
 // (the conversation-nav strip relies on this to scrollToIndex by unit).
 
 import type {
@@ -75,6 +75,22 @@ export interface HistoricalBuild {
    *  run-affecting message was agent/tool). Feeds the streaming tail
    *  unit's `isFirstInTurn`. Pending user messages do not affect it. */
   endsInAgentRun: boolean;
+}
+
+export function findHistoricalUnitIndexByMessageId(
+  historicalUnits: readonly HistoricalUnit[],
+  messageId: string,
+): number {
+  return historicalUnits.findIndex((unit) => {
+    if (unit.kind === 'agent_turn') {
+      if (unit.agent.message_id === messageId) return true;
+      return Array.from(unit.toolResultsByUseId.values())
+        .some((message) => message.message_id === messageId);
+    }
+    return 'message' in unit
+      && 'message_id' in unit.message
+      && unit.message.message_id === messageId;
+  });
 }
 
 export interface TailBuildInputs {

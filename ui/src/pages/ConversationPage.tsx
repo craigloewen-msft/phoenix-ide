@@ -1,6 +1,6 @@
-import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react';
+import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, MessageSliceAlignmentError, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
 import { canCancelConversationState, isCancellingState, parseConversationState } from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
@@ -8,6 +8,20 @@ import { generateUUID } from '../utils/uuid';
 import { cacheDB } from '../cache';
 import { terminalPaneStorageKey } from '../storage/terminalPaneStorage';
 import { ConversationNavStack } from '../components/ConversationNavStack';
+import {
+  historyMergeEventCursorFloor,
+  initialHistoryExpansionState,
+  reduceHistoryExpansion,
+  type HistoryIntent,
+  type HistoryScrollCommand,
+  type RestoreBasis,
+} from '../conversation/historyExpansion';
+import { transcriptPositioningInputFromHistoryExpansion } from '../conversation/transcriptPositioning';
+import { messageCacheWrite } from '../conversation/messageCachePersistence';
+import {
+  buildHistoricalUnits,
+  findHistoricalUnitIndexByMessageId,
+} from '../conversation/renderUnits';
 import { ConnectedInputArea } from '../components/InputArea';
 import type { InputAreaHandle } from '../components/InputArea';
 import { ExploreOnboardingBanner } from '../components/ExploreOnboardingBanner';
@@ -122,6 +136,50 @@ const ChevronRightSmall = () => (
 const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c/${conv.id}`;
 const UUID_ROUTE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuidRouteSegment = (segment: string) => UUID_ROUTE_RE.test(segment);
+
+function prefersConversationIdRoute(routeSegment: string): boolean {
+  return isUuidRouteSegment(routeSegment);
+}
+
+async function getCachedConversationForRoute(routeSegment: string): Promise<Conversation | null> {
+  return prefersConversationIdRoute(routeSegment)
+    ? await cacheDB.getConversation(routeSegment) ?? await cacheDB.getConversationBySlug(routeSegment)
+    : await cacheDB.getConversationBySlug(routeSegment) ?? await cacheDB.getConversation(routeSegment);
+}
+
+async function getConversationForRoute(routeSegment: string) {
+  if (prefersConversationIdRoute(routeSegment)) {
+    try {
+      return await api.getConversation(routeSegment);
+    } catch (err) {
+      if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
+      return api.getConversationBySlug(routeSegment);
+    }
+  }
+  try {
+    return await api.getConversationBySlug(routeSegment);
+  } catch (err) {
+    if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
+    return api.getConversation(routeSegment);
+  }
+}
+
+async function getConversationMetaForRoute(routeSegment: string) {
+  if (prefersConversationIdRoute(routeSegment)) {
+    try {
+      return await api.getConversationMeta(routeSegment);
+    } catch (err) {
+      if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
+      return api.getConversationMetaBySlug(routeSegment);
+    }
+  }
+  try {
+    return await api.getConversationMetaBySlug(routeSegment);
+  } catch (err) {
+    if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
+    return api.getConversationMeta(routeSegment);
+  }
+}
 
 
 export function ConversationPage() {
@@ -249,6 +307,21 @@ function ConversationPageContent() {
   // Page-level state — not conversation data
   const [error, setError] = useState<string | null>(null);
   const [deletingConversation, setDeletingConversation] = useState(false);
+  const historyGenerationRef = useRef(0);
+  const historyRequestTokenRef = useRef(0);
+  const historyCommandTokenRef = useRef(0);
+  const historyViewRef = useRef({ conversationId: '', generation: 0, transcriptGeneration: 0 });
+  const [historyExpansion, dispatchHistoryExpansion] = useReducer(
+    reduceHistoryExpansion,
+    initialHistoryExpansionState(
+      { conversationId: '', generation: 0, transcriptGeneration: 0 },
+      false,
+    ),
+  );
+
+  historyViewRef.current = historyExpansion.view;
+  const historyCoverageRef = useRef(historyExpansion.coverage);
+  historyCoverageRef.current = historyExpansion.coverage;
 
   // File explorer context (shared with desktop panel) — a projection of the
   // unified viewer slot below.
@@ -387,13 +460,15 @@ function ConversationPageContent() {
   // conversation. Honest UI: if the new conversation's data isn't ready, the
   // `if (!conversation)` early-return below paints a clean skeleton.
   //
-  // Refs (sendingMessagesRef, seedHydratedRef, cachedMsgCountRef) are also
+  // Refs (sendingMessagesRef, seedHydratedRef, cachedMessagesRef) are also
   // reset here. Mutating .current during render is safe because refs don't
   // trigger re-renders. The refs live alongside this block (vs. their
   // original declaration sites further down the file) so the reset can see
   // them and the contract "these are per-slug state" is colocated.
   const seedHydratedRef = useRef<string | null>(null);
-  const cachedMsgCountRef = useRef(0);
+  const cachedMessagesRef = useRef<readonly Message[]>([]);
+  const cachedRowsGenerationRef = useRef<number | null>(null);
+  const cacheWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [lastSlug, setLastSlug] = useState<string | undefined>(slug);
   if (lastSlug !== slug) {
     setLastSlug(slug);
@@ -411,7 +486,9 @@ function ConversationPageContent() {
     // Ref resets — immediate, no re-render.
     sendingMessagesRef.current = new Set();
     seedHydratedRef.current = null;
-    cachedMsgCountRef.current = 0;
+    cachedMessagesRef.current = [];
+    cachedRowsGenerationRef.current = null;
+    cacheWriteQueueRef.current = Promise.resolve();
   }
   // Terminal split-pane height — collapses to a 32px header strip.
   // Default collapsed: most conversations don't use the terminal, and an
@@ -489,12 +566,38 @@ function ConversationPageContent() {
   const atomRef = useRef(atom);
   atomRef.current = atom;
 
+  useEffect(() => {
+    if (!conversationId || atom.transcriptGeneration === null) return;
+    const currentView = historyViewRef.current;
+    if (
+      currentView.conversationId === conversationId
+      && currentView.transcriptGeneration === atom.transcriptGeneration
+    ) return;
+    historyGenerationRef.current += 1;
+    dispatchHistoryExpansion({
+      type: 'view_changed',
+      view: {
+        conversationId,
+        generation: historyGenerationRef.current,
+        transcriptGeneration: atom.transcriptGeneration,
+      },
+      hasEarlierHistory: atom.transcriptCoverage === 'tail',
+    });
+  }, [conversationId, atom.transcriptGeneration, atom.transcriptCoverage]);
+
   const eventCursorRef = useConversationEventCursorRef(slug!);
 
   const connectionInfo = useConnection({
     conversationId,
     dispatch,
     getLastAppliedEventSeq: () => eventCursorRef.current,
+    getInitialRequestMode: () => {
+      const latestLoadedMessageSeq = latestMessageSequenceId(atomRef.current.messages);
+      if (latestLoadedMessageSeq === null) return { kind: 'full' };
+      const transcriptGeneration = atomRef.current.transcriptGeneration;
+      if (transcriptGeneration === null) return { kind: 'full' };
+      return { kind: 'messages_after_floor', afterMessageFloor: latestLoadedMessageSeq, transcriptGeneration };
+    },
   });
 
   const isOffline =
@@ -512,6 +615,17 @@ function ConversationPageContent() {
 
     setError(null);
     setArchiveStatusConfirmedConversationId(null);
+    historyGenerationRef.current += 1;
+    dispatchHistoryExpansion({
+      type: 'view_changed',
+      view: {
+        conversationId: atomRef.current.conversationId ?? slug,
+        generation: historyGenerationRef.current,
+        transcriptGeneration: atomRef.current.transcriptGeneration ?? 0,
+      },
+      hasEarlierHistory: false,
+    });
+
     const hadAtomData = !!atomRef.current.conversationId;
 
     let cancelled = false;
@@ -521,9 +635,7 @@ function ConversationPageContent() {
         let cached = atomRef.current.conversation;
         let cachedMessages: Message[] = hadAtomData ? atomRef.current.messages : [];
         if (!hadAtomData) {
-          cached = isUuidRouteSegment(slug)
-            ? await cacheDB.getConversation(slug) ?? await cacheDB.getConversationBySlug(slug)
-            : await cacheDB.getConversationBySlug(slug) ?? await cacheDB.getConversation(slug);
+          cached = await getCachedConversationForRoute(slug);
           if (cached) {
             cachedMessages = await cacheDB.getMessages(cached.id);
             if (!cancelled) {
@@ -535,7 +647,8 @@ function ConversationPageContent() {
                 phase: cached.state ? parseConversationState(cached.state) : { type: 'idle' },
                 contextWindow: { used: 0 },
                 transcriptGeneration: cached.transcript_generation ?? 1,
-                eventCursorFloor: latestMessageSequenceId(cachedMessages) ?? 0,
+                transcriptCoverage: 'tail',
+                eventCursorFloor: eventCursorRef.current,
               });
             }
           }
@@ -545,8 +658,17 @@ function ConversationPageContent() {
         if (navigator.onLine && !cancelled) {
           const cachedConversationId = cached?.id ?? null;
           const hasCachedMessages = cachedConversationId !== null && cachedMessages.length > 0;
+          const cachedReplicaMeta = cachedConversationId
+            ? await cacheDB.getReplicaMeta(cachedConversationId)
+            : null;
+          let metadata = await getConversationMetaForRoute(slug);
+          if (cancelled) return;
+          let metadataTranscriptGeneration = metadata.conversation.transcript_generation ?? 1;
+          const cachedRowsTranscriptGeneration = cachedReplicaMeta?.transcriptGeneration ?? null;
+          const cacheGenerationMatchesMetadata = cachedRowsTranscriptGeneration !== null
+            && cachedRowsTranscriptGeneration === metadataTranscriptGeneration;
 
-          if (hasCachedMessages && cachedConversationId) {
+          if (hasCachedMessages && cachedConversationId && cacheGenerationMatchesMetadata) {
             try {
               const snapshotStartedAtEventSeq = eventCursorRef.current;
               const mergedTranscriptTail = latestMessageSequenceId(cachedMessages);
@@ -554,7 +676,7 @@ function ConversationPageContent() {
                 let contiguousTranscriptTail = mergedTranscriptTail;
                 let mergedMessages = cachedMessages;
                 let latestServerTail: number | null = null;
-                let latestTranscriptGeneration = cached?.transcript_generation ?? 1;
+                let latestTranscriptGeneration = cachedRowsTranscriptGeneration;
 
                 while (!cancelled) {
                   const catchUp = await api.getConversationMessagesAfter(cachedConversationId, contiguousTranscriptTail, 200);
@@ -613,8 +735,6 @@ function ConversationPageContent() {
                   lastHydratedAt: new Date().toISOString(),
                 });
 
-                const metadata = await api.getConversationMetaBySlug(slug);
-                if (cancelled) return;
                 const authoritativeConversation = metadata.conversation;
                 if (authoritativeConversation.id !== cachedConversationId) {
                   throw new Error('Cached conversation no longer owns the requested slug');
@@ -622,7 +742,19 @@ function ConversationPageContent() {
                 setArchiveStatusConfirmedConversationId(authoritativeConversation.id);
                 await cacheDB.putConversation(authoritativeConversation);
 
-                if (!atomRef.current.conversation || atomRef.current.conversation.slug === slug) {
+                if (
+                  atomRef.current.conversationId === null
+                  || atomRef.current.conversationId === authoritativeConversation.id
+                ) {
+                  dispatchHistoryExpansion({
+                    type: 'view_changed',
+                    view: {
+                      conversationId: authoritativeConversation.id,
+                      generation: historyGenerationRef.current,
+                      transcriptGeneration: latestTranscriptGeneration,
+                    },
+                    hasEarlierHistory: latestWindow.has_older_messages,
+                  });
                   dispatch({
                     type: 'merge_conversation_data',
                     conversationId: authoritativeConversation.id,
@@ -632,8 +764,9 @@ function ConversationPageContent() {
                       ? parseConversationState(authoritativeConversation.state)
                       : { type: 'idle' },
                     contextWindow: { used: metadata.context_window_size || 0 },
-                    transcriptGeneration: authoritativeConversation.transcript_generation ?? latestTranscriptGeneration,
-                    eventCursorFloor: contiguousTranscriptTail,
+                    transcriptGeneration: latestTranscriptGeneration,
+                    transcriptCoverage: latestWindow.has_older_messages ? 'tail' : 'complete',
+                    eventCursorFloor: snapshotStartedAtEventSeq,
                     snapshotStartedAtEventSeq,
                   });
                 }
@@ -648,23 +781,37 @@ function ConversationPageContent() {
 
           try {
             const snapshotStartedAtEventSeq = eventCursorRef.current;
-            const result = await (async () => {
-              if (isUuidRouteSegment(slug)) {
-                try {
-                  return await api.getConversation(slug);
-                } catch (err) {
-                  if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
-                  return api.getConversationBySlug(slug);
-                }
-              }
+            let latestWindow;
+            for (let attempt = 0; attempt < 3; attempt += 1) {
               try {
-                return await api.getConversationBySlug(slug);
-              } catch (err) {
-                if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
-                return api.getConversation(slug);
+                latestWindow = await api.getConversationMessagesLatest(metadata.conversation.id, 50);
+              } catch (error) {
+                if (!(error instanceof MessageSliceAlignmentError)) throw error;
+                const full = await api.getConversation(metadata.conversation.id);
+                latestWindow = {
+                  messages: full.messages,
+                  has_older_messages: false,
+                  server_message_tail: latestMessageSequenceId(full.messages),
+                  transcript_generation: full.conversation.transcript_generation ?? metadata.conversation.transcript_generation ?? 1,
+                };
               }
-            })();
+              if (metadataTranscriptGeneration === latestWindow.transcript_generation) break;
+              if (attempt === 2) throw new Error('Conversation transcript kept changing while loading');
+              metadata = await getConversationMetaForRoute(slug);
+              metadataTranscriptGeneration = metadata.conversation.transcript_generation ?? 1;
+            }
+            if (!latestWindow) throw new Error('Failed to load conversation messages');
+            const result = { ...metadata, messages: latestWindow.messages };
             if (!cancelled) {
+              dispatchHistoryExpansion({
+                type: 'view_changed',
+                view: {
+                  conversationId: result.conversation.id,
+                  generation: historyGenerationRef.current,
+                  transcriptGeneration: metadataTranscriptGeneration,
+                },
+                hasEarlierHistory: latestWindow.has_older_messages,
+              });
               const replacesDifferentConversation = atomRef.current.conversationId !== null
                 && atomRef.current.conversationId !== result.conversation.id;
               dispatch({
@@ -681,8 +828,9 @@ function ConversationPageContent() {
                 contextWindow: {
                   used: result.context_window_size || 0,
                 },
-                transcriptGeneration: result.conversation.transcript_generation ?? 1,
-                eventCursorFloor: latestMessageSequenceId(result.messages) ?? 0,
+                transcriptGeneration: metadataTranscriptGeneration,
+                transcriptCoverage: latestWindow.has_older_messages ? 'tail' : 'complete',
+                eventCursorFloor: snapshotStartedAtEventSeq,
                 snapshotStartedAtEventSeq,
               });
               setArchiveStatusConfirmedConversationId(result.conversation.id);
@@ -692,7 +840,7 @@ function ConversationPageContent() {
                 conversationId: result.conversation.id,
                 latestMessageSequenceId: latestMessageSequenceId(result.messages),
                 latestEventSequenceId: null,
-                transcriptGeneration: null,
+                transcriptGeneration: metadataTranscriptGeneration,
                 lastHydratedAt: new Date().toISOString(),
               });
             }
@@ -723,53 +871,161 @@ function ConversationPageContent() {
     };
   }, [slug, navigate, dispatch, eventCursorRef]);
 
+  const loadOlderMessagesForIntent = useCallback(async (intent: HistoryIntent) => {
+    if (!slug || !conversationId || historyExpansion.coverage !== 'tail' || historyExpansion.activeRequest) return;
+    const request = {
+      token: ++historyRequestTokenRef.current,
+      view: historyExpansion.view,
+      snapshotStartedAtEventSeq: eventCursorRef.current,
+      intent,
+    };
+    const requestTranscriptGeneration = request.view.transcriptGeneration;
+
+    dispatchHistoryExpansion({ type: 'request_started', request });
+    try {
+      const result = await getConversationForRoute(slug);
+      const currentView = historyViewRef.current;
+      const authoritativeTranscriptGeneration = atomRef.current.transcriptGeneration;
+      const responseTranscriptGeneration = result.conversation.transcript_generation ?? 1;
+      const requestIsCurrent = result.conversation.id === request.view.conversationId
+        && currentView.conversationId === request.view.conversationId
+        && currentView.generation === request.view.generation
+        && currentView.transcriptGeneration === request.view.transcriptGeneration
+        && authoritativeTranscriptGeneration === request.view.transcriptGeneration
+        && responseTranscriptGeneration === request.view.transcriptGeneration;
+      if (!requestIsCurrent) {
+        dispatchHistoryExpansion({
+          type: 'history_failed',
+          requestToken: request.token,
+          view: request.view,
+          transcriptGeneration: requestTranscriptGeneration,
+          message: 'Conversation changed while loading earlier history',
+        });
+        return;
+      }
+      dispatch({
+        type: 'merge_conversation_data',
+        conversationId: request.view.conversationId,
+        conversation: result.conversation,
+        messages: result.messages,
+        phase: result.conversation.state
+          ? parseConversationState(result.conversation.state)
+          : result.presentation_mode === 'working'
+            ? { type: 'awaiting_llm' }
+            : { type: 'idle' },
+        contextWindow: { used: result.context_window_size || 0 },
+        transcriptGeneration: responseTranscriptGeneration,
+        transcriptCoverage: 'complete',
+        eventCursorFloor: historyMergeEventCursorFloor(request),
+        snapshotStartedAtEventSeq: request.snapshotStartedAtEventSeq,
+      });
+      dispatchHistoryExpansion({
+        type: 'history_loaded',
+        requestToken: request.token,
+        view: request.view,
+        targetPresent: request.intent.kind !== 'deep_link'
+          || findHistoricalUnitIndexByMessageId(
+            buildHistoricalUnits({ messages: result.messages, pendingMessages: [] }).historicalUnits,
+            request.intent.targetMessageId,
+          ) >= 0,
+        commandToken: ++historyCommandTokenRef.current,
+      });
+      await cacheDB.putMessages(result.messages);
+    } catch (err) {
+      console.warn('Failed to load earlier conversation history:', err);
+      dispatchHistoryExpansion({
+        type: 'history_failed',
+        requestToken: request.token,
+        view: request.view,
+        transcriptGeneration: requestTranscriptGeneration,
+        message: err instanceof Error ? err.message : 'Failed to load earlier history',
+      });
+    }
+  }, [slug, conversationId, historyExpansion, dispatch, eventCursorRef]);
+
+  const loadOlderMessages = useCallback((restoreBasis?: RestoreBasis) => {
+    void loadOlderMessagesForIntent({
+      kind: 'manual_expansion',
+      restore: restoreBasis ?? { kind: 'following_tail' },
+    });
+  }, [loadOlderMessagesForIntent]);
+
+  useEffect(() => {
+    dispatchHistoryExpansion({ type: 'target_changed', targetMessageId: targetMessageId ?? null });
+  }, [targetMessageId]);
+
+  const requestedLoadedTargetRef = useRef<string | null>(null);
+  const loadedHistoricalUnits = useMemo(
+    () => buildHistoricalUnits({ messages: atom.messages, pendingMessages }).historicalUnits,
+    [atom.messages, pendingMessages],
+  );
+  const loadedTargetPresent = targetMessageId
+    ? findHistoricalUnitIndexByMessageId(loadedHistoricalUnits, targetMessageId) >= 0
+    : false;
+  const loadedTargetRequestKey = targetMessageId
+    ? `${historyExpansion.view.conversationId}:${historyExpansion.view.generation}:${historyExpansion.view.transcriptGeneration}:${targetMessageId}`
+    : null;
+  useEffect(() => {
+    if (!loadedTargetRequestKey) {
+      requestedLoadedTargetRef.current = null;
+      return;
+    }
+    if (
+      (historyExpansion.coverage === 'complete' || loadedTargetPresent)
+      && !historyExpansion.pendingCommand
+      && !historyExpansion.failure
+      && requestedLoadedTargetRef.current !== loadedTargetRequestKey
+    ) {
+      requestedLoadedTargetRef.current = loadedTargetRequestKey;
+      dispatchHistoryExpansion({
+        type: 'loaded_target_requested',
+        targetMessageId: targetMessageId!,
+        commandToken: ++historyCommandTokenRef.current,
+      });
+    }
+  }, [targetMessageId, loadedTargetPresent, loadedTargetRequestKey, historyExpansion.coverage, historyExpansion.pendingCommand, historyExpansion.failure]);
+
+  useEffect(() => {
+    if (targetMessageId && !loadedTargetPresent && historyExpansion.coverage === 'tail' && !historyExpansion.activeRequest && !historyExpansion.failure) {
+      void loadOlderMessagesForIntent({ kind: 'deep_link', targetMessageId });
+    }
+  }, [targetMessageId, loadedTargetPresent, historyExpansion, loadOlderMessagesForIntent]);
+
+  const handleHistoryScrollCommand = useCallback((token: number, result: 'applied' | 'target_missing' | 'superseded', view: HistoryScrollCommand['view']) => {
+    dispatchHistoryExpansion({
+      type: 'command_acknowledged',
+      commandToken: token,
+      view,
+      result,
+    });
+  }, []);
+
   useEffect(() => {
     if (!slug || !conversationId || archiveStatusConfirmed || !isConnected) return;
     let cancelled = false;
 
     const confirmArchiveStatus = async () => {
+      const snapshotStartedAtEventSeq = eventCursorRef.current;
       try {
-        const snapshotStartedAtEventSeq = eventCursorRef.current;
-        const result = await (async () => {
-          if (isUuidRouteSegment(slug)) {
-            try {
-              return await api.getConversation(slug);
-            } catch (err) {
-              if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
-              return api.getConversationBySlug(slug);
-            }
-          }
-          try {
-            return await api.getConversationBySlug(slug);
-          } catch (err) {
-            if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
-            return api.getConversation(slug);
-          }
-        })();
-        if (cancelled) return;
-        const replacesDifferentConversation = atomRef.current.conversationId !== null
-          && atomRef.current.conversationId !== result.conversation.id;
+        const result = await getConversationMetaForRoute(slug);
+        if (cancelled || result.conversation.id !== atomRef.current.conversationId) return;
         dispatch({
-          type: eventCursorRef.current > 0 && !replacesDifferentConversation ? 'merge_conversation_data' : 'set_initial_data',
-          reset: replacesDifferentConversation,
+          type: 'merge_conversation_data',
           conversationId: result.conversation.id,
           conversation: result.conversation,
-          messages: result.messages,
+          messages: [],
           phase: result.conversation.state
             ? parseConversationState(result.conversation.state)
             : result.presentation_mode === 'working'
               ? { type: 'awaiting_llm' }
               : { type: 'idle' },
-          contextWindow: {
-            used: result.context_window_size || 0,
-          },
-          transcriptGeneration: result.conversation.transcript_generation ?? 1,
-          eventCursorFloor: latestMessageSequenceId(result.messages) ?? 0,
+          contextWindow: { used: result.context_window_size || 0 },
+          transcriptGeneration: atomRef.current.transcriptGeneration ?? result.conversation.transcript_generation ?? 1,
+          eventCursorFloor: snapshotStartedAtEventSeq,
           snapshotStartedAtEventSeq,
         });
         setArchiveStatusConfirmedConversationId(result.conversation.id);
         await cacheDB.putConversation(result.conversation);
-        await cacheDB.putMessages(result.messages);
       } catch (err) {
         if (!cancelled) console.warn('Failed to confirm archive status:', err);
       }
@@ -869,17 +1125,38 @@ function ConversationPageContent() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [terminalPane]);
 
-  // Cache new messages as they arrive via SSE.
-  // (`cachedMsgCountRef` is declared with the per-slug reset block above so
-  //  it resets to 0 on slug change.)
   useEffect(() => {
-    const msgs = atom.messages;
-    if (msgs.length > cachedMsgCountRef.current) {
-      const newMsgs = msgs.slice(cachedMsgCountRef.current);
-      cachedMsgCountRef.current = msgs.length;
-      void cacheDB.putMessages(newMsgs);
-    }
-  }, [atom.messages]);
+    if (!atom.conversationId || atom.transcriptGeneration === null) return;
+    const generationChanged = cachedRowsGenerationRef.current !== atom.transcriptGeneration;
+    const cacheWrite = messageCacheWrite(
+      atom.conversationId,
+      cachedMessagesRef.current,
+      atom.messages,
+      generationChanged,
+    );
+    cachedMessagesRef.current = atom.messages;
+    cachedRowsGenerationRef.current = atom.transcriptGeneration;
+    if (cacheWrite.kind === 'append' && cacheWrite.messages.length === 0) return;
+    const conversationId = atom.conversationId;
+    const transcriptGeneration = atom.transcriptGeneration;
+    const latestSequenceId = latestMessageSequenceId(atom.messages);
+    cacheWriteQueueRef.current = cacheWriteQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        if (cacheWrite.kind === 'replace') {
+          await cacheDB.replaceMessages(cacheWrite.conversationId, cacheWrite.messages);
+        } else {
+          await cacheDB.putMessages(cacheWrite.messages);
+        }
+        await cacheDB.putReplicaMeta({
+          conversationId,
+          latestMessageSequenceId: latestSequenceId,
+          latestEventSequenceId: null,
+          transcriptGeneration,
+          lastHydratedAt: new Date().toISOString(),
+        });
+      });
+  }, [atom.conversationId, atom.messages, atom.transcriptGeneration]);
 
   // Cache conversation metadata when it changes
   useEffect(() => {
@@ -1662,7 +1939,18 @@ function ConversationPageContent() {
         conversationId={conversationId}
         slug={slug}
         systemPrompt={atom.systemPrompt ?? undefined}
-        targetMessageId={targetMessageId}
+        hasOlderMessages={historyExpansion.coverage === 'tail'}
+        onLoadOlderMessages={loadOlderMessages}
+        loadingOlderMessages={historyExpansion.activeRequest !== null}
+        olderHistoryError={historyExpansion.failure?.kind === 'request_failed'
+          ? historyExpansion.failure.message
+          : historyExpansion.failure?.kind === 'target_not_found'
+            ? 'The requested message is not in this conversation.'
+            : historyExpansion.failure?.kind === 'anchor_not_found'
+              ? 'Could not preserve the previous reading position.'
+              : null}
+        transcriptPositioning={transcriptPositioningInputFromHistoryExpansion(historyExpansion)}
+        onHistoryScrollCommandHandled={handleHistoryScrollCommand}
       />
       </RenderProfiler>
       {atom.uiError && (

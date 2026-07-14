@@ -117,6 +117,7 @@ describe('parseEvent', () => {
     const validInit = {
       sequence_id: 0,
       transcript_generation: 1,
+      message_snapshot: 'full',
       conversation: { id: 'conv-1' },
       messages: [],
       agent_working: false,
@@ -321,6 +322,7 @@ describe('parseEvent', () => {
         makeEvent({
           sequence_id: 7,
           message_id: 'msg-1',
+          transcript_generation: 3,
           display_data: { type: 'subagent_summary' },
           content: null,
         }),
@@ -328,6 +330,7 @@ describe('parseEvent', () => {
         dispatch,
       );
       expect(res.ok).toBe(true);
+      if (res.ok) expect(res.data.transcript_generation).toBe(3);
     });
 
     it('accepts update with duration_ms present', () => {
@@ -337,6 +340,7 @@ describe('parseEvent', () => {
         makeEvent({
           sequence_id: 8,
           message_id: 'msg-tool',
+          transcript_generation: 4,
           display_data: null,
           content: null,
           duration_ms: 1234,
@@ -355,6 +359,7 @@ describe('parseEvent', () => {
         makeEvent({
           sequence_id: 9,
           message_id: 'msg-subagent',
+          transcript_generation: 5,
           display_data: { type: 'subagent_summary' },
           content: null,
         }),
@@ -370,7 +375,7 @@ describe('parseEvent', () => {
         const { dispatch, actions } = mockDispatch();
         const res = parseEvent(
           SseMessageUpdatedDataSchema,
-          makeEvent({ sequence_id: 7, display_data: { type: 'x' } }),
+          makeEvent({ sequence_id: 7, transcript_generation: 1, display_data: { type: 'x' } }),
           'message_updated',
           dispatch,
         );
@@ -384,7 +389,21 @@ describe('parseEvent', () => {
         const { dispatch, actions } = mockDispatch();
         const res = parseEvent(
           SseMessageUpdatedDataSchema,
-          makeEvent({ message_id: 'msg-1', display_data: { type: 'x' } }),
+          makeEvent({ message_id: 'msg-1', transcript_generation: 1, display_data: { type: 'x' } }),
+          'message_updated',
+          dispatch,
+        );
+        expect(res.ok).toBe(false);
+        expect(actions).toHaveLength(1);
+      });
+    });
+
+    it('rejects update missing transcript_generation', () => {
+      inProdMode(() => {
+        const { dispatch, actions } = mockDispatch();
+        const res = parseEvent(
+          SseMessageUpdatedDataSchema,
+          makeEvent({ sequence_id: 7, message_id: 'msg-1', display_data: { type: 'x' } }),
           'message_updated',
           dispatch,
         );
