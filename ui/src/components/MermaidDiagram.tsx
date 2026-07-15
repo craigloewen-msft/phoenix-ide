@@ -1,4 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { Maximize2 } from 'lucide-react';
 import type { Mermaid } from 'mermaid';
 import { useTheme, type Theme } from '../hooks/useTheme';
 import { CopyButton } from './CopyButton';
@@ -63,6 +64,13 @@ function mermaidThemeVariables(theme: Theme) {
   };
 }
 
+function standaloneSvg(svg: string, background: string): string {
+  return svg.replace(
+    /(<svg\b[^>]*>)/,
+    `$1<rect width="100%" height="100%" fill="${background}"/>`,
+  );
+}
+
 function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message.trim()) return error.message;
   if (typeof error === 'string' && error.trim()) return error;
@@ -81,6 +89,7 @@ export function MermaidDiagram({ code, className = '' }: MermaidDiagramProps) {
   const [renderState, setRenderState] = useState<RenderState>({ status: 'rendering' });
   const svgContainerRef = useRef<HTMLDivElement | null>(null);
   const figureRef = useRef<HTMLElement | null>(null);
+  const standaloneUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
     const wrapper = figureRef.current?.closest('pre');
@@ -90,6 +99,11 @@ export function MermaidDiagram({ code, className = '' }: MermaidDiagramProps) {
 
   useEffect(() => {
     let cancelled = false;
+    const themeVariables = mermaidThemeVariables(theme);
+    if (standaloneUrlRef.current) {
+      URL.revokeObjectURL(standaloneUrlRef.current);
+      standaloneUrlRef.current = null;
+    }
     setRenderState({ status: 'rendering' });
 
     // mermaid.render injects a temporary measuring node into <body> with id
@@ -104,7 +118,7 @@ export function MermaidDiagram({ code, className = '' }: MermaidDiagramProps) {
           startOnLoad: false,
           theme: 'base',
           securityLevel: 'strict',
-          themeVariables: mermaidThemeVariables(theme),
+          themeVariables,
           flowchart: {
             curve: 'basis',
             htmlLabels: false,
@@ -118,6 +132,9 @@ export function MermaidDiagram({ code, className = '' }: MermaidDiagramProps) {
       .then((result) => {
         if (cancelled || !result) return;
         const { svg, bindFunctions } = result;
+        standaloneUrlRef.current = URL.createObjectURL(
+          new Blob([standaloneSvg(svg, themeVariables.background)], { type: 'image/svg+xml' }),
+        );
         setRenderState({ status: 'rendered', svg });
         window.requestAnimationFrame(() => {
           if (cancelled || !bindFunctions || !svgContainerRef.current) return;
@@ -132,6 +149,10 @@ export function MermaidDiagram({ code, className = '' }: MermaidDiagramProps) {
     return () => {
       cancelled = true;
       removeOrphanedNode();
+      if (standaloneUrlRef.current) {
+        URL.revokeObjectURL(standaloneUrlRef.current);
+        standaloneUrlRef.current = null;
+      }
     };
   }, [diagramId, source, theme]);
 
@@ -157,7 +178,21 @@ export function MermaidDiagram({ code, className = '' }: MermaidDiagramProps) {
             Source
           </button>
         </div>
-        <CopyButton text={source} className="mermaid-copy-source" title="Copy Mermaid source" />
+        <div className="mermaid-diagram-actions">
+          {mode === 'diagram' && renderState.status === 'rendered' && standaloneUrlRef.current && (
+            <a
+              className="mermaid-fullscreen"
+              href={standaloneUrlRef.current}
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label="Open Mermaid diagram fullscreen"
+              title="Open fullscreen"
+            >
+              <Maximize2 size={16} aria-hidden="true" />
+            </a>
+          )}
+          <CopyButton text={source} className="mermaid-copy-source" title="Copy Mermaid source" />
+        </div>
       </div>
 
       <div className="mermaid-diagram-body">
