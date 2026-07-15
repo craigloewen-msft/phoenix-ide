@@ -75,14 +75,14 @@ function LocationProbe() {
 }
 
 
-function toolMessage(toolUseId: string, content: string, sequenceId = 2): Message {
+function toolMessage(toolUseId: string, content: string, sequenceId = 2, displayData?: Record<string, unknown>): Message {
   return {
     message_id: `tool-${toolUseId}`,
     sequence_id: sequenceId,
     conversation_id: 'agent-1',
     message_type: 'tool',
     content: { tool_use_id: toolUseId, content, is_error: false },
-    display_data: null,
+    display_data: displayData ?? null,
     created_at: '2026-01-01T00:00:01Z',
   };
 }
@@ -257,7 +257,8 @@ describe('inline tool timers', () => {
       </MemoryRouter>,
     );
 
-    expect(document.querySelector('.tool-block-output-content')).toHaveTextContent('# README Done');
+    expect(screen.getByText('read_file')).toBeInTheDocument();
+    expect(screen.getByText(/# README/)).toBeInTheDocument();
     expect(document.querySelector('.tool-block-elapsed')).toBeNull();
     expect(screen.getByText('• 1.2s')).toBeInTheDocument();
 
@@ -1436,6 +1437,229 @@ describe('finalized code fence highlighting', () => {
     });
 
     unmount();
+  });
+});
+
+describe('read_file structured result view', () => {
+  it('renders a ranged preview while preserving full returned output beside the live-file action', async () => {
+    const onOpenFile = vi.fn();
+    const lines = Array.from({ length: 25 }, (_, index) => `${index + 40}\tfixture line ${index + 40}`).join('\n');
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-structured', [
+            { type: 'tool_use', id: 'tool-read-structured', name: 'read_file', input: { path: 'src/lib.rs', offset: 40, limit: 25 } },
+          ])}
+          toolResults={new Map([['tool-read-structured', toolMessage('tool-read-structured', lines, 2, {
+              type: 'read_file', path: 'src/lib.rs', requested_offset: 40, requested_limit: 25,
+              returned_start_line: 40, returned_end_line: 64, returned_line_count: 25,
+              total_line_count: 100, remaining_line_count: 36, viewer_available: true,
+            })]])}
+          onOpenFile={onOpenFile}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('src/lib.rs')).toBeInTheDocument();
+    expect(screen.getByText(/25 lines • lines 40-64/)).toBeInTheDocument();
+    expect(screen.getByText('requested 25')).toBeInTheDocument();
+    expect(screen.getByText('fixture line 40')).toBeInTheDocument();
+    expect(screen.queryByText('fixture line 60')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'View full file' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'View full file' }));
+    expect(onOpenFile).toHaveBeenCalledWith('src/lib.rs', new Set(), 40, 64);
+
+    fireEvent.click(screen.getByRole('button', { name: /Copy all returned lines/i }));
+    await waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith(lines));
+
+    expect(screen.getByText(/5 more returned lines/)).toBeInTheDocument();
+    expect(screen.queryByText('fixture line 60')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Show all returned lines' }));
+    expect(screen.getByText('fixture line 64')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Show preview' })).toHaveAttribute('aria-expanded', 'true');
+  });
+
+  it('keeps every returned line accessible when the full-file viewer is unavailable', async () => {
+    const lines = Array.from({ length: 25 }, (_, index) => `${index + 1}\toutside line ${index + 1}`).join('\n');
+    const copyMock = vi.mocked(copyToClipboard);
+    copyMock.mockClear();
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-unviewable', [
+            { type: 'tool_use', id: 'tool-read-unviewable', name: 'read_file', input: { path: '/tmp/outside.txt' } },
+          ])}
+          toolResults={new Map([['tool-read-unviewable', toolMessage('tool-read-unviewable', lines, 2, {
+            type: 'read_file', path: '/tmp/outside.txt', requested_offset: 1, requested_limit: 25,
+            returned_start_line: 1, returned_end_line: 25, returned_line_count: 25,
+            total_line_count: 25, remaining_line_count: 0, viewer_available: false,
+          })]])}
+          onOpenFile={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByText('outside line 25')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'View full file' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Show all returned lines' }));
+    expect(screen.getByText('outside line 25')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Show preview' })).toHaveAttribute('aria-expanded', 'true');
+
+    fireEvent.click(screen.getByRole('button', { name: /Copy all returned lines/i }));
+    await waitFor(() => expect(copyMock).toHaveBeenCalledWith(lines));
+  });
+
+  it('caps structured previews by characters without truncating copied historical output', async () => {
+    const longLine = 'x'.repeat(20_000);
+    const copyMock = vi.mocked(copyToClipboard);
+    copyMock.mockClear();
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-long-line', [
+            { type: 'tool_use', id: 'tool-read-long-line', name: 'read_file', input: { path: 'generated.min.js' } },
+          ])}
+          toolResults={new Map([['tool-read-long-line', toolMessage('tool-read-long-line', `     1\t${longLine}`, 2, {
+            type: 'read_file', path: 'generated.min.js', requested_offset: 1, requested_limit: 2000,
+            returned_start_line: 1, returned_end_line: 1, returned_line_count: 1,
+            total_line_count: 1, remaining_line_count: 0, viewer_available: true,
+          })]])}
+          onOpenFile={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText(/returned line truncated for preview/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Copy all returned lines/i }));
+    await waitFor(() => expect(copyMock).toHaveBeenCalledWith(`     1\t${longLine}`));
+  });
+
+  it('preserves literal ellipses and distinguishes an empty range from an empty file', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-empty-range', [
+            { type: 'tool_use', id: 'tool-read-empty-range', name: 'read_file', input: { path: 'short.txt', offset: 99, limit: 5 } },
+          ])}
+          toolResults={new Map([['tool-read-empty-range', toolMessage('tool-read-empty-range', '', 2, {
+            type: 'read_file', path: 'short.txt', requested_offset: 99, requested_limit: 5,
+            returned_start_line: null, returned_end_line: null, returned_line_count: 0,
+            total_line_count: 3, remaining_line_count: 0, viewer_available: true,
+          })]])}
+          onOpenFile={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByText('(empty file)')).not.toBeInTheDocument();
+    expect(screen.getByText(/No lines returned for the requested range/)).toBeInTheDocument();
+    expect(screen.getByText(/file contains 3 lines/)).toBeInTheDocument();
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-ellipsis', [
+            { type: 'tool_use', id: 'tool-read-ellipsis', name: 'read_file', input: { path: 'ellipsis.txt' } },
+          ])}
+          toolResults={new Map([['tool-read-ellipsis', toolMessage('tool-read-ellipsis', '     1\tliteral…\n     2\tstill visible', 2, {
+            type: 'read_file', path: 'ellipsis.txt', requested_offset: 1, requested_limit: 2000,
+            returned_start_line: 1, returned_end_line: 2, returned_line_count: 2,
+            total_line_count: 2, remaining_line_count: 0, viewer_available: true,
+          })]])}
+          onOpenFile={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText('still visible')).toBeInTheDocument();
+    expect(screen.queryByText(/truncated for preview/)).not.toBeInTheDocument();
+  });
+
+  it('hides the viewer action for absolute and traversal read paths', () => {
+    const metadata = {
+      type: 'read_file', requested_offset: 1, requested_limit: 1,
+      returned_start_line: 1, returned_end_line: 1, returned_line_count: 1,
+      total_line_count: 1, remaining_line_count: 0, viewer_available: false,
+    };
+    const { rerender } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-absolute', [
+            { type: 'tool_use', id: 'tool-read-absolute', name: 'read_file', input: { path: '/tmp/outside.txt' } },
+          ])}
+          toolResults={new Map([['tool-read-absolute', toolMessage('tool-read-absolute', '     1\toutside', 2, { ...metadata, path: '/tmp/outside.txt' })]])}
+          onOpenFile={vi.fn()}
+          filePathRootDir="/repo"
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByRole('button', { name: 'View full file' })).not.toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-traversal', [
+            { type: 'tool_use', id: 'tool-read-traversal', name: 'read_file', input: { path: '../outside.txt' } },
+          ])}
+          toolResults={new Map([['tool-read-traversal', toolMessage('tool-read-traversal', '     1\toutside', 2, { ...metadata, path: '../outside.txt' })]])}
+          onOpenFile={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByRole('button', { name: 'View full file' })).not.toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-in-root', [
+            { type: 'tool_use', id: 'tool-read-in-root', name: 'read_file', input: { path: '/repo/src/in-root.txt' } },
+          ])}
+          toolResults={new Map([['tool-read-in-root', toolMessage('tool-read-in-root', '     1\tinside', 2, { ...metadata, path: '/repo/src/in-root.txt', viewer_available: true })]])}
+          onOpenFile={vi.fn()}
+          filePathRootDir="/repo"
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole('button', { name: 'View full file' })).toBeInTheDocument();
+  });
+
+  it('renders empty and malformed fallback states', () => {
+    const { rerender } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-empty', [
+            { type: 'tool_use', id: 'tool-read-empty', name: 'read_file', input: { path: 'empty.txt' } },
+          ])}
+          toolResults={new Map([['tool-read-empty', toolMessage('tool-read-empty', '', 2, {
+              type: 'read_file', path: 'empty.txt', requested_offset: 1, requested_limit: 2000,
+              returned_start_line: null, returned_end_line: null, returned_line_count: 0,
+              total_line_count: 0, remaining_line_count: 0, viewer_available: true,
+            })]])}
+          onOpenFile={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('(empty file)')).toBeInTheDocument();
+    expect(screen.getByText('No file content returned')).toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-malformed', [
+            { type: 'tool_use', id: 'tool-read-malformed', name: 'read_file', input: { path: 'broken.txt', offset: 10, limit: 3 } },
+          ])}
+          toolResults={new Map([['tool-read-malformed', toolMessage('tool-read-malformed', 'oops\n12\tvalid line')]])}
+          onOpenFile={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText(/broken\.txt:10-12/)).toBeInTheDocument();
+    expect(screen.queryByText(/Ignored .* non-numbered line/)).not.toBeInTheDocument();
+    expect(screen.getByText(/oops/)).toBeInTheDocument();
   });
 });
 

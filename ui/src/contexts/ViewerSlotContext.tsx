@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 import { useLocation, useSearchParams } from 'react-router-dom';
 import { useScopedState } from '../hooks/useScopedState';
 import type { OpenFileOptions, PatchContext } from '../components/FileExplorer/fileExplorerTypes';
+import type { ViewerFocus } from '../components/viewer/metaViewerTypes';
 import { clearLastViewer, getLastViewer, setLastViewer } from '../storage/lastViewerStorage';
 
 /**
@@ -31,7 +32,7 @@ export type DiffPresentation = 'fullscreen' | 'pane';
 export interface ProseFile {
   path: string;
   rootDir: string;
-  focusLine?: number | undefined;
+  focus?: ViewerFocus | undefined;
 }
 
 export type DiffTarget = 'workspace' | 'active_pr';
@@ -81,6 +82,7 @@ const DIFF_TARGET_PARAM = 'target';
 const FILE_PARAM = 'file';
 const ROOT_PARAM = 'root';
 const LINE_PARAM = 'line';
+const END_LINE_PARAM = 'endLine';
 const SCOPE_PARAM = 'scope';
 const HANDLE_PARAM = 'handle';
 const MESSAGE_PARAM = 'message';
@@ -95,6 +97,7 @@ const SLOT_PARAMS = [
   FILE_PARAM,
   ROOT_PARAM,
   LINE_PARAM,
+  END_LINE_PARAM,
   SCOPE_PARAM,
   HANDLE_PARAM,
   MESSAGE_PARAM,
@@ -133,8 +136,17 @@ function deriveSlot(
   switch (effective) {
     case 'prose': {
       if (!file || !root) return { slot: { kind: 'none' }, malformed: true };
-      const focusLine = parseFocusLineParam(searchParams.get(LINE_PARAM));
-      return { slot: { kind: 'prose', file: { path: file, rootDir: root, focusLine }, patchContext }, malformed: false };
+      const lineNumber = parseFocusLineParam(searchParams.get(LINE_PARAM));
+      const endLine = parseFocusLineParam(searchParams.get(END_LINE_PARAM));
+      const focus: ViewerFocus | undefined = lineNumber === undefined
+        ? undefined
+        : endLine !== undefined && endLine >= lineNumber
+          ? { kind: 'range', startLine: lineNumber, endLine }
+          : { kind: 'line', lineNumber };
+      return {
+        slot: { kind: 'prose', file: { path: file, rootDir: root, focus }, patchContext },
+        malformed: false,
+      };
     }
     case 'diff': {
       if (presentation !== 'fullscreen' && presentation !== 'pane') {
@@ -230,6 +242,14 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
         next.set(ROOT_PARAM, rootDir);
         const lineNumber = options?.kind === 'line' ? validFocusLine(options.lineNumber) : undefined;
         if (lineNumber !== undefined) next.set(LINE_PARAM, String(lineNumber));
+        if (options?.kind === 'range') {
+          const startLine = validFocusLine(options.startLine);
+          const endLine = validFocusLine(options.endLine);
+          if (startLine !== undefined && endLine !== undefined && endLine >= startLine) {
+            next.set(LINE_PARAM, String(startLine));
+            next.set(END_LINE_PARAM, String(endLine));
+          }
+        }
       });
     },
     [setPatchContext, writeUrl],

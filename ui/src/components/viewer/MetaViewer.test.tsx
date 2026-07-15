@@ -259,7 +259,20 @@ describe('MetaViewer payload routing', () => {
     expect(document.querySelector('.viewer-find-match--active')).toHaveTextContent('alpha');
   });
 
-  it('lets a large HTML file still toggle to the sandboxed preview (fallback only gates source)', () => {
+  it('uses the line-aware source viewer for a focused markdown range regardless of file size', () => {
+    const { container } = renderViewer({
+      ...textCommon,
+      kind: 'markdown',
+      content: '# Heading\nparagraph first line\nparagraph second line\n```ts\nconst value = 1;\n```',
+      focus: { kind: 'range', startLine: 3, endLine: 5 },
+    });
+
+    expect(container.querySelector('.phoenix-file-codeview')).not.toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Heading' })).not.toBeInTheDocument();
+    expect(screen.getByText(/focused on lines 3–5/)).toBeInTheDocument();
+  });
+
+  it('lets a focused large HTML file still toggle from line-aware source to sandboxed preview', () => {
     const largeHtml = `${'<p>line</p>\n'.repeat(2_001)}<p>tail</p>`;
     const { container } = renderViewer({
       ...textCommon,
@@ -268,14 +281,13 @@ describe('MetaViewer payload routing', () => {
       content: largeHtml,
       renderMode: 'plainLargeText',
       previewUrl: '/preview/tmp/project/thing',
+      focus: { kind: 'range', startLine: 100, endLine: 110 },
     });
 
-    // Source view falls back to plain text for the large file...
-    expect(screen.getByTestId('viewer-large-text-fallback')).toBeInTheDocument();
-    // ...but switching to Preview must reach the iframe, not stay stranded on <pre>.
+    expect(container.querySelector('.phoenix-file-codeview')).not.toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
     expect(container.querySelector('iframe')).not.toBeNull();
-    expect(screen.queryByTestId('viewer-large-text-fallback')).toBeNull();
+    expect(container.querySelector('.phoenix-file-codeview')).toBeNull();
   });
 
   it('routes an image payload to the image body', () => {

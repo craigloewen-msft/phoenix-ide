@@ -1576,9 +1576,17 @@ function ConversationPageContent() {
   );
 
   const handleOpenFileFromPatch = useCallback(
-    (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => {
+    (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => {
       const rootDir = conversation?.worktree_path ?? conversation?.cwd ?? '/';
       const fullPath = filePath.startsWith('/') ? filePath : `${rootDir}/${filePath}`;
+      if (focusEndLine !== undefined && firstModifiedLine > 0) {
+        fileExplorer.openFile(fullPath, rootDir, {
+          kind: 'range',
+          startLine: firstModifiedLine,
+          endLine: focusEndLine,
+        });
+        return;
+      }
       fileExplorer.openFile(fullPath, rootDir, { kind: 'patch', patchContext: { modifiedLines, firstModifiedLine } });
     },
     [conversation?.worktree_path, conversation?.cwd, fileExplorer]
@@ -1719,7 +1727,7 @@ function ConversationPageContent() {
               onClose={handleCloseFileViewer}
               onSendNotes={handleSendNotes}
               patchContext={prs.patchContext ?? undefined}
-              focusLine={prs.focusLine}
+              focus={prs.focus}
               inline
             />
           </Suspense>
@@ -2416,7 +2424,7 @@ function ConversationPageContent() {
             onClose={handleCloseFileViewer}
             onSendNotes={handleSendNotes}
             patchContext={openFileState.patchContext ?? undefined}
-            focusLine={openFileState.focusLine}
+            focus={openFileState.focus}
           />
         </Suspense>
       )}
@@ -2535,7 +2543,7 @@ function ConversationPageContent() {
                   onClose={handleCloseFileViewer}
                   onSendNotes={handleSendNotes}
                   patchContext={splitPanePrs.patchContext ?? undefined}
-                  focusLine={splitPanePrs.focusLine}
+                  focus={splitPanePrs.focus}
                   inline
                 />
               ) : browserViewerOpen && conversationId ? (

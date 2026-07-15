@@ -19,7 +19,7 @@ export function FileExplorerProvider({ children }: { children: ReactNode }) {
     if (slot.kind !== 'prose') return null;
     const state: OpenFileState = { path: slot.file.path, rootDir: slot.file.rootDir };
     if (slot.patchContext) state.patchContext = slot.patchContext;
-    if (slot.file.focusLine !== undefined) state.focusLine = slot.file.focusLine;
+    if (slot.file.focus) state.focus = slot.file.focus;
     return state;
   }, [slot]);
 

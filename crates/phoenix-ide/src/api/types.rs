@@ -359,16 +359,14 @@ impl FileViewerKind {
                 "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" | "bmp" | "tiff" | "tif",
             ) => FileViewerKind::Image,
             // Known-binary extensions: the viewer cannot open them.
-            Some(
-                "db" | "sqlite" | "sqlite3" | "bin" | "dat" | "exe" | "dll" | "so" | "dylib" | "o"
-                | "a" | "wasm" | "class" | "jar" | "war" | "pyc" | "pyo" | "pdf" | "doc" | "docx"
-                | "xls" | "xlsx" | "ppt" | "pptx" | "zip" | "tar" | "gz" | "bz2" | "xz" | "7z"
-                | "rar" | "mp3" | "mp4" | "wav" | "avi" | "mkv" | "mov" | "webm" | "flac" | "ogg"
-                | "woff" | "woff2" | "ttf" | "otf",
-            ) => FileViewerKind::Opaque,
-            // Unknown extension: optimistically text; the read path confirms by
+            Some(_) => match phoenix_core::file_viewer::classify_for_viewer(path) {
+                phoenix_core::file_viewer::ViewerFileClass::Image => FileViewerKind::Image,
+                phoenix_core::file_viewer::ViewerFileClass::Opaque => FileViewerKind::Opaque,
+                phoenix_core::file_viewer::ViewerFileClass::Text => text(TextCategory::Unknown),
+            },
+            // No extension: optimistically text; the read path confirms by
             // content-sniffing before committing.
-            _ => text(TextCategory::Unknown),
+            None => text(TextCategory::Unknown),
         }
     }
 }

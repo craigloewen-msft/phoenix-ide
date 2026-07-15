@@ -41,6 +41,7 @@ import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './convers
 import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
 import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
+import './ReadFileResultView.css';
 
 const CheckIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -438,7 +439,7 @@ function SkillToolBlock({
   durationMs: number | undefined;
   toolStartedAtMs: number | null | undefined;
   inflightElapsedSeconds: number;
-  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
   toolId: string;
 }) {
   const details = extractSkillResultDetails(resultText);
@@ -870,7 +871,7 @@ function CompactToolStripImpl({
 interface AgentMessageProps {
   message: Message;
   toolResults: ReadonlyMap<string, Message>;
-  onOpenFile?: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+  onOpenFile?: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
   filePathRootDir?: string | undefined;
   workScopeKey?: string | undefined;
   activeToolUseId?: string | undefined;
@@ -1215,7 +1216,7 @@ function ThinkAsideImpl({ block }: { block: ContentBlock }) {
 interface ToolUseBlockProps {
   block: ContentBlock;
   result: Message | undefined;
-  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
   workScopeKey?: string | undefined;
   knownResultIds?: readonly string[] | undefined;
   /** Server-clock unix ms when the runtime began dispatching this
@@ -1609,6 +1610,236 @@ export function BrowserConsoleLogsView({ rawText }: { rawText: string }) {
 // its line numbers underneath.
 type SearchHit = { path: string; lineNumber: number; content: string };
 
+type ReadFileRequest = {
+  path: string;
+  offset: number | null;
+  limit: number | null;
+};
+
+type ReadFileLine = {
+  lineNumber: number;
+  content: string;
+};
+
+type ReadFileParseResult = {
+  lines: ReadFileLine[];
+  notes: string[];
+  malformed: boolean;
+};
+
+type ReadFileDisplayData = {
+  type: 'read_file';
+  path: string;
+  requested_offset: number;
+  requested_limit: number;
+  returned_start_line: number | null;
+  returned_end_line: number | null;
+  returned_line_count: number;
+  total_line_count: number;
+  remaining_line_count: number;
+  viewer_available: boolean;
+};
+
+function parseReadFileDisplayData(value: unknown): ReadFileDisplayData | null {
+  if (!value || typeof value !== 'object') return null;
+  const data = value as Record<string, unknown>;
+  if (data['type'] !== 'read_file' || typeof data['path'] !== 'string') return null;
+  if (typeof data['viewer_available'] !== 'boolean') return null;
+  const numericKeys = ['requested_offset', 'requested_limit', 'returned_line_count', 'total_line_count', 'remaining_line_count'] as const;
+  if (numericKeys.some((key) => !Number.isInteger(data[key]) || (data[key] as number) < 0)) return null;
+  const validLine = (key: 'returned_start_line' | 'returned_end_line') =>
+    data[key] === null || (Number.isInteger(data[key]) && (data[key] as number) > 0);
+  if (!validLine('returned_start_line') || !validLine('returned_end_line')) return null;
+  return data as ReadFileDisplayData;
+}
+
+const READ_FILE_PREVIEW_MAX_LINES = 20;
+const READ_FILE_PREVIEW_MAX_CHARS = 5_000;
+
+function boundedReadFileLines(lines: ReadFileLine[]): { lines: ReadFileLine[]; truncated: boolean } {
+  const visible: ReadFileLine[] = [];
+  let remainingChars = READ_FILE_PREVIEW_MAX_CHARS;
+  for (const line of lines.slice(0, READ_FILE_PREVIEW_MAX_LINES)) {
+    if (remainingChars <= 0) break;
+    const lineWasTruncated = line.content.length > remainingChars;
+    const content = lineWasTruncated
+      ? `${line.content.slice(0, remainingChars)}…`
+      : line.content;
+    visible.push({ ...line, content });
+    remainingChars -= Math.min(line.content.length, remainingChars);
+    if (lineWasTruncated) break;
+  }
+  return {
+    lines: visible,
+    truncated: visible.length < lines.length || visible.some((line, index) => line.content !== lines[index]?.content),
+  };
+}
+
+function parseReadFileRequest(input: Record<string, unknown>): ReadFileRequest {
+  const path = typeof input['path'] === 'string' ? input['path'] : '';
+  const offset = typeof input['offset'] === 'number' && Number.isFinite(input['offset'])
+    ? input['offset']
+    : null;
+  const limit = typeof input['limit'] === 'number' && Number.isFinite(input['limit'])
+    ? input['limit']
+    : null;
+  return { path, offset, limit };
+}
+
+// eslint-disable-next-line react-refresh/only-export-components -- pure parser test seam
+export const __readFileResultTestables = {
+  parseOutput: (text: string) => parseReadFileOutput(text),
+};
+
+function parseReadFileOutput(text: string): ReadFileParseResult {
+  const trimmed = text.trim();
+  if (trimmed === '') {
+    return { lines: [], notes: [], malformed: false };
+  }
+
+  const lines: ReadFileLine[] = [];
+  const notes: string[] = [];
+  let malformed = false;
+
+  for (const rawLine of text.split('\n')) {
+    if (!rawLine.trim()) continue;
+    const match = /^\s*(\d+)\t([\s\S]*)$/.exec(rawLine);
+    if (match && match[1] !== undefined) {
+      lines.push({ lineNumber: parseInt(match[1], 10), content: match[2] ?? '' });
+      continue;
+    }
+    notes.push(rawLine);
+    malformed = true;
+  }
+
+  return { lines, notes, malformed };
+}
+
+function formatReadFileRange(request: ReadFileRequest, parsed: ReadFileParseResult): string {
+  const firstLine = parsed.lines[0]?.lineNumber;
+  const lastLine = parsed.lines.at(-1)?.lineNumber;
+
+  if (firstLine !== undefined && lastLine !== undefined) {
+    return firstLine === lastLine ? `line ${firstLine}` : `lines ${firstLine}-${lastLine}`;
+  }
+
+  if (request.offset !== null && request.limit !== null) {
+    const end = request.offset + request.limit - 1;
+    return request.limit === 1 ? `line ${request.offset}` : `lines ${request.offset}-${end}`;
+  }
+
+  if (request.offset !== null) {
+    return `from line ${request.offset}`;
+  }
+
+  return 'from start of file';
+}
+
+function ReadFileResultView({
+  input,
+  rawText,
+  metadata,
+  onOpenFile,
+}: {
+  input: Record<string, unknown>;
+  rawText: string;
+  metadata: ReadFileDisplayData;
+  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
+}) {
+  const request = useMemo(() => parseReadFileRequest(input), [input]);
+  const parsed = useMemo(() => parseReadFileOutput(rawText), [rawText]);
+  const preview = useMemo(() => boundedReadFileLines(parsed.lines), [parsed.lines]);
+  const [showAllReturnedLines, setShowAllReturnedLines] = useState(false);
+  const fullFileViewerAvailable = Boolean(onOpenFile && metadata.viewer_available);
+  const hasMore = preview.truncated;
+  const canExpandReturnedOutput = hasMore;
+  const visibleLines = showAllReturnedLines ? parsed.lines : preview.lines;
+  const firstVisibleLine = metadata.returned_start_line ?? parsed.lines[0]?.lineNumber ?? request.offset ?? 0;
+  const lastVisibleLine = metadata.returned_end_line ?? parsed.lines.at(-1)?.lineNumber ?? firstVisibleLine;
+
+  if (metadata.total_line_count === 0) {
+    return (
+      <div className="read-file-result read-file-result-fallback" data-read-file-state="empty">
+        <div className="read-file-result-meta">
+          <span className="read-file-result-path">{request.path || '(unknown path)'}</span>
+          <span className="read-file-result-summary">No file content returned</span>
+        </div>
+        <div className="read-file-result-empty">(empty file)</div>
+      </div>
+    );
+  }
+
+  if (metadata.returned_line_count === 0) {
+    return (
+      <div className="read-file-result read-file-result-fallback" data-read-file-state="empty-range">
+        <div className="read-file-result-meta">
+          <span className="read-file-result-path">{request.path || '(unknown path)'}</span>
+          <span className="read-file-result-summary">No lines returned for the requested range</span>
+        </div>
+        <div className="read-file-result-empty">The file contains {metadata.total_line_count} lines.</div>
+      </div>
+    );
+  }
+
+  const rangeLabel = formatReadFileRange(request, parsed);
+
+  return (
+    <div className="read-file-result" data-read-file-state={parsed.malformed ? 'mixed' : 'structured'}>
+      <div className="read-file-result-meta">
+        <div className="read-file-result-meta-main">
+          <span className="read-file-result-path">{request.path || '(unknown path)'}</span>
+          <span className="read-file-result-summary">
+            {metadata.returned_line_count} line{metadata.returned_line_count === 1 ? '' : 's'} • {rangeLabel}
+          </span>
+          <span className="read-file-result-summary">of {metadata.total_line_count} total</span>
+          <span className="read-file-result-summary">requested {metadata.requested_limit}</span>
+        </div>
+        <div className="read-file-result-actions">
+          {fullFileViewerAvailable && (
+            <button
+              type="button"
+              className="read-file-result-open"
+              onClick={() => onOpenFile?.(request.path, new Set(), firstVisibleLine, lastVisibleLine)}
+              title="View the complete current file focused on this range"
+            >
+              View full file
+            </button>
+          )}
+          {canExpandReturnedOutput && (
+            <button
+              type="button"
+              className="read-file-result-open"
+              onClick={() => setShowAllReturnedLines((visible) => !visible)}
+              aria-expanded={showAllReturnedLines}
+            >
+              {showAllReturnedLines ? 'Show preview' : 'Show all returned lines'}
+            </button>
+          )}
+          <CopyButton text={rawText} title="Copy all returned lines" />
+        </div>
+      </div>
+      <div className="read-file-result-preview" role="table" aria-label="read_file preview">
+        {visibleLines.map((line) => (
+          <div key={line.lineNumber} className="read-file-result-line" role="row">
+            <span className="read-file-result-lineno" role="cell">{line.lineNumber}</span>
+            <span className="read-file-result-content" role="cell">{line.content || ' '}</span>
+          </div>
+        ))}
+      </div>
+      {(hasMore || metadata.remaining_line_count > 0) && (
+        <div className="read-file-result-more">
+          {hasMore && !showAllReturnedLines && (parsed.lines.length > visibleLines.length
+            ? `${parsed.lines.length - visibleLines.length} more returned lines`
+            : 'returned line truncated for preview')}
+          {hasMore && !showAllReturnedLines && metadata.remaining_line_count > 0 && ' · '}
+          {metadata.remaining_line_count > 0 && `${metadata.remaining_line_count} file lines not returned`}
+          {fullFileViewerAvailable && ' · view the complete current file for full context'}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // eslint-disable-next-line react-refresh/only-export-components
 export function parseSearchOutput(text: string): {
   hits: SearchHit[];
@@ -1646,7 +1877,7 @@ export function SearchResultsView({
   onOpenFile,
 }: {
   rawText: string;
-  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
 }) {
   const { hits, notes, noMatches } = useMemo(() => parseSearchOutput(rawText), [rawText]);
 
@@ -1801,7 +2032,7 @@ export function KeywordSearchView({
   onOpenFile,
 }: {
   rawText: string;
-  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
 }) {
   const parsed = useMemo(() => parseKeywordSearchOutput(rawText), [rawText]);
 
@@ -1943,6 +2174,10 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
     imageResult = parseImageResult(resultText);
   }
 
+  const readFileMetadata = name === 'read_file'
+    ? parseReadFileDisplayData(result?.display_data)
+    : null;
+
   // Trivial patch detection: a single-patch call whose diff has ≤3 total
   // changed lines is cheaper to read inline than click-through. We auto-expand
   // it and suppress the (redundant) PatchFileSummary below.
@@ -2075,6 +2310,13 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
             <SearchResultsView rawText={resultText} onOpenFile={onOpenFile} />
           ) : name === 'keyword_search' && !isError ? (
             <KeywordSearchView rawText={resultText} onOpenFile={onOpenFile} />
+          ) : name === 'read_file' && !isError && readFileMetadata ? (
+            <ReadFileResultView
+              input={input as Record<string, unknown>}
+              rawText={resultText}
+              metadata={readFileMetadata}
+              onOpenFile={onOpenFile}
+            />
           ) : isShortOutput ? (
             // Short output: show inline, no collapse
             <div className="tool-block-output-content">

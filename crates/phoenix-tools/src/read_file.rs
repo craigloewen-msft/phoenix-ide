@@ -4,12 +4,28 @@
 
 use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
+use phoenix_core::file_viewer::{classify_for_viewer, ViewerFileClass};
+use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const DEFAULT_LIMIT: usize = 2000;
+const FILE_VIEWER_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+fn is_within_viewer_roots(file: &Path, working_dir: &Path) -> bool {
+    let Ok(file) = std::fs::canonicalize(file) else {
+        return false;
+    };
+    let runtime_env = PhoenixRuntimeEnvironment::detect();
+    runtime_env
+        .file_viewer_roots(working_dir)
+        .into_iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .any(|root| file.starts_with(root))
+}
 
 /// Read a file's contents with line numbers.
 pub struct ReadFileTool;
@@ -19,6 +35,20 @@ struct ReadFileInput {
     path: String,
     offset: Option<usize>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadFileDisplayData {
+    r#type: &'static str,
+    path: String,
+    requested_offset: usize,
+    requested_limit: usize,
+    returned_start_line: Option<usize>,
+    returned_end_line: Option<usize>,
+    returned_line_count: usize,
+    total_line_count: usize,
+    remaining_line_count: usize,
+    viewer_available: bool,
 }
 
 /// Resolve a path relative to `working_dir`. Absolute paths are used as-is;
@@ -143,7 +173,27 @@ impl Tool for ReadFileTool {
             output = "(empty file)".to_string();
         }
 
-        ToolOutput::success(output)
+        let viewer_available = is_within_viewer_roots(&resolved, &ctx.working_dir)
+            && std::fs::metadata(&resolved)
+                .is_ok_and(|metadata| metadata.len() <= FILE_VIEWER_MAX_BYTES)
+            && classify_for_viewer(&resolved) == ViewerFileClass::Text
+            && !text.as_bytes().contains(&0);
+
+        let display_data = serde_json::to_value(ReadFileDisplayData {
+            r#type: "read_file",
+            path: input.path,
+            requested_offset: offset,
+            requested_limit: limit,
+            returned_start_line: (start_idx < end_idx).then_some(start_idx + 1),
+            returned_end_line: (start_idx < end_idx).then_some(end_idx),
+            returned_line_count: end_idx - start_idx,
+            total_line_count: total_lines,
+            remaining_line_count: remaining,
+            viewer_available,
+        })
+        .expect("read_file display metadata is serializable");
+
+        ToolOutput::success(output).with_display(display_data)
     }
 }
 
@@ -229,6 +279,147 @@ mod tests {
             result.output()
         );
         assert!(result.output().contains("reachable"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_attaches_typed_range_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.txt"), "a\nb\nc\nd\ne\n").unwrap();
+
+        let result = ReadFileTool
+            .run(
+                json!({"path": "test.txt", "offset": 2, "limit": 2}),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+
+        assert_eq!(
+            result.display_data(),
+            Some(&json!({
+                "type": "read_file",
+                "path": "test.txt",
+                "requested_offset": 2,
+                "requested_limit": 2,
+                "returned_start_line": 2,
+                "returned_end_line": 3,
+                "returned_line_count": 2,
+                "total_line_count": 5,
+                "remaining_line_count": 2,
+                "viewer_available": true,
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_file_marks_image_extension_unavailable_to_source_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("source.svg"), "<svg>text</svg>\n").unwrap();
+
+        let result = ReadFileTool
+            .run(
+                json!({"path": "source.svg"}),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+
+        assert_eq!(
+            result
+                .display_data()
+                .and_then(|data| data.get("viewer_available")),
+            Some(&json!(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_file_marks_late_nul_unavailable_to_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut contents = vec![b'x'; 9_000];
+        contents.push(0);
+        contents.extend_from_slice(b"tail\n");
+        std::fs::write(dir.path().join("nul.txt"), contents).unwrap();
+
+        let result = ReadFileTool
+            .run(
+                json!({"path": "nul.txt", "limit": 1}),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+
+        assert_eq!(
+            result
+                .display_data()
+                .and_then(|data| data.get("viewer_available")),
+            Some(&json!(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_file_marks_opaque_file_unavailable_to_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("database.sqlite"), "readable text\n").unwrap();
+
+        let result = ReadFileTool
+            .run(
+                json!({"path": "database.sqlite"}),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+
+        assert_eq!(
+            result
+                .display_data()
+                .and_then(|data| data.get("viewer_available")),
+            Some(&json!(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_file_marks_oversized_file_unavailable_to_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("large.txt"),
+            vec![b'x'; usize::try_from(FILE_VIEWER_MAX_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+
+        let result = ReadFileTool
+            .run(
+                json!({"path": "large.txt", "limit": 1}),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+
+        assert_eq!(
+            result
+                .display_data()
+                .and_then(|data| data.get("viewer_available")),
+            Some(&json!(false))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_file_marks_symlink_escape_unavailable_to_viewer() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret\n").unwrap();
+        symlink(outside.path(), dir.path().join("link")).unwrap();
+
+        let result = ReadFileTool
+            .run(
+                json!({"path": "link/secret.txt"}),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+
+        assert_eq!(
+            result
+                .display_data()
+                .and_then(|data| data.get("viewer_available")),
+            Some(&json!(false))
+        );
     }
 
     #[tokio::test]

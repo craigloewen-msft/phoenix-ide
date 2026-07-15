@@ -38,22 +38,27 @@ import type { ViewerBodyProps } from './AnnotatableBlock';
 export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   useRegisterFocusScope('file-viewer');
 
-  const { absolutePath, title, onClose, onSendNotes, inline, focusLine } = payload;
+  const { absolutePath, title, onClose, onSendNotes, inline } = payload;
   const textLike = isTextLikePayload(payload);
   const content = textLike ? payload.content : '';
   const patchContext: PatchContext | undefined = textLike ? payload.patchContext : undefined;
+  const focus = textLike ? payload.focus : undefined;
+  const focusLine = focus?.kind === 'line' ? focus.lineNumber : undefined;
+  const focusRange = focus?.kind === 'range' ? focus : undefined;
 
   const notes = useFileReviewNotes(absolutePath, onSendNotes, patchContext);
+
+  const [htmlViewMode, setHtmlViewMode] = useState<HtmlViewMode>('source');
+  const [imageTakeover, setImageTakeover] = useState(false);
 
   // Pierre-backed payloads own their virtualized scroller and line identity — the
   // lineRef/contentRef machinery below (scroll restore, jump-to-line, select-all,
   // copy) is bypassed for them and handled by PhoenixFileCodeView via its typed
   // handle instead.
-  const usePierreCode = payload.kind === 'code' || payload.kind === 'text';
+  const htmlPreview = payload.kind === 'html' && htmlViewMode === 'preview';
+  const rangeSource = focusRange !== undefined && !htmlPreview;
+  const usePierreCode = payload.kind === 'code' || payload.kind === 'text' || rangeSource;
   const fileCodeRef = useRef<PhoenixFileCodeViewHandle>(null);
-
-  const [htmlViewMode, setHtmlViewMode] = useState<HtmlViewMode>('source');
-  const [imageTakeover, setImageTakeover] = useState(false);
   const findButtonRef = useRef<HTMLButtonElement>(null);
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
   const contentRef = useRef<HTMLDivElement>(null);
@@ -190,21 +195,22 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   // Auto-scroll to a search/jump target line. Runs after file content is loaded
   // and flashes the line without creating a review note.
   useEffect(() => {
-    if (!content || !focusLine) return undefined;
+    const targetLine = focusRange?.startLine ?? focusLine;
+    if (!content || !targetLine) return undefined;
     const timer = setTimeout(() => {
       if (usePierreCode) {
-        fileCodeRef.current?.scrollToLine(focusLine);
-        highlight(focusLine);
+        fileCodeRef.current?.scrollToLine(targetLine);
+        highlight(targetLine);
       } else {
-        const lineEl = lineRefs.current.get(focusLine);
+        const lineEl = lineRefs.current.get(targetLine);
         if (lineEl) {
           lineEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          highlight(focusLine);
+          highlight(targetLine);
         }
       }
     }, 100);
     return () => clearTimeout(timer);
-  }, [content, focusLine, highlight, usePierreCode]);
+  }, [content, focusLine, focusRange, highlight, usePierreCode]);
 
   // Jump-to-line lives here, not in the notes hook, because it needs the DOM
   // refs the rendered body registers into `lineRefs`.
@@ -231,7 +237,6 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   // The plain-text fallback never applies to HTML preview: preview renders an
   // iframe (no per-line DOM cost), so a large HTML file must still reach it
   // rather than being stranded on the raw <pre>.
-  const htmlPreview = payload.kind === 'html' && htmlViewMode === 'preview';
   const largeFallback = textLike && !usePierreCode && payload.renderMode === 'plainLargeText' && !htmlPreview;
 
   const findEligible = (textLike && !htmlPreview) || largeFallback;
@@ -251,7 +256,17 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     [find.isOpen, findProjection.matches],
   );
 
-  const modifiedLines = patchContext?.modifiedLines ?? EMPTY_SET;
+  const focusedRangeLines = useMemo(() => {
+    if (!focusRange || !content) return EMPTY_SET;
+    const loadedLineCount = content.split('\n').length;
+    const startLine = Math.max(1, Math.min(focusRange.startLine, loadedLineCount));
+    const endLine = Math.max(startLine, Math.min(focusRange.endLine, loadedLineCount));
+    return new Set(Array.from(
+      { length: endLine - startLine + 1 },
+      (_, index) => startLine + index,
+    ));
+  }, [content, focusRange]);
+  const modifiedLines = patchContext?.modifiedLines ?? focusedRangeLines;
   const bodyProps: ViewerBodyProps = {
     content,
     modifiedLines,
@@ -394,6 +409,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   ) : null;
 
   const patchChangeCount = patchContext?.modifiedLines.size ?? 0;
+  const rangeLineCount = focusedRangeLines.size;
   const viewerBanner: ReactNode = largeFallback ? (
     <span>
       Large file shown as plain text for responsiveness. Rich highlighting and line notes are disabled.
@@ -405,6 +421,10 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     <span>
       Viewing {title}: {patchChangeCount} change
       {patchChangeCount !== 1 ? 's' : ''} from patch
+    </span>
+  ) : textLike && rangeLineCount > 0 && focusRange ? (
+    <span>
+      Showing the current file focused on lines {focusRange.startLine}–{focusRange.endLine} read by the agent
     </span>
   ) : null;
   const findIneligibleReason = payload.kind === 'image'
@@ -474,7 +494,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
           notes={notes.fileNotes}
           modifiedLines={modifiedLines}
           highlightedLine={notes.highlightedLine}
-          firstModifiedLine={patchContext?.firstModifiedLine ?? focusLine}
+          firstModifiedLine={patchContext?.firstModifiedLine ?? focusRange?.startLine ?? focusLine}
           scrollKey={scrollKey}
           onAnnotateLine={notes.startAnnotate}
           findMatches={findMatchTargets}
