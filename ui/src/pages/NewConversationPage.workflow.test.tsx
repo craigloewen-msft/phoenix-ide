@@ -85,10 +85,37 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-async function settleValidation() {
-  await act(async () => {
-    await new Promise(resolve => setTimeout(resolve, 350));
+async function settleValidation(options: { metadata?: 'started' | 'settled' } = {}) {
+  const input = screen.getAllByPlaceholderText('/path/to/project')[0] as HTMLInputElement;
+  const path = input.value;
+  const validateCwd = vi.mocked(api.validateCwd);
+  await waitFor(() => expect(validateCwd).toHaveBeenCalledWith(path));
+  const validationIndex = validateCwd.mock.calls.findLastIndex(([requestedPath]) => requestedPath === path);
+  const validation = await validateCwd.mock.results[validationIndex]?.value;
+  if (!validation?.is_git) return;
+
+  const listGitBranches = vi.mocked(api.listGitBranches);
+  const getTaskAvailability = vi.mocked(api.getProjectTaskAvailability);
+  await waitFor(() => {
+    expect(listGitBranches).toHaveBeenCalledWith(path);
+    expect(getTaskAvailability).toHaveBeenCalledWith(path);
   });
+  if (options.metadata === 'started') return;
+
+  const branchIndex = listGitBranches.mock.calls.findLastIndex(([requestedPath]) => requestedPath === path);
+  const availabilityIndex = getTaskAvailability.mock.calls.findLastIndex(([requestedPath]) => requestedPath === path);
+  const branchRequest = listGitBranches.mock.results[branchIndex]?.value;
+  const availabilityRequest = getTaskAvailability.mock.results[availabilityIndex]?.value;
+  let availability: Awaited<typeof availabilityRequest>;
+  await act(async () => {
+    [, availability] = await Promise.all([branchRequest, availabilityRequest]);
+  });
+  await screen.findAllByText('Chat in a fresh worktree');
+  if (availability?.available) {
+    await screen.findAllByText('Start from a task');
+  } else {
+    expect(screen.queryAllByText('Loading tasks...')).toHaveLength(0);
+  }
 }
 
 interface DraftStorageFailureOverrides {
@@ -503,7 +530,7 @@ describe('/new workflow modes', () => {
     vi.mocked(api.getProjectTaskAvailability).mockImplementation(() => new Promise(() => {}));
     renderPage();
 
-    await settleValidation();
+    await settleValidation({ metadata: 'started' });
     await screen.findAllByText('Loading tasks...');
     expect(screen.getAllByText('Start from a task').length).toBeGreaterThan(0);
     expect(api.listProjectTasks).not.toHaveBeenCalled();

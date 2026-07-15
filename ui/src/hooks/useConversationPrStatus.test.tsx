@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import { useConversationPrStatus } from './useConversationPrStatus';
 import { api, type CachedPrSummary, type PrStatusResponse } from '../api';
 
@@ -26,8 +26,12 @@ function prStatus(number: number): PrStatusResponse {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((innerResolve) => { resolve = innerResolve; });
-  return { promise, resolve };
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((innerResolve, innerReject) => {
+    resolve = innerResolve;
+    reject = innerReject;
+  });
+  return { promise, resolve, reject };
 }
 
 function cachedPr(number: number): CachedPrSummary {
@@ -81,9 +85,10 @@ describe('useConversationPrStatus', () => {
       expect(screen.getByTestId('pr-number')).toHaveTextContent('2');
     });
 
-    first.resolve(prStatus(1));
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
+    await act(async () => {
+      first.resolve(prStatus(1));
+      await first.promise;
+    });
     expect(screen.getByTestId('pr-number')).toHaveTextContent('2');
   });
 
@@ -148,8 +153,10 @@ describe('useConversationPrStatus', () => {
     rerender(<Probe conversationId="conv-2" cached={null} />);
     expect(screen.getByTestId('pr-number')).toHaveTextContent('none');
 
-    first.resolve(prStatus(1));
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await act(async () => {
+      first.resolve(prStatus(1));
+      await first.promise;
+    });
     expect(screen.getByTestId('pr-number')).toHaveTextContent('none');
 
     second.resolve(prStatus(2));
@@ -259,32 +266,36 @@ describe('useConversationPrStatus', () => {
   });
 
   it('keeps the cached PR link when the fresh status request fails', async () => {
+    const failure = deferred<PrStatusResponse>();
     const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
-    getPrStatus.mockRejectedValue(new Error('network failed'));
+    getPrStatus.mockReturnValue(failure.promise);
 
     render(<Probe conversationId="conv-9" cached={cachedPr(9)} />);
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledWith('conv-9'));
 
-    await waitFor(() => {
-      expect(getPrStatus).toHaveBeenCalledWith('conv-9');
+    await act(async () => {
+      const rejected = expect(failure.promise).rejects.toThrow('network failed');
+      failure.reject(new Error('network failed'));
+      await rejected;
     });
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
     expect(screen.getByTestId('pr-number')).toHaveTextContent('9');
     expect(screen.getByTestId('pr-title')).toHaveTextContent('Cached PR 9');
     expect(screen.getByTestId('refresh-state')).toHaveTextContent('unavailable');
   });
 
   it('keeps cached PR display-only after the fresh status request fails', async () => {
+    const failure = deferred<PrStatusResponse>();
     const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
-    getPrStatus.mockRejectedValue(new Error('network failed'));
+    getPrStatus.mockReturnValue(failure.promise);
 
     render(<Probe conversationId="conv-9" cached={cachedPr(9)} />);
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledWith('conv-9'));
 
-    await waitFor(() => {
-      expect(getPrStatus).toHaveBeenCalledWith('conv-9');
+    await act(async () => {
+      const rejected = expect(failure.promise).rejects.toThrow('network failed');
+      failure.reject(new Error('network failed'));
+      await rejected;
     });
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
     expect(screen.getByTestId('pr-number')).toHaveTextContent('9');
     expect(screen.getByTestId('pr-title')).toHaveTextContent('Cached PR 9');
     expect(screen.getByTestId('refresh-state')).toHaveTextContent('unavailable');

@@ -1,0 +1,18 @@
+id: ts-no-real-timer-settle
+language: TypeScript
+severity: error
+message: |
+  Do not settle tests by awaiting a real `setTimeout`. Elapsed time is not
+  evidence that the asynchronous state transition completed and flakes under
+  scheduler load. Wait for the observable state/API postcondition, or use fake
+  timers when timer behavior itself is the contract.
+note: "Anti-pattern: real elapsed-time sleep used to settle a TypeScript test"
+rule:
+  any:
+    - pattern: await new Promise(($RESOLVE) => setTimeout($RESOLVE, $DURATION))
+    - pattern: await new Promise(($RESOLVE) => window.setTimeout($RESOLVE, $DURATION))
+    - pattern: await new Promise(($RESOLVE) => globalThis.setTimeout($RESOLVE, $DURATION))
+    - pattern: await new Promise(($RESOLVE) => { setTimeout($RESOLVE, $DURATION); })
+    - pattern: await new Promise(($RESOLVE) => { window.setTimeout($RESOLVE, $DURATION); })
+    - pattern: await new Promise(($RESOLVE) => { globalThis.setTimeout($RESOLVE, $DURATION); })
+    - pattern: await new Promise(function ($RESOLVE) { setTimeout($RESOLVE, $DURATION) })
