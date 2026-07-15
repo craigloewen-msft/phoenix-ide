@@ -1,0 +1,801 @@
+import datetime
+import fcntl
+import importlib.util
+import json
+import os
+import plistlib
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+helper = load(ROOT / "scripts" / "launchd_deploy_helper.py", "launchd_deploy_helper_test")
+
+
+class FakeLaunchctl:
+    events = []
+    fail_start = False
+
+    def __init__(self, manifest):
+        self.manifest = manifest
+
+    def inspect(self):
+        return "running", 100
+
+    def stop(self):
+        self.events.append("stop")
+        return 100
+
+    def start(self, old_pid):
+        self.events.append("start")
+        if self.fail_start:
+            raise helper.ActivationError("injected bootstrap failure")
+        return 101
+
+
+def make_manifest(root: Path, *, expected=None, previous=None):
+    expected = expected or helper.Identity("2.0.0", "newsha")
+    previous = previous or helper.Identity("1.0.0", "oldsha")
+    files = {}
+    for name, content in {
+        "candidate_binary": b"new binary",
+        "candidate_plist": b"<?xml version='1.0'?><plist version='1.0'><dict/></plist>",
+        "rollback_binary": b"old binary",
+        "rollback_plist": b"<?xml version='1.0'?><plist version='1.0'><dict/></plist>",
+    }.items():
+        path = root / name
+        path.write_bytes(content)
+        files[name] = path
+    return helper.Manifest(
+        manifest_version=helper.HANDOFF_PROTOCOL_VERSION,
+        transaction_id="tx", source_kind="published_release", source_commit="newsha",
+        release_tag="v2.0.0", release_commit="newsha0000000000000000000000000000000000",
+        expected=expected, previous=previous,
+        previous_deployed_sha="old-full-sha" if previous is not None else None,
+        candidate_binary=str(files["candidate_binary"]), candidate_binary_sha256=helper.sha256(files["candidate_binary"]),
+        candidate_plist=str(files["candidate_plist"]), candidate_plist_sha256=helper.sha256(files["candidate_plist"]),
+        rollback_binary=str(files["rollback_binary"]), rollback_binary_sha256=helper.sha256(files["rollback_binary"]),
+        rollback_plist=str(files["rollback_plist"]), rollback_plist_sha256=helper.sha256(files["rollback_plist"]),
+        target_binary=str(root / "live-binary"), target_plist=str(root / "live.plist"),
+        label="test.phoenix.server", helper_label="test.phoenix.deploy", uid=os.getuid(), health_url="http://127.0.0.1:1/api/version",
+        health_insecure_tls=False, active_path=str(root / "active"), status_path=str(root / "status.json"),
+        previous_health_url="http://127.0.0.1:2/api/version", previous_health_insecure_tls=False,
+        previous_health_json=True,
+        deployed_sha_path=str(root / "deployed.sha"), lock_path=str(root / "activate.lock"),
+        claim_lock_path=str(root / "claim.lock"),
+        created_at="2026-01-01T00:00:00+00:00", transition_timeout_secs=0.1, health_timeout_secs=0.1,
+    )
+
+
+class ActivationTests(unittest.TestCase):
+    def test_missing_service_text_is_treated_as_unloaded(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            result = subprocess.CompletedProcess([], 0, "", "Could not find service")
+            launchctl = helper.Launchctl(manifest, run=mock.Mock(return_value=result))
+            self.assertEqual(("not_loaded", None), launchctl.inspect())
+
+    def test_bootout_timeout_marks_disruption_and_triggers_rollback(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            launchctl = mock.Mock()
+            launchctl.disruption_started = False
+            def stop():
+                launchctl.disruption_started = True
+                raise helper.ActivationError("teardown timeout")
+            launchctl.stop.side_effect = stop
+            with mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+                 mock.patch.object(helper, "restore") as restore:
+                state = helper.activate(manifest)
+            self.assertEqual("activation_failed_rolled_back", state)
+            restore.assert_called_once()
+            self.assertEqual((manifest, launchctl), restore.call_args.args[:2])
+            self.assertEqual(2, len(restore.call_args.args[2]))
+
+    def setUp(self):
+        FakeLaunchctl.events = []
+        FakeLaunchctl.fail_start = False
+
+    def test_success_installs_atomically_and_records_selected_commit_after_verification(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            events = FakeLaunchctl.events
+            def verified(_manifest, identity):
+                events.append(f"verified:{identity.git_sha}")
+            with mock.patch.object(helper, "Launchctl", FakeLaunchctl), \
+                 mock.patch.object(helper, "wait_for_identity", side_effect=verified), \
+                 mock.patch.object(helper, "fsync_dir", wraps=helper.fsync_dir) as fsync_dir, \
+                 mock.patch.object(helper.os, "replace", wraps=os.replace) as replace:
+                state = helper.activate(manifest)
+            self.assertEqual("committed", state)
+            self.assertEqual("newsha\n", Path(manifest.deployed_sha_path).read_text())
+            self.assertEqual(["stop", "start", "verified:newsha"], events)
+            live_binary_replaces = [call for call in replace.call_args_list if Path(call.args[1]) == Path(manifest.target_binary)]
+            self.assertEqual(1, len(live_binary_replaces))
+            self.assertNotEqual(Path(manifest.target_binary), Path(live_binary_replaces[0].args[0]))
+            self.assertTrue(any(call.args[0] == Path(manifest.target_binary).parent for call in fsync_dir.call_args_list))
+            self.assertEqual(b"new binary", Path(manifest.target_binary).read_bytes())
+
+    def test_failed_first_install_stops_candidate_and_removes_artifacts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_manifest(root, previous=None)
+            manifest = helper.dataclasses.replace(
+                manifest, previous=None, rollback_binary=None, rollback_binary_sha256=None,
+                previous_deployed_sha=None,
+                rollback_plist=None, rollback_plist_sha256=None,
+            )
+            launchctl = FakeLaunchctl(manifest)
+            launchctl.inspect = lambda: ("not_loaded", None) if FakeLaunchctl.events.count("stop") >= 2 else ("running", 100)
+            with mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+                 mock.patch.object(helper, "wait_for_identity", side_effect=helper.ActivationError("bad health")):
+                state = helper.activate(manifest)
+            self.assertEqual("activation_failed_rolled_back", state)
+            self.assertEqual(["stop", "start", "stop"], FakeLaunchctl.events)
+            self.assertFalse(Path(manifest.target_binary).exists())
+            self.assertFalse(Path(manifest.target_plist).exists())
+            self.assertFalse(Path(manifest.deployed_sha_path).exists())
+
+    def test_wrong_version_rolls_back_and_has_distinct_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            identities = []
+            def verify(_manifest, identity, **_kwargs):
+                identities.append(identity.git_sha)
+                if identity == manifest.expected:
+                    raise helper.ActivationError("wrong version")
+            with mock.patch.object(helper, "Launchctl", FakeLaunchctl), \
+                 mock.patch.object(helper, "wait_for_identity", side_effect=verify):
+                state = helper.activate(manifest)
+            self.assertEqual("activation_failed_rolled_back", state)
+            self.assertEqual(["newsha", "oldsha"], identities)
+            self.assertEqual("old-full-sha\n", Path(manifest.deployed_sha_path).read_text())
+            self.assertEqual(b"old binary", Path(manifest.target_binary).read_bytes())
+            self.assertEqual(state, json.loads(Path(manifest.status_path).read_text())["state"])
+
+    def test_rollback_restores_previous_deployed_sha_after_commit_status_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            Path(manifest.deployed_sha_path).write_text("candidate-sha\n")
+            launchctl = FakeLaunchctl(manifest)
+            with mock.patch.object(helper, "wait_for_identity"):
+                helper.restore(manifest, launchctl)
+            self.assertEqual("old-full-sha\n", Path(manifest.deployed_sha_path).read_text())
+
+    def test_failed_rollback_is_explicit(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            with mock.patch.object(helper, "Launchctl", FakeLaunchctl), \
+                 mock.patch.object(helper, "wait_for_identity", side_effect=helper.ActivationError("health timeout")):
+                state = helper.activate(manifest)
+            status = json.loads(Path(manifest.status_path).read_text())
+            self.assertEqual("activation_failed_rollback_failed", state)
+            self.assertIn("health timeout", status["failure"])
+            self.assertIn("health timeout", status["rollback_failure"])
+
+    def test_concurrent_activation_rejected_before_stop(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            lock = open(manifest.lock_path, "w")
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                with self.assertRaises(helper.ConcurrentDeploy):
+                    helper.activate(manifest)
+            finally:
+                lock.close()
+            self.assertEqual([], FakeLaunchctl.events)
+
+    def test_tampered_candidate_fails_before_disruption(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            Path(manifest.candidate_binary).write_text("tampered")
+            with mock.patch.object(helper, "Launchctl", FakeLaunchctl):
+                with self.assertRaises(helper.ActivationError):
+                    helper.activate(manifest)
+            self.assertEqual([], FakeLaunchctl.events)
+
+    def test_install_space_is_reserved_before_disruption(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            events = []
+
+            def prepare(staged, target, mode):
+                events.append(f"prepare:{Path(staged).name}")
+                prepared = Path(td) / f"prepared-{len(events)}"
+                prepared.write_bytes(Path(staged).read_bytes())
+                return prepared
+
+            class OrderedLaunchctl(FakeLaunchctl):
+                def stop(self):
+                    events.append("stop")
+                    return super().stop()
+
+            with mock.patch.object(helper, "Launchctl", OrderedLaunchctl), \
+                 mock.patch.object(helper, "prepare_atomic_install", side_effect=prepare), \
+                 mock.patch.object(helper, "wait_for_identity"):
+                self.assertEqual("committed", helper.activate(manifest))
+            self.assertEqual(["candidate_binary", "candidate_plist", "rollback_binary", "rollback_plist"], [
+                event.removeprefix("prepare:") for event in events[:4]
+            ])
+            self.assertEqual("stop", events[4])
+
+    def test_install_space_failure_leaves_service_running(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            with mock.patch.object(helper, "Launchctl", FakeLaunchctl), \
+                 mock.patch.object(
+                     helper,
+                     "prepare_atomic_install",
+                     side_effect=OSError(28, "No space left on device"),
+                 ):
+                with self.assertRaises(OSError):
+                    helper.activate(manifest)
+            self.assertEqual([], FakeLaunchctl.events)
+            self.assertEqual("precondition_failed", json.loads(Path(manifest.status_path).read_text())["state"])
+
+    def test_manifest_status_and_failure_do_not_copy_plist_secrets(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            secret = "SENTINEL_SECRET_7b3f2"
+            Path(manifest.candidate_plist).write_bytes(plistlib.dumps({
+                "Label": "test", "EnvironmentVariables": {"TOKEN": secret},
+            }))
+            manifest = helper.dataclasses.replace(
+                manifest, candidate_plist_sha256=helper.sha256(Path(manifest.candidate_plist))
+            )
+            encoded = json.dumps(helper.dataclasses.asdict(manifest))
+            helper.write_status(manifest, "precondition_failed", failure="candidate plist invalid")
+            diagnostics = encoded + Path(manifest.status_path).read_text()
+            self.assertNotIn(secret, diagnostics)
+            self.assertIn("candidate plist invalid", diagnostics)
+
+    def test_claim_cleanup_cannot_delete_newer_owner(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            claim = Path(manifest.active_path)
+            claim.write_text("newer-transaction\n")
+            self.assertFalse(helper.release_claim(manifest))
+            self.assertEqual("newer-transaction\n", claim.read_text())
+
+    def test_helper_requests_bootout_even_when_manifest_is_malformed(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = Path(td) / "manifest.json"
+            manifest.write_text("not-json")
+            argv = ["helper", "activate", "--manifest", str(manifest),
+                    "--helper-label", "test.helper", "--uid", str(os.getuid())]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(helper, "request_helper_bootout") as bootout:
+                self.assertEqual(1, helper.main())
+            bootout.assert_called_once_with(os.getuid(), "test.helper")
+
+    def test_helper_requests_bootout_on_concurrent_rejection(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            manifest_path = Path(td) / "manifest.json"
+            manifest_path.write_text(json.dumps(helper.dataclasses.asdict(manifest)))
+            argv = ["helper", "activate", "--manifest", str(manifest_path),
+                    "--helper-label", manifest.helper_label, "--uid", str(manifest.uid)]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(helper, "activate", side_effect=helper.ConcurrentDeploy("busy")), \
+                 mock.patch.object(helper, "request_helper_bootout") as bootout:
+                self.assertEqual(1, helper.main())
+            bootout.assert_called_once_with(manifest.uid, manifest.helper_label)
+            status = json.loads(Path(manifest.status_path).read_text())
+            self.assertEqual("rejected_concurrent", status["state"])
+            self.assertFalse(Path(manifest.active_path).exists())
+
+
+
+class PreparationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.dev = load(ROOT / "dev.py", "devpy_launchd_deploy_test")
+
+    def test_broken_pipe_after_handoff_does_not_release_claim(self):
+        with mock.patch("builtins.print", side_effect=BrokenPipeError), \
+             mock.patch.object(self.dev, "_release_launchd_deploy_claim") as release:
+            self.dev._report_launchd_handoff("tx", {"version": "1.0.0", "git_sha": "abc123"})
+        release.assert_not_called()
+
+    def test_positional_version_is_rejected_with_release_guidance(self):
+        result = subprocess.run(
+            ["python3", str(ROOT / "dev.py"), "prod", "deploy", "v1.2.3"],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("--release", result.stderr)
+
+    def test_release_path_skips_checks_and_build(self):
+        with mock.patch.object(self.dev, "detect_prod_env", return_value="launchd"), \
+             mock.patch.object(self.dev, "launchd_prod_deploy") as deploy, \
+             mock.patch.object(self.dev, "cmd_check") as check, \
+             mock.patch.object(self.dev, "prod_build") as build:
+            self.dev.cmd_prod_deploy("v1.2.3")
+        deploy.assert_called_once_with("v1.2.3")
+        check.assert_not_called()
+        build.assert_not_called()
+
+    def test_latest_resolves_once_then_downloads_immutable_tag_and_checks_checksum(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
+             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "abc123def456"}), \
+             mock.patch.object(self.dev.subprocess, "run") as run:
+            staging = Path(td)
+            asset = staging / "phoenix_ide-aarch64-apple-darwin"
+            asset.write_bytes(b"release")
+            digest = self.dev._file_sha256(asset)
+            (staging / "SHA256SUMS").write_text(f"{digest}  {asset.name}\n")
+            release_commit = "abc123def456" + "0" * 28
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False}), ""),
+                subprocess.CompletedProcess([], 0, release_commit + "\n", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            binary, tag, sha, commit = self.dev._prepare_release_candidate("latest", staging)
+            self.assertEqual(asset, binary)
+            self.assertTrue(binary.stat().st_mode & 0o100)
+        self.assertEqual(("v1.2.3", "abc123def456", release_commit), (tag, sha, commit))
+        self.assertIn("v1.2.3", run.call_args_list[2].args[0])
+
+    def test_release_rejects_asset_from_different_commit(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
+             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "bad123bad123"}), \
+             mock.patch.object(self.dev.subprocess, "run") as run:
+            staging = Path(td)
+            asset = staging / "phoenix_ide-aarch64-apple-darwin"
+            asset.write_bytes(b"release")
+            (staging / "SHA256SUMS").write_text(f"{self.dev._file_sha256(asset)}  {asset.name}\n")
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False}), ""),
+                subprocess.CompletedProcess([], 0, "abc123" + "0" * 34 + "\n", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            with self.assertRaisesRegex(SystemExit, "asset embeds"):
+                self.dev._prepare_release_candidate("latest", staging)
+
+    def test_release_rejects_truncated_embedded_identity(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
+             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "a"}), \
+             mock.patch.object(self.dev.subprocess, "run") as run:
+            staging = Path(td)
+            asset = staging / "phoenix_ide-aarch64-apple-darwin"
+            asset.write_bytes(b"release")
+            (staging / "SHA256SUMS").write_text(f"{self.dev._file_sha256(asset)}  {asset.name}\n")
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False}), ""),
+                subprocess.CompletedProcess([], 0, "abc123def456" + "0" * 28 + "\n", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            with self.assertRaisesRegex(SystemExit, "malformed git identity"):
+                self.dev._prepare_release_candidate("latest", staging)
+
+    def test_claim_release_is_transaction_owned(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", Path(td)), \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", Path(td) / "active"), \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", Path(td) / "status.json"), \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", Path(td) / "claim.lock"):
+            self.dev._claim_launchd_deploy("first")
+            self.assertFalse(self.dev._release_launchd_deploy_claim("second"))
+            self.assertEqual("first", self.dev._deploy_claim_owner())
+            with self.assertRaisesRegex(SystemExit, "first"):
+                self.dev._claim_launchd_deploy("second")
+
+    def test_release_rejects_dirty_embedded_identity(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
+             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "abc123-dirty"}), \
+             mock.patch.object(self.dev.subprocess, "run") as run:
+            staging = Path(td)
+            asset = staging / "phoenix_ide-aarch64-apple-darwin"
+            asset.write_bytes(b"release")
+            (staging / "SHA256SUMS").write_text(f"{self.dev._file_sha256(asset)}  {asset.name}\n")
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False}), ""),
+                subprocess.CompletedProcess([], 0, "abc123" + "0" * 34 + "\n", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            with self.assertRaisesRegex(SystemExit, "dirty git identity"):
+                self.dev._prepare_release_candidate("latest", staging)
+
+    def test_candidate_health_url_uses_candidate_tls_and_port(self):
+        env = {"PHOENIX_TLS": "auto", "PHOENIX_PORT": "9443"}
+        self.assertEqual("https://localhost:9443/version", self.dev._prod_local_health_url(env))
+
+    def test_stopped_install_identity_falls_back_to_binary_probe(self):
+        with mock.patch.object(self.dev, "_current_prod_identity", return_value=None), \
+             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.0.0", "git_sha": "oldsha"}) as probe:
+            identity = self.dev._current_prod_identity({}) or self.dev._binary_identity(Path("installed"))
+        self.assertEqual({"version": "1.0.0", "git_sha": "oldsha"}, identity)
+        probe.assert_called_once_with(Path("installed"))
+
+    def test_local_source_commit_stays_full_for_deployed_sha_comparison(self):
+        full_sha = "abc123" + "0" * 34
+        embedded = "abc123"
+        self.assertTrue(full_sha.startswith(embedded.removesuffix("-dirty")))
+        self.assertNotEqual(full_sha, embedded)
+
+    def test_local_helper_is_materialized_from_selected_commit(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(self.dev.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, b"#!/usr/bin/python3\nprint('selected')\n", b"")
+            destination = Path(td) / "helper.py"
+            self.dev._materialize_helper("abc123", destination, "local_head")
+            self.assertIn(b"selected", destination.read_bytes())
+        self.assertEqual(["git", "show", "abc123:scripts/launchd_deploy_helper.py"], run.call_args.args[0])
+
+    def test_release_helper_is_fetched_from_selected_commit(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(self.dev.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, b"#!/usr/bin/python3\nprint('release')\n", b"")
+            destination = Path(td) / "helper.py"
+            self.dev._materialize_helper("abc123", destination, "published_release")
+            self.assertIn(b"release", destination.read_bytes())
+        self.assertIn("ref=abc123", run.call_args.args[0][2])
+
+    def test_rollback_uses_previous_endpoint(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            launchctl = FakeLaunchctl(manifest)
+            with mock.patch.object(helper, "wait_for_identity") as wait:
+                helper.restore(manifest, launchctl)
+            wait.assert_called_once_with(
+                manifest, manifest.previous,
+                health_url=manifest.previous_health_url,
+                health_insecure_tls=manifest.previous_health_insecure_tls,
+                health_json=manifest.previous_health_json,
+            )
+
+    def test_rollback_plist_is_parsed_before_disruption(self):
+        FakeLaunchctl.events = []
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            Path(manifest.rollback_plist).write_text("not a plist")
+            Path(manifest.target_binary).write_bytes(b"installed")
+            manifest = helper.dataclasses.replace(
+                manifest, rollback_plist_sha256=helper.sha256(Path(manifest.rollback_plist))
+            )
+            with mock.patch.object(helper, "Launchctl", FakeLaunchctl):
+                with self.assertRaises(Exception):
+                    helper.activate(manifest)
+            self.assertEqual([], FakeLaunchctl.events)
+
+    def test_display_url_uses_effective_launchd_port(self):
+        self.assertEqual(
+            "https://localhost:9555",
+            self.dev._prod_display_url({"PHOENIX_TLS": "auto", "PHOENIX_PORT": "9555"}),
+        )
+
+    def test_legacy_identity_uses_public_version_and_deployed_sha(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def read(self): return b"phoenix-ide 0.9.0\n"
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "PROD_SHA_PATH", Path(td) / "deployed.sha"), \
+             mock.patch("urllib.request.urlopen", return_value=Response()):
+            self.dev.PROD_SHA_PATH.write_text("abc123\n")
+            identity, url, insecure = self.dev._legacy_prod_identity({"PHOENIX_PORT": "9123"})
+        self.assertEqual({"version": "0.9.0", "git_sha": "abc123"}, identity)
+        self.assertEqual("http://localhost:9123/version", url)
+        self.assertFalse(insecure)
+
+    def test_helper_normalizes_legacy_version_before_exact_rollback_comparison(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def read(self): return b"phoenix-ide 0.9.0\n"
+        with mock.patch.object(helper.urllib.request, "urlopen", return_value=Response()):
+            identity = helper.fetch_identity(
+                "http://localhost:8031/version",
+                expected_git_sha="abc123def456",
+            )
+        self.assertEqual(helper.Identity("0.9.0", "abc123def456"), identity)
+
+    def test_legacy_upgrade_can_use_health_identity_without_binary_probe(self):
+        legacy = {"version": "0.9.0", "git_sha": "abc123def456"}
+        with mock.patch.object(
+            self.dev,
+            "_binary_identity",
+            side_effect=SystemExit("unsupported --build-identity"),
+        ), mock.patch.object(
+            self.dev,
+            "_current_prod_identity",
+            return_value=None,
+        ), mock.patch.object(
+            self.dev,
+            "_legacy_prod_identity",
+            return_value=(legacy, "http://localhost:8031/version", False),
+        ):
+            resolved = self.dev._resolve_rollback_identity(Path("rollback"), {})
+        self.assertEqual(
+            (legacy, "http://localhost:8031/version", False, False),
+            resolved,
+        )
+
+    def test_legacy_rollback_verification_uses_plain_version_body(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = helper.dataclasses.replace(make_manifest(Path(td)), previous_health_json=False)
+            launchctl = FakeLaunchctl(manifest)
+            with mock.patch.object(helper, "fetch_identity", return_value=manifest.previous) as fetch:
+                helper.restore(manifest, launchctl)
+            self.assertEqual(manifest.previous.git_sha, fetch.call_args.kwargs["expected_git_sha"])
+
+    def test_status_failure_keeps_claim_for_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            claim = Path(manifest.active_path)
+            claim.write_text(manifest.transaction_id + "\n")
+            argv = ["helper", "activate", "--manifest", str(Path(td) / "manifest.json"),
+                    "--helper-label", manifest.helper_label, "--uid", str(manifest.uid)]
+            Path(argv[3]).write_text(json.dumps(helper.dataclasses.asdict(manifest)))
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(helper, "activate", side_effect=helper.ActivationError("status write failed")), \
+                 mock.patch.object(helper, "status_is_durable_terminal", return_value=False), \
+                 mock.patch.object(helper, "request_helper_bootout"):
+                self.assertEqual(1, helper.main())
+            self.assertEqual(manifest.transaction_id, claim.read_text().strip())
+
+    def test_precondition_failure_is_terminal_and_releases_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            helper.write_status(manifest, "precondition_failed", failure="bad staged plist")
+            self.assertTrue(helper.status_is_durable_terminal(manifest))
+            self.assertIn("precondition_failed", helper.TERMINAL_STATES)
+
+    def test_legacy_plist_overrides_are_migrated_once(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "service.plist"), \
+             mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
+             mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"SAME": "repo"})):
+            self.dev.LAUNCHD_PLIST_PATH.write_bytes(plistlib.dumps({"EnvironmentVariables": {
+                "HOME": str(Path.home()), "PHOENIX_PASSWORD": "legacy-secret",
+                "PHOENIX_PORT": "9443", "SAME": "repo",
+            }}))
+            overrides = self.dev._launchd_override_env()
+            mode = self.dev.LAUNCHD_OVERRIDE_PATH.stat().st_mode & 0o777
+        self.assertEqual({"PHOENIX_PASSWORD": "legacy-secret", "PHOENIX_PORT": "9443"}, overrides)
+        self.assertEqual(0o600, mode)
+
+    def test_legacy_custom_generated_key_value_is_preserved(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "service.plist"), \
+             mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
+             mock.patch.object(self.dev, "_load_env_file", return_value=None):
+            self.dev.LAUNCHD_PLIST_PATH.write_bytes(plistlib.dumps({"EnvironmentVariables": {
+                "PHOENIX_DB_PATH": "/custom/prod.db",
+                "PHOENIX_LOG_STDOUT": "true",
+            }}))
+            overrides = self.dev._launchd_override_env()
+        self.assertEqual({
+            "PHOENIX_DB_PATH": "/custom/prod.db",
+            "PHOENIX_LOG_STDOUT": "true",
+        }, overrides)
+
+    def test_generated_plist_values_do_not_shadow_repo_env(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
+             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "missing.plist"), \
+             mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"PHOENIX_PORT": "9443"})):
+            env, _path = self.dev._launchd_candidate_env()
+        self.assertEqual("9443", env["PHOENIX_PORT"])
+
+    def test_explicit_launchd_override_wins_over_repo_env(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_OVERRIDE_PATH", Path(td) / "overrides.json"), \
+             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "missing.plist"), \
+             mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"PHOENIX_PORT": "9443"})):
+            self.dev._write_launchd_override_env({"PHOENIX_PORT": "9555"})
+            env, _path = self.dev._launchd_candidate_env()
+        self.assertEqual("9555", env["PHOENIX_PORT"])
+
+    def test_candidate_env_includes_prod_set_overrides(self):
+        with mock.patch.object(self.dev, "_load_env_file", side_effect=lambda env: env.update({"BASE": "yes"})), \
+             mock.patch.object(self.dev, "_launchd_override_env", return_value={"PHOENIX_PASSWORD": "secret", "PHOENIX_PORT": "9443"}):
+            env, _path = self.dev._launchd_candidate_env()
+        self.assertEqual("yes", env["BASE"])
+        self.assertEqual("secret", env["PHOENIX_PASSWORD"])
+        self.assertEqual("9443", env["PHOENIX_PORT"])
+
+    def test_rollback_endpoint_is_derived_from_rollback_plist(self):
+        with tempfile.TemporaryDirectory() as td:
+            plist_path = Path(td) / "rollback.plist"
+            plist_path.write_bytes(plistlib.dumps({
+                "EnvironmentVariables": {"PHOENIX_TLS": "auto"},
+                "Sockets": {"Listeners": {"SockServiceName": "9555"}},
+            }))
+            env = self.dev._launchd_env_from_plist(plist_path)
+            url, insecure = self.dev._launchd_health_probe(env)
+        self.assertEqual("https://localhost:9555/api/version", url)
+        self.assertTrue(insecure)
+
+    def test_initial_status_failure_releases_claim(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", Path(td)), \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", Path(td) / "active"), \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", Path(td) / "claim.lock"), \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", Path(td) / "status.json"), \
+             mock.patch.object(self.dev, "_launchd_candidate_env", return_value=({}, None)), \
+             mock.patch.object(self.dev, "_preflight_prod_bind_auth"), \
+             mock.patch.object(self.dev, "_write_json_atomic", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.dev.launchd_prod_deploy()
+            self.assertFalse(self.dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
+
+    def test_rollback_binary_identity_mismatch_is_rejected(self):
+        running = {"version": "1.0.0", "git_sha": "aaaaaaaaaaaa"}
+        rollback = {"version": "1.0.0", "git_sha": "bbbbbbbbbbbb"}
+        self.assertFalse(self.dev._rollback_identity_matches(rollback, running, True))
+
+    def test_modern_rollback_rejects_dirty_or_short_prefix_identity(self):
+        running = {"version": "1.0.0", "git_sha": "aaaaaaaaaaaa"}
+        self.assertFalse(self.dev._rollback_identity_matches(
+            {"version": "1.0.0", "git_sha": "aaaaaaaaaaaa-dirty"}, running, True
+        ))
+        self.assertFalse(self.dev._rollback_identity_matches(
+            {"version": "1.0.0", "git_sha": "aaaaaa"}, running, True
+        ))
+
+    def test_legacy_rollback_allows_exact_twelve_char_commit_prefix(self):
+        legacy = {"version": "1.0.0", "git_sha": "aaaaaaaaaaaa" + "b" * 28}
+        rollback = {"version": "1.0.0", "git_sha": "aaaaaaaaaaaa"}
+        self.assertTrue(self.dev._rollback_identity_matches(rollback, legacy, False))
+
+    def test_candidate_env_snapshot_is_reused(self):
+        snapshot = {"PHOENIX_PORT": "9443", "PHOENIX_PASSWORD": "one"}
+        with mock.patch.object(self.dev, "_launchd_candidate_env", return_value=(snapshot, Path("env"))) as load:
+            first, source = self.dev._launchd_candidate_env()
+            staged = dict(first)
+        self.assertEqual(snapshot, staged)
+        self.assertEqual(Path("env"), source)
+        load.assert_called_once()
+
+    def test_helper_rejects_incompatible_manifest_protocol(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            path = Path(td) / "manifest.json"
+            value = helper.dataclasses.asdict(manifest)
+            value["manifest_version"] = helper.HANDOFF_PROTOCOL_VERSION + 1
+            path.write_text(json.dumps(value))
+            with self.assertRaisesRegex(helper.ActivationError, "unsupported handoff protocol"):
+                helper.Manifest.load(path)
+
+    def test_override_mutation_refuses_active_deploy(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", Path(td) / "active"):
+            self.dev.LAUNCHD_DEPLOY_ACTIVE_PATH.write_text("deploy-owner\n")
+            with self.assertRaisesRegex(SystemExit, "deploy-owner"):
+                self.dev._refuse_launchd_override_during_deploy()
+
+    def test_prod_status_uses_effective_launchd_env(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "service.plist"), \
+             mock.patch.object(self.dev, "_current_prod_identity", return_value=None) as identity, \
+             mock.patch.object(self.dev.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "state = running\n", "")), \
+             mock.patch("builtins.print") as output:
+            self.dev.LAUNCHD_PLIST_PATH.write_bytes(plistlib.dumps({
+                "EnvironmentVariables": {},
+                "Sockets": {"Listeners": {"SockServiceName": "9555"}},
+            }))
+            self.dev.launchd_prod_status()
+        identity.assert_called_once_with({"PHOENIX_PORT": "9555"})
+        rendered = " ".join(str(call) for call in output.call_args_list)
+        self.assertIn("Port: 9555", rendered)
+        self.assertIn("URL: http://localhost:9555", rendered)
+
+    def test_prod_status_falls_back_to_legacy_public_version(self):
+        legacy_identity = {"version": "0.9.0", "git_sha": "abc123def456"}
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "service.plist"), \
+             mock.patch.object(self.dev, "_current_prod_identity", return_value=None), \
+             mock.patch.object(
+                 self.dev,
+                 "_legacy_prod_identity",
+                 return_value=(legacy_identity, "http://localhost:8031/version", False),
+             ) as legacy, \
+             mock.patch.object(
+                 self.dev.subprocess,
+                 "run",
+                 return_value=subprocess.CompletedProcess([], 0, "state = running\n", ""),
+             ), \
+             mock.patch("builtins.print") as output:
+            self.dev.LAUNCHD_PLIST_PATH.write_bytes(plistlib.dumps({
+                "EnvironmentVariables": {"PHOENIX_PASSWORD": "secret"},
+                "Sockets": {"Listeners": {"SockServiceName": "8031"}},
+            }))
+            self.dev.launchd_prod_status()
+        legacy.assert_called_once_with({"PHOENIX_PASSWORD": "secret", "PHOENIX_PORT": "8031"})
+        rendered = " ".join(str(call) for call in output.call_args_list)
+        self.assertIn("Version: 0.9.0 (abc123def456)", rendered)
+        self.assertNotIn("Health: not responding", rendered)
+
+    def test_prod_status_reports_durable_state_with_corrupt_plist(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", Path(td) / "service.plist"), \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", Path(td) / "status.json"), \
+             mock.patch.object(self.dev, "_current_prod_identity", return_value=None), \
+             mock.patch.object(self.dev, "_legacy_prod_identity", return_value=None), \
+             mock.patch.object(
+                 self.dev.subprocess,
+                 "run",
+                 return_value=subprocess.CompletedProcess([], 0, "state = running\n", ""),
+             ), \
+             mock.patch("builtins.print") as output:
+            self.dev.LAUNCHD_PLIST_PATH.write_text("not a plist")
+            self.dev.LAUNCHD_DEPLOY_STATUS_PATH.write_text(json.dumps({
+                "transaction_id": "tx", "state": "activation_failed_rolled_back",
+                "source_kind": "local_head", "expected_version": "1.0.0",
+                "expected_git_sha": "abc123def456", "updated_at": "2026-01-01T00:00:00+00:00",
+            }))
+            self.dev.launchd_prod_status()
+        rendered = " ".join(str(call) for call in output.call_args_list)
+        self.assertIn("Config: unreadable launchd plist", rendered)
+        self.assertIn("Last deploy: activation_failed_rolled_back (tx)", rendered)
+
+    def test_release_workflow_lists_both_macos_architectures_and_checksums(self):
+        workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+        self.assertIn("phoenix_ide-aarch64-apple-darwin", workflow)
+        self.assertIn("phoenix_ide-x86_64-apple-darwin", workflow)
+        self.assertIn("SHA256SUMS", workflow)
+        self.assertEqual(2, workflow.count("git restore ui/dist/.gitkeep"))
+        self.assertEqual(2, workflow.count('test -z "$(git status --porcelain)"'))
+        self.assertIn("runner: macos-15-intel", workflow)
+        self.assertIn("runner: macos-15", workflow)
+        self.assertNotIn("runner: macos-14", workflow)
+        self.assertNotIn("runner: macos-13", workflow)
+
+    def test_helper_plist_uses_active_interpreter(self):
+        plist = plistlib.loads(self.dev._helper_plist(
+            "test.helper", Path("helper.py"), Path("manifest.json"), Path("helper.log"), Path("/opt/python3")
+        ))
+        self.assertEqual("/opt/python3", plist["ProgramArguments"][0])
+
+    def test_null_source_kind_status_remains_readable(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", Path(td) / "status.json"), \
+             mock.patch("builtins.print") as output:
+            self.dev.LAUNCHD_DEPLOY_STATUS_PATH.write_text(json.dumps({
+                "transaction_id": "tx", "state": "preparing", "source_kind": None,
+                "release_tag": "v1.2.3", "expected_version": None, "expected_git_sha": None,
+                "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }))
+            self.dev._print_launchd_deploy_status()
+        rendered = " ".join(str(call) for call in output.call_args_list)
+        self.assertIn("unknown v1.2.3", rendered)
+        self.assertNotIn("unreadable status", rendered)
+
+    def test_preparing_transaction_reports_stale_recovery(self):
+        stale = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)).isoformat()
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", Path(td) / "status.json"), \
+             mock.patch("builtins.print") as output:
+            self.dev.LAUNCHD_DEPLOY_STATUS_PATH.write_text(json.dumps({
+                "transaction_id": "tx", "state": "preparing", "source_kind": "local_head",
+                "expected_version": None, "expected_git_sha": None, "updated_at": stale,
+            }))
+            self.dev._print_launchd_deploy_status()
+        self.assertTrue(any("STALE:" in str(call) for call in output.call_args_list))
+
+    def test_socket_activation_shape_is_preserved(self):
+        plist = self.dev.generate_launchd_plist("1.0.0", path_override="/usr/bin")
+        self.assertIn("<key>Sockets</key>", plist)
+        self.assertIn("<string>IPv4v6</string>", plist)
+        self.assertIn("<string>8031</string>", plist)
+
+
+if __name__ == "__main__":
+    unittest.main()
