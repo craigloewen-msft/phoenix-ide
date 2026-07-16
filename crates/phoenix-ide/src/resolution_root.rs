@@ -20,8 +20,10 @@
 //! Both therefore resolve against the same branch ref; neither trusts the live
 //! checkout, which is what closes the discovery-vs-expansion divergence.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tempfile::TempDir;
@@ -320,8 +322,6 @@ fn list_files_in_tree(
 /// works unchanged. Only `SKILL.md` files are written — discovery and
 /// invocation read nothing else from a skill directory.
 fn materialize_skill_files(repo_root: &Path, reference: &str) -> SkillsView {
-    // On any failure, fall back to an empty temp dir: discovery still surfaces
-    // global (`$HOME`) and built-in skills, just no repo-local ones.
     let Ok(temp) = TempDir::new() else {
         return SkillsView {
             dir: repo_root.to_path_buf(),
@@ -329,37 +329,318 @@ fn materialize_skill_files(repo_root: &Path, reference: &str) -> SkillsView {
         };
     };
 
-    // Reuse the cached full tree listing and pick out `SKILL.md` files under a
-    // `.claude/skills` / `.agents/skills` directory at any depth. This matches
-    // `discover_skills`' scan scope against a real working directory — the repo
-    // root *and* immediate child projects (e.g. `service/.agents/skills/...`).
-    // Filtering in Rust avoids fragile pathspec-wildcard semantics; deeper
-    // matches that slip in are written but never surfaced, because
-    // `discover_skills` only scans depth-1 children of the materialized root.
-    for rel_path in tree_paths(repo_root, reference).iter() {
-        if !rel_path.ends_with("SKILL.md") {
-            continue;
-        }
-        if !(rel_path.contains(".claude/skills/") || rel_path.contains(".agents/skills/")) {
-            continue;
-        }
-        let spec = format!("{reference}:{rel_path}");
-        let Ok(bytes) = run_git_bytes(repo_root, &["cat-file", "blob", &spec]) else {
+    let tree = tree_index(repo_root, reference);
+    let symlinks = read_symlink_targets(repo_root, &tree);
+    let catalog_roots = skill_catalog_roots(tree.keys().map(String::as_str));
+
+    let mut materialized_metadata = HashSet::new();
+    for logical_root in catalog_roots {
+        let Some(physical_root) = resolve_tree_link_chain(&logical_root, &symlinks) else {
             continue;
         };
-        let dest = temp.path().join(rel_path);
-        if let Some(parent) = dest.parent() {
-            if std::fs::create_dir_all(parent).is_err() {
-                continue;
-            }
-        }
-        let _ = std::fs::write(&dest, bytes);
+        materialize_skill_catalog(
+            repo_root,
+            reference,
+            &tree,
+            &symlinks,
+            temp.path(),
+            &logical_root,
+            &physical_root,
+            &mut materialized_metadata,
+        );
     }
 
     SkillsView {
         dir: temp.path().to_path_buf(),
         _temp: Some(temp),
     }
+}
+
+fn skill_catalog_roots<'a>(paths: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let top_level_projects: HashSet<&str> = paths
+        .filter_map(|path| {
+            let components = validated_tree_components(path)?;
+            let project = *components.first()?;
+            (components.len() > 1 && !matches!(project, ".claude" | ".agents")).then_some(project)
+        })
+        .collect();
+    let mut roots = vec![".claude/skills".to_string(), ".agents/skills".to_string()];
+    roots.extend(top_level_projects.into_iter().flat_map(|project| {
+        [
+            format!("{project}/.claude/skills"),
+            format!("{project}/.agents/skills"),
+        ]
+    }));
+    roots.sort();
+    roots
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_skill_catalog(
+    repo_root: &Path,
+    reference: &str,
+    tree: &HashMap<String, TreeEntry>,
+    symlinks: &HashMap<String, String>,
+    destination_root: &Path,
+    logical_root: &str,
+    physical_root: &str,
+    materialized_metadata: &mut HashSet<String>,
+) {
+    for child in tree_children(tree, physical_root) {
+        let logical_skill = tree_path_join(logical_root, &child);
+        let physical_skill = tree_path_join(physical_root, &child);
+        let Some(physical_skill) = resolve_tree_link_chain(&physical_skill, symlinks) else {
+            continue;
+        };
+        let metadata = tree_path_join(&physical_skill, "SKILL.md");
+        let Some(metadata) = resolve_tree_link_chain(&metadata, symlinks) else {
+            continue;
+        };
+        if tree.get(&metadata).is_some_and(|entry| !entry.symlink)
+            && materialized_metadata.insert(metadata.clone())
+        {
+            copy_tree_blob(
+                repo_root,
+                reference,
+                &metadata,
+                destination_root,
+                &tree_path_join(&logical_skill, "SKILL.md"),
+            );
+            let logical_children = tree_path_join(&logical_skill, "skills");
+            let physical_children = tree_path_join(&physical_skill, "skills");
+            if let Some(physical_children) = resolve_tree_link_chain(&physical_children, symlinks) {
+                materialize_skill_catalog(
+                    repo_root,
+                    reference,
+                    tree,
+                    symlinks,
+                    destination_root,
+                    &logical_children,
+                    &physical_children,
+                    materialized_metadata,
+                );
+            }
+        }
+    }
+}
+
+fn tree_children(tree: &HashMap<String, TreeEntry>, directory: &str) -> Vec<String> {
+    let prefix = if directory.is_empty() {
+        String::new()
+    } else {
+        format!("{directory}/")
+    };
+    let mut children: Vec<String> = tree
+        .keys()
+        .filter_map(|path| path.strip_prefix(&prefix)?.split('/').next())
+        .filter(|child| !child.is_empty())
+        .map(str::to_string)
+        .collect();
+    children.sort();
+    children.dedup();
+    children
+}
+
+fn tree_path_join(parent: &str, child: &str) -> String {
+    if parent.is_empty() {
+        child.to_string()
+    } else {
+        format!("{parent}/{child}")
+    }
+}
+
+fn copy_tree_blob(
+    repo_root: &Path,
+    reference: &str,
+    source: &str,
+    destination_root: &Path,
+    destination: &str,
+) {
+    if validated_tree_components(source).is_none() {
+        return;
+    }
+    let Some(destination) = safe_tree_destination(destination_root, destination) else {
+        return;
+    };
+    let spec = format!("{reference}:{source}");
+    let Ok(bytes) = run_git_bytes(repo_root, &["cat-file", "blob", &spec]) else {
+        return;
+    };
+    let Some(parent) = destination.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_ok() {
+        let _ = std::fs::write(destination, bytes);
+    }
+}
+
+#[derive(Clone)]
+struct TreeEntry {
+    oid: String,
+    symlink: bool,
+}
+
+fn tree_index(repo_root: &Path, reference: &str) -> HashMap<String, TreeEntry> {
+    let Ok(listing) = run_git_bytes(
+        repo_root,
+        &["ls-tree", "-r", "-z", "--full-tree", reference],
+    ) else {
+        return HashMap::new();
+    };
+    listing
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .filter_map(|record| {
+            let record = std::str::from_utf8(record).ok()?;
+            let (metadata, path) = record.split_once('\t')?;
+            validated_tree_components(path)?;
+            let mut fields = metadata.split_whitespace();
+            let mode = fields.next()?;
+            fields.next()?;
+            let oid = fields.next()?.to_string();
+            Some((
+                path.to_string(),
+                TreeEntry {
+                    oid,
+                    symlink: mode == "120000",
+                },
+            ))
+        })
+        .collect()
+}
+
+fn read_symlink_targets(
+    repo_root: &Path,
+    tree: &HashMap<String, TreeEntry>,
+) -> HashMap<String, String> {
+    let links: Vec<(&str, &str)> = tree
+        .iter()
+        .filter(|(_, entry)| entry.symlink)
+        .map(|(path, entry)| (path.as_str(), entry.oid.as_str()))
+        .collect();
+    if links.is_empty() {
+        return HashMap::new();
+    }
+
+    let Ok(mut child) = phoenix_core::git::command()
+        .current_dir(repo_root)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return HashMap::new();
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        return HashMap::new();
+    };
+    let requests = links
+        .iter()
+        .map(|(_, oid)| *oid)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let writer = std::thread::spawn(move || writeln!(stdin, "{requests}").is_ok());
+    let Ok(output) = child.wait_with_output() else {
+        return HashMap::new();
+    };
+    if !writer.join().unwrap_or(false) {
+        return HashMap::new();
+    }
+    if !output.status.success() {
+        return HashMap::new();
+    }
+
+    parse_batch_blobs(&output.stdout, &links)
+}
+
+fn parse_batch_blobs(bytes: &[u8], links: &[(&str, &str)]) -> HashMap<String, String> {
+    let mut cursor = 0;
+    let mut targets = HashMap::new();
+    for (path, _) in links {
+        let Some(header_end) = bytes[cursor..].iter().position(|byte| *byte == b'\n') else {
+            break;
+        };
+        let header_end = cursor + header_end;
+        let Some(size) = std::str::from_utf8(&bytes[cursor..header_end])
+            .ok()
+            .and_then(|header| header.split_whitespace().nth(2))
+            .and_then(|size| size.parse::<usize>().ok())
+        else {
+            break;
+        };
+        let content_start = header_end + 1;
+        let content_end = content_start.saturating_add(size);
+        if content_end >= bytes.len() {
+            break;
+        }
+        if let Ok(target) = std::str::from_utf8(&bytes[content_start..content_end]) {
+            targets.insert((*path).to_string(), target.to_string());
+        }
+        cursor = content_end + 1;
+    }
+    targets
+}
+
+fn validated_tree_components(path: &str) -> Option<Vec<&str>> {
+    if path.is_empty() || path.starts_with('/') || path.contains(['\\', '\0']) {
+        return None;
+    }
+    let components: Vec<&str> = path.split('/').collect();
+    components
+        .iter()
+        .all(|part| !part.is_empty() && !matches!(*part, "." | ".."))
+        .then_some(components)
+}
+
+fn safe_tree_destination(root: &Path, path: &str) -> Option<PathBuf> {
+    let mut destination = root.to_path_buf();
+    for component in validated_tree_components(path)? {
+        destination.push(component);
+    }
+    Some(destination)
+}
+
+fn resolve_tree_link_chain(link_path: &str, symlinks: &HashMap<String, String>) -> Option<String> {
+    let mut path = link_path.to_string();
+    let mut visited = HashSet::new();
+    loop {
+        if path.is_empty() {
+            return Some(path);
+        }
+        let components = validated_tree_components(&path)?;
+        let Some((prefix_len, link, target)) = (1..=components.len()).find_map(|len| {
+            let prefix = components[..len].join("/");
+            symlinks
+                .get(&prefix)
+                .map(|target| (len, prefix, target.as_str()))
+        }) else {
+            return Some(path);
+        };
+        if !visited.insert(link.clone()) {
+            return None;
+        }
+        let resolved = resolve_tree_link(&link, target)?;
+        path = components[prefix_len..]
+            .iter()
+            .fold(resolved, |path, component| tree_path_join(&path, component));
+    }
+}
+
+fn resolve_tree_link(link_path: &str, target: &str) -> Option<String> {
+    let parent = Path::new(link_path).parent()?;
+    let mut resolved = Vec::new();
+    for component in parent.join(target).components() {
+        match component {
+            std::path::Component::Normal(part) => resolved.push(part.to_str()?.to_string()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                resolved.pop()?;
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(resolved.join("/"))
 }
 
 #[cfg(test)]
@@ -451,6 +732,46 @@ mod tests {
                 panic!("working dir should see untracked file")
             }
         }
+    }
+
+    #[test]
+    fn tree_index_recurses_to_nested_skill_metadata() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join(".agents/skills/review")).unwrap();
+        std::fs::write(
+            repo.path().join(".agents/skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\n\nbody",
+        )
+        .unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        let tree = tree_index(repo.path(), "main");
+        assert!(tree.contains_key(".agents/skills/review/SKILL.md"));
+    }
+
+    #[test]
+    fn skill_catalog_roots_are_bounded_by_unique_top_level_projects() {
+        let paths = [
+            "service-a/src/one.rs",
+            "service-a/src/two.rs",
+            "service-a/tests/three.rs",
+            "service-b/src/one.rs",
+            ".agents/skills/review/SKILL.md",
+            "README.md",
+        ];
+        assert_eq!(
+            skill_catalog_roots(paths.into_iter()),
+            [
+                ".agents/skills",
+                ".claude/skills",
+                "service-a/.agents/skills",
+                "service-a/.claude/skills",
+                "service-b/.agents/skills",
+                "service-b/.claude/skills",
+            ]
+        );
     }
 
     #[test]
@@ -608,6 +929,331 @@ mod tests {
             Some("main"),
             "a checked-out branch can't be fast-forwarded, so creation keeps the local tip"
         );
+    }
+
+    fn symlink_dir(target: &str, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(target, link).unwrap();
+    }
+
+    fn assert_tree_skills_match_checkout(repo: &Path, expected: &str) {
+        let checkout_names: Vec<String> = crate::system_prompt::discover_skills(repo)
+            .into_iter()
+            .filter(|skill| skill.name == expected)
+            .map(|skill| skill.name)
+            .collect();
+        let root = ResolutionRoot::git_tree(repo, "main");
+        let view = root.skills_view();
+        let tree_names: Vec<String> = crate::system_prompt::discover_skills(&view.dir)
+            .into_iter()
+            .filter(|skill| skill.name == expected)
+            .map(|skill| skill.name)
+            .collect();
+        assert_eq!(tree_names, checkout_names);
+        assert_eq!(tree_names, [expected]);
+    }
+
+    #[test]
+    fn git_tree_skills_view_matches_checkout_for_repo_relative_symlinked_skill() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join("skills/phoenix-development")).unwrap();
+        std::fs::write(
+            repo.path().join("skills/phoenix-development/SKILL.md"),
+            "---\nname: phoenix-development\ndescription: Develop Phoenix\n---\n\nbody",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join("skills/phoenix-development/skills/review"))
+            .unwrap();
+        std::fs::write(
+            repo.path()
+                .join("skills/phoenix-development/skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Review Phoenix\n---\n\nbody",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join(".agents/skills")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            "../../skills/phoenix-development",
+            repo.path().join(".agents/skills/phoenix-development"),
+        )
+        .unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(
+            "../../skills/phoenix-development",
+            repo.path().join(".agents/skills/phoenix-development"),
+        )
+        .unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        let checkout_names: Vec<String> = crate::system_prompt::discover_skills(repo.path())
+            .into_iter()
+            .filter(|skill| skill.name.starts_with("phoenix-development"))
+            .map(|skill| skill.name)
+            .collect();
+        let root = ResolutionRoot::git_tree(repo.path(), "main");
+        let view = root.skills_view();
+        let tree_names: Vec<String> = crate::system_prompt::discover_skills(&view.dir)
+            .into_iter()
+            .filter(|skill| skill.name.starts_with("phoenix-development"))
+            .map(|skill| skill.name)
+            .collect();
+
+        assert_eq!(tree_names, checkout_names);
+        assert_eq!(
+            tree_names,
+            ["phoenix-development", "phoenix-development:review"]
+        );
+    }
+
+    #[test]
+    fn git_tree_skills_view_matches_checkout_for_symlinked_catalog_root() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join(".agents")).unwrap();
+        std::fs::create_dir_all(repo.path().join("skills/review")).unwrap();
+        std::fs::write(
+            repo.path().join("skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\n\nbody",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../skills", repo.path().join(".agents/skills")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir("../skills", repo.path().join(".agents/skills")).unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        let checkout_names: Vec<String> = crate::system_prompt::discover_skills(repo.path())
+            .into_iter()
+            .filter(|skill| skill.name == "review")
+            .map(|skill| skill.name)
+            .collect();
+        let root = ResolutionRoot::git_tree(repo.path(), "main");
+        let view = root.skills_view();
+        let tree_names: Vec<String> = crate::system_prompt::discover_skills(&view.dir)
+            .into_iter()
+            .filter(|skill| skill.name == "review")
+            .map(|skill| skill.name)
+            .collect();
+
+        assert_eq!(tree_names, checkout_names);
+        assert_eq!(tree_names, ["review"]);
+    }
+
+    #[test]
+    fn git_tree_skills_view_follows_symlinked_entries_under_catalog_link() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join(".agents")).unwrap();
+        std::fs::create_dir_all(repo.path().join("catalog")).unwrap();
+        std::fs::create_dir_all(repo.path().join("real/review")).unwrap();
+        std::fs::write(
+            repo.path().join("real/review/SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\n\nbody",
+        )
+        .unwrap();
+        symlink_dir("../catalog", &repo.path().join(".agents/skills"));
+        symlink_dir("../real/review", &repo.path().join("catalog/review"));
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        assert_tree_skills_match_checkout(repo.path(), "review");
+    }
+
+    #[test]
+    fn git_tree_skills_view_follows_symlinked_catalog_parent() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join("agent-config/skills/review")).unwrap();
+        std::fs::write(
+            repo.path().join("agent-config/skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\n\nbody",
+        )
+        .unwrap();
+        symlink_dir("agent-config", &repo.path().join(".agents"));
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        assert_tree_skills_match_checkout(repo.path(), "review");
+    }
+
+    #[test]
+    fn git_tree_skills_view_preserves_catalog_parent_link_to_repo_root() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join("skills/review")).unwrap();
+        std::fs::write(
+            repo.path().join("skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\n\nbody",
+        )
+        .unwrap();
+        symlink_dir(".", &repo.path().join(".agents"));
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        assert_tree_skills_match_checkout(repo.path(), "review");
+    }
+
+    #[test]
+    fn git_tree_skills_view_preserves_catalog_root_link_to_repo_root() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join(".agents")).unwrap();
+        std::fs::create_dir_all(repo.path().join("review")).unwrap();
+        std::fs::write(
+            repo.path().join("review/SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\n\nbody",
+        )
+        .unwrap();
+        symlink_dir("..", &repo.path().join(".agents/skills"));
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        assert_tree_skills_match_checkout(repo.path(), "review");
+    }
+
+    #[test]
+    fn git_tree_skills_view_breaks_nested_catalog_symlink_cycles() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join(".agents/skills/a")).unwrap();
+        std::fs::write(
+            repo.path().join(".agents/skills/a/SKILL.md"),
+            "---\nname: a\ndescription: A\n---\n\nbody",
+        )
+        .unwrap();
+        symlink_dir("..", &repo.path().join(".agents/skills/a/skills"));
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        assert_tree_skills_match_checkout(repo.path(), "a");
+        let root = ResolutionRoot::git_tree(repo.path(), "main");
+        let view = root.skills_view();
+        assert!(view.dir.join(".agents/skills/a/SKILL.md").is_file());
+        assert!(!view.dir.join(".agents/skills/a/skills/a/SKILL.md").exists());
+    }
+
+    #[test]
+    fn tree_link_resolution_rejects_paths_outside_committed_tree() {
+        assert_eq!(
+            resolve_tree_link(
+                ".agents/skills/phoenix-development",
+                "../../skills/phoenix-development"
+            ),
+            Some("skills/phoenix-development".to_string())
+        );
+        assert_eq!(
+            resolve_tree_link(".agents/skills/escape", "../../../outside"),
+            None
+        );
+        assert_eq!(resolve_tree_link(".agents/skills/escape", "/outside"), None);
+        assert_eq!(resolve_tree_link(".agents", "."), Some(String::new()));
+        assert_eq!(
+            resolve_tree_link_chain(
+                ".agents/skills",
+                &HashMap::from([(".agents".to_string(), ".".to_string())])
+            ),
+            Some("skills".to_string())
+        );
+
+        let chained = HashMap::from([
+            (
+                ".agents/skills/phoenix-development".to_string(),
+                "../../aliases/development/current".to_string(),
+            ),
+            (
+                "aliases/development".to_string(),
+                "../skills/phoenix-development".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            resolve_tree_link_chain(".agents/skills/phoenix-development", &chained),
+            Some("skills/phoenix-development/current".to_string())
+        );
+        let cyclic = HashMap::from([
+            (".agents/skills/a".to_string(), "b".to_string()),
+            (".agents/skills/b".to_string(), "a".to_string()),
+        ]);
+        assert_eq!(resolve_tree_link_chain(".agents/skills/a", &cyclic), None);
+
+        let intermediate_cycle = HashMap::from([
+            (
+                ".agents/skills/a".to_string(),
+                "../../aliases/a/current".to_string(),
+            ),
+            ("aliases/a".to_string(), "b".to_string()),
+            ("aliases/b".to_string(), "a".to_string()),
+        ]);
+        assert_eq!(
+            resolve_tree_link_chain(".agents/skills/a", &intermediate_cycle),
+            None
+        );
+    }
+
+    #[test]
+    fn tree_destinations_reject_non_posix_and_traversing_paths() {
+        let root = Path::new("/safe/root");
+        assert_eq!(
+            safe_tree_destination(root, ".agents/skills/review/SKILL.md"),
+            Some(root.join(".agents/skills/review/SKILL.md"))
+        );
+        for unsafe_path in [
+            "../outside/SKILL.md",
+            ".agents/../outside/SKILL.md",
+            ".agents//skills/review/SKILL.md",
+            ".agents/./skills/review/SKILL.md",
+            "/outside/SKILL.md",
+            "C:\\outside\\SKILL.md",
+            ".agents\\skills\\review\\SKILL.md",
+            ".agents/skills/review/SKILL.md\0outside",
+        ] {
+            assert_eq!(
+                safe_tree_destination(root, unsafe_path),
+                None,
+                "unsafe committed-tree path must be rejected: {unsafe_path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_tree_skills_view_ignores_broken_and_escaping_symlinks() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join(".agents/skills")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("../../missing", repo.path().join(".agents/skills/broken"))
+                .unwrap();
+            std::os::unix::fs::symlink(
+                "../../../outside",
+                repo.path().join(".agents/skills/escape"),
+            )
+            .unwrap();
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(
+                "../../missing",
+                repo.path().join(".agents/skills/broken"),
+            )
+            .unwrap();
+            std::os::windows::fs::symlink_dir(
+                "../../../outside",
+                repo.path().join(".agents/skills/escape"),
+            )
+            .unwrap();
+        }
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        let root = ResolutionRoot::git_tree(repo.path(), "main");
+        let view = root.skills_view();
+        assert!(!view.dir.join(".agents/skills/broken").exists());
+        assert!(!view.dir.join(".agents/skills/escape").exists());
     }
 
     #[test]
