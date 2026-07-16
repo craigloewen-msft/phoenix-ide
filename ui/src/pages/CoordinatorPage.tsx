@@ -1,6 +1,7 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api';
+import { useMediaQuery } from '../hooks';
 import type { GlobalOpenWorkResponse } from '../api';
 import './CoordinatorPage.css';
 
@@ -8,16 +9,29 @@ const ConversationPage = lazy(() =>
   import('./ConversationPage').then((module) => ({ default: module.ConversationPage })),
 );
 
-export function CoordinatorPage() {
+type CoordinatorView = 'conversation' | 'fleet';
+
+interface CoordinatorPageFixtureData {
+  coordinatorId: string;
+  openWork: GlobalOpenWorkResponse;
+  initialView: CoordinatorView;
+  fleetError?: string;
+  conversation: ReactNode;
+}
+
+export function CoordinatorPage({ fixtureData }: { fixtureData?: CoordinatorPageFixtureData }) {
   const navigate = useNavigate();
   const { slug } = useParams<{ slug: string }>();
-  const [openWork, setOpenWork] = useState<GlobalOpenWorkResponse | null>(null);
+  const location = useLocation();
+  const compactLayout = useMediaQuery('(max-width: 1024px)');
+  const [activeView, setActiveView] = useState<CoordinatorView>(fixtureData?.initialView ?? 'conversation');
+  const [openWork, setOpenWork] = useState<GlobalOpenWorkResponse | null>(fixtureData?.openWork ?? null);
   const [openWorkLoadingMore, setOpenWorkLoadingMore] = useState(false);
   const [expandedReferences, setExpandedReferences] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
-  const [fleetError, setFleetError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [resolvedCoordinatorId, setResolvedCoordinatorId] = useState<string | null>(null);
+  const [fleetError, setFleetError] = useState<string | null>(fixtureData?.fleetError ?? null);
+  const [loading, setLoading] = useState(!fixtureData);
+  const [resolvedCoordinatorId, setResolvedCoordinatorId] = useState<string | null>(fixtureData?.coordinatorId ?? null);
   const [copiedReference, setCopiedReference] = useState<string | null>(null);
 
   const refreshOpenWork = useCallback(() => {
@@ -31,6 +45,7 @@ export function CoordinatorPage() {
   }, []);
 
   useEffect(() => {
+    if (fixtureData) return;
     setLoading(true);
     let cancelled = false;
     api.ensureGlobalCoordinator()
@@ -72,12 +87,21 @@ export function CoordinatorPage() {
         if (!cancelled) setFleetError(e instanceof Error ? e.message : String(e));
       });
     return () => { cancelled = true; };
-  }, [navigate, slug]);
+  }, [fixtureData, navigate, slug]);
 
   const itemCount = useMemo(
     () => openWork?.groups.reduce((sum, group) => sum + group.items.length, 0) ?? 0,
     [openWork],
   );
+  const fleetGlance = useMemo(() => {
+    const group = openWork?.groups.find((candidate) => candidate.items.length > 0);
+    const item = group?.items[0];
+    return group && item ? { projectName: group.project_name, item } : null;
+  }, [openWork]);
+
+  useEffect(() => {
+    if (!fixtureData && compactLayout) setActiveView('conversation');
+  }, [compactLayout, fixtureData, location.key]);
 
   const loadMoreOpenWork = async () => {
     if (!openWork || !openWork.has_more || openWorkLoadingMore) return;
@@ -118,16 +142,56 @@ export function CoordinatorPage() {
   };
 
   return (
-    <div className="coordinator-page">
+    <div className={`coordinator-page coordinator-page--${activeView}`}>
       <header className="coordinator-header">
-        <div>
+        <Link className="coordinator-back" to="/" aria-label="Back to conversations">
+          <span aria-hidden="true">←</span>
+        </Link>
+        <div className="coordinator-heading">
           <h1>Coordinator</h1>
           <p>The durable Phoenix-wide coordinator plus a compact, explainable fleet snapshot.</p>
         </div>
         <div className="coordinator-actions">
           <button type="button" onClick={refreshOpenWork}>Refresh fleet</button>
         </div>
+        <div className="coordinator-view-switch" role="group" aria-label="Coordinator view">
+          <button
+            type="button"
+            aria-pressed={activeView === 'conversation'}
+            onClick={() => setActiveView('conversation')}
+          >
+            Conversation
+          </button>
+          <button
+            type="button"
+            aria-pressed={activeView === 'fleet'}
+            onClick={() => setActiveView('fleet')}
+          >
+            Fleet <span className="coordinator-view-count">{itemCount}</span>
+          </button>
+        </div>
       </header>
+
+      <button
+        type="button"
+        className="coordinator-fleet-glance"
+        onClick={() => setActiveView('fleet')}
+        aria-label="Open Fleet snapshot"
+      >
+        <span className="coordinator-fleet-glance-label">Fleet · {itemCount} active</span>
+        {fleetError ? (
+          <span className="coordinator-fleet-glance-detail coordinator-fleet-glance-error">Unavailable</span>
+        ) : fleetGlance ? (
+          <span className="coordinator-fleet-glance-detail">
+            <span>{fleetGlance.projectName}</span>
+            <strong>{fleetGlance.item.title}</strong>
+            <span>{fleetGlance.item.state}</span>
+          </span>
+        ) : (
+          <span className="coordinator-fleet-glance-detail">No active work</span>
+        )}
+        <span aria-hidden="true">›</span>
+      </button>
 
       {error && <div className="coordinator-error">{error}</div>}
       <div className="coordinator-sr-only" aria-live="polite">
@@ -136,16 +200,30 @@ export function CoordinatorPage() {
       {loading ? <div className="coordinator-muted">Loading…</div> : null}
 
       {slug === resolvedCoordinatorId && (
-        <section className="coordinator-conversation" aria-label="Coordinator conversation">
-          <Suspense fallback={<div className="coordinator-muted">Loading Coordinator conversation…</div>}>
-            <ConversationPage routePrefix="/global" />
-          </Suspense>
+        <section
+          className="coordinator-conversation"
+          aria-label="Coordinator conversation"
+          hidden={compactLayout && activeView !== 'conversation'}
+        >
+          {fixtureData?.conversation ?? (
+            <Suspense fallback={<div className="coordinator-muted">Loading Coordinator conversation…</div>}>
+              <ConversationPage routePrefix="/global" />
+            </Suspense>
+          )}
         </section>
       )}
 
-      <div className="coordinator-fleet-pane">
+      <div
+        className="coordinator-fleet-pane"
+        hidden={compactLayout && activeView !== 'fleet'}
+      >
         <section className="coordinator-open-work">
-        {fleetError && <div className="coordinator-error">Fleet unavailable: {fleetError}</div>}
+        {fleetError && (
+          <div className="coordinator-error coordinator-fleet-error">
+            <span>Fleet unavailable: {fleetError}</span>
+            <button type="button" onClick={refreshOpenWork}>Retry</button>
+          </div>
+        )}
         <div className="coordinator-section-title">
           <h2>Fleet</h2>
           <span>{itemCount} item{itemCount === 1 ? '' : 's'}</span>
