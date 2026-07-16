@@ -1513,7 +1513,7 @@ fn place_explicit_cache_breakpoints(items: &mut [ResponsesApiInputItem]) {
     const READ_BREAKPOINT_LIMIT: usize = 50;
 
     let mut messages = items.iter_mut().filter_map(|item| match item {
-        ResponsesApiInputItem::Message { content, .. } => Some(content),
+        ResponsesApiInputItem::Message { role, content } => Some((role, content)),
         ResponsesApiInputItem::AdditionalTools { .. }
         | ResponsesApiInputItem::FunctionCall { .. }
         | ResponsesApiInputItem::FunctionCallOutput { .. } => None,
@@ -1521,7 +1521,17 @@ fn place_explicit_cache_breakpoints(items: &mut [ResponsesApiInputItem]) {
     let Some(_implicit_latest_message) = messages.next_back() else {
         return;
     };
-    for content in messages.rev().take(READ_BREAKPOINT_LIMIT) {
+    // An explicit cache marker turns text content into an `input_text` part, a
+    // discriminant valid only on input-role messages; the Responses API rejects
+    // it on an assistant message, whose parts must be `output_text`/`refusal`.
+    // Assistant turns are model output — filter them out *before* the limit so
+    // they don't consume read-marker budget, leaving the full limit for
+    // markable input-role history in a long alternating conversation.
+    for (_role, content) in messages
+        .rev()
+        .filter(|(role, _)| role.as_str() != "assistant")
+        .take(READ_BREAKPOINT_LIMIT)
+    {
         content.mark_last_block();
     }
 }
@@ -2868,6 +2878,72 @@ mod tests {
         assert_eq!(parts[1]["image_url"], "data:image/png;base64,aGVsbG8=");
     }
 
+    /// The explicit prompt-cache pass (enabled for `gpt-5.6-*`) marks history
+    /// messages by converting their text into an `input_text` part. That
+    /// discriminant is only valid on input-role messages — the Responses API
+    /// rejects it on an assistant message (parts must be `output_text` /
+    /// `refusal`) with HTTP 400. Regression guard: a replayed assistant text
+    /// turn must stay a plain string and never gain an `input_text` part.
+    #[tokio::test]
+    async fn explicit_cache_never_marks_assistant_message_with_input_text() {
+        use crate::types::{ContentBlock, LlmMessage, MessageRole};
+
+        let mut req = empty_request();
+        req.messages = vec![
+            LlmMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::text("first question")],
+            },
+            LlmMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::text("prior answer")],
+            },
+            LlmMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::text("follow-up question")],
+            },
+        ];
+
+        let translated = translate_to_responses_request("gpt-5.6-sol", &req, false);
+        let json = serde_json::to_value(&translated).unwrap();
+        let input = json["input"].as_array().expect("input array");
+
+        for item in input {
+            if item["role"] == "assistant" {
+                let content = &item["content"];
+                assert!(
+                    content.is_string(),
+                    "assistant content must stay a plain string, not an \
+                     input_text parts array; got {content}"
+                );
+            }
+            if let Some(parts) = item["content"].as_array() {
+                for part in parts {
+                    if part["type"] == "input_text" {
+                        assert_ne!(
+                            item["role"], "assistant",
+                            "assistant message must never carry an input_text part"
+                        );
+                    }
+                }
+            }
+        }
+
+        // The earlier user turn is still eligible for an explicit breakpoint,
+        // so the pass has not been disabled wholesale.
+        let earlier_user_marked = input.iter().any(|item| {
+            item["role"] == "user"
+                && item["content"]
+                    .as_array()
+                    .and_then(|parts| parts.first())
+                    .is_some_and(|part| part["type"] == "input_text")
+        });
+        assert!(
+            earlier_user_marked,
+            "explicit cache pass should still mark the earlier user message"
+        );
+    }
+
     #[tokio::test]
     async fn codex_continuation_input_including_prompt_fits_typed_item_limit() {
         use crate::types::{ContentBlock, LlmMessage, MessageRole};
@@ -3472,6 +3548,49 @@ mod tests {
             .contains("prompt_cache_breakpoint"));
         assert!(!input[3].to_string().contains("prompt_cache_breakpoint"));
         assert!(input[4].to_string().contains("prompt_cache_breakpoint"));
+    }
+
+    /// In an alternating conversation, assistant turns are skipped for cache
+    /// marking but must not consume the read-marker budget: the full limit of
+    /// input-role markers should still be placed even when assistant turns sit
+    /// among the newest messages. Regression guard against filtering after the
+    /// `take`, which would halve effective cache reads on long histories.
+    #[tokio::test]
+    async fn explicit_cache_skipped_assistants_do_not_consume_marker_budget() {
+        use crate::types::{ContentBlock, LlmMessage, MessageRole};
+
+        let mut request = empty_request();
+        // 60 user+assistant pairs -> 60 markable user turns available (more than
+        // the 50 limit), each preceded/followed by a skipped assistant turn.
+        for i in 0..60 {
+            request.messages.push(LlmMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::text(format!("q-{i}"))],
+            });
+            request.messages.push(LlmMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::text(format!("a-{i}"))],
+            });
+        }
+        request.messages.push(LlmMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::text("latest")],
+        });
+
+        let wire = serde_json::to_value(translate_to_responses_request("gpt-5.6", &request, false))
+            .unwrap();
+        assert_eq!(
+            wire.to_string().matches("prompt_cache_breakpoint").count(),
+            50,
+            "skipped assistant turns must not consume the 50-marker budget"
+        );
+        // Every marker must sit on a user message — an assistant message never
+        // gains an input_text part.
+        for item in wire["input"].as_array().unwrap() {
+            if item.to_string().contains("prompt_cache_breakpoint") {
+                assert_eq!(item["role"], "user");
+            }
+        }
     }
 
     /// A gateway that omits `input_tokens_details` must not panic or shift
