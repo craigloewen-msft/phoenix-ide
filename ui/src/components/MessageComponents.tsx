@@ -42,6 +42,9 @@ import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, 
 import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
 import './ReadFileResultView.css';
+import { CommissionReviewInputView, CommissionReviewSummaryCard } from '../features/commissionReview/CommissionReviewSummary';
+import { formatCommissionReviewInput, parseCommissionReviewInput, parseCommissionReviewResult } from '../features/commissionReview/model';
+import './MessageComponents.css';
 
 const CheckIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -194,6 +197,7 @@ export function formatMessageTime(isoStr: string): string {
 // Thresholds for auto-expanding output
 const OUTPUT_AUTO_EXPAND_THRESHOLD = 200;  // Always show inline if under this
 
+
 /**
  * Strip model artifacts from think tool thoughts:
  * - Remove optional opening <thinking> wrapper
@@ -275,6 +279,9 @@ function bashInputCopyText(input: Record<string, unknown>): string {
 }
 
 function formatToolInput(name: string, input: Record<string, unknown>, displayOverride?: string): { display: string; isMultiline: boolean } {
+  if (name === 'commission_review') {
+    return formatCommissionReviewInput(input);
+  }
   switch (name) {
     case 'bash': {
       if (isBashToolInput(input)) {
@@ -872,6 +879,7 @@ interface AgentMessageProps {
   message: Message;
   toolResults: ReadonlyMap<string, Message>;
   onOpenFile?: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
+  onOpenCommissionReview?: ((requestSequenceId: number) => void) | undefined;
   filePathRootDir?: string | undefined;
   workScopeKey?: string | undefined;
   activeToolUseId?: string | undefined;
@@ -892,7 +900,7 @@ interface AgentMessageProps {
 
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, workScopeKey, activeToolUseId, isFirstInTurn = true, forceExpandedText = false, isLatestAgentMessage = false }: AgentMessageProps) {
+function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionReview, filePathRootDir, workScopeKey, activeToolUseId, isFirstInTurn = true, forceExpandedText = false, isLatestAgentMessage = false }: AgentMessageProps) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const timestamp = message.created_at;
   const { theme } = useTheme();
@@ -1150,6 +1158,8 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
                   block={block}
                   result={result}
                   onOpenFile={onOpenFile}
+                  onOpenCommissionReview={onOpenCommissionReview}
+                  requestSequenceId={message.sequence_id}
                   workScopeKey={workScopeKey}
                   knownResultIds={knownResultIds}
                   toolStartedAtMs={toolStartedAtMs}
@@ -1217,6 +1227,8 @@ interface ToolUseBlockProps {
   block: ContentBlock;
   result: Message | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
+  onOpenCommissionReview?: ((requestSequenceId: number) => void) | undefined;
+  requestSequenceId?: number | undefined;
   workScopeKey?: string | undefined;
   knownResultIds?: readonly string[] | undefined;
   /** Server-clock unix ms when the runtime began dispatching this
@@ -1376,6 +1388,7 @@ function tryParseJson(text: string): Record<string, unknown> | null {
   }
   return null;
 }
+
 
 function BashInspectButton({ workScopeKey, handle }: { workScopeKey: string; handle: string }) {
   const { openInspect } = useViewerSlotCommands();
@@ -2123,7 +2136,7 @@ export function KeywordSearchView({
 
 export const ToolUseBlock = memo(ToolUseBlockImpl);
 
-function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult }: ToolUseBlockProps) {
+function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, requestSequenceId, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult }: ToolUseBlockProps) {
   const name = block.name || 'tool';
   const input = block.input || {};
   const toolId = block.id || '';
@@ -2297,6 +2310,13 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
   const bashCopyTitle = name === 'bash' && isBashToolInput(input as Record<string, unknown>) && (input as BashToolInput).op !== 'run'
     ? 'Copy operation'
     : 'Copy command';
+  const commissionReviewDisplayData = name === 'commission_review'
+    ? parseCommissionReviewResult(result?.display_data, resultText)
+    : null;
+  const commissionReviewInput = name === 'commission_review'
+    ? parseCommissionReviewInput(input as Record<string, unknown>)
+    : null;
+  const hasStructuredCommissionReview = commissionReviewDisplayData !== null;
 
   return (
     <div className="tool-block" data-tool-id={toolId}>
@@ -2307,10 +2327,14 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
       </div>
 
       {/* Tool input - always visible */}
-      <div className={`tool-block-input ${inputIsMultiline ? 'multiline' : ''}`}>
-        {inputDisplay}
-        <CopyButton text={rawInput} title={bashCopyTitle} />
-      </div>
+      {name === 'commission_review' && commissionReviewInput ? (
+        <CommissionReviewInputView input={commissionReviewInput} />
+      ) : (
+        <div className={`tool-block-input ${inputIsMultiline ? 'multiline' : ''}`}>
+          {inputDisplay}
+          <CopyButton text={rawInput} title={bashCopyTitle} />
+        </div>
+      )}
 
       {/* Tool output - collapsible for long outputs; suppressed when structured summary is shown */}
       {showMissingResult && !hasOutput && renderMissingToolResultBody(toolCardState)}
@@ -2351,6 +2375,13 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
               rawText={resultText}
               metadata={readFileMetadata}
               onOpenFile={onOpenFile}
+            />
+          ) : hasStructuredCommissionReview && commissionReviewDisplayData ? (
+            <CommissionReviewSummaryCard
+              data={commissionReviewDisplayData}
+              formatDuration={formatToolDuration}
+              requestSequenceId={requestSequenceId}
+              onOpenFullReview={onOpenCommissionReview}
             />
           ) : isShortOutput ? (
             // Short output: show inline, no collapse

@@ -12,6 +12,7 @@ import { ConversationReadinessProvider } from '../contexts/ConversationReadiness
 import { cacheDB } from '../cache';
 
 const viewportFlags = vi.hoisted(() => ({ isDesktop: true, isWideDesktop: true }));
+const navStackProps = vi.hoisted(() => ({ onOpenCommissionReview: undefined as ((sequenceId: number) => void) | undefined }));
 
 vi.mock('../api', async () => {
   const actual = await vi.importActual<typeof import('../api')>('../api');
@@ -77,6 +78,7 @@ vi.mock('../components/ConversationNavStack', () => ({
     loadingOlderMessages,
     transcriptPositioning,
     olderHistoryError,
+    onOpenCommissionReview,
   }: {
     messages: Message[];
     hasOlderMessages?: boolean;
@@ -91,34 +93,38 @@ vi.mock('../components/ConversationNavStack', () => ({
       view?: { conversationId: string; generation: number; transcriptGeneration: number };
     };
     olderHistoryError?: string | null;
-  }) => (
-    <div>
-      <div data-testid="message-history">
-        {messages.map((message) => {
-          const content = message.content as { text?: string } | { type?: string; text?: string }[];
-          const rendered = Array.isArray(content)
-            ? content.find((block) => block.type === 'text')?.text
-            : content?.text;
-          return <div key={message.message_id}>{rendered}</div>;
-        })}
+    onOpenCommissionReview?: (sequenceId: number) => void;
+  }) => {
+    navStackProps.onOpenCommissionReview = onOpenCommissionReview;
+    return (
+      <div>
+        <div data-testid="message-history">
+          {messages.map((message) => {
+            const content = message.content as { text?: string } | { type?: string; text?: string }[];
+            const rendered = Array.isArray(content)
+              ? content.find((block) => block.type === 'text')?.text
+              : content?.text;
+            return <div key={message.message_id}>{rendered}</div>;
+          })}
+        </div>
+        <div data-testid="history-message-count">{messages.length}</div>
+        <div data-testid="history-has-older">{hasOlderMessages ? 'yes' : 'no'}</div>
+        {hasOlderMessages && onLoadOlderMessages && (
+          <button type="button" onClick={() => onLoadOlderMessages()}>
+            Load older messages
+          </button>
+        )}
+        <div data-testid="history-loading">{loadingOlderMessages ? 'loading' : 'idle'}</div>
+        <div data-testid="history-scroll-command">
+          {transcriptPositioning?.kind === 'positioning'
+            ? `${transcriptPositioning.command.kind}:${transcriptPositioning.command.token}`
+            : 'none'}
+        </div>
+        <div data-testid="history-transcript-generation">{transcriptPositioning?.view?.transcriptGeneration ?? 'none'}</div>
+        {olderHistoryError && <div role="alert">{olderHistoryError}</div>}
       </div>
-      <div data-testid="history-message-count">{messages.length}</div>
-      <div data-testid="history-has-older">{hasOlderMessages ? 'yes' : 'no'}</div>
-      {hasOlderMessages && onLoadOlderMessages && (
-        <button type="button" onClick={() => onLoadOlderMessages()}>
-          Load older messages
-        </button>
-      )}
-      <div data-testid="history-loading">{loadingOlderMessages ? 'loading' : 'idle'}</div>
-      <div data-testid="history-scroll-command">
-        {transcriptPositioning?.kind === 'positioning'
-          ? `${transcriptPositioning.command.kind}:${transcriptPositioning.command.token}`
-          : 'none'}
-      </div>
-      <div data-testid="history-transcript-generation">{transcriptPositioning?.view?.transcriptGeneration ?? 'none'}</div>
-      {olderHistoryError && <div role="alert">{olderHistoryError}</div>}
-    </div>
-  ),
+    );
+  },
 }));
 
 vi.mock('../components/TerminalPanel', () => ({
@@ -175,14 +181,14 @@ const catchUpMessage: Message = {
   created_at: '2024-01-01T00:00:02Z',
 };
 
-function renderPage(conversation: Conversation, routeSegment: string = conversation.slug) {
+function renderPage(conversation: Conversation, routeSegment: string = conversation.slug, initialSearch = '') {
   const store = new ConversationStore();
   store.dispatch(conversation.slug, {
     type: 'set_initial_data',
     conversationId: conversation.id,
     conversation,
     messages: [{ ...historyMessage, conversation_id: conversation.id }],
-    phase: { type: 'idle' },
+    phase: conversation.state ?? { type: 'idle' },
     contextWindow: { used: 0 },
     transcriptGeneration: conversation.transcript_generation ?? 1,
   });
@@ -225,7 +231,7 @@ function renderPage(conversation: Conversation, routeSegment: string = conversat
     <ConversationContext.Provider value={store}>
       <DraftContext.Provider value={new DraftStore()}>
         <ConversationReadinessProvider>
-          <MemoryRouter initialEntries={[`/c/${routeSegment}`]}>
+          <MemoryRouter initialEntries={[`/c/${routeSegment}${initialSearch}`]}>
             <Routes>
               <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
             </Routes>
@@ -314,6 +320,22 @@ describe('ConversationPage archived read-only rendering', () => {
       expect(cacheDB.getConversation).toHaveBeenCalledWith(uuidRoute);
     });
     expect(cacheDB.getConversationBySlug).not.toHaveBeenCalledWith(uuidRoute);
+  });
+
+  it('keeps commission review actions available for non-terminal narrow layouts', async () => {
+    viewportFlags.isWideDesktop = false;
+    renderPage(makeConversation());
+    await waitFor(() => {
+      expect(navStackProps.onOpenCommissionReview).toEqual(expect.any(Function));
+    });
+  });
+
+  it('hides commission review actions when the conversation cannot open sidepanels', async () => {
+    navStackProps.onOpenCommissionReview = vi.fn();
+    renderPage(makeConversation({ archived: true }));
+    await waitFor(() => {
+      expect(navStackProps.onOpenCommissionReview).toBeUndefined();
+    });
   });
 
   it('uses authoritative metadata when the cached slug owner changed', async () => {
