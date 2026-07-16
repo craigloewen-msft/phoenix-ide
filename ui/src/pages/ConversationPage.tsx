@@ -182,8 +182,24 @@ async function getConversationMetaForRoute(routeSegment: string) {
 }
 
 
-export function ConversationPage() {
+export function ConversationPage({ routePrefix = '/c' }: { routePrefix?: '/c' | '/global' }) {
   const { slug } = useParams<{ slug: string }>();
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  useEffect(() => {
+    if (routePrefix === '/global' || !slug || location.hash.startsWith('#message-')) return;
+    let cancelled = false;
+    api.resolveCoordinatorRoute(slug)
+      .then(({ coordinator_id }) => {
+        if (cancelled) return;
+        if (coordinator_id) {
+          navigate(`/global/${coordinator_id}`, { replace: true });
+        }
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [location.hash, navigate, routePrefix, slug]);
   return (
     <ReviewNotesProvider scopeKey={slug}>
       {/* The viewer slot (prose / diff / browser) is provided by DesktopLayout,
@@ -191,7 +207,7 @@ export function ConversationPage() {
           ConversationPageContent's viewer early-returns so draft persistence
           survives composer unmounts. */}
       {slug && <DraftLifecycle slug={slug} />}
-      <ConversationPageContent />
+      <ConversationPageContent routePrefix={routePrefix} />
     </ReviewNotesProvider>
   );
 }
@@ -243,7 +259,7 @@ function mergeConversationMessages<T extends { message_id: string; sequence_id: 
   return Array.from(bySequenceId.values()).toSorted((a, b) => a.sequence_id - b.sequence_id);
 }
 
-function ConversationPageContent() {
+function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global' }) {
   const { slug } = useParams<{ slug: string }>();
   const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
@@ -1658,7 +1674,9 @@ function ConversationPageContent() {
     }
   }, [convStateForChildren.type, conversationId]);
   const handleSendTextOnly = useCallback((text: string) => handleSend(text, []), [handleSend]);
-  const fileRootPath = isArchived || !conversation ? null : (conversation.worktree_path ?? conversation.cwd);
+  const fileRootPath = routePrefix === '/global' || isArchived || !conversation
+    ? null
+    : (conversation.worktree_path ?? conversation.cwd);
   const handleOpenFiles = useCallback(() => {
     if (fileRootPath) setShowFileBrowser(true);
   }, [fileRootPath]);
@@ -1873,7 +1891,7 @@ function ConversationPageContent() {
     && isWideDesktop
     && (splitPanePrs !== null || paneDiffOpen || browserViewerOpen || inspectViewerOpen || messageViewerOpen);
 
-  const terminalSplitPane = showTerminal ? (
+  const terminalSplitPane = showTerminal && routePrefix !== '/global' ? (
     <>
       <PaneDivider
         orientation="horizontal"
@@ -1904,6 +1922,10 @@ function ConversationPageContent() {
       </Suspense>
     </>
   ) : null;
+
+  const stateBarConversation = routePrefix === '/global' && conversation
+    ? { ...conversation, cwd: '', worktree_path: null }
+    : conversation;
 
   return (
     <ForkProposalsProvider
@@ -2102,7 +2124,7 @@ function ConversationPageContent() {
                     try {
                       const res = await api.continueConversation(conversation.id);
                       if (res.slug) {
-                        navigate(`/c/${res.slug}`);
+                        navigate(`${routePrefix}/${res.conversation_id}`);
                       }
                     } catch (err) {
                       showInfo(err instanceof Error ? err.message : 'Failed to open continuation');
@@ -2137,7 +2159,7 @@ function ConversationPageContent() {
                         }
                       }
                       if (res.slug) {
-                        navigate(`/c/${res.slug}`);
+                        navigate(`${routePrefix}/${res.conversation_id}`);
                       }
                     } catch (err) {
                       showInfo(err instanceof Error ? err.message : 'Failed to start new conversation');
@@ -2209,7 +2231,7 @@ function ConversationPageContent() {
         <ConnectedInputArea
           ref={inputRef}
           slug={slug!}
-          cwd={conversation.cwd}
+          cwd={routePrefix === '/global' ? undefined : conversation.cwd}
           scopeKey={conversationId}
           convState={convStateForChildren}
           images={images}
@@ -2253,7 +2275,7 @@ function ConversationPageContent() {
           <ConnectedInputArea
             ref={inputRef}
             slug={slug!}
-            cwd={conversation.cwd}
+            cwd={routePrefix === '/global' ? undefined : conversation.cwd}
             scopeKey={conversationId}
             convState={convStateForChildren}
             images={images}
@@ -2305,15 +2327,17 @@ function ConversationPageContent() {
             />
           </Suspense>
         )}
-        <ExploreOnboardingBanner
-          convModeLabel={conversation.conv_mode_label}
-          messageCount={conversation.message_count}
-        />
+        {routePrefix !== '/global' && (
+          <ExploreOnboardingBanner
+            convModeLabel={conversation.conv_mode_label}
+            messageCount={conversation.message_count}
+          />
+        )}
         <RenderProfiler id="InputArea">
         <ConnectedInputArea
           ref={inputRef}
           slug={slug!}
-          cwd={conversation.cwd}
+          cwd={routePrefix === '/global' ? undefined : conversation.cwd}
           scopeKey={conversationId}
           convState={convStateForChildren}
           images={images}
@@ -2336,7 +2360,7 @@ function ConversationPageContent() {
       <RenderProfiler id="StateBar">
       <ConnectedStateBar
         slug={slug!}
-        conversation={conversation as Conversation}
+        conversation={stateBarConversation as Conversation}
         convState={convStateForChildren}
         connectionState={connectionInfo.state}
         connectionAttempt={connectionInfo.attempt}

@@ -890,6 +890,7 @@ export interface LlmLanguagePrompts {
   next_task_hint_template: string;
   pr_autofix_instruction_template: string;
   mermaid_rendering_hint: string;
+  coordinator_prompt: string;
 }
 
 export interface LlmLanguageCatalogEntry {
@@ -938,35 +939,10 @@ export interface GlobalOpenWorkResponse {
   has_more: boolean;
 }
 
-export interface GlobalRecallSession {
-  id: string;
-  title: string;
-  created_at: string;
-  updated_at: string;
+export interface GlobalCoordinatorResponse {
+  conversation: Conversation;
 }
 
-export interface GlobalRecallMessage {
-  id: string;
-  role: 'user' | 'assistant';
-  content: string;
-  created_at: string;
-}
-
-export interface GlobalRecallSessionResponse {
-  session: GlobalRecallSession;
-  messages: GlobalRecallMessage[];
-  older_cursor: number | null;
-}
-
-export interface GlobalRecallSessionsResponse {
-  sessions: GlobalRecallSession[];
-  has_more: boolean;
-}
-
-export interface GlobalRecallAskResponse {
-  user_message: GlobalRecallMessage;
-  assistant_message: GlobalRecallMessage;
-}
 
 export interface LlmLanguageSetting {
   language: string;
@@ -1274,39 +1250,23 @@ export const api = {
     return resp.json();
   },
 
-  async listGlobalRecallSessions(offset = 0): Promise<GlobalRecallSessionsResponse> {
-    const resp = await fetch(`/api/global/recall/sessions?offset=${offset}`);
-    if (!resp.ok) throw new Error('Failed to load Global Recall sessions');
+  async getGlobalCoordinator(): Promise<GlobalCoordinatorResponse> {
+    const resp = await fetch('/api/global/coordinator');
+    if (!resp.ok) throw new Error('Failed to load Coordinator conversation');
     return resp.json();
   },
 
-  async createGlobalRecallSession(title?: string): Promise<GlobalRecallSession> {
-    const resp = await fetch('/api/global/recall/sessions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title }),
-    });
-    if (!resp.ok) throw new Error('Failed to create Global Recall session');
-    return (await resp.json()).session;
-  },
-
-  async getGlobalRecallSession(id: string, before?: number): Promise<GlobalRecallSessionResponse> {
-    const query = before === undefined ? '' : `?before=${before}`;
-    const resp = await fetch(`/api/global/recall/sessions/${encodeURIComponent(id)}${query}`);
-    if (!resp.ok) throw new Error('Failed to load Global Recall session');
+  async ensureGlobalCoordinator(): Promise<GlobalCoordinatorResponse> {
+    const resp = await fetch('/api/global/coordinator', { method: 'POST' });
+    if (!resp.ok) throw new Error('Failed to load Coordinator conversation');
     return resp.json();
   },
 
-  async askGlobalRecallSession(id: string, question: string): Promise<GlobalRecallAskResponse> {
-    const resp = await fetch(`/api/global/recall/sessions/${encodeURIComponent(id)}/ask`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question }),
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({})) as { error?: string };
-      throw new Error(err.error ?? 'Failed to ask Global Recall');
-    }
+  async resolveCoordinatorRoute(conversation: string): Promise<{ coordinator_id: string | null }> {
+    const resp = await fetch(
+      `/api/global/coordinator/route/${encodeURIComponent(conversation)}`,
+    );
+    if (!resp.ok) throw new Error('Failed to resolve Coordinator route');
     return resp.json();
   },
 

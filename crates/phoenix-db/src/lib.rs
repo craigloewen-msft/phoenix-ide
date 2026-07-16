@@ -2396,6 +2396,92 @@ impl Database {
         })
     }
 
+    /// Resolve the singleton Coordinator, creating its standard-runtime row atomically.
+    ///
+    /// # Errors
+    /// Returns an error when the transaction, insert, or conversation reload fails.
+    pub async fn get_or_create_coordinator(
+        &self,
+        cwd: &str,
+        model: Option<&str>,
+        llm_language: phoenix_core::llm_language::LlmLanguage,
+    ) -> DbResult<Conversation> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let result: DbResult<String> = async {
+            if let Some(id) = sqlx::query_scalar(
+                "SELECT conversation_id FROM coordinator WHERE singleton = 1",
+            )
+            .fetch_optional(&mut *conn)
+            .await?
+            {
+                return Ok(id);
+            }
+
+            let id = uuid::Uuid::new_v4().to_string();
+            let slug = format!("coordinator-{}", id.get(..8).unwrap_or(&id));
+            let now = Utc::now().to_rfc3339();
+            let idle = serde_json::to_string(&ConvState::Idle)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            sqlx::query(
+                "INSERT INTO conversations (id, slug, title, cwd, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind)
+                 VALUES (?1, ?2, 'Coordinator', ?3, 0, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, 'explore')",
+            )
+            .bind(&id)
+            .bind(slug)
+            .bind(cwd)
+            .bind(idle)
+            .bind(now)
+            .bind(model)
+            .bind(llm_language.as_str())
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query("INSERT INTO coordinator (singleton, conversation_id) VALUES (1, ?1)")
+                .bind(&id)
+                .execute(&mut *conn)
+                .await?;
+            Ok(id)
+        }
+        .await;
+
+        match result {
+            Ok(conversation_id) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                drop(conn);
+                self.get_conversation(&conversation_id).await
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Return the Coordinator conversation id when the singleton has been created.
+    ///
+    /// # Errors
+    /// Returns an error when the singleton relation cannot be queried.
+    pub async fn coordinator_conversation_id(&self) -> DbResult<Option<String>> {
+        sqlx::query_scalar("SELECT conversation_id FROM coordinator WHERE singleton = 1")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(DbError::Sqlx)
+    }
+
+    /// Whether this conversation is the singleton Coordinator.
+    ///
+    /// # Errors
+    /// Returns an error when the singleton relation cannot be queried.
+    pub async fn is_coordinator_conversation(&self, conversation_id: &str) -> DbResult<bool> {
+        let found: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM coordinator WHERE singleton = 1 AND conversation_id = ?1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(found.is_some())
+    }
+
     /// Get conversation by ID
     ///
     /// # Errors
@@ -2467,6 +2553,7 @@ impl Database {
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0 AND c.user_initiated = 1
+               AND c.id != COALESCE((SELECT conversation_id FROM coordinator WHERE singleton = 1), '')
              ORDER BY c.updated_at DESC",
         )
         .try_map(parse_conversation_row)
@@ -2492,7 +2579,8 @@ impl Database {
     pub async fn list_usage_limit_errors(&self) -> DbResult<Vec<(String, schema::ConvState)>> {
         let rows: Vec<(String, String)> = sqlx::query(
             "SELECT id, state FROM conversations
-             WHERE archived = 0 AND user_initiated = 1
+             WHERE archived = 0
+               AND (user_initiated = 1 OR id = (SELECT conversation_id FROM coordinator WHERE singleton = 1))
                AND json_extract(state, '$.type') = 'error'
                AND json_extract(state, '$.error_kind') = 'usage_limit_reached'
                AND json_extract(state, '$.resets_at') IS NOT NULL",
@@ -2526,11 +2614,26 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn preview_roots(&self) -> DbResult<Vec<String>> {
         let rows = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT cwd FROM conversations WHERE cwd IS NOT NULL AND cwd != ''
+            "WITH RECURSIVE coordinator_chain(id) AS (
+                 SELECT conversation_id FROM coordinator WHERE singleton = 1
+                 UNION
+                 SELECT c.id
+                 FROM conversations c
+                 JOIN coordinator_chain cc ON c.continued_in_conv_id = cc.id
+                 UNION
+                 SELECT c.continued_in_conv_id
+                 FROM conversations c
+                 JOIN coordinator_chain cc ON c.id = cc.id
+                 WHERE c.continued_in_conv_id IS NOT NULL
+             )
+             SELECT cwd FROM conversations
+               WHERE cwd IS NOT NULL AND cwd != ''
+                 AND id NOT IN (SELECT id FROM coordinator_chain)
              UNION
              SELECT cm_worktree_path FROM conversations
                WHERE cm_worktree_path IS NOT NULL
-                 AND cm_worktree_path != ''",
+                 AND cm_worktree_path != ''
+                 AND id NOT IN (SELECT id FROM coordinator_chain)",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -4591,7 +4694,7 @@ impl Database {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
                 "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint)
-                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?20, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -4614,6 +4717,7 @@ impl Database {
             .bind(cm.task_id)
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
+            .bind(parent.user_initiated)
             .execute(&mut *tx)
             .await;
 
@@ -4666,6 +4770,14 @@ impl Database {
             return Err(DbError::ConversationNotFound(parent_id.to_string()));
         }
 
+        sqlx::query(
+            "UPDATE coordinator SET conversation_id = ?1 WHERE singleton = 1 AND conversation_id = ?2",
+        )
+        .bind(&new_id)
+        .bind(parent_id)
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
 
         let title_str = schema::title_from_slug(&actual_slug);
@@ -4675,7 +4787,7 @@ impl Database {
             title: Some(title_str),
             cwd: parent.cwd,
             parent_conversation_id: None,
-            user_initiated: true,
+            user_initiated: parent.user_initiated,
             state: ConvState::Idle,
             state_updated_at: now,
             created_at: now,
@@ -10905,6 +11017,91 @@ mod tests {
         assert_eq!(fetched.id, conv.id);
     }
 
+    #[tokio::test]
+    async fn coordinator_relation_is_singleton_and_keeps_conversation_shape_ordinary() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        let first = db
+            .get_or_create_coordinator(
+                "/tmp/coordinator",
+                Some("test-model"),
+                phoenix_core::llm_language::LlmLanguage::Caveman,
+            )
+            .await
+            .unwrap();
+        let second = db
+            .get_or_create_coordinator(
+                "/tmp/ignored",
+                Some("other-model"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(
+            first.llm_language,
+            phoenix_core::llm_language::LlmLanguage::Caveman
+        );
+        assert_eq!(
+            db.coordinator_conversation_id().await.unwrap().as_deref(),
+            Some(first.id.as_str())
+        );
+        assert!(db.is_coordinator_conversation(&first.id).await.unwrap());
+
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('conversations')")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert!(!columns.iter().any(|column| column == "conversation_kind"));
+    }
+
+    #[tokio::test]
+    async fn coordinator_creation_handles_slug_collision_and_concurrent_first_access() {
+        let path = std::env::temp_dir().join(format!(
+            "phoenix-coordinator-race-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        migrations::run_pending_migrations(db.pool()).await.unwrap();
+        db.create_conversation("ordinary", "coordinator", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let (left, right) = tokio::join!(
+            db.get_or_create_coordinator(
+                "/tmp/coordinator",
+                Some("test-model"),
+                phoenix_core::llm_language::LlmLanguage::default()
+            ),
+            db.get_or_create_coordinator(
+                "/tmp/coordinator",
+                Some("test-model"),
+                phoenix_core::llm_language::LlmLanguage::default()
+            ),
+        );
+        let left = left.unwrap();
+        let right = right.unwrap();
+        assert_eq!(left.id, right.id);
+        assert_ne!(left.slug.as_deref(), Some("coordinator"));
+
+        let coordinator_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coordinator")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let coordinator_conversation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversations WHERE id = (SELECT conversation_id FROM coordinator WHERE singleton = 1)",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(coordinator_count, 1);
+        assert_eq!(coordinator_conversation_count, 1);
+        db.pool().close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
     /// The clear watermark write is structurally monotonic: a value below the
     /// persisted watermark is ignored, never regressing it (REQ-STR-007). A
     /// transient stale-low write (e.g. after a failed read re-planning from 0)
@@ -10992,12 +11189,24 @@ mod tests {
             .await
             .unwrap();
 
+        let coordinator = db
+            .get_or_create_coordinator(
+                "/tmp",
+                Some("test-model"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        db.update_conversation_state(&coordinator.id, &usage_limit_err(Some(reset)))
+            .await
+            .unwrap();
+
         let got = db.list_usage_limit_errors().await.unwrap();
         let ids: Vec<&str> = got.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["ul"],
-            "only the top-level usage-limit error with a reset time"
+            vec!["ul", coordinator.id.as_str()],
+            "user-facing conversations include the singleton Coordinator"
         );
         assert!(matches!(
             got[0].1,
@@ -13056,6 +13265,84 @@ mod tests {
             Some("my-task-3"),
             "second continuation slug must be {{root_slug}}-3, not the parent slug appended"
         );
+    }
+
+    #[tokio::test]
+    async fn coordinator_relation_moves_to_continuation() {
+        let db = Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(
+                "/tmp",
+                Some("test-model"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &coordinator.id,
+            &ConvState::ContextExhausted {
+                summary: "summary".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let continuation = match db.continue_conversation(&coordinator.id).await.unwrap() {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected created continuation, got {other:?}")
+            }
+        };
+        assert_eq!(
+            db.coordinator_conversation_id().await.unwrap().as_deref(),
+            Some(continuation.id.as_str())
+        );
+        assert!(!db
+            .is_coordinator_conversation(&coordinator.id)
+            .await
+            .unwrap());
+        assert!(db
+            .is_coordinator_conversation(&continuation.id)
+            .await
+            .unwrap());
+        assert!(!continuation.user_initiated);
+        assert!(!db
+            .list_conversations()
+            .await
+            .unwrap()
+            .iter()
+            .any(|conversation| conversation.id == continuation.id));
+        db.update_conversation_state(
+            &continuation.id,
+            &ConvState::ContextExhausted {
+                summary: "second summary".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let second = match db.continue_conversation(&continuation.id).await.unwrap() {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected second continuation, got {other:?}")
+            }
+        };
+        assert!(!second.user_initiated);
+        let listed_ids: Vec<_> = db
+            .list_conversations()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|conversation| conversation.id)
+            .collect();
+        assert!(!listed_ids.contains(&coordinator.id));
+        assert!(!listed_ids.contains(&continuation.id));
+        assert!(!listed_ids.contains(&second.id));
+        let preview_roots = db.preview_roots().await.unwrap();
+        assert!(!preview_roots.contains(&coordinator.cwd));
+        assert!(!preview_roots.contains(&continuation.cwd));
+        assert!(!preview_roots.contains(&second.cwd));
     }
 
     // ------------------------------------------------------------------

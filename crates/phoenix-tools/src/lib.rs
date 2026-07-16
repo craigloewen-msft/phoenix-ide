@@ -623,6 +623,16 @@ impl ToolRegistry {
         }
     }
 
+    /// Minimal read-only registry for the global Coordinator. The host supplies
+    /// the fleet/history tools so their global scope cannot be model-selected.
+    /// Filesystem, browser, shell, MCP, and lifecycle tools are absent.
+    #[must_use]
+    pub fn coordinator(mut global_read_tools: Vec<Arc<dyn Tool>>) -> Self {
+        let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(ThinkTool)];
+        tools.append(&mut global_read_tools);
+        Self { tools }
+    }
+
     /// Create tool registry for Explore mode WITHOUT sandbox.
     ///
     /// REQ-PROJ-002, REQ-PROJ-013: Restricted tool set — no bash, no

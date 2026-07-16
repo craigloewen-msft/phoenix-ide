@@ -1,5 +1,5 @@
 import { useLocation } from 'react-router-dom';
-import { lazy, Suspense, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
+import { lazy, Suspense, useEffect, useLayoutEffect, useCallback, useMemo, useRef, useState } from 'react';
 import {
   useConversationsList,
   useConversationsRefresh,
@@ -7,6 +7,7 @@ import {
   useWorkScope,
 } from '../conversation';
 import { useResizablePane, useIsDesktop } from '../hooks';
+import { api, type Conversation } from '../api';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
@@ -32,6 +33,7 @@ import {
   consumeNotificationPermissionCue,
   loadNotificationSettingsAndCatchUp,
   notifyCatchUp,
+  registerCoordinatorForNotifications,
   useNotificationClickNavigationBridge,
 } from '../notifications';
 
@@ -134,14 +136,55 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   // `Conversation[]` state, no per-field bridge hooks.
   const { refresh: refreshConversations } = useConversationsRefresh();
   const { active: conversations, archived: archivedConversations } = useConversationsList();
+  const [coordinatorForNotifications, setCoordinatorForNotifications] = useState<Conversation | null>(null);
 
   useEffect(() => {
-    void loadNotificationSettingsAndCatchUp(conversations).catch(() => {});
-  }, [conversations]);
+    let active = true;
+    let generation = 0;
+    const acceptCoordinator = (conversation: Conversation) => {
+      if (!active) return;
+      generation += 1;
+      registerCoordinatorForNotifications(conversation.id);
+      setCoordinatorForNotifications(conversation);
+    };
+    const refreshCoordinator = () => {
+      const requestGeneration = generation;
+      api.getGlobalCoordinator()
+        .then(({ conversation }) => acceptCoordinator(conversation))
+        .catch(() => {
+          if (active && requestGeneration === generation) {
+            setCoordinatorForNotifications(null);
+          }
+        });
+    };
+    refreshCoordinator();
+    const pollId = window.setInterval(refreshCoordinator, 5_000);
+    const onCoordinatorReady = (event: Event) => {
+      const conversation = (event as CustomEvent<{ conversation?: Conversation }>).detail?.conversation;
+      if (conversation) acceptCoordinator(conversation);
+    };
+    window.addEventListener('phoenix:coordinator-ready', onCoordinatorReady);
+    return () => {
+      active = false;
+      window.clearInterval(pollId);
+      window.removeEventListener('phoenix:coordinator-ready', onCoordinatorReady);
+    };
+  }, []);
+
+  const notificationConversations = useMemo(
+    () => coordinatorForNotifications
+      ? [...conversations, coordinatorForNotifications]
+      : conversations,
+    [conversations, coordinatorForNotifications],
+  );
 
   useEffect(() => {
-    notifyCatchUp(conversations);
-  }, [conversations]);
+    void loadNotificationSettingsAndCatchUp(notificationConversations).catch(() => {});
+  }, [notificationConversations]);
+
+  useEffect(() => {
+    notifyCatchUp(notificationConversations);
+  }, [notificationConversations]);
 
   useEffect(() => {
     const handler = () => {

@@ -103,6 +103,13 @@ pub fn snapshot_next_taskmd_id_hint(
     })
 }
 
+pub fn build_coordinator_system_prompt(language: LlmLanguage) -> String {
+    let mut prompt = llm_language::coordinator_prompt(language).to_string();
+    prompt.push_str("\n\n");
+    prompt.push_str(llm_language::mermaid_rendering_hint(language));
+    prompt
+}
+
 /// Build the complete system prompt for a conversation.
 pub fn build_system_prompt(
     working_dir: &Path,
@@ -272,6 +279,22 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn coordinator_prompt_excludes_project_and_explore_guidance() {
+        let prompt = build_coordinator_system_prompt(LlmLanguage::default());
+        assert!(prompt.contains("You are Phoenix Coordinator"));
+        assert!(!prompt.contains("taskmd"));
+        assert!(!prompt.contains("available_skills"));
+        assert!(!prompt.contains("propose_task"));
+    }
+
+    #[test]
+    fn coordinator_prompt_uses_conversation_llm_language() {
+        let prompt = build_coordinator_system_prompt(LlmLanguage::Caveman);
+        assert!(prompt.contains("You Phoenix Coordinator"));
+        assert!(!prompt.contains("You are Phoenix Coordinator"));
+    }
 
     #[test]
     fn test_discover_no_files() {

@@ -47,7 +47,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, RwLock};
 
 /// Shared slot carrying the trace identity of whatever triggered a
 /// conversation's next turn: the HTTP request span that delivered the user
@@ -142,6 +142,7 @@ pub struct TaskApprovalHandoffResponse {
 pub struct RuntimeManager {
     db: Database,
     llm_registry: Arc<ModelRegistry>,
+    message_retriever: Arc<dyn crate::db::MessageRetriever>,
     platform: PlatformCapability,
     browser_sessions: Arc<BrowserSessionManager>,
     /// Per-process bash handle registry. Shared by every conversation's
@@ -158,6 +159,9 @@ pub struct RuntimeManager {
     /// Active PTY terminal sessions — threaded into `ToolContext` for `read_terminal`.
     pub terminals: crate::terminal::ActiveTerminals,
     runtimes: RwLock<HashMap<String, ConversationHandle>>,
+    /// Serializes the slow runtime-construction path. Fast lookups remain
+    /// lock-free; eviction state therefore has exactly one consumer.
+    runtime_creation_lock: AsyncMutex<()>,
     /// Broadcasters from evicted runtimes, waiting to be inherited by a
     /// replacement runtime created by the next `get_or_create` call.
     ///
@@ -1182,6 +1186,25 @@ impl RuntimeManager {
         mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
         credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     ) -> Self {
+        let message_retriever = Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+        Self::new_with_message_retriever(
+            db,
+            llm_registry,
+            message_retriever,
+            platform,
+            mcp_manager,
+            credential_helper,
+        )
+    }
+
+    pub fn new_with_message_retriever(
+        db: Database,
+        llm_registry: Arc<ModelRegistry>,
+        message_retriever: Arc<dyn crate::db::MessageRetriever>,
+        platform: PlatformCapability,
+        mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
+        credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
+    ) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = mpsc::channel(32);
         let (handoff_tx, handoff_rx) = mpsc::channel(32);
@@ -1209,6 +1232,7 @@ impl RuntimeManager {
         Self {
             db,
             llm_registry,
+            message_retriever,
             platform,
             browser_sessions: BrowserSessionManager::with_lifecycle_sink(Some(
                 browser_lifecycle_tx,
@@ -1220,6 +1244,7 @@ impl RuntimeManager {
             mcp_manager,
             terminals: crate::terminal::ActiveTerminals::new(),
             runtimes: RwLock::new(HashMap::new()),
+            runtime_creation_lock: AsyncMutex::new(()),
             evicted_broadcasters: RwLock::new(HashMap::new()),
             evicted_model_upgrades: RwLock::new(HashSet::new()),
             spawn_tx,
@@ -2472,6 +2497,20 @@ impl RuntimeManager {
             }
         }
 
+        let _creation_guard = self.runtime_creation_lock.lock().await;
+        {
+            let runtimes = self.runtimes.read().await;
+            if let Some(handle) = runtimes.get(conversation_id) {
+                return Ok(ConversationHandle {
+                    event_tx: handle.event_tx.clone(),
+                    turn_trigger: handle.turn_trigger.clone(),
+                    broadcast_tx: handle.broadcast_tx.clone(),
+                    identity: handle.identity.clone(),
+                    state_rx: handle.state_rx.clone(),
+                });
+            }
+        }
+
         // Need to start a new runtime
         let conv = self
             .db
@@ -2600,6 +2639,14 @@ impl RuntimeManager {
         } else {
             Arc::from(phoenix_agents::discover_agents(&context.working_dir))
         };
+        let is_coordinator = !is_sub_agent
+            && self
+                .db
+                .is_coordinator_conversation(conversation_id)
+                .await
+                .map_err(|e| e.to_string())?;
+        context.is_coordinator = is_coordinator;
+
         let tool_executor = if is_sub_agent {
             let registry = sub_agent_registry_for_conv_mode(
                 &conv.conv_mode,
@@ -2612,38 +2659,49 @@ impl RuntimeManager {
             )
         } else {
             use crate::db::ConvMode;
-            let registry = match conv.conv_mode {
-                ConvMode::Explore { .. } => ToolRegistry::explore(
-                    &context.tasks_dir_name,
-                    agent_catalog.to_vec(),
-                    ExploreToolPolicy::from_platform(&self.platform),
-                ),
-                ConvMode::Direct => {
-                    // Full tool suite for Direct mode. `propose_task` (the
-                    // fork proposal) is offered only when the working dir is
-                    // inside a git repo — a fork cuts from the repository's
-                    // default branch (REQ-PROJ-036).
-                    let registry = ToolRegistry::direct(agent_catalog.to_vec());
-                    if phoenix_core::git::detect_git_repo_root(&context.working_dir).is_some() {
-                        registry.with_propose_task().with_commission_review()
-                    } else {
-                        registry
+            if is_coordinator {
+                let service = crate::api::global_read::GlobalReadService::new(
+                    self.db.clone(),
+                    self.message_retriever.clone(),
+                );
+                ToolRegistryExecutor::builtin_only(
+                    ToolRegistry::coordinator(crate::coordinator_tools::tools(service)),
+                    agent_catalog.clone(),
+                )
+            } else {
+                let registry = match conv.conv_mode {
+                    ConvMode::Explore { .. } => ToolRegistry::explore(
+                        &context.tasks_dir_name,
+                        agent_catalog.to_vec(),
+                        ExploreToolPolicy::from_platform(&self.platform),
+                    ),
+                    ConvMode::Direct => {
+                        // Full tool suite for Direct mode. `propose_task` (the
+                        // fork proposal) is offered only when the working dir is
+                        // inside a git repo — a fork cuts from the repository's
+                        // default branch (REQ-PROJ-036).
+                        let registry = ToolRegistry::direct(agent_catalog.to_vec());
+                        if phoenix_core::git::detect_git_repo_root(&context.working_dir).is_some() {
+                            registry.with_propose_task().with_commission_review()
+                        } else {
+                            registry
+                        }
                     }
-                }
-                ConvMode::Work { .. } | ConvMode::Branch { .. } => {
-                    // Full tool suite plus `propose_task` (non-blocking fork
-                    // proposal — REQ-PROJ-036). Work/Branch always sit on git
-                    // history, so the tool is always offered.
-                    ToolRegistry::direct(agent_catalog.to_vec())
-                        .with_propose_task()
-                        .with_commission_review()
-                }
-            };
-            ToolRegistryExecutor::with_mcp(
-                registry,
-                self.mcp_manager.clone(),
-                agent_catalog.clone(),
-            )
+                    ConvMode::Work { .. } | ConvMode::Branch { .. } => {
+                        // Full tool suite plus `propose_task` (non-blocking fork
+                        // proposal — REQ-PROJ-036). Work/Branch always sit on git
+                        // history, so the tool is always offered.
+                        ToolRegistry::direct(agent_catalog.to_vec())
+                            .with_propose_task()
+                            .with_commission_review()
+                    }
+                };
+                ToolRegistryExecutor::with_mcp(
+                    registry,
+                    self.mcp_manager.clone(),
+                    agent_catalog.clone(),
+                )
+            }
         };
 
         // Determine initial state: check if conversation needs auto-continuation
@@ -2771,6 +2829,40 @@ impl RuntimeManager {
         // removing a replacement entry created after eviction.
         let identity = Arc::new(());
         let cleanup_identity = identity.clone();
+        let handle = ConversationHandle {
+            event_tx: event_tx.clone(),
+            turn_trigger: turn_trigger.clone(),
+            broadcast_tx: broadcaster.clone(),
+            identity: identity.clone(),
+            state_rx: state_rx.clone(),
+        };
+
+        // Another caller may have completed construction while this caller was
+        // awaiting DB/tool setup. Publish exactly one runtime and discard the
+        // losing, not-yet-spawned executor.
+        {
+            let mut runtimes = self.runtimes.write().await;
+            if let Some(existing) = runtimes.get(conversation_id) {
+                return Ok(ConversationHandle {
+                    event_tx: existing.event_tx.clone(),
+                    turn_trigger: existing.turn_trigger.clone(),
+                    broadcast_tx: existing.broadcast_tx.clone(),
+                    identity: existing.identity.clone(),
+                    state_rx: existing.state_rx.clone(),
+                });
+            }
+            runtimes.insert(
+                conversation_id.to_string(),
+                ConversationHandle {
+                    event_tx,
+                    turn_trigger,
+                    broadcast_tx: broadcaster,
+                    identity,
+                    state_rx,
+                },
+            );
+        }
+
         tokio::spawn(async move {
             runtime.run().await;
 
@@ -2791,26 +2883,6 @@ impl RuntimeManager {
                 );
             }
         });
-
-        let handle = ConversationHandle {
-            event_tx: event_tx.clone(),
-            turn_trigger: turn_trigger.clone(),
-            broadcast_tx: broadcaster.clone(),
-            identity: identity.clone(),
-            state_rx: state_rx.clone(),
-        };
-
-        // Store handle
-        self.runtimes.write().await.insert(
-            conversation_id.to_string(),
-            ConversationHandle {
-                event_tx,
-                turn_trigger,
-                broadcast_tx: broadcaster,
-                identity,
-                state_rx,
-            },
-        );
 
         Ok(handle)
     }

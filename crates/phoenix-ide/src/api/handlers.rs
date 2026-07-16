@@ -13,7 +13,7 @@ use super::git_handlers::{
     get_conversation_pr_status, list_git_branches, pin_associated_pr,
     record_pr_auto_fix_context_baseline, resume_associated_pr_inference,
 };
-use super::global_recall;
+use super::global_read;
 use super::lifecycle_handlers::{
     abandon_task, approve_commission_review, approve_fork_proposal, approve_task,
     dismiss_fork_proposal, list_fork_proposals, mark_merged, reject_commission_review, reject_task,
@@ -58,7 +58,7 @@ use chrono::Datelike;
 use chrono::{Local, Timelike};
 use futures::future::BoxFuture;
 use rand::seq::IndexedRandom;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
@@ -113,23 +113,16 @@ pub fn create_router(state: AppState) -> Router {
         .route("/preview/*filepath", get(serve_preview_file))
         // Conversation listing (REQ-API-001)
         .route("/api/conversations", get(list_conversations))
-        .route("/api/global/open-work", get(global_recall::open_work))
+        .route("/api/global/open-work", get(global_read::open_work))
         .route(
-            "/api/global/recall/sessions",
-            get(global_recall::list_sessions).post(global_recall::create_session),
+            "/api/global/coordinator",
+            get(get_existing_coordinator).post(ensure_coordinator),
         )
         .route(
-            "/api/global/recall/sessions/:id",
-            get(global_recall::get_session),
+            "/api/global/coordinator/route/:conversation",
+            get(resolve_coordinator_route),
         )
-        .route(
-            "/api/global/recall/sessions/:id/ask",
-            post(global_recall::ask_session),
-        )
-        .route(
-            "/api/global/resolve",
-            post(global_recall::resolve_reference),
-        )
+        .route("/api/global/resolve", post(global_read::resolve_reference))
         .route(
             "/api/conversations/archived",
             get(list_archived_conversations),
@@ -814,6 +807,91 @@ async fn cached_pr_summaries_for_conversations(
         .into_iter()
         .map(|(key, pr)| (key, sidebar_cached_pr_summary(&pr)))
         .collect())
+}
+
+async fn get_existing_coordinator(
+    State(state): State<AppState>,
+) -> Result<Json<ConversationResponse>, AppError> {
+    let conversation_id = state
+        .db
+        .coordinator_conversation_id()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Coordinator has not been created".to_string()))?;
+    let conversation = state
+        .db
+        .get_conversation(&conversation_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(ConversationResponse {
+        conversation: conversation_to_json(&state, &conversation, None),
+    }))
+}
+
+#[derive(Serialize)]
+struct CoordinatorRouteResponse {
+    coordinator_id: Option<String>,
+}
+
+async fn resolve_coordinator_route(
+    State(state): State<AppState>,
+    Path(conversation): Path<String>,
+) -> Result<Json<CoordinatorRouteResponse>, AppError> {
+    let Some(coordinator_id) = state
+        .db
+        .coordinator_conversation_id()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    else {
+        return Ok(Json(CoordinatorRouteResponse {
+            coordinator_id: None,
+        }));
+    };
+    let root_id = state
+        .db
+        .chain_root_of(&coordinator_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .unwrap_or_else(|| coordinator_id.clone());
+    let members = state
+        .db
+        .chain_members_forward(&root_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let matched = if members.iter().any(|id| id == &conversation) {
+        true
+    } else {
+        match state.db.get_conversation_by_slug(&conversation).await {
+            Ok(candidate) => members.iter().any(|id| id == &candidate.id),
+            Err(DbError::ConversationNotFound(_)) => false,
+            Err(error) => return Err(AppError::Internal(error.to_string())),
+        }
+    };
+    Ok(Json(CoordinatorRouteResponse {
+        coordinator_id: matched.then_some(coordinator_id),
+    }))
+}
+
+async fn ensure_coordinator(
+    State(state): State<AppState>,
+) -> Result<Json<ConversationResponse>, AppError> {
+    let llm_language = state
+        .db
+        .get_default_llm_language()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let conversation = state
+        .db
+        .get_or_create_coordinator(
+            &state.runtime_env.home().to_string_lossy(),
+            Some(state.llm_registry.default_model_id()),
+            llm_language,
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(ConversationResponse {
+        conversation: conversation_to_json(&state, &conversation, None),
+    }))
 }
 
 /// Serialize a conversation to JSON with `presentation_mode` included.
@@ -3003,15 +3081,24 @@ async fn get_system_prompt(
     } else {
         phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
     };
-    let system_prompt = crate::system_prompt::build_system_prompt(
-        &cwd,
-        &tasks_dir_name,
-        is_sub_agent,
-        Some(&mode_context),
-        conversation.llm_language,
-        persona.as_deref(),
-        explore_bash,
-    );
+    let system_prompt = if state
+        .db
+        .is_coordinator_conversation(&conversation.id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        crate::system_prompt::build_coordinator_system_prompt(conversation.llm_language)
+    } else {
+        crate::system_prompt::build_system_prompt(
+            &cwd,
+            &tasks_dir_name,
+            is_sub_agent,
+            Some(&mode_context),
+            conversation.llm_language,
+            persona.as_deref(),
+            explore_bash,
+        )
+    };
 
     Ok(Json(SystemPromptResponse { system_prompt }))
 }
@@ -3414,14 +3501,26 @@ async fn send_chat(
 
             let resolution_root =
                 crate::resolution_root::ResolutionRoot::working_dir(&conversation.cwd);
-            let expanded =
+            let expanded = if state
+                .db
+                .is_coordinator_conversation(&conversation.id)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?
+            {
+                crate::message_expander::ExpandedMessage {
+                    display_text: req.text.clone(),
+                    llm_text: req.text.clone(),
+                    skill_invocation: None,
+                }
+            } else {
                 crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
                     AppError::UnprocessableEntity(ExpansionErrorResponse {
                         error: e.to_string(),
                         error_type: e.error_type().to_string(),
                         reference: e.reference(),
                     })
-                })?;
+                })?
+            };
             let images: Vec<ImageData> = req
                 .images
                 .into_iter()
@@ -3482,13 +3581,26 @@ async fn send_chat(
     }
 
     let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(&conversation.cwd);
-    let expanded = crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
-        AppError::UnprocessableEntity(ExpansionErrorResponse {
-            error: e.to_string(),
-            error_type: e.error_type().to_string(),
-            reference: e.reference(),
-        })
-    })?;
+    let expanded = if state
+        .db
+        .is_coordinator_conversation(&conversation.id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        crate::message_expander::ExpandedMessage {
+            display_text: req.text.clone(),
+            llm_text: req.text.clone(),
+            skill_invocation: None,
+        }
+    } else {
+        crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
+            AppError::UnprocessableEntity(ExpansionErrorResponse {
+                error: e.to_string(),
+                error_type: e.error_type().to_string(),
+                reference: e.reference(),
+            })
+        })?
+    };
 
     // Convert images
     let images: Vec<ImageData> = req

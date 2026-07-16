@@ -231,7 +231,22 @@ const MIGRATIONS: &[Migration] = &[
         name: "normalize_pr_feedback_baselines_by_full_identity",
         sql: MIGRATION_043,
     },
+    Migration {
+        version: 44,
+        name: "replace_global_recall_with_coordinator",
+        sql: MIGRATION_044,
+    },
 ];
+
+const MIGRATION_044: &str = r"
+CREATE TABLE coordinator (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    conversation_id TEXT NOT NULL UNIQUE
+        REFERENCES conversations(id) ON DELETE RESTRICT
+);
+DROP TABLE IF EXISTS global_recall_messages;
+DROP TABLE IF EXISTS global_recall_sessions;
+";
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
 /// closing the divergence between SQL `json_extract` queries and Rust deserialization.
