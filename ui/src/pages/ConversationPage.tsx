@@ -2588,6 +2588,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
         firstByteRequestId={atom.firstByteRequestId}
         turnRetryContext={atom.turnRetryContext}
         onOpenFiles={isDesktop || !fileRootPath ? undefined : handleOpenFiles}
+        workActionsAvailable={!isArchived}
         prStatusHandle={prStatusHandle}
       />
       </RenderProfiler>
