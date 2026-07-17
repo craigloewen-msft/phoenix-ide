@@ -4,12 +4,14 @@ import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-rou
 import { CoordinatorPage } from './CoordinatorPage';
 import type { Conversation, GlobalOpenWorkResponse } from '../api';
 
-const { apiMock } = vi.hoisted(() => ({
+const { apiMock, conversationSnapshotMock, conversationPhaseMock } = vi.hoisted(() => ({
   apiMock: {
     ensureGlobalCoordinator: vi.fn(),
     getGlobalOpenWork: vi.fn(),
     resolveCoordinatorRoute: vi.fn(),
   },
+  conversationSnapshotMock: vi.fn(),
+  conversationPhaseMock: vi.fn(),
 }));
 
 vi.mock('../api', async () => {
@@ -27,6 +29,11 @@ vi.mock('../hooks', async () => {
     useMediaQuery: () => true,
   };
 });
+
+vi.mock('../conversation', () => ({
+  useConversationSnapshot: (slug: string | null) => conversationSnapshotMock(slug),
+  useConversationPhase: (slug: string | null) => conversationPhaseMock(slug),
+}));
 
 vi.mock('./ConversationPage', () => ({
   ConversationPage: ({ routePrefix }: { routePrefix?: string }) => (
@@ -88,7 +95,7 @@ const openWork = (): GlobalOpenWorkResponse => ({
           root_conversation_slug: 'root-fix-coordinator',
           updated_at: '2024-01-02T10:00:00Z',
           mode: 'WORK',
-          state: 'working',
+          state: 'needs_action',
           task_id: '08700',
           task_title: 'Replace Global Recall with Coordinator',
           task_status: 'in-progress',
@@ -96,7 +103,7 @@ const openWork = (): GlobalOpenWorkResponse => ({
           base_branch: 'main',
           worktree_path: '/wt/task-08700',
           member_count: 2,
-          signals: ['active runtime', 'task open'],
+          signals: ['needs action', 'task open'],
           href: '/c/fix-coordinator',
           reference: '@work:item-1',
         },
@@ -111,13 +118,55 @@ describe('CoordinatorPage', () => {
     apiMock.ensureGlobalCoordinator.mockResolvedValue({ conversation: coordinatorConversation() });
     apiMock.getGlobalOpenWork.mockResolvedValue(openWork());
     apiMock.resolveCoordinatorRoute.mockResolvedValue({ coordinator_id: 'conv-coordinator' });
-    Object.defineProperty(navigator, 'clipboard', {
+    conversationSnapshotMock.mockReturnValue({ state: { type: 'idle' } });
+    conversationPhaseMock.mockReturnValue({ type: 'idle' });
+    Object.defineProperty(document, 'visibilityState', {
       configurable: true,
-      value: { writeText: vi.fn().mockResolvedValue(undefined) },
+      value: 'visible',
     });
   });
 
-  it('loads the coordinator contract and renders a compact fleet snapshot', async () => {
+  it('keeps an applied find-work query stable without rerunning bootstrap', async () => {
+    renderPage();
+    await screen.findByText('Shared conversation runtime /global');
+    fireEvent.click(screen.getByRole('tab', { name: /^Work \d+$/ }));
+
+    fireEvent.change(screen.getByPlaceholderText('task id, branch, title, signal'), {
+      target: { value: 'auth' },
+    });
+    fireEvent.submit(screen.getByPlaceholderText('task id, branch, title, signal').closest('form')!);
+
+    await waitFor(() => expect(apiMock.getGlobalOpenWork).toHaveBeenCalledWith(0, 'auth'));
+    expect(apiMock.ensureGlobalCoordinator).toHaveBeenCalledTimes(1);
+    expect(screen.getByDisplayValue('auth')).toBeInTheDocument();
+  });
+
+  it('treats approval and recovery signals as attention and links to the owning conversation', async () => {
+    const data = openWork();
+    const group = data.groups[0];
+    if (!group) throw new Error('fixture group missing');
+    const item = group.items[0];
+    if (!item) throw new Error('fixture item missing');
+    group.items[0] = {
+      ...item,
+      source: 'chain',
+      href: '/chains/root-1',
+      current_conversation_slug: 'latest-owner',
+      state: 'awaiting_task_approval',
+      signals: ['task approval pending', 'recovery needed'],
+    };
+    apiMock.getGlobalOpenWork.mockResolvedValue(data);
+
+    renderPage();
+    await screen.findByText('Shared conversation runtime /global');
+    fireEvent.click(screen.getByRole('tab', { name: /^Work \d+$/ }));
+
+    expect(screen.getByRole('heading', { name: '1 conversation need attention' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Fix coordinator page/ })).toHaveAttribute('href', '/c/latest-owner');
+    expect(screen.getByText('awaiting_task_approval')).toHaveClass('coordinator-state-pill--urgent');
+  });
+
+  it('loads the coordinator contract and renders attention-first work', async () => {
     renderPage();
 
     await waitFor(() => {
@@ -126,29 +175,30 @@ describe('CoordinatorPage', () => {
     });
 
     expect(await screen.findByText('Shared conversation runtime /global')).toBeInTheDocument();
-    expect(document.querySelector('.coordinator-fleet-pane a')).toHaveTextContent('Fix coordinator page');
-    expect(screen.getByText('TASK 08700')).toBeInTheDocument();
-    expect(screen.queryByText(/ROOT conv-root/i)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: /^Work \d+$/ }));
+    expect(screen.getByRole('heading', { name: '1 conversation need attention' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Fix coordinator page/ })).toHaveAttribute('href', '/c/fix-coordinator');
+    expect(screen.getByText('Showing all open work')).toBeInTheDocument();
   });
 
-  it('defaults to Conversation and preserves its mounted state while switching to Fleet', async () => {
+  it('defaults to Conversation and preserves its mounted state while switching to Work', async () => {
     renderPage();
 
     const conversation = await screen.findByRole('region', { name: 'Coordinator conversation' });
-    const fleet = document.querySelector('.coordinator-fleet-pane');
+    const workPane = document.querySelector('.coordinator-work-pane');
+    expect(workPane).not.toBeNull();
     const draft = screen.getByRole('textbox', { name: 'Coordinator draft' });
     fireEvent.change(draft, { target: { value: 'unsent follow-up' } });
 
-    expect(screen.getByRole('button', { name: 'Conversation' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('tab', { name: 'Conversation' })).toHaveAttribute('aria-selected', 'true');
     expect(conversation).not.toHaveAttribute('hidden');
-    expect(fleet).toHaveAttribute('hidden');
-    expect(screen.getByRole('button', { name: 'Open Fleet snapshot' })).toHaveTextContent('Fix coordinator page');
+    expect(workPane).toHaveAttribute('hidden');
 
-    fireEvent.click(screen.getByRole('button', { name: /^Fleet \d+$/ }));
+    fireEvent.click(screen.getByRole('tab', { name: /^Work \d+$/ }));
     expect(conversation).toHaveAttribute('hidden');
-    expect(fleet).not.toHaveAttribute('hidden');
+    expect(workPane).not.toHaveAttribute('hidden');
 
-    fireEvent.click(screen.getByRole('button', { name: 'Conversation' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Conversation' }));
     expect(screen.getByRole('textbox', { name: 'Coordinator draft' })).toHaveValue('unsent follow-up');
   });
 
@@ -169,32 +219,44 @@ describe('CoordinatorPage', () => {
     );
 
     await screen.findByText('Shared conversation runtime /global');
-    fireEvent.click(screen.getByRole('button', { name: /^Fleet \d+$/ }));
+    fireEvent.click(screen.getByRole('tab', { name: /^Work \d+$/ }));
     const conversation = document.querySelector('.coordinator-conversation');
+    expect(conversation).not.toBeNull();
     expect(conversation).toHaveAttribute('hidden');
 
     fireEvent.click(screen.getByRole('button', { name: 'Open citation' }));
     await waitFor(() => expect(conversation).not.toHaveAttribute('hidden'));
   });
 
-  it('offers a compact Fleet retry after projection failure', async () => {
-    apiMock.getGlobalOpenWork.mockRejectedValueOnce(new Error('projection unavailable'));
+  it('refreshes open work when the window regains focus', async () => {
     renderPage();
+    await screen.findByText('Shared conversation runtime /global');
 
-    await screen.findByText(/Fleet unavailable: projection unavailable/);
-    fireEvent.click(screen.getByRole('button', { name: /^Fleet \d+$/ }));
-    apiMock.getGlobalOpenWork.mockResolvedValueOnce(openWork());
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    fireEvent.focus(window);
 
     await waitFor(() => expect(apiMock.getGlobalOpenWork).toHaveBeenCalledTimes(2));
   });
 
-  it('mounts the Coordinator even when fleet loading fails', async () => {
-    apiMock.getGlobalOpenWork.mockRejectedValueOnce(new Error('projection unavailable'));
-    renderPage();
+  it('refreshes open work when the coordinator turn completes', async () => {
+    let phase: { type: 'seeded_llm_requesting'; attempt: number } | { type: 'idle' } = { type: 'seeded_llm_requesting', attempt: 1 };
+    conversationPhaseMock.mockImplementation(() => phase);
 
-    expect(await screen.findByText('Shared conversation runtime /global')).toBeInTheDocument();
-    expect(await screen.findByText('Fleet unavailable: projection unavailable')).toBeInTheDocument();
+    const { rerender } = render(
+      <MemoryRouter initialEntries={['/global/conv-coordinator']}>
+        <Routes><Route path="/global/:slug" element={<CoordinatorPage />} /></Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByText('Shared conversation runtime /global');
+    expect(apiMock.getGlobalOpenWork).toHaveBeenCalledTimes(1);
+
+    phase = { type: 'idle' };
+    rerender(
+      <MemoryRouter initialEntries={['/global/conv-coordinator']}>
+        <Routes><Route path="/global/:slug" element={<CoordinatorPage />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(apiMock.getGlobalOpenWork).toHaveBeenCalledTimes(2));
   });
 
   it('redirects an ordinary conversation away from the Coordinator shell', async () => {
@@ -235,23 +297,5 @@ describe('CoordinatorPage', () => {
     );
 
     expect(await screen.findByText('/global/conv-coordinator')).toBeInTheDocument();
-  });
-
-  it('expands a fleet row to reveal audit detail and copies the durable reference', async () => {
-    renderPage();
-
-    await screen.findByText('Shared conversation runtime /global');
-    fireEvent.click(screen.getByRole('button', { name: /^Fleet \d+$/ }));
-    expect(screen.getByRole('link', { name: 'Fix coordinator page' })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Show details' }));
-
-    expect(screen.getByText('ROOT conv-roo')).toBeInTheDocument();
-    expect(screen.getByText(/WORKTREE \/wt\/task-08700/)).toBeInTheDocument();
-    expect(screen.getByText('REF @work:item-1')).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: 'Copy ref' }));
-    await waitFor(() => {
-      expect(navigator.clipboard.writeText).toHaveBeenCalledWith('@work:item-1');
-    });
   });
 });

@@ -138,6 +138,13 @@ pub struct TaskApprovalHandoffResponse {
     pub successor_conv_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChatAcceptanceReceipt {
+    pub conversation_id: String,
+    pub request_fingerprint: String,
+    pub steering: bool,
+}
+
 /// Manager for all conversation runtimes
 pub struct RuntimeManager {
     db: Database,
@@ -162,6 +169,9 @@ pub struct RuntimeManager {
     /// Serializes the slow runtime-construction path. Fast lookups remain
     /// lock-free; eviction state therefore has exactly one consumer.
     runtime_creation_lock: AsyncMutex<()>,
+    /// Serializes message-id acceptance and bridges the gap between event
+    /// dispatch and durable message persistence for in-process retries.
+    chat_acceptance_receipts: AsyncMutex<HashMap<String, ChatAcceptanceReceipt>>,
     /// Broadcasters from evicted runtimes, waiting to be inherited by a
     /// replacement runtime created by the next `get_or_create` call.
     ///
@@ -1291,6 +1301,7 @@ impl RuntimeManager {
             terminals: crate::terminal::ActiveTerminals::new(),
             runtimes: RwLock::new(HashMap::new()),
             runtime_creation_lock: AsyncMutex::new(()),
+            chat_acceptance_receipts: AsyncMutex::new(HashMap::new()),
             evicted_broadcasters: RwLock::new(HashMap::new()),
             evicted_model_upgrades: RwLock::new(HashSet::new()),
             spawn_tx,
@@ -2573,8 +2584,13 @@ impl RuntimeManager {
                     self.db.clone(),
                     self.message_retriever.clone(),
                 );
+                let send_chat =
+                    Arc::new(crate::send_chat_service::SendChatApplicationService::new(
+                        self.db.clone(),
+                        self.clone(),
+                    ));
                 ToolRegistryExecutor::builtin_only(
-                    ToolRegistry::coordinator(crate::coordinator_tools::tools(service)),
+                    ToolRegistry::coordinator(crate::coordinator_tools::tools(service, send_chat)),
                     agent_catalog.clone(),
                 )
             } else {
@@ -2655,13 +2671,22 @@ impl RuntimeManager {
             event_rx,
             event_tx.clone(),
             broadcaster.clone(),
-        )
-        .with_state_updated_at(initial_state_updated_at)
-        .with_steering_queue(steering_queue)
-        .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
-        .with_task_handoff_channel(self.handoff_tx.clone())
-        .with_credential_helper(self.credential_helper.clone())
-        .with_agent_catalog(agent_catalog);
+        );
+        let runtime = if is_coordinator {
+            runtime.with_coordinator_read_service(crate::api::global_read::GlobalReadService::new(
+                self.db.clone(),
+                self.message_retriever.clone(),
+            ))
+        } else {
+            runtime
+        };
+        let runtime = runtime
+            .with_state_updated_at(initial_state_updated_at)
+            .with_steering_queue(steering_queue)
+            .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
+            .with_task_handoff_channel(self.handoff_tx.clone())
+            .with_credential_helper(self.credential_helper.clone())
+            .with_agent_catalog(agent_catalog);
 
         // Fork proposals are bound to top-level (parent) origins; sub-agents
         // never hold any. Give parent runtimes the fork-resolution consumer
@@ -2867,6 +2892,12 @@ impl RuntimeManager {
                 "Runtime evicted; shutdown signal sent, broadcaster preserved for new runtime"
             );
         }
+    }
+
+    pub(crate) async fn lock_chat_acceptance(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, HashMap<String, ChatAcceptanceReceipt>> {
+        self.chat_acceptance_receipts.lock().await
     }
 
     pub async fn send_event(
