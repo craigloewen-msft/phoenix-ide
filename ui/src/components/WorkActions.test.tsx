@@ -552,9 +552,14 @@ describe('WorkControlBar — checking / loading', () => {
     );
 
     expect(document.querySelector('.work-actions-checking-note')).toBeInTheDocument();
-    expect(screen.getByText(/Checking PR/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/Checking PR/i)).toHaveLength(2);
     expect(screen.getByTestId('abandon-button')).toBeInTheDocument();
     expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+    expect(screen.getByTestId('desktop-work-controls')).toBeInTheDocument();
+    expect(screen.queryByText('Done?')).not.toBeInTheDocument();
+    expect(screen.getByTestId('desktop-work-actions-identity')).toHaveTextContent('WorkspaceChecking PR…');
+    expect(screen.getByTestId('desktop-work-actions-identity').tagName).toBe('SPAN');
+    expect(screen.getByTestId('desktop-work-actions-identity')).not.toHaveAttribute('tabindex');
   });
 });
 
@@ -719,7 +724,12 @@ describe('WorkControlBar — active PR interactions', () => {
 
     await waitFor(() => expect(handle.refresh).toHaveBeenCalledTimes(1));
     expect(api.markMerged).not.toHaveBeenCalled();
+    expect(screen.getAllByLabelText(/Mark as merged\. Deletes the worktree/)).toHaveLength(2);
+    expect(screen.getAllByText('ⓘ')).toHaveLength(2);
     expect(screen.getByText('Select an active PR before cleaning up or abandoning this task.')).toBeInTheDocument();
+    const alert = screen.getByRole('alert');
+    expect(alert.closest('.desktop-work-actions-rail')).toBeNull();
+    expect(alert.closest('.desktop-work-actions-compact')).toBeInTheDocument();
   });
 
   it('shows mixed associated PR cleanup summary while keeping cleanup task-scoped', () => {
@@ -1212,12 +1222,92 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
       <WorkControlBar conversationId="conv-desktop-feedback" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
     );
 
-    expect(screen.getByRole('button', { name: /#13 Needs review open task-124 feedback open/ })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /#14 Being handled open task-125 feedback in progress/ })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /#12 Fix CI open task-123$/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#13 Needs review open task-124$/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#14 Being handled open task-125 feedback in progress \(eyes reaction\)/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#12 Fix CI open task-123 feedback approved \(thumbs-up reaction\)/ })).toBeInTheDocument();
+    expect(screen.getByText('👀').parentElement).toHaveAttribute('title', 'feedback in progress (eyes reaction)');
+    expect(screen.getByText('👍').parentElement).toHaveAttribute('title', 'feedback approved (thumbs-up reaction)');
   });
 
-  it('falls back when an explicit active PR is absent from associated summaries', () => {
+  it('shows the active PR review state in the compact desktop rail', () => {
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      display_state: 'open',
+      feedback_status: 'approved',
+      selection: {
+        ...selection(),
+        associated_prs: [
+          { ...selection().associated_prs[0]!, feedback_status: 'approved' },
+        ],
+      },
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-desktop-approved" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByTestId('desktop-work-actions-identity')).toHaveTextContent('#12open👍');
+    expect(screen.getByText('feedback approved (thumbs-up reaction)')).toHaveClass('pr-review-state-label');
+  });
+
+  it('renders legacy cached PR identity as status when no selector can open', () => {
+    const handle = prStatusHandle(
+      { found: true, number: 12, display_state: 'open', feedback_status: 'approved' },
+      { activeSelection: null, activePrSummary: null, ambiguous: false },
+    );
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-desktop-legacy-pr" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    const identity = screen.getByTestId('desktop-work-actions-identity');
+    expect(identity.tagName).toBe('SPAN');
+    expect(identity).toHaveTextContent('#12open👍');
+    expect(identity).not.toHaveAttribute('tabindex');
+  });
+
+  it('uses the active summary for compact chip state and review status', () => {
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      display_state: 'open',
+      feedback_status: 'open',
+      selection: {
+        ...selection(),
+        associated_prs: [
+          { ...selection().associated_prs[0]!, display_state: 'draft', feedback_status: 'approved' },
+        ],
+      },
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-desktop-summary-authority" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByTestId('desktop-work-actions-identity')).toHaveTextContent('#12draft👍');
+    expect(screen.getByRole('button', { name: '#12 draft feedback approved (thumbs-up reaction)' })).toBeInTheDocument();
+  });
+
+  it('shows review state on compact PR chips independently of freshness', () => {
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      display_state: 'open',
+      feedback_status: 'in_progress',
+      selection: {
+        ...selection(),
+        associated_prs: [
+          { ...selection().associated_prs[0]!, feedback_status: 'in_progress' },
+        ],
+      },
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-review-state" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByRole('button', { name: /#12 open feedback in progress \(eyes reaction\)/ })).toBeInTheDocument();
+    expect(screen.getByText('👀')).toBeInTheDocument();
+  });
+
+  it('uses the compact desktop rail when an explicit active PR is absent from associated summaries', () => {
     const handle = prStatusHandle({
       found: false,
       selection: {
@@ -1234,17 +1324,18 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
       <WorkControlBar conversationId="conv-desktop-stale-active" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
     );
 
-    expect(screen.queryByTestId('desktop-work-controls')).not.toBeInTheDocument();
-    expect(screen.getByText('Done?')).toBeInTheDocument();
+    expect(screen.getByTestId('desktop-work-controls')).toBeInTheDocument();
+    expect(screen.queryByText('Done?')).not.toBeInTheDocument();
   });
 
-  it('keeps the legacy desktop presentation for a single actionable PR', () => {
+  it('uses the compact desktop rail for a single actionable PR', () => {
     renderWithProviders(
       <WorkControlBar conversationId="conv-desktop-single" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={prStatusHandle()} />,
     );
 
-    expect(screen.queryByTestId('desktop-work-controls')).not.toBeInTheDocument();
-    expect(screen.getByText('Done?')).toBeInTheDocument();
+    expect(screen.getByTestId('desktop-work-controls')).toBeInTheDocument();
+    expect(screen.queryByText('Done?')).not.toBeInTheDocument();
+    expect(screen.getByTestId('view-diff-button')).toBeInTheDocument();
   });
 });
 

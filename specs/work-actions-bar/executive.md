@@ -4,8 +4,8 @@
 
 The work actions surface is rendered in Work and Branch conversations while the conversation is
 idle, errored, or context-exhausted. Desktop presents a persistent rich PR rail when multiple
-actionable PRs can represent the active selection, and otherwise retains the `.work-actions-bar`
-row. Narrow mobile viewports preserve the transcript with a thin rail of actionable PRs that expands
+actionable PRs can represent the active selection, and otherwise presents the same derived verbs in
+a thin compact rail. Narrow mobile viewports preserve the transcript with a thin rail of actionable PRs that expands
 the selected PR's hero and supporting actions upward. Its purpose is first-time legibility: a user should know
 the next action immediately and be able to inspect every other available verb without losing the
 conversation as the primary work surface.
@@ -14,7 +14,7 @@ This is a composition spec. It selects which verb is primary and which verbs are
 re-derives none of its inputs. It owns:
 
 - **Visibility** — when the bar appears and when it is hidden.
-- **Responsive three-zone presentation** — REVIEW, RESOLVE, and FINISH, the single-primary rule,
+- **Responsive compact presentation** — REVIEW, RESOLVE, and FINISH semantics, the single-primary rule,
   and the responsive active-PR rail with expandable action rows.
 - **`WorkDisposition` derivation** — the single derived state that selects the primary verb,
   total over every open-PR and stuck-with-PR case.
@@ -51,7 +51,7 @@ click to arm.
 | ID | Summary |
 |----|---------|
 | REQ-WAB-001 | Bar visibility: Work/Branch mode AND phase ∈ {idle, error, context_exhausted} |
-| REQ-WAB-002 | Responsive presentation: desktop multi-PR rail with three-zone fallback; mobile PR rail; hero and supporting action groups |
+| REQ-WAB-002 | Responsive presentation: stable compact desktop rail; mobile PR rail; hero and supporting action groups |
 | REQ-WAB-003 | Exactly one primary (glowing) verb across the bar — or none, in the continuation case |
 | REQ-WAB-004 | WorkDisposition derivation: a single derived state, total over every open-PR and stuck-with-PR case |
 | REQ-WAB-005 | RESOLVE zone suppressed in stuck phases (error, context_exhausted) |
@@ -61,7 +61,7 @@ click to arm.
 | REQ-WAB-009 | Continuation mute: when continued_in_conv_id is set, RESOLVE and FINISH are suppressed and there is no primary |
 | REQ-WAB-010 | PR link verbs (Merge / Open PR) are GitHub links; Phoenix has no merge API |
 | REQ-WAB-011 | Mobile rail shows actionable PR status/freshness and expands one active PR without parallel selection state |
-| REQ-WAB-012 | Desktop multi-PR rail shows rich PR context, shares active selection authority, and preserves selector fallback |
+| REQ-WAB-012 | Desktop multi-PR rail shows rich PR context and sidebar-consistent review state, shares active selection authority, and preserves selector fallback |
 
 Increment 1 also depends on the `pr-association` migration from hidden singular-primary targeting
 to one explicit active PR. The work actions bar remains a composition surface: it does not infer
@@ -93,6 +93,7 @@ ambiguous.
 | `WorkControlBar` component | `ui/src/components/WorkActions.tsx` |
 | Responsive active-PR rail styling | `ui/src/components/WorkActions.css` |
 | Shared rail availability derivation | `ui/src/components/prRailAvailability.ts` |
+| Shared sidebar/Work Actions review-state mapping | `ui/src/components/prReviewState.ts` |
 | Desktop multi-PR QA surface | `ui/src/fixtures/desktopMultiPrConversation/renderFixture.tsx` |
 | `WorkDisposition` derivation | `deriveWorkDisposition` in the same file |
 | Shared FINISH-primary selector | `finishPrimaryForDisposition` in the same file |

@@ -6,6 +6,7 @@ import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
 import { prFeedbackFreshnessLabel, prFeedbackCoverageMarker } from './prBadge';
 import { deriveWorkDisposition } from './workDisposition';
 import { derivePrRailAvailability } from './prRailAvailability';
+import { prReviewState } from './prReviewState';
 import { useIsMobile } from '../hooks';
 import './WorkActions.css';
 
@@ -19,18 +20,12 @@ interface WorkControlBarProps {
   prStatusHandle: ConversationPrStatusHandle;
 }
 
-/** A small ⓘ affordance carrying a hover/focus tooltip (REQ-WAB-007). */
 function InfoHint({ text }: { text: string }) {
   return (
-    <span
-      className="work-actions-info-hint"
-      tabIndex={0}
-      role="img"
-      aria-label={text}
-      title={text}
-    >
-      ⓘ
-    </span>
+    <details className="work-actions-info-hint">
+      <summary aria-label={text} title={text}>ⓘ</summary>
+      <span role="tooltip">{text}</span>
+    </details>
   );
 }
 
@@ -104,16 +99,15 @@ function abandonHintText(isBranch: boolean): string {
     : 'Captures a diff snapshot, then deletes the worktree and the task branch. Asks for confirmation.';
 }
 
-function railFeedbackIndicator(
-  pr: (NonNullable<ConversationPrStatusHandle['activeSelection']>['associated_prs'])[number],
-  selectedFreshness: string | null,
-): { label: string; text: string } | null {
-  if (selectedFreshness) {
-    return { label: `${selectedFreshness} feedback`, text: selectedFreshness.replace(' new', '') };
-  }
-  if (pr.feedback_status === 'in_progress') return { label: 'feedback in progress', text: 'in progress' };
-  if (pr.feedback_status === 'open') return { label: 'feedback open', text: 'feedback' };
-  return null;
+function PrReviewStateIndicator({ feedbackStatus }: { feedbackStatus: 'open' | 'in_progress' | 'approved' | null }) {
+  const reviewState = prReviewState(feedbackStatus);
+  if (!reviewState) return null;
+  return (
+    <span className={`pr-review-state ${reviewState.className}`} title={reviewState.label}>
+      <span aria-hidden="true">{reviewState.symbol}</span>
+      <span className="pr-review-state-label">{reviewState.label}</span>
+    </span>
+  );
 }
 
 export function WorkControlBar({
@@ -143,19 +137,24 @@ export function WorkControlBar({
     ? (prStatus.number ?? prStatus.pr?.number ?? null)
     : null;
   const activePrNumber = activePr?.pr_number ?? legacyActivePrNumber;
+  const canOpenActivePrSelector = activePr !== null
+    || (prStatusHandle.activeSelection?.associated_prs.some(
+      (pr) => pr.display_state === 'open' || pr.display_state === 'draft',
+    ) ?? false)
+    || prStatusHandle.ambiguous;
   const activePrLabel = activePrNumber ? `PR #${activePrNumber}` : 'PR';
-  const selection = prStatusHandle.activeSelection;
   const prSpecificActionsEnabled = activePrNumber !== null && !prStatusHandle.ambiguous;
   const canShowPrDiff = !!activePr && prSpecificActionsEnabled;
-  const associatedPrs = useMemo(() => selection?.associated_prs ?? [], [selection?.associated_prs]);
+  const diffLabel = canShowPrDiff ? `${activePrLabel} Diff` : 'Workspace Diff';
+  const associatedPrs = useMemo(
+    () => prStatusHandle.activeSelection?.associated_prs ?? [],
+    [prStatusHandle.activeSelection?.associated_prs],
+  );
   const { actionablePrs, canRepresentActiveSelection, shouldRender: shouldRenderPrRail } = derivePrRailAvailability(
     prStatusHandle,
     isMobile,
   );
-  const diffLabel = useMemo(
-    () => (canShowPrDiff ? `${activePrLabel} Diff` : 'Workspace Diff'),
-    [activePrLabel, canShowPrDiff],
-  );
+
   const cleanupBlockedByAmbiguity = prStatusHandle.ambiguous && actionablePrs.length > 1 && !activePr;
   useEffect(() => {
     if (!openSelectorAfterRefresh || !prStatusHandle.ambiguous) return;
@@ -458,7 +457,6 @@ export function WorkControlBar({
             const identity = `${pr.repo_owner}/${pr.repo_name}#${pr.pr_number}`;
             const selected = identity === activeIdentity;
             const isExpanded = selected && expanded;
-            const feedbackIndicator = railFeedbackIndicator(pr, selected ? freshnessLabel : null);
             return (
               <button
                 key={identity}
@@ -475,12 +473,10 @@ export function WorkControlBar({
                 {!isMobile && <span className="desktop-pr-chip-title">{pr.title}</span>}
                 <span className="mobile-pr-chip-state">{savingPrIdentity === identity ? 'saving…' : pr.display_state}</span>
                 {!isMobile && <span className="desktop-pr-chip-branch">{pr.head}</span>}
-                {(isMobile ? selected && freshnessLabel : feedbackIndicator) && (
-                  <span
-                    className="mobile-pr-notification"
-                    aria-label={feedbackIndicator?.label ?? `${freshnessLabel} feedback`}
-                  >
-                    {feedbackIndicator?.text ?? freshnessLabel?.replace(' new', '')}
+                <PrReviewStateIndicator feedbackStatus={pr.feedback_status} />
+                {selected && freshnessLabel && (
+                  <span className="mobile-pr-notification" aria-label={`${freshnessLabel} feedback`}>
+                    {freshnessLabel.replace(' new', '')}
                   </span>
                 )}
               </button>
@@ -494,11 +490,30 @@ export function WorkControlBar({
   }
 
   return (
-    <div className="work-actions-bar">
-      <span className="work-actions-label">Done?</span>
-
-      {/* REVIEW zone */}
-      <div className="work-actions-zone work-actions-zone--review">
+    <div className="desktop-work-actions-compact" data-testid="desktop-work-controls">
+      <div className="desktop-work-actions-rail" aria-label="Work actions">
+        {activePrNumber && canOpenActivePrSelector ? (
+          <button
+            type="button"
+            className="mobile-pr-chip desktop-work-actions-identity"
+            data-testid="desktop-work-actions-identity"
+            onClick={requestActivePrSelectorOpen}
+          >
+            <span className="mobile-pr-status-dot" aria-hidden="true" />
+            <span className="mobile-pr-chip-number">#{activePrNumber}</span>
+            <span className="mobile-pr-chip-state">{activePr?.display_state ?? prStatus?.display_state ?? 'actions'}</span>
+            <PrReviewStateIndicator feedbackStatus={activePr?.feedback_status ?? prStatus?.feedback_status ?? null} />
+          </button>
+        ) : (
+          <span className="mobile-pr-chip desktop-work-actions-identity" data-testid="desktop-work-actions-identity">
+            <span className={`mobile-pr-status-dot${prLoading ? ' mobile-pr-status-dot--loading' : ''}`} aria-hidden="true" />
+            <span className="mobile-pr-chip-number">{activePrNumber ? `#${activePrNumber}` : 'Workspace'}</span>
+            <span className="mobile-pr-chip-state">
+              {activePrNumber ? prStatus?.display_state ?? 'actions' : prLoading ? 'Checking PR…' : 'actions'}
+            </span>
+            {activePrNumber && <PrReviewStateIndicator feedbackStatus={prStatus?.feedback_status ?? null} />}
+          </span>
+        )}
         <button
           className={`work-actions-btn work-actions-view-diff${primaryClass('review')}`}
           data-testid="view-diff-button"
@@ -516,104 +531,68 @@ export function WorkControlBar({
             {diffLabel}
           </button>
         )}
-      </div>
-
-      {/* RESOLVE zone — only when the disposition pushes forward (idle). */}
-      {disposition.primary === 'resolve' && disposition.resolve && (
-        <div className="work-actions-zone work-actions-zone--resolve">
-          {disposition.resolve.kind === 'address_feedback' && prSpecificActionsEnabled && (
-            <button
-              type="button"
-              className={`work-actions-btn work-actions-address${primaryClass('resolve')}`}
-              data-testid="address-feedback-button"
-              aria-label={addressFeedbackAriaLabel}
-              disabled={capturing}
-              onClick={handleAddressFeedback}
-            >
-              <span className="work-actions-address-copy">{addressFeedbackLabel}</span>
-              {freshnessLabel && <span className="work-actions-pr-freshness">{freshnessLabel}</span>}
-              <CoverageMarker marker={coverageMarker} />
-            </button>
-          )}
-          {!prStatusHandle.ambiguous &&
-            (disposition.resolve.kind === 'merge_pr' ||
-              disposition.resolve.kind === 'open_pr' ||
-              disposition.resolve.kind === 'create_pr') && (
-              <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
-            )}
-          {/* Non-glowing secondary link-out beside the Address-feedback primary
-              (e.g. Merge on a passing PR). REQ-WAB-003: never a second primary. */}
-          {!prStatusHandle.ambiguous &&
-            disposition.secondaryResolve &&
-            (disposition.secondaryResolve.kind === 'merge_pr' ||
-              disposition.secondaryResolve.kind === 'open_pr') && (
-              <ResolveLink
-                verb={disposition.secondaryResolve}
-                primary={false}
-                coverageMarker={coverageMarker}
-              />
-            )}
-        </div>
-      )}
-
-      {/* FINISH zone */}
-      <div className="work-actions-zone work-actions-zone--finish">
+        {disposition.primary === 'resolve' && disposition.resolve?.kind === 'address_feedback' && prSpecificActionsEnabled && (
+          <button
+            type="button"
+            className={`work-actions-btn work-actions-address${primaryClass('resolve')}`}
+            data-testid="address-feedback-button"
+            aria-label={addressFeedbackAriaLabel}
+            disabled={capturing}
+            onClick={handleAddressFeedback}
+          >
+            <span className="work-actions-address-copy">{addressFeedbackLabel}</span>
+            {freshnessLabel && <span className="work-actions-pr-freshness">{freshnessLabel}</span>}
+            <CoverageMarker marker={coverageMarker} />
+          </button>
+        )}
+        {!prStatusHandle.ambiguous && disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && (
+          <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
+        )}
+        {!prStatusHandle.ambiguous && disposition.secondaryResolve && disposition.secondaryResolve.kind !== 'address_feedback' && (
+          <ResolveLink verb={disposition.secondaryResolve} primary={false} coverageMarker={coverageMarker} />
+        )}
         {!cleanupBlockedByAmbiguity && disposition.showCleanUp && (
-          <>
+          <div className="desktop-work-actions-terminal">
             <button
               className={`work-actions-btn work-actions-clean-up${primaryClass('clean_up')}`}
               data-testid="clean-up-button"
+              aria-label={`Clean up. ${cleanUpHintText(isBranch)}`}
+              title={cleanUpHintText(isBranch)}
               disabled={isLoading}
               onClick={handleCleanUp}
             >
-              {markingMerged ? 'Cleaning...' : 'Clean up'}
+              {markingMerged ? 'Cleaning…' : 'Clean up'}
             </button>
             <InfoHint text={cleanUpHintText(isBranch)} />
-          </>
+          </div>
         )}
         {!cleanupBlockedByAmbiguity && disposition.showAbandon && (
-          <>
+          <div className="desktop-work-actions-terminal">
             <button
               className={`work-actions-btn work-actions-abandon${primaryClass('abandon')}`}
               data-testid="abandon-button"
+              aria-label={`Abandon. ${abandonHintText(isBranch)}`}
+              title={abandonHintText(isBranch)}
               disabled={isLoading}
               onClick={handleAbandon}
             >
-              {abandoning ? 'Abandoning...' : 'Abandon'}
+              {abandoning ? 'Abandoning…' : 'Abandon'}
             </button>
             <InfoHint text={abandonHintText(isBranch)} />
-          </>
+          </div>
+        )}
+        {note && (
+          <span className={`work-actions-note desktop-work-actions-note${note.kind === 'continued' ? ' work-actions-continuation-note' : ''}${note.kind === 'checking' ? ' work-actions-checking-note' : ''}${note.kind === 'gh_unavailable' ? ' work-actions-pr-note--warning' : ''}${note.kind === 'pr_closed' || note.kind === 'pr_open_stuck' || note.kind === 'no_pr_dirty' ? ' work-actions-pr-note' : ''}`}>
+            {note.text}
+          </span>
+        )}
+        {mixedAssociatedStateSummary && (
+          <span className="work-actions-note desktop-work-actions-note" data-testid="mixed-associated-pr-summary">
+            {mixedAssociatedStateSummary}
+          </span>
         )}
       </div>
-
-      {/* Inline note — muted text, never a button. */}
-      {note?.kind === 'continued' && (
-        <span className="work-actions-continuation-note">{note.text}</span>
-      )}
-      {note?.kind === 'checking' && (
-        <span className="work-actions-checking-note">{note.text}</span>
-      )}
-      {note?.kind === 'gh_unavailable' && (
-        <span className="work-actions-pr-note work-actions-pr-note--warning">{note.text}</span>
-      )}
-      {(note?.kind === 'pr_closed' || note?.kind === 'pr_open_stuck' || note?.kind === 'no_pr_dirty') && (
-        <span className="work-actions-pr-note">{note.text}</span>
-      )}
-
-      {prStatusHandle.ambiguous && selection && (
-        <button
-          type="button"
-          className="work-actions-pr-note work-actions-pr-note--warning work-actions-pr-note-button"
-          data-testid="active-pr-ambiguity-note"
-          onClick={() => requestActivePrSelectorOpen()}
-        >
-          Multiple actionable PRs are associated with this work. Select one before PR-specific actions.
-        </button>
-      )}
-      {mixedAssociatedStateSummary && (
-        <span className="work-actions-pr-note" data-testid="mixed-associated-pr-summary">{mixedAssociatedStateSummary}</span>
-      )}
-      {error && <div className="work-actions-error">{error}</div>}
+      {error && <div className="work-actions-error desktop-work-actions-error" role="alert">{error}</div>}
     </div>
   );
 }
