@@ -832,6 +832,7 @@ where
     // (`success = false`) is an application result, not a span error — only
     // unknown-tool dispatch marks the span as an error.
     let span = tracing::info_span!(
+        target: "phoenix_ide::otel",
         "tool.execute",
         otel.name = %tool_name,
         otel.status_code = tracing::field::Empty,
@@ -841,6 +842,7 @@ where
         tool_use_id = %tool_use_id,
         outcome = tracing::field::Empty,
         success = tracing::field::Empty,
+        duration_ms = tracing::field::Empty,
     );
     tracing::info!(parent: &span, conv_id = %conv_id, tool = %tool_name, id = %tool_use_id, "Executing tool");
     let tool_start = std::time::Instant::now();
@@ -867,6 +869,7 @@ where
                 });
         }
         let duration_ms = u64::try_from(tool_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        span.record("duration_ms", duration_ms);
         span.record("outcome", "completed");
         span.record("success", out.is_success());
         tracing::info!(
@@ -4184,6 +4187,7 @@ where
             return span.clone();
         }
         let span = tracing::info_span!(
+            target: "phoenix_ide::otel",
             "conversation.turn",
             conv_id = %self.context.conversation_id,
             root_conv_id = %self.context.root_conversation_id,
@@ -4308,6 +4312,12 @@ where
                 // build_llm_messages call as a user-role message.
             }
         }
+
+        let retry_attempt = match self.state {
+            ConvState::LlmRequesting { attempt }
+            | ConvState::SeededLlmRequesting { attempt, .. } => attempt,
+            _ => 1,
+        };
 
         // Typed oneshot channel: background task gets Sender<LlmOutcome>,
         // physically cannot send a ToolExecOutcome or other type.
@@ -4494,6 +4504,12 @@ where
                 messages,
                 tools,
                 max_tokens: Some(16_384),
+                telemetry: Some(phoenix_llm::LlmRequestTelemetry {
+                    conversation_id: conv_id.clone(),
+                    root_conversation_id: root_conv_id.clone(),
+                    request_id: request_id.clone(),
+                    retry_attempt,
+                }),
                 // Every turn in a conversation reuses the same prefix
                 // (system prompt + earlier turns), so all turns share one key.
                 cache_key: PromptCacheKey::stable(&conv_id),
@@ -4751,7 +4767,8 @@ where
             self.terminals.clone(),
             self.tmux_registry.clone(),
             scope_worktree,
-        );
+        )
+        .with_root_conversation_id(self.context.root_conversation_id.clone());
 
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();
@@ -5145,12 +5162,14 @@ where
     }
 
     /// Request continuation summary from LLM (REQ-BED-020)
-    #[allow(clippy::needless_pass_by_value)] // Consistent with Effect signature
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)] // Consistent with Effect signature; single spawned continuation pipeline
     fn request_continuation(&mut self, rejected_tool_calls: Vec<ToolCall>) {
         let llm_client = Arc::clone(&self.llm_client);
         let storage = self.storage.clone();
         let event_tx = self.event_tx.clone();
         let conv_id = self.context.conversation_id.clone();
+        let root_conv_id = self.context.root_conversation_id.clone();
+        let request_id = uuid::Uuid::new_v4().to_string();
         let context_window = self.context.context_window;
         let continuation_limits = self.llm_client.continuation_request_limits();
 
@@ -5231,6 +5250,12 @@ where
                 // Handoff quality favors completeness; cap high enough that a
                 // thorough summary is not truncated mid-thought.
                 max_tokens: Some(4096),
+                telemetry: Some(phoenix_llm::LlmRequestTelemetry {
+                    conversation_id: conv_id.clone(),
+                    root_conversation_id: root_conv_id,
+                    request_id,
+                    retry_attempt: 1,
+                }),
                 // Same conversation as the main loop — different system
                 // prompt won't share a prefix in practice, but using the
                 // conv id keeps the cache cohort coherent.

@@ -97,7 +97,6 @@ impl LlmError {
             429 => Self::rate_limit(format!("Rate limited: {body}")),
             400..=499 => Self::invalid_request(format!("Bad request ({status}): {body}")),
             500..=599 => Self::server_error(format!("Server error ({status}): {body}")),
-            // Unexpected status (1xx, 3xx, etc.) — treat as retryable server error
             _ => Self::server_error(format!("Unexpected HTTP {status}: {body}")),
         }
     }
@@ -270,6 +269,46 @@ mod tests {
         "You've hit your usage limit. To get more access now, send a request to your admin";
     const PRO_MSG: &str = "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits";
     const FREE_MSG: &str = "You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus),";
+
+    #[test]
+    fn http_status_classification_preserves_actionable_provider_detail() {
+        let cases = [
+            (
+                401,
+                LlmErrorKind::Auth,
+                "Authentication failed: invalid API key",
+            ),
+            (
+                429,
+                LlmErrorKind::RateLimit,
+                "Rate limited: retry after 30 seconds",
+            ),
+            (
+                400,
+                LlmErrorKind::InvalidRequest,
+                "Bad request (400): context window exceeded",
+            ),
+            (
+                503,
+                LlmErrorKind::ServerError,
+                "Server error (503): overloaded",
+            ),
+            (
+                302,
+                LlmErrorKind::ServerError,
+                "Unexpected HTTP 302: redirect rejected",
+            ),
+        ];
+
+        for (status, kind, expected) in cases {
+            let detail = expected
+                .rsplit_once(": ")
+                .map_or(expected, |(_, detail)| detail);
+            let error = LlmError::from_http_status(status, detail);
+            assert_eq!(error.kind, kind);
+            assert_eq!(error.message, expected);
+        }
+    }
 
     #[test]
     fn plus_plan_full_string_matches_codex_cli_verbatim() {

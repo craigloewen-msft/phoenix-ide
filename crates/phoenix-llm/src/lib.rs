@@ -196,12 +196,33 @@ pub trait LlmService: Send + Sync {
 pub struct LoggingService {
     inner: Arc<dyn LlmService>,
     model_id: String,
+    provider: &'static str,
+    streaming_transport: &'static str,
 }
 
 impl LoggingService {
-    pub fn new(inner: Arc<dyn LlmService>) -> Self {
+    pub fn new(
+        inner: Arc<dyn LlmService>,
+        provider: &'static str,
+        streaming_transport: &'static str,
+    ) -> Self {
         let model_id = inner.model_id().to_string();
-        Self { inner, model_id }
+        Self {
+            inner,
+            model_id,
+            provider,
+            streaming_transport,
+        }
+    }
+
+    fn transport_for(&self, streaming: bool) -> &'static str {
+        if self.streaming_transport == "in_process" {
+            "in_process"
+        } else if streaming {
+            self.streaming_transport
+        } else {
+            "http_json"
+        }
     }
 }
 
@@ -211,20 +232,32 @@ impl LoggingService {
     /// and error aggregation); the tracing-side name stays `llm.request` for
     /// local log filtering. Usage/error fields are `Empty` until the call
     /// resolves.
-    fn request_span(&self, streaming: bool) -> tracing::Span {
+    fn request_span(&self, request: &LlmRequest, streaming: bool) -> tracing::Span {
+        let transport = self.transport_for(streaming);
+        let telemetry = request.telemetry.as_ref();
+        let generated_request_id = format!("llm-{}", rand::random::<u64>());
+        let request_id = telemetry.map_or(generated_request_id.as_str(), |value| {
+            value.request_id.as_str()
+        });
         tracing::info_span!(
+            target: "phoenix_llm::otel",
             "llm.request",
             otel.kind = "client",
             otel.name = %self.model_id,
             otel.status_code = tracing::field::Empty,
             model = %self.model_id,
+            provider = self.provider,
+            transport,
             streaming,
+            conv_id = telemetry.map(|value| value.conversation_id.as_str()),
+            root_conv_id = telemetry.map(|value| value.root_conversation_id.as_str()),
+            request_id,
+            retry_attempt = telemetry.map_or(1, |value| value.retry_attempt),
             input_tokens = tracing::field::Empty,
             output_tokens = tracing::field::Empty,
             cache_read_tokens = tracing::field::Empty,
             cache_creation_tokens = tracing::field::Empty,
-            time_to_first_token_ms = tracing::field::Empty,
-            error.message = tracing::field::Empty,
+            error.kind = tracing::field::Empty,
         )
     }
 
@@ -241,7 +274,7 @@ impl LoggingService {
             }
             Err(e) => {
                 span.record("otel.status_code", "ERROR");
-                span.record("error.message", e.message.as_str());
+                span.record("error.kind", format!("{:?}", e.kind));
             }
         }
     }
@@ -250,7 +283,7 @@ impl LoggingService {
 #[async_trait]
 impl LlmService for LoggingService {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        let span = self.request_span(false);
+        let span = self.request_span(request, false);
         let start = std::time::Instant::now();
         let result = self.inner.complete(request).instrument(span.clone()).await;
         let duration = start.elapsed();
@@ -272,7 +305,7 @@ impl LlmService for LoggingService {
                     parent: &span,
                     model = %self.model_id,
                     duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-                    error = %e.message,
+                    error_kind = ?e.kind,
                     auto_retryable = e.kind.is_auto_retryable(),
                     user_resumable = e.kind.is_user_resumable(),
                     "LLM request failed"
@@ -288,7 +321,7 @@ impl LlmService for LoggingService {
         request: &LlmRequest,
         chunk_tx: &mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
-        let span = self.request_span(true);
+        let span = self.request_span(request, true);
         let start = std::time::Instant::now();
 
         let result = self
@@ -315,7 +348,7 @@ impl LlmService for LoggingService {
                     parent: &span,
                     model = %self.model_id,
                     duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-                    error = %e.message,
+                    error_kind = ?e.kind,
                     auto_retryable = e.kind.is_auto_retryable(),
                     user_resumable = e.kind.is_user_resumable(),
                     "LLM streaming request failed"
@@ -336,5 +369,27 @@ impl LlmService for LoggingService {
 
     fn continuation_request_limits(&self) -> ContinuationRequestLimits {
         self.inner.continuation_request_limits()
+    }
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::*;
+    use crate::mock::MockLlmService;
+
+    #[test]
+    fn logging_transport_matches_the_actual_call_path() {
+        let http = LoggingService::new(Arc::new(MockLlmService), "anthropic", "http_sse");
+        assert_eq!(http.transport_for(false), "http_json");
+        assert_eq!(http.transport_for(true), "http_sse");
+
+        let codex =
+            LoggingService::new(Arc::new(MockLlmService), "openai", "websocket_or_http_sse");
+        assert_eq!(codex.transport_for(false), "http_json");
+        assert_eq!(codex.transport_for(true), "websocket_or_http_sse");
+
+        let mock = LoggingService::new(Arc::new(MockLlmService), "mock", "in_process");
+        assert_eq!(mock.transport_for(false), "in_process");
+        assert_eq!(mock.transport_for(true), "in_process");
     }
 }
