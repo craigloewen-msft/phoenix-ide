@@ -101,9 +101,9 @@ THE SYSTEM SHALL emit an SSE `WakeContractRegistered` event with the
 contract id, handle reference, condition summary, and `expires_at`
 
 **Rationale:** Registration is the LLM's explicit commitment "I have
-nothing further to do until this fires." The tool call itself does
-not return a synchronous payload to the LLM. The conversation state
-is unchanged — the LLM's next invocation is when the contract fires
+nothing further to do until this fires." The tool call returns a provider-valid
+registration receipt in tool-result history; it does not synchronously wait for
+terminal handle output. The conversation state is unchanged — the LLM's next invocation is when the contract fires
 (or expires / is cancelled / is forgotten). See REQ-WAKE-006 for
 delivery semantics; ADR-006 records the explicit non-state rationale.
 
@@ -160,13 +160,16 @@ THE SYSTEM SHALL atomically:
   1. mark the contract row as fired with cause and observed payload,
   2. construct a synthetic tool result per REQ-WAKE-006,
   3. append the tool result to the conversation message log,
-  4. trigger the conversation's next LLM turn (same path as a normal
-     user message arrival or tool result completion), and
+  4. route that durable observation through the same owed-acceptance /
+     reducer path that governs normal wake delivery rather than invoking
+     the LLM directly, and
   5. emit `WakeContractFired` SSE
 
+Explicit cancellation SHALL persist and accept its synthetic terminal result through the same durable path without scheduling an LLM turn solely for cancellation.
+
 WHEN a contract's `expires_at` passes without firing
-THE SYSTEM SHALL fire the contract with cause `Expired` and the same
-delivery path as a normal fire
+THE SYSTEM SHALL resolve the contract with cause `Expired` and the same
+durable observation / owed-acceptance delivery path as a normal fire
 
 **Rationale:** The router is the single writer of contract terminal
 state. Per-condition-kind evaluators are pure functions over (handle
@@ -175,23 +178,28 @@ mirrors the existing bash `reaper.rs` and tmux registry patterns.
 
 ---
 
-### REQ-WAKE-004: `is_busy()` Derivation
+### REQ-WAKE-004: Pending-Wake Lifecycle Guard
 
-THE conversation `is_busy()` derivation SHALL return true when the
-conversation has at least one pending wake contract
+THE conversation `is_busy()` derivation SHALL remain unchanged by pending wake
+contracts alone
 
-WHEN `is_busy()` would otherwise return false (state == Idle) AND
+WHEN a conversation would otherwise remain idle AND
 `has_pending_wake_contracts(conv)` is true
-THE SYSTEM SHALL return true
+THE SYSTEM SHALL keep runtime busy/idle semantics unchanged and SHALL instead
+expose the pending wake through wake-specific presentation detail, capability
+guards, and lifecycle conflict checks driven directly by the pending-wake
+lifecycle
 
-**Rationale:** Pit-of-success at the lifecycle boundary. Archive,
-hard-delete, abandon, and mark-merged today all check `is_busy()`
-before proceeding. A conversation with pending wake contracts that
-returned `false` from `is_busy()` would be silently archive-able,
-which would mean either (a) the cascade silently cancels contracts
-the user did not know existed, or (b) the contracts orphan. Neither
-is acceptable. The is_busy() augmentation is a single SQLite count
-query on `wake_contracts WHERE conv_id = ? AND status = pending`.
+Archive, hard-delete, abandon, mark-merged, and any equivalent destructive
+lifecycle operation SHALL query pending wake contracts, unconsumed wake
+observations, and owed runtime acceptances directly and SHALL reject or serialize
+the lifecycle transition until those obligations are resolved
+
+**Rationale:** Wake waits are runtime-owned obligations, not proof that the LLM
+is actively executing. Fabricating `is_busy()` would create a duplicate semantic
+state alongside the durable wake rows and would misrepresent an otherwise idle
+conversation. Lifecycle safety still matters, so the pit-of-success guard moves
+to an explicit pending-wake conflict check rather than overloading runtime busy.
 
 ---
 
@@ -252,7 +260,8 @@ would create a parallel scheduler inside the handle-wake plane.
 WHEN a contract fires
 THE SYSTEM SHALL deliver to the conversation a synthetic tool result
 shaped as the tool result the equivalent successful synchronous wait would have
-returned.
+returned, but wake delivery SHALL enter the conversation only through the durable
+observation / owed-acceptance path rather than an immediate direct-to-LLM wake-up.
 
 For `HandleTerminal/Bash`, the tool result MUST carry the handle's terminal
 status (`exited` / `killed` / `kill_pending_kernel` / `forgotten` and any other
@@ -360,15 +369,15 @@ A conversation MAY hold multiple pending contracts (e.g., agent
 registered two waits in parallel via two `wait_until` calls in one
 turn)
 
-WHEN the first contract fires
-THE SYSTEM SHALL deliver only that contract's payload as the next
-synthetic tool result, and the other pending contracts SHALL continue
-to be evaluated normally (no auto-cancellation of siblings)
+WHEN one or more contracts fire before the next runtime acceptance
+THE SYSTEM SHALL deliver the committed contract payloads as one bounded,
+ordered batch of synthetic tool results, and the other pending contracts
+SHALL continue to be evaluated normally (no auto-cancellation of siblings)
 
 **Rationale:** Independent contracts represent independent things the
 LLM cares about. There is no reason to cancel a still-relevant
 `cargo build` watch just because an unrelated `subagent` finished
-first. The LLM consumes the first fire, makes whatever decisions, and
+first. The LLM consumes each accepted batch, makes whatever decisions, and
 either lets the other contracts continue to fire on their own
 schedule or cancels them explicitly via the cancel endpoint. The
 rejected "first-fire-wins-cancel-siblings" semantics only makes sense
@@ -594,7 +603,7 @@ bash waits as `Forgotten { reason: "phoenix_restart" }`.
 
 A `TmuxPane` wake handle SHALL be addressed by the tmux registry's stable
 `window_id`. It is WorkScope-keyed for continuation inheritance and lifecycle
-teardown. A hard-delete or WorkScope teardown with no inheriting successor fires
+teardown. After lifecycle admission confirms no pending wake contract, unconsumed observation, or owed acceptance, a hard-delete or WorkScope teardown with no inheriting successor fires
 pending tmux waits as forgotten unless the registry already recorded a terminal
 exit-marker or killed-window state; a surviving tmux handle is re-registered on
 router startup.
@@ -607,8 +616,7 @@ its durable terminal cause: children whose terminal cause occurred before the
 contract deadline deliver the corresponding tagged terminal payload;
 non-terminal children fire `Forgotten { reason: "phoenix_restart" }`. Child
 cancellation observed independently of parent wake cancellation produces a fired
-sub-agent `cancelled` payload. Parent hard-delete SHALL
-cancel pending wake contracts before deleting the child; hard-delete MUST NOT
+sub-agent `cancelled` payload. Parent hard-delete SHALL reject while pending wake contracts or undelivered wake obligations remain; after those obligations resolve, hard-delete MUST NOT
 report lifecycle cancellation as a missing child handle.
 
 **Rationale:** The three v1 handle kinds deliberately use their existing stable
