@@ -970,10 +970,21 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
 
   const loadOlderMessages = useCallback((restoreBasis?: RestoreBasis) => {
     void loadOlderMessagesForIntent({
-      kind: 'manual_expansion',
+      kind: 'reader_expansion',
       restore: restoreBasis ?? { kind: 'following_tail' },
     });
   }, [loadOlderMessagesForIntent]);
+
+  const updateOlderMessagesRestore = useCallback((restore: RestoreBasis) => {
+    const active = historyExpansion.activeRequest;
+    if (!active || active.intent.kind !== 'reader_expansion') return;
+    dispatchHistoryExpansion({
+      type: 'reader_restore_updated',
+      requestToken: active.token,
+      view: active.view,
+      restore,
+    });
+  }, [historyExpansion.activeRequest]);
 
   useEffect(() => {
     dispatchHistoryExpansion({ type: 'target_changed', targetMessageId: targetMessageId ?? null });
@@ -1996,6 +2007,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
         systemPrompt={atom.systemPrompt ?? undefined}
         hasOlderMessages={historyExpansion.coverage === 'tail'}
         onLoadOlderMessages={loadOlderMessages}
+        onUpdateOlderMessagesRestore={updateOlderMessagesRestore}
         loadingOlderMessages={historyExpansion.activeRequest !== null}
         olderHistoryError={historyExpansion.failure?.kind === 'request_failed'
           ? historyExpansion.failure.message

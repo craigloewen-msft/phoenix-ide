@@ -45,6 +45,7 @@ export interface VirtualTranscriptHandle {
   scrollToIndex(index: number, align: 'start' | 'end', viewportStartOffset?: number): void;
   scrollToTail(): void;
   captureVisibleAnchor(): VirtualTranscriptAnchor | null;
+  preserveViewportOnNextItemsChange(): void;
   measureOffsetForIndex(index: number): number | null;
   measureOffsetForIndexAtSnapshot(index: number, snapshot: VirtualTranscriptPhysicalSnapshot): number | null;
   layoutRevision(): number;
@@ -86,6 +87,7 @@ interface PhysicalStore<T> {
   rowElements: Map<string, HTMLDivElement>;
   resizeObserver: ResizeObserver | null;
   initialTailPending: boolean;
+  preservedViewport: { top: number; firstKey: string | null } | null;
   pinned: boolean;
   revision: number;
 }
@@ -384,6 +386,7 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     rowElements: new Map(),
     resizeObserver: null,
     initialTailPending: props.initialTail ?? true,
+    preservedViewport: null,
     pinned: true,
     revision: 0,
   };
@@ -527,11 +530,20 @@ function VirtualTranscriptInner<T>(
   useLayoutEffect(() => {
     const current = storeRef.current;
     if (!current) return;
-    const anchor = current.pinned ? null : captureTopAnchor(current);
-    const wasPinned = current.pinned;
+    const nextKeys = resolvedPhysicalKeys.keys;
+    const preserved = current.preservedViewport;
+    const prefixInserted = preserved !== null
+      && preserved.firstKey !== null
+      && nextKeys.indexOf(preserved.firstKey) > 0;
+    if (prefixInserted) {
+      current.preservedViewport = null;
+      current.viewportTop = preserved.top;
+    }
+    const anchor = prefixInserted || current.pinned ? null : captureTopAnchor(current);
+    const wasPinned = !prefixInserted && current.pinned;
     current.items = items;
     current.getKey = getKey;
-    current.keys = resolvedPhysicalKeys.keys;
+    current.keys = nextKeys;
     current.estimatedExtent = estimatedExtent;
     current.overscan = clampNonNegative(overscan);
     const presentKeys = new Set(current.keys);
@@ -604,6 +616,15 @@ function VirtualTranscriptInner<T>(
       publish();
       return anchor;
     },
+    preserveViewportOnNextItemsChange() {
+      const current = storeRef.current;
+      if (!current) return;
+      current.preservedViewport = {
+        top: current.scroller?.scrollTop ?? current.viewportTop,
+        firstKey: current.keys[0] ?? null,
+      };
+      current.activeAnchor = null;
+    },
     measureOffsetForIndex(index) {
       const current = storeRef.current;
       if (!current) return null;
@@ -634,6 +655,7 @@ function VirtualTranscriptInner<T>(
     const current = storeRef.current;
     if (!current?.scroller) return;
     current.viewportTop = current.scroller.scrollTop;
+    if (current.preservedViewport) current.preservedViewport.top = current.viewportTop;
     current.viewportExtent = current.scroller.clientHeight;
     current.activeAnchor = captureTopAnchor(current);
     recompute(current);

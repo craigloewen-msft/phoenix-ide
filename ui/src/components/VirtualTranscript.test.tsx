@@ -1,5 +1,5 @@
 import { type ReactElement } from 'react';
-import { act, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { VirtualTranscript, type VirtualTranscriptHandle, type VirtualTranscriptPhysicalSnapshot } from './VirtualTranscript';
 
@@ -506,6 +506,61 @@ describe('VirtualTranscript', () => {
     act(() => resizeObservers[0]!.triggerEntries([[header, 40]]));
 
     expect(totals.at(-1)).toBe(40);
+  });
+
+  it('preserves absolute viewport position for a header-only view across the next prepend', () => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    const initial = makeItems(20, 20);
+    const view = render(
+      <VirtualTranscript
+        ref={ref}
+        items={initial}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={0}
+        initialTail={false}
+        header={<div data-height={500}>System prompt</div>}
+        renderItem={renderRow}
+      />,
+    );
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+    act(() => ref.current?.scrollToIndex(10, 'start'));
+    const viewportTop = scroller.scrollTop;
+
+    act(() => ref.current?.preserveViewportOnNextItemsChange());
+    const unrelatedTailUpdate = [...initial, { id: 'streaming-tail', height: 40, label: 'streaming tail' }];
+    act(() => {
+      view.rerender(
+        <VirtualTranscript
+          ref={ref}
+          items={unrelatedTailUpdate}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={0}
+          initialTail={false}
+          header={<div data-height={500}>System prompt</div>}
+          renderItem={renderRow}
+        />,
+      );
+    });
+    scroller.scrollTop = viewportTop + 25;
+    fireEvent.scroll(scroller);
+    act(() => {
+      view.rerender(
+        <VirtualTranscript
+          ref={ref}
+          items={[...makeItems(5, 20).map((item) => ({ ...item, id: `older-${item.id}` })), ...unrelatedTailUpdate]}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={0}
+          initialTail={false}
+          header={<div data-height={500}>System prompt</div>}
+          renderItem={renderRow}
+        />,
+      );
+    });
+
+    expect(scroller.scrollTop).toBe(viewportTop + 25);
   });
 
   it('preserves measured extents by stable key across prepends and removes only absent keys', () => {
