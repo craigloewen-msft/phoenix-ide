@@ -161,7 +161,7 @@ fn count_restart_messages_since_last_user_msg(messages: &[Message]) -> usize {
     let mut count = 0;
     for msg in messages.iter().rev() {
         match &msg.content {
-            MessageContent::User(_) => break, // new turn boundary — stop counting
+            MessageContent::User(_) | MessageContent::Skill(_) => break,
             MessageContent::System(sys) if sys.text.contains(RESTART_SYSTEM_MESSAGE_MARKER) => {
                 count += 1;
             }

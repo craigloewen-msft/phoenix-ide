@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { ConversationPage } from './ConversationPage';
 import { DesktopLayout } from '../components/DesktopLayout';
@@ -7,7 +7,7 @@ import { ConversationContext } from '../conversation/ConversationContext';
 import { DraftContext } from '../conversation/DraftContext';
 import { ConversationStore } from '../conversation';
 import { DraftStore } from '../conversation/DraftStore';
-import { api, MessageSliceAlignmentError, type Conversation, type Message } from '../api';
+import { api, ExpansionError, MessageSliceAlignmentError, type Conversation, type Message } from '../api';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
 import { cacheDB } from '../cache';
 
@@ -26,6 +26,7 @@ vi.mock('../api', async () => {
       getConversationMetaBySlug: vi.fn(),
       getConversationMessagesAfter: vi.fn(),
       getConversationMessagesLatest: vi.fn(),
+      reconcileAcceptedMessages: vi.fn(),
       listConversations: vi.fn(() => Promise.resolve([])),
       listArchivedConversations: vi.fn(() => Promise.resolve([])),
       getModels: vi.fn(() => Promise.resolve([])),
@@ -142,6 +143,16 @@ vi.mock('../components/FileExplorer/FileTree', () => ({
 const slug = 'archived-idle';
 const conversationId = 'conv-archived';
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function makeConversation(overrides: Partial<Conversation> = {}): Conversation {
   return {
     id: conversationId,
@@ -227,9 +238,10 @@ function renderPage(conversation: Conversation, routeSegment: string = conversat
     context_window_size: 0,
   });
 
-  render(
+  const draftStore = new DraftStore();
+  const page = () => (
     <ConversationContext.Provider value={store}>
-      <DraftContext.Provider value={new DraftStore()}>
+      <DraftContext.Provider value={draftStore}>
         <ConversationReadinessProvider>
           <MemoryRouter initialEntries={[`/c/${routeSegment}${initialSearch}`]}>
             <Routes>
@@ -238,10 +250,11 @@ function renderPage(conversation: Conversation, routeSegment: string = conversat
           </MemoryRouter>
         </ConversationReadinessProvider>
       </DraftContext.Provider>
-    </ConversationContext.Provider>,
+    </ConversationContext.Provider>
   );
+  const view = render(page());
 
-  return { store };
+  return { store, ...view, rerenderPage: () => view.rerender(page()) };
 }
 
 afterEach(() => {
@@ -249,6 +262,400 @@ afterEach(() => {
   viewportFlags.isWideDesktop = true;
   vi.clearAllMocks();
   vi.restoreAllMocks();
+  vi.mocked(api.getConversationMessagesLatest).mockReset();
+  localStorage.clear();
+});
+
+describe('ConversationPage message delivery reconciliation', () => {
+  it('does not overwrite authoritative idle when SSE completes before the chat POST response', async () => {
+    const response = deferred<{ queued: boolean; steering: boolean }>();
+    const sendMessage = vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
+    const { store } = renderPage(makeConversation());
+
+    const textbox = await screen.findByRole('textbox');
+    fireEvent.change(textbox, { target: { value: 'race this request' } });
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+
+    act(() => {
+      store.dispatch(slug, {
+        type: 'sse_state_change',
+        sequenceId: 1,
+        phase: { type: 'llm_requesting', attempt: 1 },
+        stateUpdatedAt: Date.now() + 10,
+      });
+      store.dispatch(slug, {
+        type: 'sse_state_change',
+        sequenceId: 2,
+        phase: { type: 'idle' },
+        stateUpdatedAt: Date.now() + 11,
+      });
+    });
+    expect(store.getSnapshot(slug).phase.type).toBe('idle');
+
+    await act(async () => {
+      response.resolve({ queued: true, steering: false });
+      await response.promise;
+    });
+
+    await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));
+  });
+
+  it('rolls back an optimistic phase when expansion rejects before a turn starts', async () => {
+    vi.spyOn(api, 'sendMessage').mockRejectedValue(new ExpansionError({
+      error: 'No matching reference',
+      error_type: 'file_not_found',
+      reference: '@missing',
+    }));
+    const { store } = renderPage(makeConversation());
+
+    const textbox = await screen.findByRole('textbox');
+    fireEvent.change(textbox, { target: { value: '@missing' } });
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));
+  });
+
+  it('optimistically leaves a resumable error while an accepted retry awaits SSE', async () => {
+    const response = deferred<{ queued: boolean; steering: boolean }>();
+    vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
+    const errorState = {
+      type: 'error' as const,
+      message: 'retryable',
+      error_kind: 'server_overloaded' as const,
+    };
+    const { store } = renderPage(makeConversation({ state: errorState }));
+
+    const textbox = await screen.findByRole('textbox');
+    fireEvent.change(textbox, { target: { value: 'retry from error' } });
+    const form = textbox.closest('form');
+    const sendButton = form?.querySelector<HTMLButtonElement>('button[type="submit"]');
+    expect(sendButton).not.toBeNull();
+    fireEvent.click(sendButton!);
+
+    await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('awaiting_llm'));
+    response.resolve({ queued: true, steering: false });
+    await response.promise;
+    expect(store.getSnapshot(slug).phase.type).toBe('awaiting_llm');
+  });
+
+  it('rolls back an optimistic phase after a steering response despite non-phase SSE traffic', async () => {
+    const response = deferred<{ queued: boolean; steering: boolean }>();
+    vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
+    const { store } = renderPage(makeConversation());
+
+    const textbox = await screen.findByRole('textbox');
+    fireEvent.change(textbox, { target: { value: 'becomes steering' } });
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('awaiting_llm'));
+
+    act(() => {
+      store.dispatch(slug, { type: 'sse_sequence_consumed', sequenceId: 1 });
+    });
+    await act(async () => {
+      response.resolve({ queued: true, steering: true });
+      await response.promise;
+    });
+
+    await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));
+  });
+
+  it('rolls back an optimistic phase after a failed POST despite non-phase SSE traffic', async () => {
+    const response = deferred<{ queued: boolean; steering: boolean }>();
+    vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
+    const { store } = renderPage(makeConversation());
+
+    const textbox = await screen.findByRole('textbox');
+    fireEvent.change(textbox, { target: { value: 'failed request' } });
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('awaiting_llm'));
+
+    act(() => {
+      store.dispatch(slug, { type: 'sse_sequence_consumed', sequenceId: 1 });
+    });
+    await act(async () => {
+      response.reject(new Error('network failed'));
+      await response.promise.catch(() => undefined);
+    });
+
+    await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));
+  });
+
+  it('rolls back and reconciles an idempotent direct replay without waiting for SSE', async () => {
+    const sendMessage = vi.spyOn(api, 'sendMessage').mockResolvedValue({
+      queued: true,
+      steering: false,
+      already_persisted: true,
+    });
+    vi.mocked(api.reconcileAcceptedMessages).mockResolvedValue({
+      conversation_idle: true,
+      entries: [{
+        message_id: 'idempotent-replay',
+        status: 'persisted',
+        message: { ...historyMessage, message_id: 'idempotent-replay', sequence_id: 20 },
+      }],
+    });
+    localStorage.setItem(`phoenix:queue:${conversationId}`, JSON.stringify([{
+      localId: 'idempotent-replay',
+      conversationId,
+      text: 'already persisted',
+      timestamp: 1,
+      status: 'pending',
+    }]));
+    const { store } = renderPage(makeConversation());
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));
+    await waitFor(() => expect(api.reconcileAcceptedMessages).toHaveBeenCalled());
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]')).toEqual([]);
+    });
+  });
+
+  it('keeps a fresh direct message retryable while its SSE echo is missing', async () => {
+    const sendMessage = vi.spyOn(api, 'sendMessage').mockResolvedValue({
+      queued: true,
+      steering: false,
+    });
+    renderPage(makeConversation());
+
+    const textbox = await screen.findByRole('textbox');
+    fireEvent.change(textbox, { target: { value: 'accepted without echo' } });
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+    await waitFor(() => {
+      const queue = JSON.parse(
+        localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]',
+      ) as Array<{ status: string }>;
+      expect(queue[0]?.status).toBe('pending');
+    });
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('prevents overlapping composer submissions while the first POST is unresolved', async () => {
+    const response = deferred<{ queued: boolean; steering: boolean }>();
+    const sendMessage = vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
+    renderPage(makeConversation());
+
+    const textbox = await screen.findByRole('textbox');
+    const sendButton = screen.getByRole('button', { name: /send/i });
+    fireEvent.change(textbox, { target: { value: 'first submission' } });
+    fireEvent.click(sendButton);
+    fireEvent.change(textbox, { target: { value: 'overlapping submission' } });
+    fireEvent.click(sendButton);
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+    expect(
+      JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]'),
+    ).toHaveLength(1);
+    response.resolve({ queued: true, steering: false });
+    await response.promise;
+  });
+
+  it('reconciles accepted messages from a non-working error phase', async () => {
+    const acceptedId = 'accepted-error';
+    localStorage.setItem(`phoenix:queue:${conversationId}`, JSON.stringify([{
+      localId: acceptedId,
+      conversationId,
+      text: 'accepted before error',
+      timestamp: 1,
+      status: 'accepted',
+      acceptedAfterEventSeq: 0,
+    }]));
+    vi.mocked(api.reconcileAcceptedMessages).mockResolvedValue({
+      conversation_idle: true,
+      entries: [{
+        message_id: acceptedId,
+        status: 'persisted',
+        message: { ...historyMessage, message_id: acceptedId, sequence_id: 20 },
+      }],
+    });
+    const { store } = renderPage(makeConversation({
+      state: { type: 'error', message: 'retryable', error_kind: 'server_error' },
+    }));
+
+    await waitFor(() => expect(api.reconcileAcceptedMessages).toHaveBeenCalled());
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]')).toEqual([]);
+    });
+    expect(store.getSnapshot(slug).messages.map((message) => message.message_id)).toContain(acceptedId);
+  });
+
+  it('exact-ID reconciles an accepted direct message after its SSE echo is missed', async () => {
+    const acceptedId = 'accepted-direct';
+    localStorage.setItem(`phoenix:queue:${conversationId}`, JSON.stringify([{
+      localId: acceptedId,
+      conversationId,
+      text: 'accepted direct',
+      timestamp: 1,
+      status: 'accepted',
+      acceptedAfterEventSeq: 0,
+    }]));
+    vi.mocked(api.reconcileAcceptedMessages).mockResolvedValue({
+      conversation_idle: true,
+      entries: [{
+        message_id: acceptedId,
+        status: 'persisted',
+        message: { ...historyMessage, message_id: acceptedId, sequence_id: 20 },
+      }],
+    });
+    const { store } = renderPage(makeConversation({
+      state: { type: 'llm_requesting', attempt: 1 },
+    }));
+
+    await screen.findByText('keep this history visible');
+    act(() => {
+      store.dispatch(slug, {
+        type: 'sse_state_change',
+        sequenceId: 1,
+        phase: { type: 'idle' },
+        stateUpdatedAt: Date.now() + 5,
+      });
+    });
+
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]')).toEqual([]);
+    });
+    expect(store.getSnapshot(slug).messages.map((message) => message.message_id)).toContain(acceptedId);
+  });
+
+  it('chunks more than 100 accepted entries within the reconciliation API limit', async () => {
+    const acceptedIds = Array.from({ length: 205 }, (_, index) => `accepted-${index}`);
+    localStorage.setItem(`phoenix:queue:${conversationId}`, JSON.stringify(acceptedIds.map((localId) => ({
+      localId,
+      conversationId,
+      text: localId,
+      timestamp: 1,
+      status: 'steering_queued',
+      acceptedAfterEventSeq: 0,
+    }))));
+    vi.mocked(api.reconcileAcceptedMessages).mockImplementation(async (_conversationId, ids) => ({
+      conversation_idle: true,
+      entries: ids.map((messageId, index) => ({
+        message_id: messageId,
+        status: 'persisted' as const,
+        message: { ...historyMessage, message_id: messageId, sequence_id: index + 20 },
+      })),
+    }));
+    const { store } = renderPage(makeConversation({
+      state: { type: 'llm_requesting', attempt: 1 },
+    }));
+
+    await screen.findByText('keep this history visible');
+    act(() => {
+      store.dispatch(slug, {
+        type: 'sse_state_change',
+        sequenceId: 1,
+        phase: { type: 'idle' },
+        stateUpdatedAt: Date.now() + 5,
+      });
+    });
+
+    await waitFor(() => expect(api.reconcileAcceptedMessages).toHaveBeenCalledTimes(3));
+    expect(vi.mocked(api.reconcileAcceptedMessages).mock.calls.map((call) => call[1].length)).toEqual([
+      100, 100, 5,
+    ]);
+  });
+
+  it('retries idle reconciliation when connectivity returns after a transient failure', async () => {
+    const acceptedId = 'accepted-reconnect';
+    localStorage.setItem(`phoenix:queue:${conversationId}`, JSON.stringify([{
+      localId: acceptedId,
+      conversationId,
+      text: 'queued reconnect',
+      timestamp: 1,
+      status: 'steering_queued',
+      acceptedAfterEventSeq: 0,
+    }]));
+    vi.mocked(api.reconcileAcceptedMessages)
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce({
+        conversation_idle: true,
+        entries: [{
+          message_id: acceptedId,
+          status: 'persisted',
+          message: { ...historyMessage, message_id: acceptedId, sequence_id: 20 },
+        }],
+      });
+    hooksMockState.useConnection.mockReturnValue({
+      state: 'connected', attempt: 0, nextRetryIn: null, retryNow: vi.fn(),
+    });
+    const { store, rerenderPage } = renderPage(makeConversation({
+      state: { type: 'llm_requesting', attempt: 1 },
+    }));
+
+    await screen.findByText('keep this history visible');
+    act(() => {
+      store.dispatch(slug, {
+        type: 'sse_state_change',
+        sequenceId: 1,
+        phase: { type: 'idle' },
+        stateUpdatedAt: Date.now() + 5,
+      });
+    });
+    await waitFor(() => expect(api.reconcileAcceptedMessages).toHaveBeenCalledTimes(1));
+
+    hooksMockState.useConnection.mockReturnValue({
+      state: 'offline', attempt: 1, nextRetryIn: null, retryNow: vi.fn(),
+    });
+    rerenderPage();
+    hooksMockState.useConnection.mockReturnValue({
+      state: 'reconnected', attempt: 0, nextRetryIn: null, retryNow: vi.fn(),
+    });
+    rerenderPage();
+
+    await waitFor(() => expect(api.reconcileAcceptedMessages).toHaveBeenCalledTimes(2));
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]')).toEqual([]);
+    });
+  });
+
+  it('compacts accepted steering entries after newer authoritative idle history contains their IDs', async () => {
+    const acceptedIds = ['accepted-1', 'accepted-2'];
+    localStorage.setItem(`phoenix:queue:${conversationId}`, JSON.stringify(acceptedIds.map((localId) => ({
+      localId,
+      conversationId,
+      text: `queued ${localId}`,
+      timestamp: 1,
+      status: 'steering_queued',
+      acceptedAfterEventSeq: 0,
+    }))));
+    vi.mocked(api.reconcileAcceptedMessages).mockResolvedValue({
+      conversation_idle: true,
+      entries: acceptedIds.map((messageId, index) => ({
+        message_id: messageId,
+        status: 'persisted',
+        message: {
+          ...historyMessage,
+          message_id: messageId,
+          sequence_id: index + 20,
+        },
+      })),
+    });
+    const sendMessage = vi.spyOn(api, 'sendMessage');
+    const { store } = renderPage(makeConversation({
+      state: { type: 'llm_requesting', attempt: 1 },
+    }));
+
+    await screen.findByText('keep this history visible');
+    act(() => {
+      store.dispatch(slug, {
+        type: 'sse_state_change',
+        sequenceId: 1,
+        phase: { type: 'idle' },
+        stateUpdatedAt: Date.now() + 5,
+      });
+    });
+
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]')).toEqual([]);
+    });
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(store.getSnapshot(slug).messages.map((message) => message.message_id)).toEqual(
+      expect.arrayContaining(acceptedIds),
+    );
+  });
 });
 
 describe('ConversationPage archived read-only rendering', () => {

@@ -179,6 +179,33 @@ pub struct ConversationMessageSliceResponse {
     pub server_message_tail: Option<i64>,
     pub has_older_messages: bool,
 }
+#[derive(Debug, Deserialize)]
+pub struct ReconcileAcceptedMessagesRequest {
+    pub message_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AcceptedMessageDisposition {
+    Persisted {
+        message: Box<crate::api::wire::EnrichedMessage>,
+    },
+    SteeringQueued,
+    Absent,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AcceptedMessageReconciliation {
+    pub message_id: String,
+    #[serde(flatten)]
+    pub disposition: AcceptedMessageDisposition,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconcileAcceptedMessagesResponse {
+    pub conversation_idle: bool,
+    pub entries: Vec<AcceptedMessageReconciliation>,
+}
 
 /// Response for exact inclusive range fetches.
 #[derive(Debug, Serialize)]
@@ -218,6 +245,9 @@ pub struct ChatResponse {
     /// Absent (`null`/`undefined` on the client) for normal immediate processing.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub steering: bool,
+    /// The supplied message ID was already persisted before this request.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub already_persisted: bool,
 }
 
 /// Response for cancel action.

@@ -2,7 +2,12 @@ import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallba
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, MessageSliceAlignmentError, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
-import { canCancelConversationState, isCancellingState, parseConversationState } from '../utils';
+import {
+  canCancelConversationState,
+  isAgentWorking,
+  isCancellingState,
+  parseConversationState,
+} from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
 import { generateUUID } from '../utils/uuid';
 import { cacheDB } from '../cache';
@@ -572,11 +577,21 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
   // Credential helper auto-open — shared hook consolidates the pattern.
   const { showAuthPanel, setShowAuthPanel } = useAutoAuth(credentialStatus);
 
+  const eventCursorRef = useConversationEventCursorRef(slug!);
+
   // Message queue management. `queuedMessages` is the raw store; the rendered
   // split between "pending in the message list" and "failed in the input area"
   // is derived below.
-  const { queuedMessages, enqueue, markFailed, markSteeringQueued, dismiss } =
-    useMessageQueue(conversationId);
+  const {
+    queuedMessages,
+    enqueue,
+    markFailed,
+    markAccepted,
+    markSteeringQueued,
+    markRecoverableInconsistency,
+    reconcileAuthoritative,
+    dismiss,
+  } = useMessageQueue(conversationId);
 
   // Pending messages shown in the conversation are a pure derivation of the
   // queue and `atom.messages` — see `derivePendingMessages` for the rule.
@@ -584,6 +599,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     () => derivePendingMessages(queuedMessages, atom.messages.map((m) => m.message_id)),
     [atom.messages, queuedMessages],
   );
+
   const viewableMessages = atom.messages;
 
   // Failed messages are rendered in InputArea with retry/dismiss controls.
@@ -614,8 +630,6 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     });
   }, [conversationId, atom.transcriptGeneration, atom.transcriptCoverage]);
 
-  const eventCursorRef = useConversationEventCursorRef(slug!);
-
   const connectionInfo = useConnection({
     conversationId,
     dispatch,
@@ -633,6 +647,125 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     connectionInfo.state === 'offline' || connectionInfo.state === 'reconnecting';
   const isConnected =
     connectionInfo.state === 'connected' || connectionInfo.state === 'reconnected';
+
+  // Authoritative echoes are terminal for local queue ownership. Compact them
+  // from localStorage instead of merely filtering them from this render.
+  useEffect(() => {
+    reconcileAuthoritative(atom.messages.map((message) => message.message_id));
+  }, [atom.messages, reconcileAuthoritative]);
+
+  const idleReconciliationKeyRef = useRef<string | null>(null);
+  const optimisticPhaseOwnerRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (atom.phase.type !== 'awaiting_llm') {
+      optimisticPhaseOwnerRef.current = null;
+    }
+  }, [atom.phase.type, atom.phaseLastAppliedEventSeq]);
+  useEffect(() => {
+    if (!conversationId || !isConnected || isAgentWorking(atom.phase)) return;
+    const accepted = queuedMessages.filter((message) => {
+      if (message.status === 'accepted') return true;
+      return message.status === 'steering_queued'
+        && atom.phaseLastAppliedEventSeq > (message.acceptedAfterEventSeq ?? 0);
+    });
+    if (accepted.length === 0) return;
+
+    const key = [
+      conversationId,
+      atom.phaseLastAppliedEventSeq,
+      accepted.map((message) => message.localId).join(','),
+    ].join(':');
+    if (idleReconciliationKeyRef.current === key) return;
+    idleReconciliationKeyRef.current = key;
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const snapshotStartedAtEventSeq = eventCursorRef.current;
+        const settledResults = await Promise.allSettled(
+          Array.from({ length: Math.ceil(accepted.length / 100) }, (_, index) => {
+            const chunk = accepted.slice(index * 100, (index + 1) * 100);
+            return api.reconcileAcceptedMessages(
+              conversationId,
+              chunk.map((message) => message.localId),
+            );
+          }),
+        );
+        if (cancelled) return;
+
+        const results = settledResults.flatMap((result) =>
+          result.status === 'fulfilled' ? [result.value] : []
+        );
+        if (results.length === 0) {
+          throw new Error('All accepted-message reconciliation chunks failed');
+        }
+        if (results.length < settledResults.length) {
+          idleReconciliationKeyRef.current = null;
+          console.warn('[message-queue] some reconciliation chunks failed', {
+            conversationId,
+            failedChunks: settledResults.length - results.length,
+          });
+        }
+        const entries = results.flatMap((result) => result.entries);
+        const persisted = entries.filter((entry) => entry.status === 'persisted');
+        const current = atomRef.current;
+        if (
+          persisted.length > 0
+          && current.conversationId === conversationId
+          && current.conversation
+        ) {
+          dispatch({
+            type: 'merge_conversation_data',
+            conversationId,
+            conversation: current.conversation,
+            messages: persisted.map((entry) => entry.message),
+            phase: current.phase,
+            contextWindow: current.contextWindow,
+            ...(current.transcriptGeneration !== null && {
+              transcriptGeneration: current.transcriptGeneration,
+            }),
+            transcriptCoverage: current.transcriptCoverage,
+            snapshotStartedAtEventSeq,
+          });
+          reconcileAuthoritative(persisted.map((entry) => entry.message_id));
+        }
+
+        if (results.every((result) => result.conversation_idle)) {
+          for (const entry of entries) {
+            if (entry.status === 'absent') {
+              markRecoverableInconsistency(entry.message_id);
+            }
+          }
+        } else {
+          idleReconciliationKeyRef.current = null;
+        }
+      } catch (error) {
+        idleReconciliationKeyRef.current = null;
+        console.warn('[message-queue] authoritative idle reconciliation failed', {
+          conversationId,
+          messageIds: accepted.map((message) => message.localId),
+          error,
+        });
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (idleReconciliationKeyRef.current === key) {
+        idleReconciliationKeyRef.current = null;
+      }
+    };
+  }, [
+    conversationId,
+    isConnected,
+    atom.phase,
+    atom.phaseLastAppliedEventSeq,
+    queuedMessages,
+    markRecoverableInconsistency,
+    reconcileAuthoritative,
+    dispatch,
+    eventCursorRef,
+  ]);
 
 
   // Load conversation by slug — skip if atom already has data from a previous visit
@@ -1229,28 +1362,55 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
 
       sendingMessagesRef.current.add(localId);
 
+      const phaseEventSeqBeforePost = atomRef.current.phaseLastAppliedEventSeq;
+      const phaseBeforePost = atomRef.current.phase;
+      const optimisticPhaseOwner = (
+        (phaseBeforePost.type === 'idle' || phaseBeforePost.type === 'error')
+        && optimisticPhaseOwnerRef.current === null
+      ) ? localId : null;
+      if (optimisticPhaseOwner) {
+        optimisticPhaseOwnerRef.current = optimisticPhaseOwner;
+      }
+      const rollbackOptimisticPhase = () => {
+        if (
+          optimisticPhaseOwner
+          && optimisticPhaseOwnerRef.current === optimisticPhaseOwner
+          && atomRef.current.phase.type === 'awaiting_llm'
+          && atomRef.current.phaseLastAppliedEventSeq === phaseEventSeqBeforePost
+        ) {
+          dispatch({
+            type: 'local_phase_change',
+            phase: phaseBeforePost,
+            expectedConversationId: conversationId,
+          });
+          optimisticPhaseOwnerRef.current = null;
+        }
+      };
+
       try {
         if (isOnline) {
+          if (optimisticPhaseOwner) {
+            dispatch({
+              type: 'local_phase_change',
+              phase: { type: 'awaiting_llm' },
+              expectedConversationId: conversationId,
+            });
+          }
           const result = await api.sendMessage(conversationId, text, imgs, files, localId);
           // Don't touch the queue here. The entry stays `pending` until
           // `atom.messages` contains a row with `message_id == localId`
           // (SSE echo), at which point `pendingMessages` filters it out
           // via the derivation above.
           //
-          // Optimistic phase update: user pressed send, show awaiting_llm
-          // immediately. The authoritative server-side phase change arrives
-          // later via `sse_state_change` (with its own sequence_id) and
-          // takes precedence. `local_phase_change` exists precisely to
-          // carve out this "client-originated, not part of server total
-          // order" action from the `applyIfNewer` guard (task 02675).
           if (result.steering) {
             // Conversation was busy — message queued server-side for delivery
             // when the conversation next reaches Idle. Show a "Queued" pill
             // on the message bubble instead of the normal sending spinner.
-            markSteeringQueued(localId);
-            // No phase change: the conversation is already running.
-          } else {
-            dispatch({ type: 'local_phase_change', phase: { type: 'awaiting_llm' }, expectedConversationId: conversationId });
+            markSteeringQueued(localId, phaseEventSeqBeforePost);
+            rollbackOptimisticPhase();
+          } else if (result.already_persisted) {
+            markAccepted(localId, phaseEventSeqBeforePost);
+            rollbackOptimisticPhase();
           }
         } else {
           // Offline path: hand the send off to the offline operation queue
@@ -1261,7 +1421,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
           // during the offline window. (task 02676)
           await queueOperation({
             type: 'send_message',
-              conversationId,
+            conversationId,
             payload: { text, images: imgs, files, localId },
             createdAt: new Date(),
             retryCount: 0,
@@ -1275,16 +1435,25 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
           // @reference (REQ-IR-007). Keeping the message in the queue as
           // "failed" would duplicate it alongside the restored draft.
           dismissRef.current(localId);
+          rollbackOptimisticPhase();
           // Re-throw so InputArea can display inline error (REQ-IR-007)
           throw err;
         }
         console.error('Failed to send message:', err);
         markFailedRef.current(localId);
+        rollbackOptimisticPhase();
       } finally {
+        if (
+          optimisticPhaseOwner
+          && optimisticPhaseOwnerRef.current === optimisticPhaseOwner
+          && atomRef.current.phase.type !== 'awaiting_llm'
+        ) {
+          optimisticPhaseOwnerRef.current = null;
+        }
         sendingMessagesRef.current.delete(localId);
       }
     },
-    [conversationId, isArchived, isOnline, queueOperation, dispatch, markSteeringQueued]
+    [conversationId, isArchived, isOnline, queueOperation, dispatch, markAccepted, markSteeringQueued]
   );
 
   const sendMessageRef = useRef(sendMessage);
@@ -1311,7 +1480,7 @@ function ConversationPageContent({ routePrefix }: { routePrefix: '/c' | '/global
     if (!isConnected || !conversationId || isArchived) return;
 
     for (const msg of pendingMessages) {
-      if (msg.status === 'steering_queued') continue;
+      if (msg.status === 'accepted' || msg.status === 'steering_queued') continue;
       if (sendingMessagesRef.current.has(msg.localId)) continue;
       sendMessageRef.current(msg.localId, msg.text, msg.images, msg.files ?? []);
     }
