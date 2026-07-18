@@ -1,6 +1,6 @@
 import { render, screen, fireEvent, within, act, waitFor } from '@testing-library/react';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { DiffView } from './DiffView';
+import { __diffViewFindTestables, DiffView } from './DiffView';
 import * as searchProjectionModule from '../viewer-find/searchProjections';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
 import { codeViewMockState, itemVersion, resetCodeViewMock } from './__testutils__/codeViewMock';
@@ -41,6 +41,31 @@ function addNoteViaGutter(body: string) {
   fireEvent.change(screen.getByPlaceholderText(/Add your note/), { target: { value: body } });
   fireEvent.click(screen.getByRole('button', { name: 'Add Note' }));
 }
+
+describe('DiffView find identities', () => {
+  it('bounds identities for arbitrarily long changed lines', () => {
+    const text = `token ${'x'.repeat(20_000)}`;
+    const id = __diffViewFindTestables.stableDiffMatchIds()({
+      sourceId: 'diff-line',
+      sourceText: text,
+      start: 0,
+      end: 5,
+      target: {
+        kind: 'diff-line',
+        section: 'committed',
+        filePath: 'src/min.js',
+        itemId: 'item-1',
+        side: 'additions',
+        lineNumber: 1,
+        startColumn: 0,
+        endColumn: 5,
+      },
+    });
+
+    expect(id).not.toContain(text);
+    expect(id.length).toBeLessThan(128);
+  });
+});
 
 describe('DiffView (Pierre CodeView wiring)', () => {
   beforeEach(() => resetCodeViewMock());
@@ -150,6 +175,86 @@ describe('DiffView (Pierre CodeView wiring)', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     expect(screen.getByText('1 of 1')).toBeInTheDocument();
+  });
+
+  it('preserves and re-reveals the exact active diff match when insertions move it', async () => {
+    const base = [
+      'diff --git a/foo.txt b/foo.txt',
+      'index 0000000..1111111 100644',
+      '--- a/foo.txt',
+      '+++ b/foo.txt',
+      '@@ -0,0 +1,2 @@',
+      '+alpha one',
+      '+alpha two',
+    ].join('\n');
+    const insertedBefore = [
+      'diff --git a/foo.txt b/foo.txt',
+      'index 0000000..1111111 100644',
+      '--- a/foo.txt',
+      '+++ b/foo.txt',
+      '@@ -0,0 +1,3 @@',
+      '+alpha zero',
+      '+alpha one',
+      '+alpha two',
+    ].join('\n');
+
+    const { rerender } = render(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={base}
+          uncommittedDiff=""
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    await waitFor(() => expect(screen.getByText('1 of 2')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('2 of 2')).toBeInTheDocument();
+
+    const scrollCountBefore = codeViewMockState.scrollToCalls.length;
+
+    rerender(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={insertedBefore}
+          uncommittedDiff=""
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByText('3 of 3')).toBeInTheDocument());
+    await waitFor(() => expect(codeViewMockState.scrollToCalls.length).toBe(scrollCountBefore + 1));
+  });
+
+  it('keeps repeated identical diff matches distinct', async () => {
+    const repeated = [
+      'diff --git a/foo.txt b/foo.txt',
+      '--- a/foo.txt',
+      '+++ b/foo.txt',
+      '@@ -0,0 +1,2 @@',
+      '+same',
+      '+same',
+    ].join('\n');
+    renderDiff(repeated, '');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'same' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 2')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('2 of 2')).toBeInTheDocument();
   });
 
   it('keeps diff find inert until open with a non-empty query', () => {
