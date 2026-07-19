@@ -862,6 +862,47 @@ pub struct GitBranchesResponse {
 /// indicate whether the streaming reader hit its hard limit and stopped
 /// counting — when `true`, `*_truncated_kib` is a LOWER BOUND, not the
 /// exact size, and consumers should render it as e.g. "≥X KiB".
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BranchRemoteStatus {
+    Tracked {
+        remote_ref: String,
+        ahead: u32,
+        behind: u32,
+    },
+    Matching {
+        remote_ref: String,
+        ahead: u32,
+        behind: u32,
+    },
+    NoKnown,
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CheckoutStatus {
+    NamedBranch {
+        branch_name: String,
+        head_oid: String,
+        remote_status: BranchRemoteStatus,
+    },
+    Detached {
+        head_oid: String,
+        #[serde(default)]
+        pointing_refs: Vec<String>,
+    },
+    Unborn {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        branch_name: Option<String>,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
 #[derive(Debug, Serialize)]
 pub struct ConversationDiffResponse {
     /// The ref used as the comparator — e.g. `"origin/main"` when the
@@ -874,6 +915,7 @@ pub struct ConversationDiffResponse {
     /// The active PR number for PR-specific diffs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<u64>,
+    pub checkout_status: CheckoutStatus,
     /// `git log --oneline <comparator>..HEAD` — commits on the branch
     /// not yet in the comparator. Subject lines only; uncapped (commit
     /// titles are tiny).
