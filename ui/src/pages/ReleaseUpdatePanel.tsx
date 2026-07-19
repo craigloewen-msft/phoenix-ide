@@ -17,24 +17,12 @@ const TERMINAL_STATES = new Set([
 function authorityText(authority: ReleaseUpdateAuthority): string | null {
   switch (authority.kind) {
     case 'allowed': return null;
-    case 'remote_browser': return 'Updates can be reviewed remotely, but approval is available only from a browser on the Phoenix host.';
+    case 'remote_browser': return 'Approval is unavailable from this remote browser.';
     case 'not_production': return 'In-app updates are available only for production installations. Use dev.py for local HEAD builds.';
     case 'unsupported_host': return 'This host does not have a supported native deployment backend.';
     case 'unmanaged_installation': return `Updates are disabled because this Phoenix process has no supported runtime owner. ${authority.reason}`;
     case 'ambiguous_installation': return `Updates are disabled because runtime ownership is ambiguous. ${authority.reason}`;
     case 'missing_prerequisite': return authority.reason;
-  }
-}
-
-function ownershipText(ownership: ReleaseUpdateSnapshot['installation_ownership']): string {
-  switch (ownership.kind) {
-    case 'launchd_managed': return 'launchd managed';
-    case 'systemd_managed': return 'systemd managed';
-    case 'bare_supervisor_managed': return 'bare supervisor managed';
-    case 'development': return 'development';
-    case 'unmanaged': return 'unmanaged';
-    case 'ambiguous': return 'ambiguous ownership';
-    case 'unsupported': return `unsupported on ${ownership.platform}`;
   }
 }
 
@@ -89,7 +77,11 @@ function TransactionStatus({ transaction }: { transaction: ReleaseTransactionSta
   );
 }
 
-export function ReleaseUpdatePanel() {
+export function ReleaseUpdatePanel({
+  onDeploymentChange,
+}: {
+  onDeploymentChange?: (snapshot: Pick<ReleaseUpdateSnapshot, 'current_version' | 'current_git_sha' | 'installation_ownership'>) => void;
+}) {
   const [snapshot, setSnapshot] = useState<ReleaseUpdateSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -111,6 +103,7 @@ export function ReleaseUpdatePanel() {
         }
       }
       setSnapshot(next);
+      onDeploymentChange?.(next);
       setError(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -118,7 +111,7 @@ export function ReleaseUpdatePanel() {
       setLoading(false);
       loadInFlight.current = false;
     }
-  }, [confirmedIdentity]);
+  }, [confirmedIdentity, onDeploymentChange]);
 
   useEffect(() => {
     void load();
@@ -166,7 +159,7 @@ export function ReleaseUpdatePanel() {
       <div className="settings-section__title-row">
         <div>
           <h3 className="settings-section__title">Phoenix updates</h3>
-          {snapshot && <div className="release-update__hint">{ownershipText(snapshot.installation_ownership)} · running {snapshot.current_version} <code>{snapshot.current_git_sha}</code></div>}
+          <div className="release-update__hint">Review the latest stable release against the running deployment summary.</div>
         </div>
         <button type="button" className="settings-inline-btn" onClick={() => { setLoading(true); void load(true); }} disabled={loading}>
           {loading ? 'Checking…' : 'Check for updates'}

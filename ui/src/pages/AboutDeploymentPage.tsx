@@ -15,6 +15,7 @@ import {
 import { api } from '../api';
 import type { AboutResourcesSnapshot } from '../generated/AboutResourcesSnapshot';
 import type { DeploymentInfo } from '../generated/DeploymentInfo';
+import type { ReleaseUpdateSnapshot } from '../generated/ReleaseUpdateSnapshot';
 import type { DeploymentDiskInfo } from '../generated/DeploymentDiskInfo';
 import type { DiskSize } from '../generated/DiskSize';
 import type { ManagedProcessRow } from '../generated/ManagedProcessRow';
@@ -137,16 +138,73 @@ function diskSizeLabel(size: DiskSize): string {
   }
 }
 
-function installationOwnershipText(ownership: DeploymentInfo['installation_ownership']): string {
+function installationOwnershipPresentation(
+  ownership: DeploymentInfo['installation_ownership'],
+): { label: string; detail: string; tone: 'managed' | 'neutral' | 'warning' } {
   switch (ownership.kind) {
-    case 'launchd_managed': return 'launchd managed';
-    case 'systemd_managed': return 'systemd managed';
-    case 'bare_supervisor_managed': return 'bare supervisor managed';
-    case 'development': return 'development';
-    case 'unmanaged': return `unmanaged — ${ownership.reason}`;
-    case 'ambiguous': return `ambiguous — ${ownership.reason}`;
-    case 'unsupported': return `unsupported on ${ownership.platform}`;
+    case 'launchd_managed':
+      return { label: 'Managed by launchd', detail: 'Phoenix proved launchd owns this process.', tone: 'managed' };
+    case 'systemd_managed':
+      return { label: 'Managed by systemd', detail: 'Phoenix proved systemd owns this process.', tone: 'managed' };
+    case 'bare_supervisor_managed':
+      return { label: 'Managed by Phoenix supervisor', detail: 'Phoenix proved its bare Linux supervisor owns this process.', tone: 'managed' };
+    case 'development':
+      return { label: 'Development instance', detail: 'Production service management does not apply to this local development instance.', tone: 'neutral' };
+    case 'unmanaged':
+      return { label: 'Running without a proven manager', detail: ownership.reason, tone: 'neutral' };
+    case 'ambiguous':
+      return { label: 'Runtime manager is ambiguous', detail: ownership.reason, tone: 'warning' };
+    case 'unsupported':
+      return { label: 'Runtime manager unsupported', detail: `Phoenix cannot manage this process on ${ownership.platform}.`, tone: 'neutral' };
   }
+}
+
+function DeploymentSummary({ info }: { info: DeploymentInfo }) {
+  const ownership = installationOwnershipPresentation(info.installation_ownership);
+  const access = info.local_access
+    ? {
+        label: 'Viewing locally',
+        detail: 'This browser is on the Phoenix host, so host-local actions can be available.',
+        tone: 'local',
+      } as const
+    : {
+        label: 'Viewing remotely',
+        detail: 'This browser is not on the Phoenix host. You can inspect this deployment, but host-local actions are unavailable.',
+        tone: 'remote',
+      } as const;
+
+  return (
+    <section className="settings-section about-deployment-summary" aria-labelledby="deployment-summary-title">
+      <div className="about-deployment-summary__identity">
+        <div>
+          <span className="about-deployment-summary__eyebrow">Running Phoenix</span>
+          <h3 id="deployment-summary-title">Version {info.build.version}</h3>
+        </div>
+        <code aria-label={`Running git commit ${info.build.git_sha}`} title={info.build.git_sha}>{info.build.git_sha}</code>
+      </div>
+      <div className="about-deployment-summary__facts">
+        <div className="about-deployment-summary__fact">
+          <span className={`about-deployment-summary__badge about-deployment-summary__badge--${ownership.tone}`}>
+            {ownership.label}
+          </span>
+          <p>{ownership.detail}</p>
+        </div>
+        <div className="about-deployment-summary__fact">
+          <span className={`about-deployment-summary__badge about-deployment-summary__badge--${access.tone}`}>
+            {access.label}
+          </span>
+          <p>{access.detail}</p>
+        </div>
+      </div>
+      <div className="about-deployment-summary__runtime">
+        <span>Listening at <code>{info.network.bind_address}</code></span>
+        <span aria-hidden="true">·</span>
+        <span>Started {formatDateTime(info.build.started_at)}</span>
+        <span aria-hidden="true">·</span>
+        <span>Up {formatUptime(info.build.uptime_seconds)}</span>
+      </div>
+    </section>
+  );
 }
 
 function resourceText(value: number | null, format: (n: number) => string): string {
@@ -578,6 +636,9 @@ export function AboutDeploymentPage() {
   const resourcesTimerRef = useRef<number | null>(null);
   const resourcesMountedRef = useRef(false);
   const resourcesGenerationRef = useRef(0);
+  const identityRefreshRef = useRef<string | null>(null);
+  const infoRef = useRef<DeploymentInfo | null>(null);
+  infoRef.current = info;
   const activeResourceRequestRef = useRef<ActiveResourceRequest | null>(null);
 
   const invalidateActiveResourceRequest = useCallback(() => {
@@ -613,6 +674,27 @@ export function AboutDeploymentPage() {
     api.revealPath(path).catch((e) => {
       setRevealError(e instanceof Error ? e.message : String(e));
     });
+  }, []);
+
+  const refreshDeployment = useCallback((snapshot: Pick<ReleaseUpdateSnapshot, 'current_version' | 'current_git_sha' | 'installation_ownership'>) => {
+    const identity = `${snapshot.current_version}:${snapshot.current_git_sha}:${JSON.stringify(snapshot.installation_ownership)}`;
+    const current = infoRef.current;
+    if (
+      !current
+      || (
+        current.build.version === snapshot.current_version
+        && current.build.git_sha === snapshot.current_git_sha
+        && JSON.stringify(current.installation_ownership) === JSON.stringify(snapshot.installation_ownership)
+      )
+      || identityRefreshRef.current === identity
+    ) return;
+    identityRefreshRef.current = identity;
+    api.deploymentInfo()
+      .then((data) => setInfo(data))
+      .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))
+      .finally(() => {
+        if (identityRefreshRef.current === identity) identityRefreshRef.current = null;
+      });
   }, []);
 
   const loadDisk = useCallback(() => {
@@ -770,8 +852,8 @@ export function AboutDeploymentPage() {
               >
                 {loading ? 'Refreshing…' : 'Refresh'}
               </button>
-              <button type="button" className="settings-inline-btn" onClick={() => navigate(-1)}>
-                Back
+              <button type="button" className="settings-inline-btn" onClick={() => navigate('/')}>
+                Conversations
               </button>
             </div>
           </div>
@@ -781,16 +863,9 @@ export function AboutDeploymentPage() {
 
           {info && (
             <>
-              <ReleaseUpdatePanel />
+              <DeploymentSummary info={info} />
 
-              <section className="settings-section">
-                <h3 className="settings-section__title">Build</h3>
-                <Row label="Version"><code>{info.build.version}</code></Row>
-                <Row label="Build"><code title="Git SHA">{info.build.git_sha}</code></Row>
-                <Row label="Runtime owner">{installationOwnershipText(info.installation_ownership)}</Row>
-                <Row label="Started">{formatDateTime(info.build.started_at)}</Row>
-                <Row label="Uptime">{formatUptime(info.build.uptime_seconds)}</Row>
-              </section>
+              <ReleaseUpdatePanel onDeploymentChange={refreshDeployment} />
 
               <section className="settings-section">
                 <h3 className="settings-section__title">Network &amp; TLS</h3>
@@ -945,7 +1020,7 @@ export function AboutDeploymentPage() {
                       {cleanupError && <div className="settings-section__error">{cleanupError}</div>}
                       {!info.local_access && (
                         <div className="settings-section__hint">
-                          Reveal-in-file-manager is available only when viewing from the server host.
+                          Reveal actions require viewing this page on the Phoenix host. Cleanup availability is shown separately per worktree.
                         </div>
                       )}
                       <div className="settings-section__hint">Disk sampled at {formatDateTime(diskInfo.sampled_at)}</div>
