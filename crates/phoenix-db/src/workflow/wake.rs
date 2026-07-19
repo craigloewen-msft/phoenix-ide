@@ -2566,7 +2566,7 @@ impl WakeRepository {
 
             if has_message_fts_tx(&mut tx).await? {
                 sqlx::query(
-                    "UPDATE message_fts
+                    "UPDATE message_fts_rows
                      SET conversation_id = ?3
                      WHERE message_id IN (
                          SELECT l.message_id FROM wake_delivery_messages l
@@ -8049,8 +8049,16 @@ mod tests {
                 .fetch_one(&repo.workflow_repo.pool)
                 .await
                 .unwrap();
+        let locator_owner: String = sqlx::query_scalar(
+            "SELECT conversation_id FROM message_fts_rows WHERE message_id = ?1",
+        )
+        .bind(&linked.linked_message.message.message_id)
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
         assert_eq!(link_owner, "conv-2");
         assert_eq!(message_owner, "conv-2");
+        assert_eq!(locator_owner, "conv-2");
     }
 
     #[tokio::test]

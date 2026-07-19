@@ -266,6 +266,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_tmux_completion_policy",
         sql: MIGRATION_050,
     },
+    Migration {
+        version: 51,
+        name: "index_message_fts_row_locations",
+        sql: MIGRATION_051,
+    },
 ];
 
 const MIGRATION_050: &str = r"
@@ -811,6 +816,35 @@ BEGIN
 END;
 ";
 
+const MIGRATION_051: &str = r"
+CREATE TABLE message_fts_rows (
+    fts_rowid INTEGER PRIMARY KEY,
+    message_id TEXT NOT NULL,
+    chunk_ordinal INTEGER NOT NULL,
+    conversation_id TEXT NOT NULL,
+    message_type TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    content_hash TEXT NOT NULL
+);
+CREATE INDEX idx_message_fts_rows_message_id
+    ON message_fts_rows(message_id);
+CREATE INDEX idx_message_fts_rows_conversation_id
+    ON message_fts_rows(conversation_id);
+INSERT INTO message_fts_rows
+    (fts_rowid, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash)
+SELECT rowid, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash
+FROM message_fts;
+
+CREATE VIRTUAL TABLE message_fts_text USING fts5(
+    text,
+    tokenize = 'porter unicode61 remove_diacritics 2'
+);
+INSERT INTO message_fts_text (rowid, text)
+SELECT rowid, text FROM message_fts;
+DROP TABLE message_fts;
+ALTER TABLE message_fts_text RENAME TO message_fts;
+";
+
 const MIGRATION_044: &str = r"
 CREATE TABLE coordinator (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -1246,10 +1280,11 @@ ALTER TABLE conversations ADD COLUMN spawned_from_conversation_id TEXT;
 /// A standalone FTS5 table over extracted message prose — *not* an
 /// external-content table over `messages`, because the indexed text is a
 /// Rust-side extraction of typed `MessageContent`, not the raw JSON column.
-/// `text` is the only tokenized column; the rest are `UNINDEXED` provenance /
-/// change-detection columns available to filtering and projection without
-/// participating in the match. The migration creates the empty structure; the
-/// typed backfill from existing `messages` is performed by the Rust startup
+/// Migration 18's original shape carries provenance as `UNINDEXED` columns;
+/// migration 51 normalizes that metadata into an indexed row-locator table and
+/// rebuilds this virtual table with `text` as its sole column. The initial
+/// migration creates the empty structure; the typed backfill from existing
+/// `messages` is performed by the Rust startup
 /// reconciliation (`Fts5Retriever::reconcile`), which static SQL cannot do.
 const MIGRATION_018: &str = r"
 CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
@@ -2078,6 +2113,47 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_051_backfills_fts_row_locators() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(MIGRATION_018).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO message_fts
+             (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash)
+             VALUES ('needle', 'm-1', 0, 'c-1', 'user', '2026-01-01T00:00:00Z', 'hash-1')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_051).execute(&pool).await.unwrap();
+
+        let locator: (i64, String, i64, String, String, String, String) = sqlx::query_as(
+            "SELECT fts_rowid, message_id, chunk_ordinal, conversation_id,
+                    message_type, created_at, content_hash
+             FROM message_fts_rows",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let fts_rowid: i64 = sqlx::query_scalar("SELECT rowid FROM message_fts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            locator,
+            (
+                fts_rowid,
+                "m-1".into(),
+                0,
+                "c-1".into(),
+                "user".into(),
+                "2026-01-01T00:00:00Z".into(),
+                "hash-1".into()
+            )
+        );
     }
 
     #[tokio::test]
