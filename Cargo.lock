@@ -2936,6 +2936,7 @@ dependencies = [
  "chrono",
  "libsqlite3-sys",
  "phoenix-core",
+ "phoenix-workflow",
  "rand 0.10.1",
  "serde",
  "serde_json",
@@ -3060,6 +3061,7 @@ dependencies = [
  "chrono",
  "futures",
  "globset",
+ "hex",
  "ignore",
  "libc",
  "nono",
@@ -3070,6 +3072,7 @@ dependencies = [
  "phoenix-mcp",
  "phoenix-skills",
  "phoenix-terminal",
+ "phoenix-workflow",
  "proptest",
  "regex",
  "serde",
@@ -3092,6 +3095,8 @@ name = "phoenix-workflow"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -3129,6 +3134,7 @@ dependencies = [
  "phoenix-terminal",
  "phoenix-tls",
  "phoenix-tools",
+ "phoenix-workflow",
  "proptest",
  "pulldown-cmark",
  "rand 0.10.1",

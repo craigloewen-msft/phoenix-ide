@@ -1423,6 +1423,22 @@ fn render_messages(
     for msg in db_messages {
         match &msg.content {
             MessageContent::User(user_content) => {
+                if user_content.is_meta
+                    && msg
+                        .display_data
+                        .as_ref()
+                        .and_then(|data| data.get("type"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("wake_result")
+                    && !msg
+                        .display_data
+                        .as_ref()
+                        .and_then(|data| data.get("adopted"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
                 // Use llm_text when expansion occurred (REQ-IR-001, REQ-IR-006):
                 // the model sees the fully resolved form while the DB stores the shorthand.
                 let mut text_for_llm = user_content.llm_text().to_string();
@@ -1650,6 +1666,7 @@ where
     tmux_registry: Arc<crate::tools::TmuxRegistry>,
     /// LLM registry for `ToolContext`
     llm_registry: Arc<ModelRegistry>,
+    wake_registrar: Option<Arc<dyn crate::tools::WakeRegistrar>>,
     /// Active PTY terminal sessions — passed to `ToolContext` for `read_terminal` tool.
     terminals: crate::terminal::ActiveTerminals,
     event_rx: mpsc::Receiver<Event>,
@@ -1905,6 +1922,7 @@ where
             bash_handles,
             tmux_registry,
             llm_registry,
+            wake_registrar: None,
             terminals,
             event_rx,
             event_tx,
@@ -1943,6 +1961,15 @@ where
             fork_cmd_tx: None,
             state_watcher: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_wake_registrar(
+        mut self,
+        wake_registrar: Option<Arc<dyn crate::tools::WakeRegistrar>>,
+    ) -> Self {
+        self.wake_registrar = wake_registrar;
+        self
     }
 
     pub fn with_startup_creation_completion(
@@ -2515,6 +2542,30 @@ where
         Ok(())
     }
 
+    async fn process_adopted_wake_batch(&mut self) -> Result<(), String> {
+        self.parent_tool_cycle_count = 0;
+        if !matches!(self.state, ConvState::Idle) {
+            tracing::debug!(
+                conv_id = %self.context.conversation_id,
+                state = self.state.variant_name(),
+                "Ignoring wake batch notification because runtime is no longer idle"
+            );
+            return Ok(());
+        }
+        self.state = ConvState::LlmRequesting { attempt: 1 };
+        self.state_updated_at = Utc::now();
+        if let Some(state_watcher) = &self.state_watcher {
+            let _ = state_watcher.send(self.state.clone());
+        }
+        let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
+            sequence_id: seq,
+            state: self.state.clone(),
+            state_updated_at: self.state_updated_at,
+            presentation_mode: self.state.presentation_mode().to_string(),
+        });
+        self.execute_effect(Effect::RequestLlm).await.map(|_| ())
+    }
+
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
         // A fresh user turn always resets the parent tool-cycle counter
         // (task 24680). Cap logic lives in the `Effect::RequestLlm` handler.
@@ -2576,6 +2627,10 @@ where
                 "Steering message cancelled in executor"
             );
             return Ok(());
+        }
+
+        if matches!(event, Event::WakeBatchAdopted) {
+            return self.process_adopted_wake_batch().await;
         }
 
         // Check if this is a SubAgentResult that needs buffering
@@ -4823,7 +4878,9 @@ where
             scope_worktree,
         )
         .with_bash_progress_sink(bash_progress_sink)
-        .with_root_conversation_id(self.context.root_conversation_id.clone());
+        .with_root_conversation_id(self.context.root_conversation_id.clone())
+        .with_tool_use_id(tool.id.clone())
+        .with_wake_registrar(self.wake_registrar.clone());
 
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();
@@ -9888,6 +9945,27 @@ mod steer_drain_detector_tests {
         assert!(
             text.contains("Timed out") && text.contains("investigate"),
             "the summary must carry the per-result outcome, got: {text}"
+        );
+    }
+
+    #[test]
+    fn render_messages_withholds_unadopted_wake_observation() {
+        let created_at = chrono::Utc::now();
+        let msgs = vec![crate::db::Message {
+            message_id: "wake-msg".to_string(),
+            conversation_id: "conv".to_string(),
+            sequence_id: 7,
+            message_type: crate::db::MessageType::User,
+            content: MessageContent::User(crate::db::UserContent::meta("bash finished normally")),
+            display_data: Some(serde_json::json!({"type": "wake_result"})),
+            usage_data: None,
+            created_at,
+        }];
+
+        let rendered = render_messages(&msgs, &std::collections::HashSet::new());
+        assert!(
+            rendered.is_empty(),
+            "wake observations become provider-visible only through the adoption event"
         );
     }
 

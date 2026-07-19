@@ -33,6 +33,7 @@ phoenix-mcp = { path = "../phoenix-mcp" }
 # Headless-browser engine (chromiumoxide/CDP driver, session manager,
 # screencast broker). The browser_* tool impls here wrap this engine.
 phoenix-browser = { path = "../phoenix-browser" }
+phoenix-workflow = { path = "../phoenix-workflow" }
 
 # Async tool trait.
 async-trait = "0.1"
@@ -74,6 +75,7 @@ base64 = "0.22"
 
 # Hashing (deterministic socket/session keying).
 sha2 = "0.11"
+hex = "0.4"
 
 # UUIDs for browser scratch-file paths.
 uuid = { version = "1", features = ["v4"] }

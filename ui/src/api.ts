@@ -1180,6 +1180,18 @@ export interface DiscoveryServicesResponse {
 
 export type TaskApprovalHandoff = 'continue_in_current_conversation' | 'start_fresh_work_conversation';
 
+export interface WakeContractStatus {
+  workflow_id: number;
+  contract_id: string;
+  expires_at: number;
+}
+
+export interface WakeStatus {
+  pending_count: number;
+  soonest_expires_at: number | null;
+  contracts: WakeContractStatus[];
+}
+
 export const api = {
   async authStatus(): Promise<AuthStatus> {
     const resp = await fetch('/api/auth/status');
@@ -1808,6 +1820,21 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path }),
     });
+    return resp.json();
+  },
+
+  async getWakeStatus(convId: string): Promise<WakeStatus> {
+    const resp = await fetch(`/api/conversations/${convId}/wake`);
+    if (!resp.ok) throw new Error(await resp.text());
+    return resp.json();
+  },
+
+  async cancelWake(convId: string, contractId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(
+      `/api/conversations/${convId}/wake/${encodeURIComponent(contractId)}/cancel`,
+      { method: 'POST' },
+    );
+    if (!resp.ok) throw new Error(await resp.text());
     return resp.json();
   },
 
