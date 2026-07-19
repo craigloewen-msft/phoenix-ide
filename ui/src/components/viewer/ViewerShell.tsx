@@ -1,4 +1,5 @@
-import { useEffect } from 'react';
+import { useCallback, useEffect, useInsertionEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { ArrowLeft, Maximize2, MessageSquare, Minimize2, Send } from 'lucide-react';
 import type { ReactNode } from 'react';
 import type { FocusedReviewExitTarget } from './useFocusedReviewExit';
@@ -121,8 +122,52 @@ export function ViewerShell({
     : mode === 'takeover'
       ? 'viewer-shell viewer-shell--overlay viewer-shell--takeover'
       : 'viewer-shell viewer-shell--overlay';
+  const localMountRef = useRef<HTMLDivElement | null>(null);
+  const portalHostRef = useRef<HTMLDivElement | null>(null);
+  if (portalHostRef.current === null) {
+    const host = document.createElement('div');
+    host.className = 'viewer-shell-portal-host';
+    portalHostRef.current = host;
+  }
 
-  return (
+  const movePortalHost = useCallback(() => {
+    const host = portalHostRef.current!;
+    const destination = mode === 'takeover' ? document.body : localMountRef.current;
+    if (!destination || host.parentElement === destination) return;
+
+    const moveBefore = (destination as Element & {
+      moveBefore?: (node: Node, child: Node | null) => void;
+    }).moveBefore;
+    if (moveBefore && host.isConnected && destination.isConnected) {
+      moveBefore.call(destination, host, null);
+      return;
+    }
+
+    const activeElement = host.contains(document.activeElement)
+      ? document.activeElement as HTMLElement
+      : null;
+    const scrollPositions = [host, ...host.querySelectorAll<HTMLElement>('*')]
+      .filter((element) => element.scrollTop !== 0 || element.scrollLeft !== 0)
+      .map((element) => ({ element, top: element.scrollTop, left: element.scrollLeft }));
+    destination.append(host);
+    for (const { element, top, left } of scrollPositions) {
+      element.scrollTop = top;
+      element.scrollLeft = left;
+    }
+    activeElement?.focus({ preventScroll: true });
+  }, [mode]);
+
+  const setLocalMount = useCallback((element: HTMLDivElement | null) => {
+    localMountRef.current = element;
+    if (element) movePortalHost();
+  }, [movePortalHost]);
+
+  useInsertionEffect(movePortalHost, [movePortalHost]);
+
+  useEffect(movePortalHost, [movePortalHost]);
+  useEffect(() => () => portalHostRef.current?.remove(), []);
+
+  const shell = (
     <div
       className={className}
       role={modal ? 'dialog' : 'region'}
@@ -170,6 +215,13 @@ export function ViewerShell({
       {dialog}
       {confirm}
     </div>
+  );
+
+  return (
+    <>
+      <div ref={setLocalMount} className="viewer-shell-local-mount" />
+      {createPortal(shell, portalHostRef.current)}
+    </>
   );
 }
 
