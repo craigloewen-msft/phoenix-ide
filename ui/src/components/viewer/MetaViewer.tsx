@@ -16,7 +16,7 @@ import type { ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { Maximize2, Minimize2 } from 'lucide-react';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
-import { ViewerShell } from './ViewerShell';
+import { FocusedReviewExitDialog, ViewerPresentationControl, ViewerShell } from './ViewerShell';
 import {
   FindBar,
   activeSessionMatchIndex,
@@ -47,11 +47,12 @@ import { HtmlViewerBody } from './HtmlViewerBody';
 import type { HtmlViewMode } from './HtmlViewerBody';
 import { ImageViewerBody } from './ImageViewerBody';
 import type { ViewerBodyProps } from './AnnotatableBlock';
+import { useFocusedReviewExit } from './useFocusedReviewExit';
 
 export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   useRegisterFocusScope('file-viewer');
 
-  const { absolutePath, title, onClose, onSendNotes, inline } = payload;
+  const { absolutePath, title, onClose, onSendNotes, inline, presentation = 'pane', canTogglePresentation = false, onPresentationChange } = payload;
   const textLike = isTextLikePayload(payload);
   const content = textLike ? payload.content : '';
   const patchContext: PatchContext | undefined = textLike ? payload.patchContext : undefined;
@@ -60,6 +61,22 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const focusRange = focus?.kind === 'range' ? focus : undefined;
 
   const notes = useFileReviewNotes(absolutePath, onSendNotes, patchContext);
+  const supportsFocusedReview = payload.kind === 'markdown';
+  const focused = supportsFocusedReview && presentation === 'fullscreen' && canTogglePresentation;
+  const returnToPane = useCallback(() => onPresentationChange?.('pane'), [onPresentationChange]);
+  const focusedExit = useFocusedReviewExit({
+    noteCount: notes.fileNotes.length,
+    send: notes.send,
+    discard: notes.clearAll,
+    returnToPane,
+    closeViewer: onClose,
+  });
+
+  useEffect(() => {
+    if (presentation === 'fullscreen' && canTogglePresentation && !supportsFocusedReview) {
+      onPresentationChange?.('pane');
+    }
+  }, [canTogglePresentation, onPresentationChange, presentation, supportsFocusedReview]);
 
   const [htmlViewMode, setHtmlViewMode] = useState<HtmlViewMode>('source');
   const [imageTakeover, setImageTakeover] = useState(false);
@@ -414,6 +431,12 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
         </button>
       )}
       <CopyButton text={content} className="viewer-shell-copy-btn" title="Copy file contents" />
+      {supportsFocusedReview && canTogglePresentation && onPresentationChange && (
+        <ViewerPresentationControl
+          fullscreen={focused}
+          onToggle={focused ? focusedExit.requestReturn : () => onPresentationChange('fullscreen')}
+        />
+      )}
       {payload.kind === 'html' && (
         <>
           <button
@@ -498,7 +521,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     />
   ) : viewerBanner ?? (findIneligibleReason ? <span>{findIneligibleReason}</span> : null);
 
-  const viewerMode = payload.kind === 'image' && imageTakeover ? 'takeover' : inline ? 'inline' : 'overlay';
+  const viewerMode = focused || (payload.kind === 'image' && imageTakeover) ? 'takeover' : inline ? 'inline' : 'overlay';
   const shell = (
     <ViewerShell
       closeOnEscape={!findOpen}
@@ -510,9 +533,10 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
       headerExtras={headerExtras}
       noteCount={notes.fileNotes.length}
       onToggleNotes={notes.togglePanel}
-      onSend={notes.send}
+      onSend={focused ? focusedExit.sendAndReturn : () => { void notes.send(); }}
       banner={banner}
-      onClose={onClose}
+      onClose={focused ? focusedExit.requestClose : onClose}
+      onEscape={focused ? focusedExit.requestReturn : undefined}
       suppressCloseButtonFocus={findSession !== null}
       bodyScroll={usePierreCode ? 'children' : 'shell'}
       panel={
@@ -522,7 +546,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
             onJumpTo={handleJumpTo}
             onRemove={notes.removeNote}
             onClearAll={notes.clearAll}
-            onSend={notes.send}
+            onSend={focused ? focusedExit.sendAndReturn : () => { void notes.send(); }}
             onClose={notes.closePanel}
           />
         ) : null
@@ -537,6 +561,16 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
           />
         ) : null
       }
+      confirm={focusedExit.exitTarget ? (
+        <FocusedReviewExitDialog
+          target={focusedExit.exitTarget}
+          sending={focusedExit.sending}
+          error={focusedExit.error}
+          onSend={() => { void focusedExit.sendAndReturn(); }}
+          onDiscard={focusedExit.discardAndReturn}
+          onKeepReviewing={focusedExit.keepReviewing}
+        />
+      ) : null}
     >
       {usePierreCode ? (
         <PhoenixFileCodeView

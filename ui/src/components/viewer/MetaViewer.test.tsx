@@ -334,6 +334,57 @@ describe('MetaViewer payload routing', () => {
     expect(img).toHaveAttribute('src', '/preview/tmp/project/thing.png');
   });
 
+  it('normalizes unsupported prose fullscreen presentation back to pane', async () => {
+    const onPresentationChange = vi.fn();
+    renderViewer({
+      ...textCommon,
+      kind: 'text',
+      content: 'plain text',
+      presentation: 'fullscreen',
+      canTogglePresentation: true,
+      onPresentationChange,
+    });
+
+    await waitFor(() => expect(onPresentationChange).toHaveBeenCalledWith('pane'));
+    expect(screen.queryByRole('button', { name: 'Return to pane' })).not.toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: /File viewer/ })).not.toHaveClass('viewer-shell--takeover');
+  });
+
+  it('preserves Markdown scroll position across presentation changes', () => {
+    const payload: MetaViewerPayload = {
+      ...textCommon,
+      kind: 'markdown',
+      content: '# Heading\n\nLong review content',
+      presentation: 'pane',
+      canTogglePresentation: true,
+      onPresentationChange: vi.fn(),
+    };
+    const view = renderViewer(payload);
+    const paneContent = view.container.querySelector('.viewer-content') as HTMLDivElement;
+    paneContent.scrollTop = 420;
+    fireEvent.scroll(paneContent);
+
+    view.rerender(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...payload, presentation: 'fullscreen' }} />
+      </ReviewNotesProvider>,
+    );
+
+    const focusedContent = document.body.querySelector('.viewer-shell--takeover .viewer-content') as HTMLDivElement;
+    expect(focusedContent.scrollTop).toBe(420);
+    focusedContent.scrollTop = 860;
+    fireEvent.scroll(focusedContent);
+
+    view.rerender(
+      <ReviewNotesProvider>
+        <MetaViewer payload={payload} />
+      </ReviewNotesProvider>,
+    );
+
+    const restoredPaneContent = view.container.querySelector('.viewer-content') as HTMLDivElement;
+    expect(restoredPaneContent.scrollTop).toBe(860);
+  });
+
   it('shows fullscreen controls only for image payloads', () => {
     const { rerender } = render(
       <ReviewNotesProvider>

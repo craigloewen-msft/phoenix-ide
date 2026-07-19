@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
-import { ArrowLeft, MessageSquare, Send } from 'lucide-react';
+import { ArrowLeft, Maximize2, MessageSquare, Minimize2, Send } from 'lucide-react';
 import type { ReactNode } from 'react';
+import type { FocusedReviewExitTarget } from './useFocusedReviewExit';
 
 export type ViewerMode = 'overlay' | 'inline' | 'takeover';
 
@@ -38,6 +39,8 @@ interface ViewerShellProps {
    *  from patch"). */
   banner?: ReactNode;
   onClose: () => void;
+  /** Optional Escape action when it differs from the header close action. */
+  onEscape?: (() => void) | undefined;
   /** Scroll strategy for the shell body. The default lets file viewers scroll
    *  their `.viewer-content`; `children` lets virtualized children such as the
    *  diff CodeView own wheel/trackpad scrolling without a competing parent. */
@@ -80,6 +83,7 @@ export function ViewerShell({
   onSend,
   banner,
   onClose,
+  onEscape,
   children,
   panel,
   dialog,
@@ -105,11 +109,11 @@ export function ViewerShell({
         return;
       }
       e.stopPropagation();
-      onClose();
+      (onEscape ?? onClose)();
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [onClose, dialog, confirm, closeOnEscape, onInnerEscape]);
+  }, [onClose, onEscape, dialog, confirm, closeOnEscape, onInnerEscape]);
 
   const modal = mode !== 'inline';
   const className = mode === 'inline'
@@ -165,6 +169,75 @@ export function ViewerShell({
       {panel}
       {dialog}
       {confirm}
+    </div>
+  );
+}
+
+export function ViewerPresentationControl({
+  fullscreen,
+  onToggle,
+}: {
+  fullscreen: boolean;
+  onToggle: () => void;
+}) {
+  const label = fullscreen ? 'Return to pane' : 'Fullscreen';
+  return (
+    <button
+      type="button"
+      className="viewer-shell-toggle viewer-shell-icon-toggle"
+      onClick={onToggle}
+      aria-label={label}
+      title={label}
+    >
+      {fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+      <span>{label}</span>
+    </button>
+  );
+}
+
+export function FocusedReviewExitDialog({
+  target,
+  sending,
+  error,
+  onSend,
+  onDiscard,
+  onKeepReviewing,
+}: {
+  target: FocusedReviewExitTarget;
+  sending: boolean;
+  error: string | null;
+  onSend: () => void;
+  onDiscard: () => void;
+  onKeepReviewing: () => void;
+}) {
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || sending) return;
+      event.stopPropagation();
+      onKeepReviewing();
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [onKeepReviewing, sending]);
+  const closing = target === 'closed';
+  const title = closing ? 'Resolve feedback before closing' : 'Resolve feedback before returning';
+  const destination = closing ? 'closing the viewer' : 'returning to the pane';
+  const sendLabel = closing ? 'Send feedback and close' : 'Send feedback and return';
+  const discardLabel = closing ? 'Discard notes and close' : 'Discard notes and return';
+  return (
+    <div className="focused-review-exit-overlay" role="presentation">
+      <div className="modal confirm-dialog focused-review-exit" role="dialog" aria-modal="true" aria-labelledby="focused-review-exit-title">
+        <h3 id="focused-review-exit-title">{title}</h3>
+        <p>Pending notes belong to this full-screen review. Send or discard them before {destination}.</p>
+        {error && <p className="viewer-send-error" role="alert">{error}</p>}
+        <div className="modal-actions focused-review-exit-actions">
+          <button className="btn-secondary" type="button" onClick={onKeepReviewing} disabled={sending}>Keep reviewing</button>
+          <button className="btn-danger" type="button" onClick={onDiscard} disabled={sending}>{discardLabel}</button>
+          <button className="btn-primary" type="button" onClick={onSend} disabled={sending}>
+            {sending ? 'Sending…' : sendLabel}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
