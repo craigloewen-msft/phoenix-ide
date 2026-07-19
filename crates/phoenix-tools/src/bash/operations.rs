@@ -32,6 +32,7 @@ use super::ring::{RingLine, WindowView};
 use super::sandbox::ExploreSandboxLauncher;
 use super::types::{BashOp, BashToolInput};
 use crate::{ToolContext, ToolOutput};
+use phoenix_core::domain::bash_progress::{BashProgressLine, BashToolProgress};
 use phoenix_core::domain::tool_wire::{
     BashErrorResponse, BashKillPendingKernelPayload, BashLiveHandleSummary, BashResponse,
     BashRingLine, BashRingWindow, BashRunTombstonePayload, BashRunningPayload,
@@ -528,11 +529,18 @@ async fn run_run(
                     &ctx.work_scope,
                     crate::bash::registry::BashLifecyclePhase::Spawned,
                 );
+                let progress_reporter = ctx
+                    .bash_progress_sink()
+                    .map(|sink| Arc::new(LiveBashProgressReporter::new(sink)));
+                let _progress_lease = progress_reporter
+                    .as_ref()
+                    .map(|reporter| LiveBashProgressLease(reporter.clone()));
                 start_io_tasks(
                     &inserted,
                     child,
                     registry.lifecycle_sink(),
                     sandbox_scratch_dir,
+                    progress_reporter.clone(),
                 );
                 race_run_response(inserted, cmd, wait_seconds, read_args, ctx).await
             }
@@ -648,9 +656,22 @@ fn start_io_tasks(
     mut child: tokio::process::Child,
     lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
     sandbox_scratch_dir: Option<std::path::PathBuf>,
+    progress_reporter: Option<Arc<LiveBashProgressReporter>>,
 ) {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+
+    if let Some(reporter) = progress_reporter.clone() {
+        let progress_handle = handle.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(LIVE_PROGRESS_MIN_INTERVAL);
+            interval.tick().await;
+            while reporter.is_active() {
+                interval.tick().await;
+                reporter.maybe_emit_handle(&progress_handle, false).await;
+            }
+        });
+    }
 
     // Spawn the readers and capture their JoinHandles so the waiter
     // can join them between `child.wait()` and `transition_to_terminal`.
@@ -660,14 +681,16 @@ fn start_io_tasks(
     // a non-Live state and silently drops those bytes.
     let stdout_join = stdout.map(|s| {
         let h = handle.clone();
+        let reporter = progress_reporter.clone();
         tokio::spawn(async move {
-            read_pipe_to_ring(s, h, "stdout").await;
+            read_pipe_to_ring(s, h, reporter).await;
         })
     });
     let stderr_join = stderr.map(|s| {
         let h = handle.clone();
+        let reporter = progress_reporter.clone();
         tokio::spawn(async move {
-            read_pipe_to_ring(s, h, "stderr").await;
+            read_pipe_to_ring(s, h, reporter).await;
         })
     });
 
@@ -681,13 +704,17 @@ fn start_io_tasks(
             stderr_join,
             lifecycle_sink,
             sandbox_scratch_dir,
+            progress_reporter,
         )
         .await;
     });
 }
 
-async fn read_pipe_to_ring<R>(mut pipe: R, handle: Arc<Handle>, _which: &'static str)
-where
+async fn read_pipe_to_ring<R>(
+    mut pipe: R,
+    handle: Arc<Handle>,
+    progress_reporter: Option<Arc<LiveBashProgressReporter>>,
+) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     use tokio::io::AsyncReadExt;
@@ -710,8 +737,12 @@ where
                 let mut ring = live.ring.lock().await;
                 if ring.has_partial() {
                     ring.flush_partial();
+                    if let Some(reporter) = &progress_reporter {
+                        reporter.maybe_emit(&handle, &ring, true);
+                    }
                 }
             }
+
             continue;
         };
         match read_result {
@@ -725,6 +756,9 @@ where
                 if let HandleState::Live(live) = state.as_ref() {
                     let mut ring = live.ring.lock().await;
                     ring.append(&buf[..n]);
+                    if let Some(reporter) = &progress_reporter {
+                        reporter.maybe_emit(&handle, &ring, false);
+                    }
                 }
             }
             Err(e) => {
@@ -738,6 +772,9 @@ where
     if let HandleState::Live(live) = state.as_ref() {
         let mut ring = live.ring.lock().await;
         ring.flush_partial();
+        if let Some(reporter) = &progress_reporter {
+            reporter.maybe_emit(&handle, &ring, true);
+        }
     }
 }
 
@@ -748,6 +785,171 @@ where
 /// timeout protects the waiter from that pathological case at the cost
 /// of dropping a few bytes in extreme scenarios.
 const READER_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
+const LIVE_PROGRESS_MAX_LINES: usize = 40;
+const LIVE_PROGRESS_MAX_BYTES: usize = 24 * 1024;
+const LIVE_PROGRESS_MAX_PARTIAL_BYTES: usize = 4 * 1024;
+const LIVE_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(120);
+const LIVE_PROGRESS_REANNOUNCE_INTERVAL: Duration = Duration::from_secs(2);
+
+fn suffix_within_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text.get(start..).unwrap_or_default().to_string()
+}
+
+struct LiveBashProgressLease(Arc<LiveBashProgressReporter>);
+
+impl Drop for LiveBashProgressLease {
+    fn drop(&mut self) {
+        self.0.deactivate();
+    }
+}
+
+struct LiveBashProgressPoller {
+    reporter: Arc<LiveBashProgressReporter>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl LiveBashProgressPoller {
+    fn spawn(handle: Arc<Handle>, reporter: Arc<LiveBashProgressReporter>) -> Self {
+        let task_reporter = reporter.clone();
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(LIVE_PROGRESS_MIN_INTERVAL);
+            interval.tick().await;
+            while task_reporter.is_active() {
+                interval.tick().await;
+                if handle.state().await.is_terminal() {
+                    break;
+                }
+                task_reporter.maybe_emit_handle(&handle, false).await;
+            }
+        });
+        Self { reporter, task }
+    }
+}
+
+impl Drop for LiveBashProgressPoller {
+    fn drop(&mut self) {
+        self.reporter.deactivate();
+        self.task.abort();
+    }
+}
+
+struct LiveBashProgressReporter {
+    sink: Arc<dyn crate::BashProgressSink>,
+    last_emitted_output_bytes: std::sync::atomic::AtomicU64,
+    last_emitted_at_ms: std::sync::atomic::AtomicU64,
+    active: std::sync::atomic::AtomicBool,
+}
+
+impl LiveBashProgressReporter {
+    fn new(sink: Arc<dyn crate::BashProgressSink>) -> Self {
+        Self {
+            sink,
+            last_emitted_output_bytes: std::sync::atomic::AtomicU64::new(0),
+            last_emitted_at_ms: std::sync::atomic::AtomicU64::new(0),
+            active: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    fn deactivate(&self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    async fn maybe_emit_handle(&self, handle: &Handle, force: bool) {
+        let state = handle.state().await;
+        if let HandleState::Live(live) = state.as_ref() {
+            let ring = live.ring.lock().await;
+            self.maybe_emit(handle, &ring, force);
+        }
+    }
+
+    fn maybe_emit(&self, handle: &Handle, ring: &super::ring::RingBuffer, force: bool) {
+        if !self.active.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let output_bytes = ring.output_bytes();
+        let prior_output_bytes = self
+            .last_emitted_output_bytes
+            .load(std::sync::atomic::Ordering::Acquire);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let prior_at = self
+            .last_emitted_at_ms
+            .load(std::sync::atomic::Ordering::Acquire);
+        let output_unchanged = output_bytes == prior_output_bytes;
+        if !force
+            && output_unchanged
+            && now_ms.saturating_sub(prior_at)
+                < u64::try_from(LIVE_PROGRESS_REANNOUNCE_INTERVAL.as_millis()).unwrap_or(u64::MAX)
+        {
+            return;
+        }
+        if !force
+            && prior_at != 0
+            && now_ms.saturating_sub(prior_at)
+                < u64::try_from(LIVE_PROGRESS_MIN_INTERVAL.as_millis()).unwrap_or(u64::MAX)
+        {
+            return;
+        }
+
+        let view = ring.tail(LIVE_PROGRESS_MAX_LINES);
+        let end_offset = view.end_offset;
+        let raw_partial = ring.partial_str();
+        let partial_was_truncated = raw_partial
+            .as_ref()
+            .is_some_and(|text| text.len() > LIVE_PROGRESS_MAX_PARTIAL_BYTES);
+        let partial =
+            raw_partial.map(|text| suffix_within_bytes(&text, LIVE_PROGRESS_MAX_PARTIAL_BYTES));
+
+        let mut remaining_bytes =
+            LIVE_PROGRESS_MAX_BYTES.saturating_sub(partial.as_ref().map_or(0, String::len));
+        let mut lines: Vec<BashProgressLine> = Vec::new();
+        let mut projected_lines_truncated = false;
+        for line in view.lines.iter().rev() {
+            if remaining_bytes == 0 {
+                projected_lines_truncated = true;
+                break;
+            }
+            let text = String::from_utf8_lossy(&line.bytes);
+            let bounded = suffix_within_bytes(&text, remaining_bytes);
+            projected_lines_truncated |= bounded.len() < text.len();
+            remaining_bytes = remaining_bytes.saturating_sub(bounded.len());
+            lines.push(BashProgressLine {
+                offset: line.offset,
+                text: bounded,
+            });
+        }
+        lines.reverse();
+        let line_limit_truncated = ring.len() > view.lines.len();
+        let projection_truncated =
+            partial_was_truncated || projected_lines_truncated || line_limit_truncated;
+        let start_offset = lines.first().map_or(end_offset, |line| line.offset);
+        self.sink.emit(BashToolProgress {
+            handle: handle.handle_id.to_string(),
+            start_offset,
+            end_offset,
+            truncated_before: view.truncated_before || projection_truncated,
+            lines,
+            partial,
+        });
+        self.last_emitted_output_bytes
+            .store(output_bytes, std::sync::atomic::Ordering::Release);
+        self.last_emitted_at_ms
+            .store(now_ms, std::sync::atomic::Ordering::Release);
+    }
+}
 
 async fn run_waiter(
     handle: Arc<Handle>,
@@ -756,6 +958,7 @@ async fn run_waiter(
     stderr_join: Option<tokio::task::JoinHandle<()>>,
     lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
     sandbox_scratch_dir: Option<std::path::PathBuf>,
+    progress_reporter: Option<Arc<LiveBashProgressReporter>>,
 ) {
     let panic_guard = ExitWatchPanicGuard::new(handle.clone());
     let started_at = Instant::now();
@@ -783,6 +986,10 @@ async fn run_waiter(
         }
     };
     let _ = tokio::time::timeout(READER_DRAIN_TIMEOUT, drain).await;
+    if let Some(reporter) = &progress_reporter {
+        reporter.maybe_emit_handle(&handle, true).await;
+        reporter.deactivate();
+    }
 
     let elapsed = started_at.elapsed();
     if handle
@@ -921,9 +1128,19 @@ async fn run_wait(
         return shape_handle_response(&handle, &read_args, ResponseKind::Wait, None).await;
     }
 
+    let progress_reporter = ctx
+        .bash_progress_sink()
+        .map(|sink| Arc::new(LiveBashProgressReporter::new(sink)));
+    if let Some(reporter) = &progress_reporter {
+        reporter.maybe_emit_handle(&handle, true).await;
+    }
+    let _progress_poller = progress_reporter
+        .as_ref()
+        .map(|reporter| LiveBashProgressPoller::spawn(handle.clone(), reporter.clone()));
+
     let mut exit_rx = handle.exit_observer();
     let started = Instant::now();
-    tokio::select! {
+    let response = tokio::select! {
         biased;
         () = ctx.cancel.cancelled() => {
             still_running_response(&handle, started.elapsed(), &read_args, &handle.cmd).await
@@ -932,10 +1149,10 @@ async fn run_wait(
             terminal_or_panic_response(&handle, &read_args, false, false, None).await
         }
         () = tokio::time::sleep(Duration::from_secs(wait_seconds)) => {
-            // Re-timeout: SAME handle id (REQ-BASH-003).
             still_running_response(&handle, Duration::from_secs(wait_seconds), &read_args, &handle.cmd).await
         }
-    }
+    };
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -974,6 +1191,16 @@ async fn run_kill(
 
     // Send the signal EXACTLY ONCE (REQ-BASH-003).
     send_signal_to_group(pgid, signal);
+
+    let progress_reporter = ctx
+        .bash_progress_sink()
+        .map(|sink| Arc::new(LiveBashProgressReporter::new(sink)));
+    if let Some(reporter) = &progress_reporter {
+        reporter.maybe_emit_handle(&handle, true).await;
+    }
+    let _progress_poller = progress_reporter
+        .as_ref()
+        .map(|reporter| LiveBashProgressPoller::spawn(handle.clone(), reporter.clone()));
 
     // Race exit observer vs KILL_RESPONSE_TIMEOUT.
     let mut exit_rx = handle.exit_observer();
@@ -1521,6 +1748,70 @@ mod tests {
     }
 
     #[test]
+    fn progress_lease_deactivates_reporter_on_drop() {
+        let sink: Arc<dyn crate::BashProgressSink> = Arc::new(|_| {});
+        let reporter = Arc::new(LiveBashProgressReporter::new(sink));
+        {
+            let _lease = LiveBashProgressLease(reporter.clone());
+            assert!(reporter.is_active());
+        }
+        assert!(!reporter.is_active());
+    }
+
+    #[test]
+    fn progress_projection_reports_byte_budget_truncation() {
+        use std::sync::Mutex;
+
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let captured = emitted.clone();
+        let sink: Arc<dyn crate::BashProgressSink> = Arc::new(move |progress| {
+            captured.lock().expect("progress lock").push(progress);
+        });
+        let reporter = LiveBashProgressReporter::new(sink);
+        let handle = live_handle();
+        let mut ring = RingBuffer::new(RING_BUFFER_BYTES);
+        ring.append(format!("{}\n", "x".repeat(LIVE_PROGRESS_MAX_BYTES + 100)).as_bytes());
+
+        reporter.maybe_emit(&handle, &ring, true);
+
+        let snapshots = emitted.lock().expect("progress lock");
+        let snapshot = snapshots.last().expect("progress snapshot");
+        assert!(snapshot.truncated_before);
+        assert!(
+            snapshot
+                .lines
+                .iter()
+                .map(|line| line.text.len())
+                .sum::<usize>()
+                <= LIVE_PROGRESS_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn progress_projection_reports_line_limit_truncation() {
+        use std::sync::Mutex;
+
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let captured = emitted.clone();
+        let sink: Arc<dyn crate::BashProgressSink> = Arc::new(move |progress| {
+            captured.lock().expect("progress lock").push(progress);
+        });
+        let reporter = LiveBashProgressReporter::new(sink);
+        let handle = live_handle();
+        let mut ring = RingBuffer::new(RING_BUFFER_BYTES);
+        for index in 0..=LIVE_PROGRESS_MAX_LINES {
+            ring.append(format!("line {index}\n").as_bytes());
+        }
+
+        reporter.maybe_emit(&handle, &ring, true);
+
+        let snapshots = emitted.lock().expect("progress lock");
+        let snapshot = snapshots.last().expect("progress snapshot");
+        assert!(snapshot.truncated_before);
+        assert_eq!(snapshot.lines.len(), LIVE_PROGRESS_MAX_LINES);
+    }
+
+    #[test]
     fn exit_code_128_is_not_signal_zero() {
         let status = std::process::Command::new("sh")
             .arg("-c")
@@ -1635,7 +1926,7 @@ mod tests {
         };
         let h2 = h.clone();
         let task = tokio::spawn(async move {
-            read_pipe_to_ring(reader, h2, "stdout").await;
+            read_pipe_to_ring(reader, h2, None).await;
         });
 
         // Let the chunk land in `partial` before any timer fires.

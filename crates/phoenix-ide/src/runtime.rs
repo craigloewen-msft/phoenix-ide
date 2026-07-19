@@ -42,6 +42,7 @@ use crate::db::{ConvMode, Database};
 use crate::state_machine::{ConvContext, ConvState, Event};
 use crate::system_prompt::ModeContext;
 use chrono::{DateTime, Utc};
+use phoenix_core::domain::bash_progress::BashToolProgress;
 use phoenix_llm::ModelRegistry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -514,6 +515,9 @@ enum RingOp {
     /// Append the event to the ring. Used for ephemeral events emitted via
     /// `send_seq` and for eager (non-persisted) Message broadcasts.
     Append,
+    /// Broadcast without consuming reconnect replay capacity. Used for
+    /// replaceable, non-authoritative progress snapshots.
+    BroadcastOnly,
 }
 
 #[derive(Debug)]
@@ -558,6 +562,9 @@ impl Drop for ReservedBroadcastRange {
 ///    [`SseBroadcaster::send_seq`], which hands the id to a construction
 ///    closure so the caller cannot forget to insert it. These append to
 ///    the `ReplayRing` so a reconnect mid-turn can replay them.
+///
+/// Live bash progress is the exception: it is replaceable UI state broadcast
+/// with the current sequence witness and is intentionally not replayed.
 ///
 /// 2. **Persisted `Message` events** already carry a `message.sequence_id`
 ///    allocated by `add_message` in the DB layer. Use
@@ -691,6 +698,7 @@ impl SseBroadcaster {
                         sequence_id: seq,
                     });
             }
+            RingOp::BroadcastOnly => {}
         }
         self.tx.send(event).map_err(|_| ())
     }
@@ -754,6 +762,14 @@ impl SseBroadcaster {
         let seq = self.next_seq();
         let event = build(seq);
         self.send_with_ring(event, seq, RingOp::Append)
+    }
+
+    /// Broadcast a replaceable live-progress event without consuming the
+    /// reconnect ring reserved for lifecycle-critical ephemeral events.
+    pub fn send_live_progress(&self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
+        let witnessed_seq = self.current_seq();
+        let event = build(witnessed_seq);
+        self.send_with_ring(event, witnessed_seq, RingOp::BroadcastOnly)
     }
 
     /// Broadcast a persisted `Message` event using the DB-allocated
@@ -1133,6 +1149,15 @@ pub enum SseEvent {
     BrowserSessionState {
         sequence_id: i64,
         active: bool,
+    },
+    /// Ephemeral bounded/rate-limited live output snapshot for one in-flight
+    /// bash tool call. Replayed from the conversation ring on reconnect, keyed
+    /// by `tool_use_id` so client tool widgets can attach without parsing tool
+    /// result messages.
+    BashToolProgress {
+        sequence_id: i64,
+        tool_use_id: String,
+        progress: BashToolProgress,
     },
     /// A steering message was accepted and queued for delivery when the
     /// conversation next reaches `Idle`. The UI uses this to show the message
@@ -3633,6 +3658,60 @@ mod broadcaster_tests {
         );
         assert!(events.is_empty());
         assert_eq!(b.replay_ring_bytes(), 0);
+    }
+
+    #[test]
+    fn live_progress_broadcasts_without_consuming_replay_capacity() {
+        use phoenix_core::domain::bash_progress::BashToolProgress;
+
+        let b = SseBroadcaster::new(16, 0);
+        let mut rx = b.subscribe();
+        let _ = b.send_live_progress(|sequence_id| SseEvent::BashToolProgress {
+            sequence_id,
+            tool_use_id: "tool-1".to_string(),
+            progress: BashToolProgress {
+                handle: "b-1".to_string(),
+                start_offset: 0,
+                end_offset: 0,
+                truncated_before: false,
+                lines: Vec::new(),
+                partial: None,
+            },
+        });
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SseEvent::BashToolProgress { .. })
+        ));
+        drop(rx);
+
+        for index in 0..(REPLAY_RING_CAPACITY + 9) {
+            let _ = b.send_live_progress(|sequence_id| SseEvent::BashToolProgress {
+                sequence_id,
+                tool_use_id: "tool-1".to_string(),
+                progress: BashToolProgress {
+                    handle: "b-1".to_string(),
+                    start_offset: index as u64,
+                    end_offset: index as u64,
+                    truncated_before: false,
+                    lines: Vec::new(),
+                    partial: None,
+                },
+            });
+        }
+
+        let _rx = b.subscribe();
+        let _ = b.send_seq(|sequence_id| token_event(sequence_id, "lifecycle"));
+        let (anchor, truncated, highest, events) = b.snapshot_pending();
+        assert_eq!(anchor, 0);
+        assert!(!truncated);
+        assert_eq!(highest, 1);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], SseEvent::Token { text, .. } if text == "lifecycle"));
+        assert_eq!(
+            b.current_seq(),
+            1,
+            "replaceable progress must not create replay gaps"
+        );
     }
 
     /// `send_seq` (ephemeral) appends the event to the ring.

@@ -3,6 +3,7 @@ import remarkGfm from 'remark-gfm';
 import { unified } from 'unified';
 
 import type { ContentBlock, Message, ToolResultContent } from '../../api';
+import type { BashToolProgress } from '../../generated/sse';
 import type { StreamingBuffer } from '../../conversation/atom';
 import type { DiffSection } from '../../contexts/ReviewNotesContext';
 import type { QueuedMessage } from '../../hooks/useMessageQueue';
@@ -687,6 +688,7 @@ export interface ConversationProjectionOptions {
   systemPrompt?: string | null;
   systemPromptExpanded?: boolean;
   commissionReviewCanOpenFullReview?: boolean;
+  liveBashProgress?: Readonly<Record<string, { progress: BashToolProgress }>>;
 }
 
 export function buildConversationSearchProjection(
@@ -723,6 +725,7 @@ export function buildConversationSearchProjection(
           density,
           unit.key === options.latestAgentKey,
           options.commissionReviewCanOpenFullReview === true,
+          options.liveBashProgress ?? {},
         )) {
           addConversationSource(
             sources,
@@ -897,28 +900,89 @@ function visibleStreamingText(buffer: StreamingBuffer | null | undefined): strin
   return buffer?.text ?? '';
 }
 
-function firstLineSummary(text: string, maxLen = 140): string {
-  const firstLine = text.split('\n').find((l) => l.trim()) ?? text;
-  const flat = firstLine.replace(/\s+/g, ' ').trim();
-  return flat.length > maxLen ? `${flat.slice(0, maxLen - 1)}…` : flat;
-}
-
-function shouldCollapseCompactText(text: string): boolean {
-  if (containsMermaidFence(text)) return false;
-  const nonEmptyLines = text.split('\n').filter((line) => line.trim());
-  const firstLineFlat = (nonEmptyLines[0] ?? '').replace(/\s+/g, ' ').trim();
-  const fullFlat = text.replace(/\s+/g, ' ').trim();
-  const significantThreshold = 280;
-  if (text.length >= significantThreshold) return false;
-  const hidesAdditionalLines = nonEmptyLines.length > 1 && firstLineFlat !== fullFlat;
-  const truncatesFirstLine = firstLineFlat.length > 140;
-  return hidesAdditionalLines || truncatesFirstLine;
-}
-
 function toolResultText(result: Message | undefined): string {
   if (!result) return '';
   const content = result.content as ToolResultContent | undefined;
   return content?.content || content?.result || content?.error || '';
+}
+
+function tryParseJsonText(text: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+function formatVisibleMillis(ms: number): string {
+  if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
+  const seconds = ms / 1000;
+  if (seconds < 10) return `${seconds.toFixed(1)}s`;
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remaining = Math.round(seconds % 60);
+  return remaining > 0 ? `${minutes}m ${remaining}s` : `${minutes}m`;
+}
+
+function compactBashTailText(parts: string[]): string {
+  const text = parts.join(' · ');
+  return text.length > 140 ? `${text.slice(0, 139)}…` : text;
+}
+
+function bashVisibleSearchText(
+  block: ContentBlock,
+  result: Message | undefined,
+  progress: BashToolProgress | undefined,
+  density: 'full' | 'compact',
+): string {
+  const parts: string[] = [];
+  const input = block.input as Record<string, unknown> | undefined;
+  const op = typeof input?.['op'] === 'string' ? input['op'] : null;
+  const handle = typeof input?.['handle'] === 'string' ? input['handle'] : null;
+  if (op === 'wait' && handle) parts.push(`wait ${handle}`);
+  if (op === 'peek' && handle) parts.push(`peek ${handle}`);
+  if (op === 'kill' && handle) parts.push(`kill ${handle}`);
+  const parsed = result ? tryParseJsonText(toolResultText(result)) : null;
+  if (parsed) {
+    if (typeof parsed['status'] === 'string') {
+      const status = String(parsed['status']);
+      const finalCause = typeof parsed['final_cause'] === 'string' ? parsed['final_cause'] : null;
+      parts.push(status === 'kill_pending_kernel'
+        ? 'kill pending (kernel)'
+        : status === 'tombstoned' && finalCause
+          ? `tombstoned ${finalCause.replace(/_/g, ' ')}`
+          : status.replace(/_/g, ' '));
+    }
+    if (typeof parsed['handle'] === 'string') parts.push(parsed['handle'] as string);
+    if (typeof parsed['waited_ms'] === 'number') parts.push(`waited ${formatVisibleMillis(parsed['waited_ms'])}`);
+    if (typeof parsed['duration_ms'] === 'number') parts.push(`ran ${formatVisibleMillis(parsed['duration_ms'])}`);
+    if (parsed['exit_code'] !== undefined && parsed['exit_code'] !== null) parts.push(`exit ${String(parsed['exit_code'])}`);
+    if (typeof parsed['error'] === 'string') parts.push(parsed['error']);
+    if (typeof parsed['error_message'] === 'string') parts.push(parsed['error_message']);
+    if (parsed['truncated_before'] === true) parts.push('older output omitted');
+    const lines = Array.isArray(parsed['lines']) ? parsed['lines'] : [];
+    const visibleLines = density === 'full' ? lines : lines.slice(-2);
+    const outputParts: string[] = [];
+    for (const line of visibleLines) {
+      const text = line && typeof line === 'object' && typeof (line as { bytes?: unknown }).bytes === 'string'
+        ? (line as { bytes: string }).bytes
+        : '';
+      if (text) outputParts.push(text);
+    }
+    if (typeof parsed['partial'] === 'string' && parsed['partial'].length > 0) outputParts.push(parsed['partial']);
+    parts.push(density === 'compact' ? compactBashTailText(outputParts) : outputParts.join('\n'));
+    return parts.join('\n');
+  }
+  if (result) parts.push(toolResultText(result));
+  if (progress) {
+    if (progress.truncated_before) parts.push('older output omitted');
+    const visibleProgressLines = density === 'full' ? progress.lines.slice(-8) : progress.lines.slice(-2);
+    const progressParts = visibleProgressLines.map((line) => line.text);
+    if (progress.partial) progressParts.push(progress.partial);
+    parts.push(density === 'compact' ? compactBashTailText(progressParts) : progressParts.join('\n'));
+  }
+  return parts.join('\n');
 }
 
 function keywordSearchToolResultKey(blockId: string): string {
@@ -1481,7 +1545,7 @@ export function buildKeywordSearchOutputProjection(
 
 export function buildAgentTextFragments(
   blocks: readonly ContentBlock[],
-  density: 'full' | 'compact',
+  _density: 'full' | 'compact',
   options: { forceExpandedText?: boolean | undefined; forSearch?: boolean | undefined } = {},
 ): ConversationTextFragment[] {
   const out: ConversationTextFragment[] = [];
@@ -1495,14 +1559,11 @@ export function buildAgentTextFragments(
       ? markdownBlocks.map((markdownBlock) => markdownBlock.searchableText).join('\n')
       : sourceText;
     const fragmentId = `agent-text-${index}`;
-    const collapsed = !options.forceExpandedText && density === 'compact' && shouldCollapseCompactText(sourceText);
     out.push({
       fragmentId,
       semanticText,
       revealTarget: { kind: 'agent-text', key: fragmentId },
-      display: collapsed
-        ? { mode: 'compact-collapsed', summaryText: firstLineSummary(semanticText), sourceText }
-        : { mode: 'full', summaryText: semanticText, sourceText },
+      display: { mode: 'full', summaryText: semanticText, sourceText },
     });
   });
   return out;
@@ -1533,13 +1594,14 @@ function agentTurnSources(
   density: 'full' | 'compact',
   isLatestAgentMessage: boolean,
   commissionReviewCanOpenFullReview: boolean,
+  liveBashProgress: Readonly<Record<string, { progress: BashToolProgress }>>,
 ): Array<{ role: string; text: string; fragmentId?: string; revealTarget?: ConversationFragmentRevealTarget }> {
   const forceExpandedText = isLatestAgentMessage
     || (message.display_data as { forceExpandedText?: boolean } | null | undefined)?.forceExpandedText === true;
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const out: Array<{ role: string; text: string; fragmentId?: string; revealTarget?: ConversationFragmentRevealTarget }> = [];
   const textFragments = new Map(
-    buildAgentTextFragments(blocks, density, { forceExpandedText, forSearch: true })
+    buildAgentTextFragments(blocks, 'full', { forceExpandedText, forSearch: true })
       .map((fragment) => [fragment.fragmentId, fragment] as const),
   );
   blocks.forEach((block, index) => {
@@ -1563,6 +1625,18 @@ function agentTurnSources(
         });
       }
       const toolResult = toolResultsByUseId.get(toolUseId);
+      if (block.name === 'bash') {
+        const visibleText = bashVisibleSearchText(block, toolResult, liveBashProgress[toolUseId]?.progress, density);
+        if (visibleText) {
+          out.push({
+            role: `tool-use-visible-bash-${index}`,
+            text: visibleText,
+            fragmentId: 'bash-visible',
+            revealTarget: { kind: 'tool-result-terminal', toolUseId, fragmentId: 'bash-visible', family: 'bash' },
+          });
+        }
+        return;
+      }
       if (!toolResult) return;
       const resultText = toolResultText(toolResult);
       const resultContent = toolResult.content as ToolResultContent | undefined;
@@ -1662,10 +1736,6 @@ function agentTurnSources(
     }
   });
   return out;
-}
-
-function containsMermaidFence(text: string): boolean {
-  return /```\s*mermaid\b/i.test(text);
 }
 
 function projectMatches<TTarget, TSource extends SearchableSource<TTarget>>(

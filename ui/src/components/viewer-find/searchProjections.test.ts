@@ -524,14 +524,14 @@ describe('buildPatchOutputProjection', () => {
 });
 
 describe('buildAgentTextFragments', () => {
-  it('preserves semantic text for compact-collapsed assistant fragments', () => {
+  it('keeps compact assistant fragments fully visible', () => {
     const blocks = [{ type: 'text', text: 'first line\nhidden second line alpha' }] as const;
     const fragments = buildAgentTextFragments(blocks, 'compact');
     expect(fragments).toHaveLength(1);
     expect(fragments[0]?.fragmentId).toBe('agent-text-0');
     expect(fragments[0]?.semanticText).toBe('first line\nhidden second line alpha');
-    expect(fragments[0]?.display.mode).toBe('compact-collapsed');
-    expect(fragments[0]?.display.summaryText).toBe('first line');
+    expect(fragments[0]?.display.mode).toBe('full');
+    expect(fragments[0]?.display.summaryText).toBe('first line\nhidden second line alpha');
   });
 
   it('force-expands latest assistant fragments without changing semantic text', () => {
@@ -779,7 +779,7 @@ describe('buildConversationSearchProjection', () => {
           { type: 'tool_use', id: 'tool-1', name: 'bash', display: 'bash ls', input: { script: 'secret alpha payload' } },
         ]),
         toolResultsByUseId: new Map([
-          ['tool-1', toolMsg('t1', 'tool-1', { result: 'hidden alpha result' })],
+          ['tool-1', toolMsg('t1', 'tool-1', { content: JSON.stringify({ status: 'tombstoned', final_cause: 'exited', exit_code: 7, duration_ms: 1200, lines: [] }) })],
         ]),
       },
     ];
@@ -788,12 +788,16 @@ describe('buildConversationSearchProjection', () => {
     expect(fullInputProjection.matches).toHaveLength(1);
     expect(buildConversationSearchProjection(units, 'bash ls', { density: 'full' }).matches).toHaveLength(0);
 
-    const fullResultProjection = buildConversationSearchProjection(units, 'hidden alpha result', { density: 'full' });
+    const fullResultProjection = buildConversationSearchProjection(units, 'exit 7', { density: 'full' });
     expect(fullResultProjection.matches).toHaveLength(1);
-    expect(fullResultProjection.matches[0]?.target.sourceId).toContain('tool-use-result-0');
+    expect(fullResultProjection.matches[0]?.target.sourceId).toContain('tool-use-visible-bash-0');
+    expect(buildConversationSearchProjection(units, 'ran 1.2s', { density: 'full' }).matches).toHaveLength(1);
+    const rawJsonProjection = buildConversationSearchProjection(units, 'final_cause', { density: 'full' });
+    expect(rawJsonProjection.matches).toHaveLength(0);
 
     const compactProjection = buildConversationSearchProjection(units, 'secret alpha payload', { density: 'compact' });
     expect(compactProjection.matches).toHaveLength(1);
+    expect(compactProjection.matches[0]?.target.sourceId).toContain('tool-use-input-0');
   });
 
   it('excludes successful image-rendered tool results from transcript text search', () => {
@@ -839,9 +843,8 @@ describe('buildConversationSearchProjection', () => {
     expect(buildConversationSearchProjection(units, 'image missing', { density: 'full' }).matches).toHaveLength(1);
   });
 
-  it('keeps force-expanded latest compact text searchable past the first line', () => {
+  it('keeps compact assistant text searchable past the first line', () => {
     const message = agentMsg('a1', [{ type: 'text', text: 'first line\nvisible second line alpha' }]);
-    message.display_data = { forceExpandedText: true };
     const units: RenderUnit[] = [{
       kind: 'agent_turn',
       key: 'a1',
@@ -853,6 +856,32 @@ describe('buildConversationSearchProjection', () => {
     const projection = buildConversationSearchProjection(units, 'visible second line alpha', { density: 'compact' });
     expect(projection.matches).toHaveLength(1);
     expect(projection.matches[0]?.target.sourceId).toContain('agent-text-0');
+  });
+
+  it('indexes compact-visible bash identity and tail without exposing hidden structured details', () => {
+    const units: RenderUnit[] = [
+      {
+        kind: 'agent_turn',
+        key: 'a1',
+        isFirstInTurn: true,
+        agent: agentMsg('a1', [
+          { type: 'tool_use', id: 'tool-1', name: 'bash', display: 'pnpm vitest run ui/src/components/MessageComponents.test.tsx', input: { op: 'wait', handle: 'b-22', wait_seconds: 5, secret: 'hidden alpha payload' } },
+        ]),
+        toolResultsByUseId: new Map([
+          ['tool-1', toolMsg('t1', 'tool-1', { result: JSON.stringify({ status: 'still_running', handle: 'b-22', truncated_before: true, lines: [{ offset: 9, bytes: '68 tests collected' }], partial: 'watching for changes' }) })],
+        ]),
+      },
+    ];
+
+    const visibleProjection = buildConversationSearchProjection(units, 'watching for changes', { density: 'compact' });
+    expect(visibleProjection.matches).toHaveLength(1);
+    expect(visibleProjection.matches[0]?.target.sourceId).toContain('tool-use-visible-bash-0');
+
+    const omittedProjection = buildConversationSearchProjection(units, 'older output omitted', { density: 'compact' });
+    expect(omittedProjection.matches).toHaveLength(1);
+
+    const hiddenProjection = buildConversationSearchProjection(units, 'hidden alpha payload', { density: 'compact' });
+    expect(hiddenProjection.matches).toHaveLength(0);
   });
 
   it('includes full read_file logical content in compact mode while keeping stable typed fragments', () => {
@@ -903,7 +932,7 @@ describe('buildConversationSearchProjection', () => {
     expect(matchingSources).toEqual([
       'agent-text-0',
       'tool-use-input-1',
-      'tool-use-result-1:terminal-result:bash',
+      'tool-use-visible-bash-1',
       'agent-text-2',
     ]);
   });

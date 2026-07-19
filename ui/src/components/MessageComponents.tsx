@@ -174,10 +174,8 @@ function formatToolDuration(ms: number): string {
   return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
 }
 
-// ============================================================================
-// Helper functions
-// ============================================================================
-
+// =====================================================================// Helper functions
+// =====================================================================
 // eslint-disable-next-line react-refresh/only-export-components
 export function formatMessageTime(isoStr: string): string {
   if (!isoStr) return '';
@@ -337,10 +335,8 @@ function SkillToolBlock({
   );
 }
 
-// ============================================================================
-// User Message Components
-// ============================================================================
-
+// =====================================================================// User Message Components
+// =====================================================================
 function MessageCopyButton({ message, title }: { message: Message; title: string }) {
   const markdown = getMessageMarkdown(message);
   if (markdown.trim() === '') return null;
@@ -499,10 +495,6 @@ function QueuedUserMessageImpl({
     </div>
   );
 }
-
-// ============================================================================
-// Compact-density helpers
-// ============================================================================
 
 type MarkdownHighlight = {
   sourceStart: number;
@@ -675,6 +667,14 @@ function CompactToolStripImpl({
   items: ToolStripItem[];
   onExpand: (toolId: string) => void;
 }) {
+  const hasRunningTimer = items.some((item) => !item.hasResult && item.startedAtMs !== null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!hasRunningTimer) return undefined;
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [hasRunningTimer]);
+
   return (
     <div className="compact-tool-strip" role="list" aria-label="Tool calls">
       {items.map((item, i) => {
@@ -685,20 +685,43 @@ function CompactToolStripImpl({
           !item.hasResult ? 'pending' : '',
         ].filter(Boolean).join(' ');
         const summary = item.resultSummary ?? item.inputSummary;
-        const statusLabel = item.isError ? 'failed' : item.hasResult ? 'done' : 'running';
+        const statusLabel = item.isError
+          ? 'failed'
+          : item.hasResult
+            ? 'done'
+            : item.startedAtMs !== null || item.finalStatus === 'running'
+              ? 'running'
+              : 'queued';
+        const liveElapsed = !item.hasResult && item.startedAtMs !== null
+          ? ` · ${Math.max(0, Math.floor((nowMs - item.startedAtMs) / 1_000))}s`
+          : '';
+        const ariaStatus = item.finalStatus ?? statusLabel;
+        const ariaSummary = item.outputTail ?? summary;
+        const isCompactBash = item.name === 'bash';
         return (
           <button
             key={item.toolId || `${item.name}-${i}`}
             type="button"
             className={classNames}
             onClick={() => onExpand(item.toolId)}
-            aria-label={`${item.name}: ${summary} (${statusLabel}) — expand tool detail`}
+            aria-label={`${item.name}: ${item.commandIdentity ?? item.inputSummary} (${ariaStatus})${ariaSummary ? ` — ${ariaSummary}` : ''} — expand tool detail`}
           >
             <span className="compact-tool-card-header">
               <span className="compact-tool-card-name">{item.name}</span>
-              <span className="compact-tool-card-status">{statusLabel}</span>
+              <span className="compact-tool-card-status">{item.finalStatus ?? statusLabel}{liveElapsed}</span>
             </span>
-            <span className="compact-tool-card-summary" title={summary}>{summary}</span>
+            {isCompactBash ? (
+              <>
+                <span className="compact-tool-card-identity" title={item.commandIdentity ?? item.inputSummary}>
+                  {item.commandIdentity ?? item.inputSummary}
+                </span>
+                <span className="compact-tool-card-summary compact-tool-card-summary-tail" title={item.outputTail ?? ''}>
+                  {item.outputTail ?? '(no output)'}
+                </span>
+              </>
+            ) : (
+              <span className="compact-tool-card-summary" title={summary}>{summary}</span>
+            )}
           </button>
         );
       })}
@@ -706,10 +729,8 @@ function CompactToolStripImpl({
   );
 }
 
-// ============================================================================
-// Agent Message Components
-// ============================================================================
-
+// =====================================================================// Agent Message Components
+// =====================================================================
 export interface AgentTextRevealRequest {
   unitKey: string;
   fragmentId: string;
@@ -739,6 +760,7 @@ interface AgentMessageProps {
   filePathRootDir?: string | undefined;
   workScopeKey?: string | undefined;
   activeToolUseId?: string | undefined;
+  liveBashProgress?: import('../conversation/atom').ConversationAtom['liveBashProgress'];
   /**
    * When false, suppresses the "Phoenix HH:MM" header row. Used by the list
    * to collapse repeated headers across a run of consecutive agent messages
@@ -760,7 +782,7 @@ interface AgentMessageProps {
 
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionReview, filePathRootDir, workScopeKey, activeToolUseId, isFirstInTurn = true, forceExpandedText = false, isLatestAgentMessage = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
+function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionReview, filePathRootDir, workScopeKey, activeToolUseId, liveBashProgress = {}, isFirstInTurn = true, forceExpandedText = false, isLatestAgentMessage = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
   const blocks = useMemo(
     () => (Array.isArray(message.content) ? (message.content as ContentBlock[]) : []),
     [message.content],
@@ -784,8 +806,8 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
   // Derived purely from this turn's own content blocks + paired results — the
   // turn is the single source of truth for what it did (never phase state).
   const toolStripItems = useMemo(
-    () => deriveToolStripItems(message, toolResults),
-    [message, toolResults],
+    () => deriveToolStripItems(message, toolResults, liveBashProgress),
+    [message, toolResults, liveBashProgress],
   );
   const knownResultIds = useMemo(
     () => (import.meta.env.DEV ? Array.from(toolResults.keys()) : undefined),
@@ -1082,11 +1104,11 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
                     knownResultIds={knownResultIds}
                     toolStartedAtMs={toolStartedAtMs}
                     showMissingResult={showMissingResult}
+                    liveBashProgress={liveBashProgress[block.id || '']?.progress}
                     revealRequest={revealRequest}
                     activeHighlight={activeHighlight}
                     onRevealHandled={onRevealHandled}
                   />
-
               );
             }
             return null;
@@ -1097,10 +1119,8 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
   );
 }
 
-// ============================================================================
-// Think Aside — subtle inline collapsed aside for `think` tool blocks
-// ============================================================================
-
+// =====================================================================// Think Aside — subtle inline collapsed aside for `think` tool blocks
+// =====================================================================
 export const ThinkAside = memo(ThinkAsideImpl);
 
 function ThinkAsideImpl({ block }: { block: ContentBlock }) {
@@ -1141,10 +1161,8 @@ function ThinkAsideImpl({ block }: { block: ContentBlock }) {
   );
 }
 
-// ============================================================================
-// Tool Use Block
-// ============================================================================
-
+// =====================================================================// Tool Use Block
+// =====================================================================
 interface ToolUseBlockProps {
   block: ContentBlock;
   result: Message | undefined;
@@ -1163,6 +1181,7 @@ interface ToolUseBlockProps {
    *  elapsed counter that survives reconnect / reload / multi-tab. */
   toolStartedAtMs?: number | undefined;
   showMissingResult?: boolean | undefined;
+  liveBashProgress?: import('../generated/sse').BashToolProgress | undefined;
 }
 
 type ToolCardState =
@@ -1332,6 +1351,79 @@ function BashInspectButton({ workScopeKey, handle }: { workScopeKey: string; han
 // response. Renders a status pill, optional kill-pending badge, the line
 // tail, and (when present) the agent-supplied `label` so concurrent
 // handles are distinguishable at a glance.
+function bashStatusText(status: string, finalCause: string | null): string {
+  switch (status) {
+    case 'running': return 'running';
+    case 'still_running': return 'still running';
+    case 'kill_pending_kernel': return 'kill pending (kernel)';
+    case 'tombstoned': return finalCause ? `tombstoned · ${finalCause}` : 'tombstoned';
+    case 'exited': return 'exited';
+    case 'killed': return 'killed';
+    default: return status;
+  }
+}
+
+function formatBashMillis(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  const seconds = ms / 1000;
+  if (seconds < 10) return `${seconds.toFixed(1)}s`;
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.round(seconds % 60);
+  return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+}
+
+function summarizeBashVisibleTail(lines: string[], partial: string | null, truncatedBefore: boolean, maxLines = 8): string[] {
+  const out = lines.slice(-Math.max(0, maxLines - (partial ? 1 : 0)));
+  if (partial) out.push(partial);
+  if (truncatedBefore && out.length > 0) out[0] = `… ${out[0]}`;
+  return out;
+}
+
+function BashOutputView({
+  lines,
+  partial,
+  truncatedBefore,
+  bounded = false,
+}: {
+  lines: string[];
+  partial: string | null;
+  truncatedBefore: boolean;
+  bounded?: boolean;
+}) {
+  const visible = bounded
+    ? summarizeBashVisibleTail(lines, partial, truncatedBefore)
+    : [...lines, ...(partial ? [partial] : [])];
+  const localTailTruncated = bounded && lines.length + (partial ? 1 : 0) > 8;
+  const outputTruncated = truncatedBefore || localTailTruncated;
+  if (visible.length === 0) return null;
+  return (
+    <div className="bash-output-shell">
+      {outputTruncated && (
+        <div className="bash-truncated-notice" aria-label="Earlier bash output fell out of the bounded tail">
+          [older output omitted from this tail]
+        </div>
+      )}
+      <div className="bash-output-viewport" role="log" aria-live="polite" aria-atomic="false" aria-relevant="additions text">
+        {visible.map((line, index) => {
+          const isPartial = partial !== null && index === visible.length - 1;
+          return (
+            <div
+              key={`${index}-${line}`}
+              className={`bash-output-line${isPartial ? ' bash-output-line-partial' : ''}`}
+              title={isPartial ? 'Live trailing partial line — still being written' : undefined}
+            >
+              <span className="bash-output-line-text">{line}</span>
+              {isPartial && <span className="bash-partial-badge">partial</span>}
+            </div>
+          );
+        })}
+      </div>
+      {partial && <div className="bash-partial-affordance">[final line still streaming — no newline yet]</div>}
+    </div>
+  );
+}
+
 function BashResponseView({ response, workScopeKey }: { response: Record<string, unknown>; workScopeKey?: string | undefined }) {
   // Error envelope branch (REQ-BASH-008): `error` field present.
   if (typeof response['error'] === 'string') {
@@ -1356,53 +1448,32 @@ function BashResponseView({ response, workScopeKey }: { response: Record<string,
   const isExited = status === 'exited';
   const isKilled = status === 'killed';
   const isTombstone = status === 'tombstoned';
-
-  const text = lines.map((l) => l.bytes ?? '').join('\n');
+  const partial = typeof response['partial'] === 'string' ? response['partial'] : null;
+  const lineTexts = lines.map((l) => l.bytes ?? '');
+  const statusText = bashStatusText(status, finalCause);
 
   return (
     <div className="bash-response">
       <div className="bash-response-header">
-        <span className={`bash-status bash-status-${status.replace(/_/g, '-')}`}>
-          {status === 'running'
-            ? 'running'
-            : status === 'still_running'
-              ? 'still running'
-              : status === 'kill_pending_kernel'
-                ? 'kill pending (kernel)'
-                : status === 'tombstoned'
-                  ? `tombstoned${finalCause ? ` · ${finalCause}` : ''}`
-                  : status === 'exited'
-                    ? 'exited'
-                    : status === 'killed'
-                      ? 'killed'
-                      : status}
-        </span>
+        <span className={`bash-status bash-status-${status.replace(/_/g, '-')}`}>{statusText}</span>
         {handle && <span className="bash-handle">{handle}</span>}
         {handle && workScopeKey && <BashInspectButton workScopeKey={workScopeKey} handle={handle} />}
         {label && <span className="bash-label" title="agent-supplied handle label">{label}</span>}
         {(isExited || isTombstone) && exitCode !== undefined && exitCode !== null && (
-          <span className="bash-exit-code">exit code {String(exitCode)}</span>
+          <span className="bash-exit-code">exit {String(exitCode)}</span>
         )}
         {(isKilled || isTombstone) && typeof signalNumber === 'number' && (
           <span className="bash-signal-number">signal {String(signalNumber)}</span>
         )}
-        {killSignalSent && (
-          <span className="bash-kill-signal">kill: {killSignalSent}</span>
-        )}
-        {signalSent && signalSent !== killSignalSent && (
-          <span className="bash-signal-sent">signal_sent: {signalSent}</span>
-        )}
-        {waitedMs !== null && (
-          <span className="bash-duration">waited {Math.round(waitedMs)} ms</span>
-        )}
-        {durationMs !== null && (
-          <span className="bash-duration">duration {Math.round(durationMs)} ms</span>
-        )}
+        {killSignalSent && <span className="bash-kill-signal">kill {killSignalSent}</span>}
+        {signalSent && signalSent !== killSignalSent && <span className="bash-signal-sent">sent {signalSent}</span>}
+        {waitedMs !== null && <span className="bash-duration">waited {formatBashMillis(waitedMs)}</span>}
+        {durationMs !== null && <span className="bash-duration">ran {formatBashMillis(durationMs)}</span>}
       </div>
-      {truncatedBefore && (
-        <div className="bash-truncated-notice">[output truncated before this view]</div>
+      <BashOutputView lines={lineTexts} partial={partial} truncatedBefore={truncatedBefore} />
+      {status === 'waiter_panicked' && typeof response['error_message'] === 'string' && (
+        <div className="bash-error-message">{response['error_message']}</div>
       )}
-      {text && <pre className="bash-lines">{text}</pre>}
     </div>
   );
 }
@@ -2243,7 +2314,7 @@ export function KeywordSearchView({
 
 export const ToolUseBlock = memo(ToolUseBlockImpl);
 
-function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, requestSequenceId, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult, revealRequest = null, activeHighlight = null, onRevealHandled }: ToolUseBlockProps) {
+function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, requestSequenceId, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult, liveBashProgress, revealRequest = null, activeHighlight = null, onRevealHandled }: ToolUseBlockProps) {
   const name = block.name || 'tool';
   const input = useMemo(() => block.input || {}, [block.input]);
   const toolId = block.id || '';
@@ -2560,6 +2631,16 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
       )}
 
       {/* Tool output - collapsible for long outputs; suppressed when structured summary is shown */}
+      {name === 'bash' && !result && liveBashProgress && (
+        <div className="tool-block-output bash-live-output">
+          <BashOutputView
+            lines={liveBashProgress.lines.map((line) => line.text)}
+            partial={liveBashProgress.partial ?? null}
+            truncatedBefore={liveBashProgress.truncated_before}
+            bounded
+          />
+        </div>
+      )}
       {showMissingResult && !hasOutput && renderMissingToolResultBody(toolCardState)}
       {hasOutput && !isSubAgentResult && (
         <div className={`tool-block-output ${isError ? 'error' : ''} ${outputExpanded ? 'expanded' : ''}`}>
@@ -2703,10 +2784,8 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
   );
 }
 
-// ============================================================================
-// Sub-Agent Summary (persistent view after completion)
-// ============================================================================
-
+// =====================================================================// Sub-Agent Summary (persistent view after completion)
+// =====================================================================
 type SubAgentStatusKind = 'running' | 'success' | 'failure' | 'timed_out';
 
 function statusKindFromOutcome(outcome: SubAgentResult['outcome'] | null): SubAgentStatusKind {
@@ -2772,12 +2851,15 @@ function SubAgentStatusIcon({ status }: { status: SubAgentStatusKind }) {
   return <XIcon />;
 }
 
-function ChildToolActivity({ block, result }: { block: ContentBlock; result: Message | undefined }) {
+function ChildToolActivity({ block, result, liveProgress }: { block: ContentBlock; result: Message | undefined; liveProgress?: import('../generated/sse').BashToolProgress | undefined }) {
   const name = block.name || 'tool';
   const input = (block.input || {}) as Record<string, unknown>;
   const output = getToolResultText(result);
   const firstOutputLine = output.split('\n').find((line) => line.trim())?.trim() ?? '';
-  const outputPreview = firstOutputLine ? truncate(firstOutputLine, 140) : result ? '(empty)' : 'running…';
+  const liveOutput = liveProgress
+    ? [...liveProgress.lines.map((line) => line.text), ...(liveProgress.partial ? [liveProgress.partial] : [])].slice(-2).join(' · ')
+    : '';
+  const outputPreview = firstOutputLine ? truncate(firstOutputLine, 140) : liveOutput ? truncate(liveOutput, 140) : result ? '(empty)' : 'running…';
   const outputClass = firstOutputLine ? '' : result ? 'empty' : 'pending';
   const isError = (result?.content as ToolResultContent | undefined)?.is_error || (result?.content as ToolResultContent | undefined)?.error;
 
@@ -2799,7 +2881,7 @@ function ChildToolActivity({ block, result }: { block: ContentBlock; result: Mes
 // `toolResults` map are referentially stable across token-only atom updates, so
 // a shallow prop compare bails. Mirrors the AgentTextBlock / StreamingBlock
 // memoization for the same re-parse-on-unchanged-content problem.
-const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResults, markdownComponents }: { message: Message; toolResults: Map<string, Message>; markdownComponents: React.ComponentProps<typeof ReactMarkdown>['components'] }) {
+const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResults, liveBashProgress, markdownComponents }: { message: Message; toolResults: Map<string, Message>; liveBashProgress: import('../conversation/atom').ConversationAtom['liveBashProgress']; markdownComponents: React.ComponentProps<typeof ReactMarkdown>['components'] }) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   return (
     <>
@@ -2819,6 +2901,7 @@ const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResul
               key={block.id || `${message.message_id}-tool-${idx}`}
               block={block}
               result={toolResults.get(block.id || '')}
+              liveProgress={liveBashProgress[block.id || '']?.progress}
             />
           );
         }
@@ -2876,7 +2959,7 @@ export function SubAgentTranscript({ inline, running, full = false, finalResult 
         <div className="subagent-activity-placeholder">Showing latest {visibleAgentMessages.length} agent steps ({hiddenCount} earlier hidden)</div>
       )}
       {visibleAgentMessages.map((message) => (
-        <ChildAgentActivity key={message.message_id} message={message} toolResults={toolResults} markdownComponents={markdownComponents} />
+        <ChildAgentActivity key={message.message_id} message={message} toolResults={toolResults} liveBashProgress={atom.liveBashProgress} markdownComponents={markdownComponents} />
       ))}
       {atom.streamingBuffer?.text && (
         <div className="subagent-activity-event agent-text streaming">
@@ -3024,10 +3107,8 @@ function SubAgentSummary({ results, revealRequest = null, activeHighlight = null
   );
 }
 
-// ============================================================================
-// Sub-Agent Status (live progress indicator)
-// ============================================================================
-
+// =====================================================================// Sub-Agent Status (live progress indicator)
+// =====================================================================
 /** Truncate text with ellipsis */
 function truncate(text: string, maxLen: number): string {
   if (text.length <= maxLen) return text;

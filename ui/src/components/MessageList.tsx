@@ -10,6 +10,7 @@ import {
   useImperativeHandle,
 } from 'react';
 import { useDensity } from '../hooks/useDensity';
+import { useLiveBashProgressForToolIds } from '../conversation';
 import {
   FindBar,
   activeSessionMatchIndex,
@@ -199,6 +200,17 @@ function activeToolUseIdFromState(convState: ConversationState): string | undefi
   return typeof id === 'string' && id.length > 0 ? id : undefined;
 }
 
+function LiveAgentTurn({ slug, message, ...props }: Omit<React.ComponentProps<typeof AgentMessage>, 'liveBashProgress' | 'message'> & { slug: string | null; message: Message }) {
+  const toolUseIds = useMemo(
+    () => (Array.isArray(message.content) ? message.content : [])
+      .filter((block) => block.type === 'tool_use' && block.name === 'bash')
+      .flatMap((block) => block.id ? [block.id] : []),
+    [message.content],
+  );
+  const liveBashProgress = useLiveBashProgressForToolIds(slug, toolUseIds);
+  return <AgentMessage message={message} liveBashProgress={liveBashProgress} {...props} />;
+}
+
 function renderHistoricalUnit(
   unit: HistoricalUnit,
   onOpenFile: OnOpenFile,
@@ -208,6 +220,7 @@ function renderHistoricalUnit(
   onCancelSteering: ((localId: string) => void) | undefined,
   workScopeKey: string | undefined,
   activeToolUseId: string | undefined,
+  slug: string | null,
   isLatestAgentMessage: boolean,
   revealRequest: AgentTextRevealRequest | null,
   activeHighlight: ConversationHighlight | null,
@@ -251,7 +264,8 @@ function renderHistoricalUnit(
     }
     case 'agent_turn':
       return (
-        <AgentMessage
+        <LiveAgentTurn
+          slug={slug}
           message={unit.agent}
           toolResults={unit.toolResultsByUseId}
           onOpenFile={onOpenFile}
@@ -327,7 +341,21 @@ function renderUnit(
   ) {
     return renderTailUnit(unit, slug, filePathRootDir);
   }
-  return renderHistoricalUnit(unit, onOpenFile, onOpenCommissionReview, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, isLatestAgentMessage, revealRequest, activeHighlight, onRevealHandled);
+  return renderHistoricalUnit(
+    unit,
+    onOpenFile,
+    onOpenCommissionReview,
+    filePathRootDir,
+    onRetry,
+    onCancelSteering,
+    workScopeKey,
+    activeToolUseId,
+    slug ?? null,
+    isLatestAgentMessage,
+    revealRequest,
+    activeHighlight,
+    onRevealHandled,
+  );
 }
 
 interface SystemPromptHeaderProps {
@@ -516,6 +544,8 @@ function MessageListImpl({
   const findSession = findState.status === 'open' ? findState : null;
   const findOpen = findSession !== null;
   const findQuery = findSession?.query ?? '';
+  const findUsesLiveBashProgress = findOpen && findQuery.length > 0;
+  const findLiveBashProgress = useLiveBashProgressForToolIds(slug ?? null, findUsesLiveBashProgress ? null : []);
   const findProjection = useMemo(
     () => (findOpen && findQuery.length > 0
       ? buildConversationSearchProjection(allUnits, findQuery, {
@@ -525,9 +555,10 @@ function MessageListImpl({
           systemPrompt: systemPrompt ?? null,
           systemPromptExpanded,
           commissionReviewCanOpenFullReview: onOpenCommissionReview !== undefined,
+          liveBashProgress: findLiveBashProgress,
         })
       : { sources: [], matches: [] }),
-    [allUnits, density, findOpen, findQuery, findStreamingBuffer, latestAgentKey, onOpenCommissionReview, systemPrompt, systemPromptExpanded],
+    [allUnits, density, findLiveBashProgress, findOpen, findQuery, findStreamingBuffer, latestAgentKey, onOpenCommissionReview, systemPrompt, systemPromptExpanded]
   );
   const findSessionMatches = useMemo(
     () => projectionMatchesToSessionMatches(findProjection.matches, stableConversationMatchId),

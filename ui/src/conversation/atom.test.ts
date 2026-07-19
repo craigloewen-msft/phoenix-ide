@@ -2500,3 +2500,95 @@ describe('conversationReducer', () => {
     });
   });
 });
+
+
+describe('bash tool progress', () => {
+  const progress = {
+    handle: 'b-1',
+    start_offset: 0,
+    end_offset: 1,
+    truncated_before: false,
+    lines: [{ offset: 0, text: 'building' }],
+    partial: null,
+  };
+
+  it('stores progress and clears it when the final tool result arrives', () => {
+    let atom = createInitialAtom();
+    atom = conversationReducer(atom, {
+      type: 'sse_bash_tool_progress', sequenceId: 1, toolUseId: 'tool-1', progress,
+    });
+    expect(atom.liveBashProgress['tool-1']?.progress.lines[0]?.text).toBe('building');
+
+    atom = conversationReducer(atom, {
+      type: 'sse_message',
+      sequenceId: 1,
+      message: makeMessage(1, {
+        message_type: 'tool',
+        content: { tool_use_id: 'tool-1', content: 'done', is_error: false },
+      }),
+    });
+    expect(atom.liveBashProgress['tool-1']).toBeUndefined();
+  });
+
+  it('clears progress when the agent turn completes', () => {
+    let atom = createInitialAtom();
+    atom = conversationReducer(atom, {
+      type: 'sse_bash_tool_progress', sequenceId: 1, toolUseId: 'tool-1', progress,
+    });
+    atom = conversationReducer(atom, { type: 'sse_agent_done', sequenceId: 1 });
+    expect(atom.liveBashProgress).toEqual({});
+  });
+});
+
+it('replaces bash progress at the same sequence when output advances', () => {
+  const base = {
+    handle: 'b-1', start_offset: 0, truncated_before: false, partial: null,
+  };
+  let atom = createInitialAtom();
+  atom = conversationReducer(atom, {
+    type: 'sse_bash_tool_progress', sequenceId: 0, toolUseId: 'tool-1',
+    progress: { ...base, end_offset: 1, lines: [{ offset: 0, text: 'first' }] },
+  });
+  atom = conversationReducer(atom, {
+    type: 'sse_bash_tool_progress', sequenceId: 0, toolUseId: 'tool-1',
+    progress: { ...base, end_offset: 2, lines: [{ offset: 1, text: 'second' }] },
+  });
+  expect(atom.liveBashProgress['tool-1']?.progress.lines[0]?.text).toBe('second');
+});
+
+it('rejects delayed bash progress below the applied sequence floor', () => {
+  const atom = { ...createInitialAtom(), lastAppliedEventSeq: 5 };
+  const next = conversationReducer(atom, {
+    type: 'sse_bash_tool_progress', sequenceId: 4, toolUseId: 'completed-tool',
+    progress: {
+      handle: 'b-1', start_offset: 0, end_offset: 1, truncated_before: false,
+      lines: [{ offset: 0, text: 'stale' }], partial: null,
+    },
+  });
+  expect(next).toBe(atom);
+  expect(next.liveBashProgress).toEqual({});
+});
+
+it('applies replaceable bash progress without advancing the replay sequence floor', () => {
+  const progress = {
+    handle: 'b-1',
+    start_offset: 0,
+    end_offset: 1,
+    truncated_before: false,
+    lines: [{ offset: 0, text: 'building' }],
+    partial: null,
+  };
+  let atom = createInitialAtom();
+  atom = { ...atom, lastAppliedEventSeq: 4 };
+  atom = conversationReducer(atom, {
+    type: 'sse_bash_tool_progress', sequenceId: 4, toolUseId: 'tool-1', progress,
+  });
+  expect(atom.liveBashProgress['tool-1']?.progress.lines[0]?.text).toBe('building');
+  expect(atom.lastAppliedEventSeq).toBe(4);
+
+  atom = conversationReducer(atom, {
+    type: 'sse_state_change', sequenceId: 5, phase: { type: 'idle' }, stateUpdatedAt: 0,
+  });
+  expect(atom.lastAppliedEventSeq).toBe(5);
+  expect(atom.eventGap).toBeNull();
+});

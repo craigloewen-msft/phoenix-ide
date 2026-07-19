@@ -832,6 +832,145 @@ describe('inline tool timers', () => {
 
     expect(screen.queryByText('result not received')).not.toBeInTheDocument();
   });
+  it('renders compact bash cards with identity, final status+duration, and output tail from existing results', () => {
+    mockDensity = 'compact';
+    const agent = agentMessage('agent-compact-bash', [
+      {
+        type: 'tool_use',
+        id: 'tool-bash',
+        name: 'bash',
+        input: { op: 'wait', handle: 'b-22', wait_seconds: 5 },
+      },
+    ]);
+    const result = toolMessage('tool-bash', JSON.stringify({
+      status: 'exited',
+      exit_code: 0,
+      duration_ms: 1840,
+      lines: [
+        { offset: 1, bytes: ' ✓ src/components/MessageComponents.test.tsx (68 tests)' },
+        { offset: 2, bytes: ' Test Files  1 passed' },
+      ],
+    }), 2);
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agent}
+          toolResults={new Map([['tool-bash', result]])}
+          onOpenFile={undefined}
+          forceExpandedText={false}
+        />
+      </MemoryRouter>,
+    );
+
+    const compactCard = document.querySelector('.compact-tool-card');
+    expect(compactCard).not.toBeNull();
+    expect(screen.getByText('bash')).toBeInTheDocument();
+    expect(screen.getByText('exit 0 · 1.8s')).toBeInTheDocument();
+    expect(screen.getByText('wait b-22')).toBeInTheDocument();
+    expect(screen.getByText('✓ src/components/MessageComponents.test.tsx (68 tests) · Test Files 1 passed')).toBeInTheDocument();
+    expect(document.querySelector('.compact-tool-card-identity')).not.toBeNull();
+    expect(document.querySelector('.compact-tool-card-summary-tail')).not.toBeNull();
+  });
+
+  it('renders typed bash output with bounded log viewport, partial affordance, truncation notice, and friendly durations', () => {
+    const agent = agentMessage('agent-bash-typed-live', [
+      {
+        type: 'tool_use',
+        id: 'tool-bash',
+        name: 'bash',
+        input: { op: 'wait', handle: 'b-22', wait_seconds: 5 },
+      },
+    ]);
+    const result = toolMessage('tool-bash', JSON.stringify({
+      status: 'still_running',
+      handle: 'b-22',
+      label: 'fixture-vitest',
+      waited_ms: 1840,
+      truncated_before: true,
+      lines: [
+        { offset: 41, bytes: ' ✓ src/components/MessageComponents.test.tsx (68 tests)' },
+        { offset: 42, bytes: ' Test Files  1 passed' },
+      ],
+      partial: 'watching for file changes',
+    }), 2);
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agent}
+          toolResults={new Map([['tool-bash', result]])}
+          onOpenFile={undefined}
+          forceExpandedText={false}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('still running')).toBeInTheDocument();
+    expect(screen.getByText('waited 1.8s')).toBeInTheDocument();
+    expect(screen.getByText('[older output omitted from this tail]')).toBeInTheDocument();
+    expect(screen.getByText('[final line still streaming — no newline yet]')).toBeInTheDocument();
+    expect(screen.getByText('partial')).toBeInTheDocument();
+    const log = screen.getByRole('log');
+    expect(log).toBeInTheDocument();
+    expect(log.className).toContain('bash-output-viewport');
+    expect(screen.getByText('✓ src/components/MessageComponents.test.tsx (68 tests)')).toBeInTheDocument();
+    expect(screen.getByText('watching for file changes')).toBeInTheDocument();
+  });
+
+  it('preserves every returned line in finalized full-density bash output', () => {
+    const lines = Array.from({ length: 12 }, (_, offset) => ({ offset, bytes: `line ${offset}` }));
+    const agent = agentMessage('agent-bash-all-lines', [{
+      type: 'tool_use', id: 'tool-bash-all-lines', name: 'bash', input: { op: 'peek', handle: 'b-all' },
+    }]);
+    const result = toolMessage('tool-bash-all-lines', JSON.stringify({
+      status: 'running', handle: 'b-all', truncated_before: false, lines,
+    }), 2);
+
+    render(
+      <MemoryRouter>
+        <AgentMessage message={agent} toolResults={new Map([['tool-bash-all-lines', result]])} />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('line 0')).toBeInTheDocument();
+    expect(screen.getByText('line 11')).toBeInTheDocument();
+    expect(screen.queryByText('[older output omitted from this tail]')).not.toBeInTheDocument();
+  });
+
+  it('renders tombstone exit metadata and final duration in typed bash output', () => {
+    const agent = agentMessage('agent-bash-tombstone', [
+      {
+        type: 'tool_use',
+        id: 'tool-bash',
+        name: 'bash',
+        input: { op: 'peek', handle: 'b-24', lines: 20 },
+      },
+    ]);
+    const result = toolMessage('tool-bash', JSON.stringify({
+      status: 'tombstoned',
+      final_cause: 'exited normally',
+      handle: 'b-24',
+      exit_code: 17,
+      duration_ms: 30000,
+      lines: [{ offset: 1, bytes: ' archived output retained for inspection' }],
+    }), 2);
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agent}
+          toolResults={new Map([['tool-bash', result]])}
+          onOpenFile={undefined}
+          forceExpandedText={false}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('tombstoned · exited normally')).toBeInTheDocument();
+    expect(screen.getByText('exit 17')).toBeInTheDocument();
+    expect(screen.getByText('ran 30s')).toBeInTheDocument();
+  });
 
   it('shows a diagnostic when a historical tool_use has no paired result', () => {
     const agent = agentMessage('agent-missing-result', [
@@ -1991,7 +2130,7 @@ describe('finalized code fence highlighting', () => {
     expect(container.querySelector('.agent-text-collapsed')).not.toBeInTheDocument();
   });
 
-  it('collapses one-line assistant prose that exceeds the compact preview limit', () => {
+  it('renders long one-line assistant prose in full in compact mode', () => {
     mockDensity = 'compact';
     const text = 'A'.repeat(150);
 
@@ -2007,12 +2146,11 @@ describe('finalized code fence highlighting', () => {
       </MemoryRouter>,
     );
 
-    expect(container.querySelector('.agent-text-collapsed')).toBeInTheDocument();
-    expect(container.querySelector('.agent-text-block')).not.toBeInTheDocument();
-    expect(container.querySelector('.agent-text-collapsed')).toHaveTextContent(`${'A'.repeat(139)}…`);
+    expect(container.querySelector('.agent-text-block')).toHaveTextContent(text);
+    expect(container.querySelector('.agent-text-collapsed')).not.toBeInTheDocument();
   });
 
-  it('collapses short multi-line assistant prose when later lines are omitted', () => {
+  it('renders every line of short multi-line assistant prose in compact mode', () => {
     mockDensity = 'compact';
 
     const { container } = render(
@@ -2027,9 +2165,9 @@ describe('finalized code fence highlighting', () => {
       </MemoryRouter>,
     );
 
-    expect(container.querySelector('.agent-text-collapsed')).toBeInTheDocument();
-    expect(container.querySelector('.agent-text-block')).not.toBeInTheDocument();
-    expect(container.querySelector('.agent-text-collapsed')).toHaveTextContent('First line summary.');
+    expect(container.querySelector('.agent-text-block')).toHaveTextContent('First line summary.');
+    expect(container.querySelector('.agent-text-block')).toHaveTextContent('Second line with more detail.');
+    expect(container.querySelector('.agent-text-collapsed')).not.toBeInTheDocument();
   });
 
   it('renders compact text fully when forceExpandedText is set', () => {
@@ -2379,10 +2517,10 @@ describe('compact tool summaries', () => {
     expect(container.querySelectorAll('.compact-tool-card')).toHaveLength(3);
     expect(screen.getByText('2 matches in 2 files')).toBeInTheDocument();
     expect(screen.getByText('2 lines')).toBeInTheDocument();
-    expect(screen.getByText('exited 0')).toBeInTheDocument();
+    expect(screen.getByText('exit 0')).toBeInTheDocument();
     expect(container.querySelectorAll('.tool-block')).toHaveLength(0);
 
-    fireEvent.click(screen.getByRole('button', { name: /read_file: 2 lines .*expand tool detail/i }));
+    fireEvent.click(screen.getByRole('button', { name: /read_file: ui\/src\/components\/MessageComponents\.tsx:711-750 .*expand tool detail/i }));
 
     expect(container.querySelectorAll('.tool-block')).toHaveLength(3);
     expect(screen.getByText('ui/src/components/MessageComponents.tsx:711-750')).toBeInTheDocument();
@@ -3441,7 +3579,7 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
 
 
 describe('AgentMessage compact find reveal', () => {
-  it('expands a hidden compact fragment on reveal and marks the exact occurrence', async () => {
+  it('marks the exact occurrence in fully visible compact commentary', async () => {
     mockDensity = 'compact';
     const message = agentMessage('agent-find', [
       { type: 'text', text: 'first line\nhidden second line alpha target' },
@@ -3462,8 +3600,8 @@ describe('AgentMessage compact find reveal', () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByRole('button', { name: 'first line' })).toHaveTextContent('first line');
-    expect(screen.queryByText('hidden second line alpha target')).toBeNull();
+    expect(screen.getByText(/first line/)).toBeInTheDocument();
+    expect(screen.getByText(/hidden second line alpha target/)).toBeInTheDocument();
 
     rerender(
       <MemoryRouter>
