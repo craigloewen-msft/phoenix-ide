@@ -24,6 +24,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -3855,7 +3856,123 @@ def _append_git_config_override(key, value, environ=None):
         env["GIT_CONFIG_COUNT"] = str(count)
 
 
-def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False):
+_COMPILER_CACHE_BACKENDS = ("auto", "kache", "sccache", "none")
+
+
+def _kache_binary() -> str | None:
+    configured = os.environ.get("PHOENIX_KACHE_BIN")
+    if configured:
+        path = Path(configured).expanduser()
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path.resolve())
+        return None
+    return shutil.which("kache")
+
+
+def _private_kache_socket_dir() -> Path:
+    uid = os.getuid()
+    directory = Path(tempfile.gettempdir()) / f"phoenix-kache-{uid}"
+    try:
+        directory.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    info = directory.lstat()
+    if not directory.is_dir() or directory.is_symlink() or info.st_uid != uid:
+        raise OSError(f"unsafe kache socket directory: {directory}")
+    directory.chmod(0o700)
+    return directory
+
+
+def _ensure_kache_daemon(binary: str) -> str | None:
+    cache_dir = os.environ.get("KACHE_CACHE_DIR")
+    if os.name != "nt" and cache_dir and "KACHE_SOCKET_PATH" not in os.environ:
+        digest = hashlib.sha256(str(Path(cache_dir).expanduser().resolve()).encode()).hexdigest()[:16]
+        try:
+            socket_dir = _private_kache_socket_dir()
+        except OSError as error:
+            return str(error)
+        os.environ["KACHE_SOCKET_PATH"] = str(socket_dir / f"{digest}.sock")
+
+    try:
+        result = subprocess.run(
+            [binary, "daemon", "start"],
+            capture_output=True,
+            text=True,
+            env=os.environ,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return str(error)
+    if result.returncode != 0:
+        return (result.stderr or result.stdout).strip() or f"exit code {result.returncode}"
+    return None
+
+
+def _configure_compiler_cache(requested: str | None = None) -> str:
+    """Configure the compiler cache without overriding an explicit wrapper."""
+    if "RUSTC_WRAPPER" in os.environ:
+        return "explicit"
+
+    backend = requested or os.environ.get("PHOENIX_COMPILER_CACHE", "auto")
+    if backend not in _COMPILER_CACHE_BACKENDS:
+        choices = ", ".join(_COMPILER_CACHE_BACKENDS)
+        raise SystemExit(
+            f"invalid compiler cache {backend!r}; choose one of: {choices}"
+        )
+
+    if backend == "none":
+        return "none"
+
+    automatic = backend == "auto"
+    kache_binary = _kache_binary()
+    if automatic:
+        if shutil.which("sccache"):
+            backend = "sccache"
+        elif kache_binary:
+            backend = "kache"
+        else:
+            return "none"
+    elif backend == "kache" and not kache_binary:
+        raise SystemExit(
+            "requested compiler cache 'kache' is not installed; put it on PATH "
+            "or set PHOENIX_KACHE_BIN"
+        )
+    elif backend == "sccache" and not shutil.which("sccache"):
+        raise SystemExit("requested compiler cache 'sccache' is not installed or not on PATH")
+
+    wrapper = kache_binary if backend == "kache" else backend
+    assert wrapper is not None
+    os.environ["RUSTC_WRAPPER"] = wrapper
+    if backend == "kache":
+        generated_socket = "KACHE_SOCKET_PATH" not in os.environ
+        daemon_error = _ensure_kache_daemon(wrapper)
+        if daemon_error:
+            if not automatic:
+                raise SystemExit(f"kache daemon failed to start: {daemon_error}")
+            os.environ.pop("RUSTC_WRAPPER", None)
+            if generated_socket:
+                os.environ.pop("KACHE_SOCKET_PATH", None)
+            print(f"  ⚠ kache unavailable; continuing without compiler cache: {daemon_error}")
+            return "none"
+    elif backend == "sccache":
+        os.environ.setdefault("SCCACHE_CACHE_SIZE", "20G")
+    return backend
+
+
+_CARGO_CHECK_LANES = frozenset({"rust", "clippy", "e2e"})
+
+
+def _cargo_check_active(active: set[str]) -> bool:
+    return bool(active & _CARGO_CHECK_LANES)
+
+
+def cmd_check(
+    gate: bool = True,
+    lanes: str | None = None,
+    pretty: bool = False,
+    compiler_cache: str | None = None,
+):
     """Run lint, format check, tests, and task validation in parallel.
 
     `lanes` is an optional comma-separated lane subset (CI splits the check
@@ -3894,11 +4011,11 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
             reporter.lane_skipped(lane, skipped[lane])
 
     # Lane groups whose shared, expensive setup is gated below. UI lanes need
-    # Corepack/pnpm (ensure_ui_deps); cargo lanes need the rustc/sccache env
+    # Corepack/pnpm (ensure_ui_deps); cargo lanes need the compiler-cache env
     # and the env-classification probes. Only `rust` consumes the nextest
     # probe + thread sizing + codegen commands.
     ui_active = bool(active & {"tsc", "ui-lint", "vitest"})
-    cargo_active = bool(active & {"rust", "e2e"})
+    cargo_active = _cargo_check_active(active)
 
     # Stage 3 / per-crate gating: when the rust lane runs under gating, try to
     # narrow clippy + test to the changed crate(s) and their reverse-dep
@@ -4490,16 +4607,10 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
     if ui_active:
         ensure_ui_deps()
 
-    # Enable sccache (if installed) as the rustc wrapper so deps' object files
-    # are shared across worktrees / `cargo clean` cycles. Honored by every
-    # cargo invocation below because the env is inherited by run_step's
-    # subprocesses. Skip cleanly if sccache isn't on PATH or the user has
-    # explicitly set RUSTC_WRAPPER already. Only relevant when a cargo lane runs.
-    if cargo_active and shutil.which("sccache") and "RUSTC_WRAPPER" not in os.environ:
-        os.environ["RUSTC_WRAPPER"] = "sccache"
-        # Default cache dir + 20G cap. Devs can override via SCCACHE_DIR /
-        # SCCACHE_CACHE_SIZE before invoking dev.py.
-        os.environ.setdefault("SCCACHE_CACHE_SIZE", "20G")
+    # Share compiler outputs across worktrees and independent target dirs.
+    # The selected wrapper is inherited by every cargo subprocess below.
+    if cargo_active:
+        _configure_compiler_cache(compiler_cache)
 
     # Environment classification and Git subprocess safety only matter when a
     # cargo lane runs.
@@ -8410,6 +8521,10 @@ def main():
         "--pretty", action="store_true", default=False,
         help="Render lanes as a live table instead of line-per-step output",
     )
+    check_parser.add_argument(
+        "--compiler-cache", choices=_COMPILER_CACHE_BACKENDS, default=None,
+        help="Rust compiler cache (default: PHOENIX_COMPILER_CACHE or auto)",
+    )
 
     check_plan_parser = sub.add_parser(
         "check-plan",
@@ -8594,7 +8709,12 @@ def main():
     elif args.command == "status":
         cmd_status()
     elif args.command == "check":
-        cmd_check(gate=not args.check_all, lanes=args.lanes, pretty=pretty)
+        cmd_check(
+            gate=not args.check_all,
+            lanes=args.lanes,
+            pretty=pretty,
+            compiler_cache=args.compiler_cache,
+        )
     elif args.command == "check-plan":
         cmd_check_plan(gate=not args.check_all, lanes=args.lanes, fmt=args.format)
     elif args.command == "codegen":
