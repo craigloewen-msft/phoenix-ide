@@ -12,13 +12,10 @@ import { useTheme } from '../hooks';
 import type { CodexLoginPreflight } from '../api';
 import { subscribeModels } from '../modelsPoller';
 import { ConversationContext } from '../conversation/ConversationContext';
+import { getDisambiguatedPathLabels } from '../utils/conversationIdentity';
 
 const PROJECT_FILTER_KEY = 'phoenix:sidebar-project-filter';
 const COLLAPSED_DOT_LIMIT = 9;
-
-function projectLabel(project: Project): string {
-  return project.canonical_path.split('/').filter(Boolean).pop() || project.canonical_path;
-}
 
 function countForProject(conversations: readonly Conversation[], projectId: string | null): number {
   if (projectId === null) return conversations.length;
@@ -173,8 +170,12 @@ export function Sidebar({
     return archivedConversations.filter(c => c.project_id === activeProjectId);
   }, [archivedConversations, activeProjectId]);
 
+  const projectLabels = useMemo(
+    () => getDisambiguatedPathLabels(projects.map((project) => project.canonical_path)),
+    [projects],
+  );
   const activeProject = activeProjectId ? projects.find((p) => p.id === activeProjectId) ?? null : null;
-  const activeProjectLabel = activeProject ? projectLabel(activeProject) : null;
+  const activeProjectLabel = activeProject ? projectLabels.get(activeProject.canonical_path) ?? null : null;
   const scopedActiveCount = filteredConversations.length;
   const scopedArchivedCount = filteredArchivedConversations.length;
 
@@ -457,7 +458,7 @@ export function Sidebar({
               <span className="project-tab-count">{conversations.length}</span>
             </button>
             {projects.map(p => {
-              const label = projectLabel(p);
+              const label = projectLabels.get(p.canonical_path) ?? 'Project';
               return (
                 <button
                   key={p.id}

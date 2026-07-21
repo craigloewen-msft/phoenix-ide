@@ -250,7 +250,8 @@ describe('StateBar PR badge', () => {
       check_state: state.check_state,
     }) });
 
-    const badge = await screen.findByRole('link', { name: label });
+    const badge = await screen.findByRole('link', { name: /#12.*Add PR tracking/i });
+    expect(badge).toHaveTextContent(label);
     expect(badge).toHaveClass('pr-badge', className);
     expect(badge).toHaveAttribute('href', 'https://github.com/scottopell/phoenix-ide/pull/12');
     expect(badge).toHaveAttribute('target', '_blank');
@@ -274,7 +275,7 @@ describe('StateBar PR badge', () => {
   it('does not fetch PR status itself for conversations without a branch', async () => {
     renderStateBar({ conversation: makeConversation({ branch_name: null, base_branch: null }) });
 
-    await waitFor(() => expect(screen.getByText('track-pr-status')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getAllByText('track-pr-status')).not.toHaveLength(0));
     expect(api.getPrStatus).not.toHaveBeenCalled();
   });
 
@@ -957,6 +958,71 @@ describe('StateBar working-phase indicators', () => {
   });
 });
 
+describe('StateBar desktop identity layout', () => {
+  it('shows human conversation and project identity with explicit branch labels and PR authority', async () => {
+    renderStateBar({
+      prStatus: mockPrStatus({
+        found: true,
+        number: 12,
+        title: 'Desktop identity redesign',
+        url: 'https://github.com/scottopell/phoenix-ide/pull/12',
+        state: 'OPEN',
+        draft: false,
+        base: 'main',
+        head: 'task-123-pr-status',
+        display_state: 'open',
+        check_state: 'passing',
+      }),
+    });
+
+    expect(screen.getByText('Track PR status')).toBeInTheDocument();
+    expect(screen.getByText('Work')).toBeInTheDocument();
+    expect(screen.queryByText('phoenix-ide')).not.toBeInTheDocument();
+    expect(screen.getByText('Task branch')).toBeInTheDocument();
+    expect(screen.getAllByText('Branch')).toHaveLength(1);
+    expect(screen.getByText('task-123-pr-status')).toBeInTheDocument();
+    expect(screen.getByText('from')).toBeInTheDocument();
+    expect(screen.getByText('main')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /#12 checks ✓/i })).toBeInTheDocument();
+    expect(screen.getAllByText('track-pr-status')).not.toHaveLength(0);
+  });
+
+  it('normalizes mode and model casing for desktop branch conversations', () => {
+    renderStateBar({
+      conversation: makeConversation({
+        slug: 'feature-followup',
+        task_title: 'Tidy follow-up',
+        conv_mode_label: 'bRaNcH',
+        model: 'Claude-Sonnet-5',
+        branch_name: 'feature/existing-branch',
+        base_branch: 'develop',
+        cwd: '/Users/scott/projects/phoenix-ide',
+      }),
+    });
+
+    expect(screen.getAllByText('Branch')).toHaveLength(2);
+    expect(screen.getByText('Existing branch')).toBeInTheDocument();
+    expect(screen.getByText('Claude-Sonnet-5')).toBeInTheDocument();
+    expect(screen.getByText('feature/existing-branch')).toBeInTheDocument();
+    expect(screen.getByText('develop')).toBeInTheDocument();
+  });
+  it('prefers worktree_path for desktop project tooltip metadata', () => {
+    renderStateBar({
+      conversation: makeConversation({
+        slug: 'proj-slug',
+        task_title: null,
+        branch_name: null,
+        base_branch: null,
+        cwd: '/repo/.phoenix/worktrees/conv-1',
+        worktree_path: '/Users/scott/projects/phoenix-ide',
+        project_name: null,
+      }),
+    });
+
+    expect(screen.getByText('phoenix-ide')).toHaveAttribute('title', '/Users/scott/projects/phoenix-ide');
+  });
+});
+
 describe('StateBar mobile layout', () => {
   beforeEach(() => {
     setMobileViewport(true);
@@ -972,6 +1038,7 @@ describe('StateBar mobile layout', () => {
         slug: 'explore-long-project',
         conv_mode_label: 'Explore',
         cwd: '/Users/scott/projects/phoenix-ide',
+        worktree_path: null,
         branch_name: null,
         base_branch: 'main',
         task_title: null,
@@ -993,6 +1060,22 @@ describe('StateBar mobile layout', () => {
     expect(screen.getByRole('button', { name: /copy full working directory .*phoenix-ide/i })).toBeInTheDocument();
     expect(screen.queryByText('Phoenix IDE')).not.toBeInTheDocument();
     expect(screen.queryByText('main')).not.toBeInTheDocument();
+  });
+
+  it('uses the displayed worktree path for mobile tooltip and copy action', () => {
+    const { container } = renderStateBar({
+      conversation: makeConversation({
+        cwd: '/repo/original',
+        worktree_path: '/repo/.phoenix/worktrees/worktree-1',
+      }),
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
+    const copy = screen.getByRole('button', { name: /copy full working directory .*worktree-1/i });
+    expect(container.querySelector('.statebar-mobile-path')).toHaveAttribute('title', '/repo/.phoenix/worktrees/worktree-1');
+    expect(container.querySelector('.statebar-mobile-path')).toHaveTextContent('…/worktrees/worktree-1');
+    fireEvent.click(copy);
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith('/repo/.phoenix/worktrees/worktree-1');
   });
 
   it('renders work task, branch, PR, context, cwd copy, model, and file action without base branch', () => {
@@ -1057,6 +1140,7 @@ describe('StateBar mobile layout', () => {
       conversation: makeConversation({
         conv_mode_label: 'Direct',
         cwd: '/Users/scott/projects/direct-project',
+        worktree_path: null,
         branch_name: null,
         base_branch: null,
         task_title: null,
@@ -1071,6 +1155,19 @@ describe('StateBar mobile layout', () => {
     expect(screen.getByText('…/projects/direct-project')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /copy full working directory .*direct-project/i })).toBeInTheDocument();
     expect(screen.queryByText('Direct Project')).not.toBeInTheDocument();
+  });
+
+  it('does not mount an empty desktop secondary row', () => {
+    const { container } = renderStateBar({
+      conversation: makeConversation({
+        conv_mode_label: 'Direct',
+        branch_name: null,
+        base_branch: null,
+        task_title: null,
+      }),
+    });
+
+    expect(container.querySelector('.statebar-line2')).toBeNull();
   });
 
   it('keeps active-PR selection in StateBar when the terminal active PR cannot be represented by the rail', () => {

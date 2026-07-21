@@ -219,16 +219,9 @@ function decodeBase64Utf8(b64: string): string {
   return new TextDecoder().decode(bytes);
 }
 
-/** Truncate from the LEFT, preserving the tail (cwd + prompt glyph). */
-function truncateLeft(s: string, max: number): string {
-  if (s.length <= max) return s;
-  return '…' + s.slice(s.length - (max - 1));
-}
-
-/** Format a cwd path for the rich HUD — no glyph, just the path. */
+/** Format a cwd path for the rich HUD — CSS truncates only when space runs out. */
 function formatCwdPlain(cwd: string): string {
-  const trimmed = cwd.replace(/\/+$/, '');
-  return truncateLeft(trimmed, 40);
+  return cwd.replace(/\/+$/, '');
 }
 
 /** Truncate command text to first line, capped to 50 chars. */
@@ -1119,7 +1112,7 @@ export function TerminalPanel({
       // Shell integration not detected. Show the static conversation cwd
       // so the user has a useful anchor. Hover the dot for the hint.
       return (
-        <span className="terminal-panel-prompt">
+        <span className="terminal-panel-prompt terminal-panel-prompt--cwd-only">
           <span className="terminal-hud-cwd terminal-hud-cwd--dim">
             {formatCwdPlain(cwd ?? '') || '❯_ Terminal'}
           </span>
@@ -1177,7 +1170,7 @@ export function TerminalPanel({
     }
     // Idle
     return (
-      <span className="terminal-panel-prompt">
+      <span className="terminal-panel-prompt terminal-panel-prompt--cwd-only">
         <span className="terminal-hud-cwd">{formatCwdPlain(effectiveCwd)}</span>
       </span>
     );

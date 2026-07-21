@@ -1183,6 +1183,21 @@ describe('Mobile conversation list redesign', () => {
     expect(container.querySelector('[data-id="project-context"] .conv-project-label')?.textContent).toBe('phoenix-ide');
   });
 
+  it('uses the repository label instead of a generated worktree identifier on mobile rows', () => {
+    const conv = makeConv('generated-project-context', 'generated-project-context', {
+      project_name: null,
+      cwd: '/repo/.phoenix/worktrees/123e4567-e89b-12d3-a456-426614174000',
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} listDensity="mobile" conversations={[conv]} />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-id="generated-project-context"] .conv-project-label')?.textContent).toBe('repo');
+  });
+
   it('uses semantic chain and latest-title fallbacks in collapsed mobile chain summaries', () => {
     const root = makeConv('guid-root', 'f872dd1a-f701-49f3-ad25-2605c6b6f3dc', {
       continued_in_conv_id: 'guid-leaf',
@@ -1207,6 +1222,29 @@ describe('Mobile conversation list redesign', () => {
     expect(container.querySelector('.conv-chain-summary-title')?.textContent).toBe('Latest #2: Readable latest task title');
     expect(container.querySelector('.conv-chain-name-label')?.textContent).not.toContain('f872dd1a');
     expect(container.querySelector('.conv-chain-summary-title')?.textContent).not.toContain('9d1b4cc');
+  });
+
+  it('rejects generated prefixed UUID names in collapsed chain headers', () => {
+    const root = makeConv('fork-root', 'fork-123e4567-e89b-42d3-a456-426614174000', {
+      continued_in_conv_id: 'fork-leaf',
+      chain_name: null,
+      task_title: 'Readable fork task title',
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+      updated_at: '2024-01-01T00:00:00Z',
+    });
+    const leaf = makeConv('fork-leaf', 'continue-readable-work', {
+      updated_at: '2024-02-01T00:00:00Z',
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} listDensity="mobile" conversations={[leaf, root]} />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('.conv-chain-name-label')?.textContent).toBe('Readable fork task title');
+    expect(container.querySelector('.conv-chain-name-label')?.textContent).not.toContain('fork-123e4567');
   });
 
   it('keeps cleaned-up terminal mobile chains collapsed by default', () => {
