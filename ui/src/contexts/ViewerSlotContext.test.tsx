@@ -5,17 +5,24 @@
 // URL normalization, and the browser-session edges.
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { render, act, waitFor } from '@testing-library/react';
+import { render, act, waitFor, fireEvent } from '@testing-library/react';
 import { useEffect, useState } from 'react';
-import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom';
-import { ViewerSlotProvider, useViewerSlot } from './ViewerSlotContext';
+import { MemoryRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
+import { ViewerSlotProvider, useBrowserSessionActive, useViewerSlot } from './ViewerSlotContext';
 import type { ViewerSlotValue } from './ViewerSlotContext';
+import { getLastViewer, setLastViewer } from '../storage/lastViewerStorage';
 
 beforeEach(() => { localStorage.clear(); });
 
 function Capture({ onCtx }: { onCtx: (ctx: ViewerSlotValue) => void }) {
   const ctx = useViewerSlot();
   useEffect(() => { onCtx(ctx); }, [ctx, onCtx]);
+  return null;
+}
+
+function BrowserActiveCapture({ onActive }: { onActive: (active: boolean) => void }) {
+  const active = useBrowserSessionActive();
+  useEffect(() => { onActive(active); }, [active, onActive]);
   return null;
 }
 
@@ -330,12 +337,329 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
     expect(h.get().slot.kind).toBe('prose');
   });
 
-  it('falling edge auto-closes the browser viewer', () => {
+  it('falling edge auto-closes the browser viewer and invalidates its snapshot', () => {
     const h = renderWithFlag();
     act(() => { h.setActive(true); });
     expect(h.get().slot.kind).toBe('browser');
+    expect(getLastViewer('conv-A')).toContain('viewer=browser');
     act(() => { h.setActive(false); });
     expect(h.get().slot.kind).toBe('none');
+    expect(getLastViewer('conv-A')).toBeNull();
+  });
+
+  it('discards an inactive stored browser viewer on in-app entry', () => {
+    setLastViewer('conv-A', 'viewer=browser');
+    let latest: ViewerSlotValue | null = null;
+    function Enter() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/c/conv-A')}>enter</button>;
+    }
+    const { getByText } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="/" element={<Enter />} />
+          <Route path="/c/:slug" element={(
+            <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={false}>
+              <Capture onCtx={(ctx) => { latest = ctx; }} />
+            </ViewerSlotProvider>
+          )} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    act(() => { fireEvent.click(getByText('enter')); });
+
+    expect(latest!.slot.kind).toBe('none');
+    expect(getLastViewer('conv-A')).toBeNull();
+  });
+
+  it('preserves a stored browser viewer while session truth is unknown, then discards it when confirmed inactive', () => {
+    setLastViewer('conv-A', 'viewer=browser');
+    let latest: ViewerSlotValue | null = null;
+    let setActive: ((active: boolean | undefined) => void) | null = null;
+    function BrowserDestination() {
+      const [active, setActiveState] = useState<boolean | undefined>(undefined);
+      setActive = setActiveState;
+      return (
+        <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={active}>
+          <Capture onCtx={(ctx) => { latest = ctx; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    function Enter() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/c/conv-A')}>enter</button>;
+    }
+    const { getByText } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="/" element={<Enter />} />
+          <Route path="/c/:slug" element={<BrowserDestination />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    act(() => { fireEvent.click(getByText('enter')); });
+    expect(latest!.slot.kind).toBe('none');
+    expect(getLastViewer('conv-A')).toContain('viewer=browser');
+
+    act(() => { setActive!(false); });
+    expect(latest!.slot.kind).toBe('none');
+    expect(getLastViewer('conv-A')).toBeNull();
+  });
+
+  it('restores a durable viewer instead of auto-opening an already-active browser', () => {
+    setLastViewer('conv-A', 'viewer=prose&file=%2Frepo%2FREADME.md&root=%2Frepo');
+    let latest: ViewerSlotValue | null = null;
+    let setActive: ((active: boolean | undefined) => void) | null = null;
+    function Destination() {
+      const [active, setActiveState] = useState<boolean | undefined>(undefined);
+      setActive = setActiveState;
+      return (
+        <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={active}>
+          <Capture onCtx={(ctx) => { latest = ctx; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    function Enter() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/c/conv-A')}>enter</button>;
+    }
+    const { getByText } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="/" element={<Enter />} />
+          <Route path="/c/:slug" element={<Destination />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    act(() => { fireEvent.click(getByText('enter')); });
+    act(() => { setActive!(true); });
+
+    expect(latest!.slot.kind).toBe('prose');
+
+    act(() => { latest!.close(); });
+    act(() => { setActive!(false); });
+    act(() => { setActive!(true); });
+    expect(latest!.slot.kind).toBe('browser');
+  });
+
+  it('restores a stored browser viewer only after loaded session truth is active', () => {
+    setLastViewer('conv-A', 'viewer=browser');
+    let latest: ViewerSlotValue | null = null;
+    let setActive: ((active: boolean | undefined) => void) | null = null;
+    function BrowserDestination() {
+      const [active, setActiveState] = useState<boolean | undefined>(undefined);
+      setActive = setActiveState;
+      return (
+        <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={active}>
+          <Capture onCtx={(ctx) => { latest = ctx; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    function Enter() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/c/conv-A')}>enter</button>;
+    }
+    const { getByText } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="/" element={<Enter />} />
+          <Route path="/c/:slug" element={<BrowserDestination />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    act(() => { fireEvent.click(getByText('enter')); });
+    expect(latest!.slot.kind).toBe('none');
+    expect(getLastViewer('conv-A')).toContain('viewer=browser');
+
+    act(() => { setActive!(true); });
+    expect(latest!.slot.kind).toBe('browser');
+  });
+
+  it('closes a browser fall while readiness is pending, then invalidates storage when confirmed', () => {
+    setLastViewer('conv-A', 'viewer=browser');
+    let latest: ViewerSlotValue | null = null;
+    let setActive: ((active: boolean) => void) | null = null;
+    let setLoaded: ((loaded: boolean) => void) | null = null;
+    function Harness() {
+      const [active, setActiveState] = useState(false);
+      const [loaded, setLoadedState] = useState(false);
+      setActive = setActiveState;
+      setLoaded = setLoadedState;
+      return (
+        <ViewerSlotProvider
+          scopeKey="conv-A"
+          browserSessionActive={active}
+          browserSessionStateLoaded={loaded}
+        >
+          <Capture onCtx={(ctx) => { latest = ctx; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={['/c/conv-A']}>
+        <Routes>
+          <Route path="/c/:slug" element={<Harness />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    act(() => { setActive!(true); });
+    expect(latest!.slot.kind).toBe('browser');
+    act(() => { setActive!(false); });
+    expect(latest!.slot.kind).toBe('none');
+    expect(getLastViewer('conv-A')).toContain('viewer=browser');
+
+    act(() => { latest!.openProse('/repo/README.md', '/repo'); });
+    expect(getLastViewer('conv-A')).toContain('viewer=prose');
+    act(() => { setLoaded!(true); });
+    expect(getLastViewer('conv-A')).toContain('viewer=prose');
+  });
+
+  it('preserves a durable snapshot when readiness resolves on the browser fall', () => {
+    setLastViewer('conv-A', 'viewer=prose&file=%2Frepo%2FREADME.md&root=%2Frepo');
+    let latest: ViewerSlotValue | null = null;
+    let setState: ((state: { active: boolean; loaded: boolean }) => void) | null = null;
+    function Harness() {
+      const [state, setStateValue] = useState({ active: false, loaded: false });
+      setState = setStateValue;
+      return (
+        <ViewerSlotProvider
+          scopeKey="conv-A"
+          browserSessionActive={state.active}
+          browserSessionStateLoaded={state.loaded}
+        >
+          <Capture onCtx={(ctx) => { latest = ctx; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={['/c/conv-A']}>
+        <Routes><Route path="/c/:slug" element={<Harness />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    act(() => { setState!({ active: true, loaded: false }); });
+    expect(latest!.slot.kind).toBe('browser');
+    expect(getLastViewer('conv-A')).toContain('viewer=prose');
+    act(() => { setState!({ active: false, loaded: true }); });
+
+    expect(latest!.slot.kind).toBe('none');
+    expect(getLastViewer('conv-A')).toContain('viewer=prose');
+  });
+
+  it('invalidates an unchanged browser snapshot when a pending fall is confirmed', () => {
+    setLastViewer('conv-A', 'viewer=browser');
+    let latest: ViewerSlotValue | null = null;
+    let setActive: ((active: boolean) => void) | null = null;
+    let setLoaded: ((loaded: boolean) => void) | null = null;
+    function Harness() {
+      const [active, setActiveState] = useState(false);
+      const [loaded, setLoadedState] = useState(false);
+      setActive = setActiveState;
+      setLoaded = setLoadedState;
+      return (
+        <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={active} browserSessionStateLoaded={loaded}>
+          <Capture onCtx={(ctx) => { latest = ctx; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={['/c/conv-A']}>
+        <Routes><Route path="/c/:slug" element={<Harness />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    act(() => { setActive!(true); });
+    act(() => { setActive!(false); });
+    expect(latest!.slot.kind).toBe('none');
+    expect(getLastViewer('conv-A')).toContain('viewer=browser');
+    act(() => { setLoaded!(true); });
+    expect(getLastViewer('conv-A')).toBeNull();
+  });
+
+  it('hides cached browser activity from public affordances until readiness confirms it', () => {
+    let publicActive = true;
+    let setLoaded: ((loaded: boolean) => void) | null = null;
+    function Harness() {
+      const [loaded, setLoadedState] = useState(false);
+      setLoaded = setLoadedState;
+      return (
+        <ViewerSlotProvider
+          scopeKey="conv-A"
+          browserSessionActive={true}
+          browserSessionStateLoaded={loaded}
+        >
+          <BrowserActiveCapture onActive={(active) => { publicActive = active; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={['/c/conv-A']}>
+        <Routes><Route path="/c/:slug" element={<Harness />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    expect(publicActive).toBe(false);
+    act(() => { setLoaded!(true); });
+    expect(publicActive).toBe(true);
+  });
+
+  it('does not auto-open when readiness confirms a browser that was already active on entry', () => {
+    let latest: ViewerSlotValue | null = null;
+    let setLoaded: ((loaded: boolean) => void) | null = null;
+    function Harness() {
+      const [loaded, setLoadedState] = useState(false);
+      setLoaded = setLoadedState;
+      return (
+        <ViewerSlotProvider
+          scopeKey="conv-A"
+          browserSessionActive={true}
+          browserSessionStateLoaded={loaded}
+        >
+          <Capture onCtx={(ctx) => { latest = ctx; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={['/c/conv-A']}>
+        <Routes>
+          <Route path="/c/:slug" element={<Harness />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(latest!.slot.kind).toBe('none');
+    act(() => { setLoaded!(true); });
+    expect(latest!.slot.kind).toBe('none');
+  });
+
+  it('auto-opens when loaded session truth rises from unknown to active in the same conversation', () => {
+    let latest: ViewerSlotValue | null = null;
+    let setActive: ((active: boolean | undefined) => void) | null = null;
+    function Harness() {
+      const [active, setActiveState] = useState<boolean | undefined>(undefined);
+      setActive = setActiveState;
+      return (
+        <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={active}>
+          <Capture onCtx={(ctx) => { latest = ctx; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={['/c/conv-A']}>
+        <Routes>
+          <Route path="/c/:slug" element={<Harness />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(latest!.slot.kind).toBe('none');
+    act(() => { setActive!(true); });
+    expect(latest!.slot.kind).toBe('browser');
   });
 
   it('entering a conversation whose session is already active is NOT a rising edge', () => {

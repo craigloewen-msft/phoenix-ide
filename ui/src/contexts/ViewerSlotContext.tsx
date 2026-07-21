@@ -213,11 +213,19 @@ interface ViewerSlotProviderProps {
   /** Active conversation slug — scopes patchContext and per-conversation
    *  last-viewer storage. */
   scopeKey?: string | undefined;
-  /** Server-authoritative live-session flag; pass false when no atom yet. */
-  browserSessionActive: boolean;
+  /** Latest browser-session state from the conversation snapshot. */
+  browserSessionActive: boolean | undefined;
+  /** Whether the snapshot is live enough to authorize browser storage and
+   *  public active-state affordances. Defaults true for isolated consumers. */
+  browserSessionStateLoaded?: boolean;
 }
 
-export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }: ViewerSlotProviderProps) {
+export function ViewerSlotProvider({
+  children,
+  scopeKey,
+  browserSessionActive,
+  browserSessionStateLoaded = true,
+}: ViewerSlotProviderProps) {
   const [searchParams, setSearchParams] = useSearchParams();
   const location = useLocation();
 
@@ -329,10 +337,8 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     writeUrl((next) => next.set(DIFF_PRESENTATION_PARAM, nextPresentation));
   }, [slot.kind, writeUrl]);
 
-  // Clear the URL to the empty slot. `clearStorage` distinguishes an explicit
-  // user close (clears the last-viewer entry so navigating back doesn't reopen)
-  // from a system-driven close like the browser-session falling edge (which
-  // leaves storage intact — see REQ-VS-009 vs the user-close storage rule).
+  // Clear the URL to the empty slot. `clearStorage` distinguishes closes that
+  // invalidate the last-viewer entry from normalization-only URL cleanup.
   const clearSlot = useCallback(
     (clearStorage: boolean) => {
       setPatchContext(null);
@@ -358,8 +364,9 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   useEffect(() => {
     if (!scopeKey) return;
     if (slot.kind === 'none') return;
+    if (slot.kind === 'browser' && (!browserSessionStateLoaded || browserSessionActive !== true)) return;
     setLastViewer(scopeKey, searchString);
-  }, [scopeKey, slot.kind, searchString]);
+  }, [scopeKey, slot.kind, searchString, browserSessionActive, browserSessionStateLoaded]);
 
   // REQ-VS-014: restore the last viewer on in-app *entry* to a conversation.
   // Entry is a scopeKey change (the user navigated to a different conversation),
@@ -371,12 +378,19 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   // excluded by design (D1): the URL is authoritative there. A URL that already
   // carries viewer params is left alone (browser back/forward, shared link).
   const enteredScopeRef = useRef<string | undefined | typeof UNSET_SCOPE>(UNSET_SCOPE);
+  const restorationScheduledForScopeRef = useRef<string | undefined>(undefined);
   useEffect(() => {
     const isEntry = enteredScopeRef.current !== scopeKey;
-    enteredScopeRef.current = scopeKey;
     if (!isEntry) return;
-    if (!scopeKey) return;
-    if (location.key === 'default') return;
+    restorationScheduledForScopeRef.current = undefined;
+    if (!scopeKey) {
+      enteredScopeRef.current = scopeKey;
+      return;
+    }
+    if (location.key === 'default') {
+      enteredScopeRef.current = scopeKey;
+      return;
+    }
     if (
       searchParams.has(VIEWER_PARAM)
       || searchParams.has(FILE_PARAM)
@@ -385,16 +399,39 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
       || searchParams.has(DIFF_TARGET_PARAM)
       || searchParams.has(MESSAGE_PARAM)
       || searchParams.has(REVIEW_PARAM)
-    ) return;
+    ) {
+      enteredScopeRef.current = scopeKey;
+      return;
+    }
     const stored = getLastViewer(scopeKey);
-    if (!stored) return;
-    setSearchParams(new URLSearchParams(stored), { replace: true });
-  }, [scopeKey, location.key, searchParams, setSearchParams]);
+    if (!stored) {
+      enteredScopeRef.current = scopeKey;
+      return;
+    }
+    const storedParams = new URLSearchParams(stored);
+    if (storedParams.get(VIEWER_PARAM) === 'browser') {
+      if (!browserSessionStateLoaded || browserSessionActive === undefined) return;
+      if (!browserSessionActive) {
+        clearLastViewer(scopeKey);
+        enteredScopeRef.current = scopeKey;
+        return;
+      }
+    }
+    enteredScopeRef.current = scopeKey;
+    restorationScheduledForScopeRef.current = scopeKey;
+    setSearchParams(storedParams, { replace: true });
+  }, [scopeKey, browserSessionActive, browserSessionStateLoaded, location.key, searchParams, setSearchParams]);
+
+  useEffect(() => {
+    if (restorationScheduledForScopeRef.current === scopeKey && slot.kind !== 'none') {
+      restorationScheduledForScopeRef.current = undefined;
+    }
+  }, [scopeKey, slot.kind]);
 
   // REQ-VS-008 / REQ-VS-009: browser-session edges. Rising edge auto-opens the
   // browser viewer only when the slot is empty (never steals prose/diff);
-  // falling edge auto-closes only when the browser viewer is showing, without
-  // clearing storage (a system close, not a user close).
+  // falling edge auto-closes only when the browser viewer is showing and
+  // invalidates its ephemeral snapshot so a dead viewer cannot be restored.
   //
   // The provider is mounted once in DesktopLayout and lives across conversation
   // switches, so the edge tracker is scoped: on a scopeKey change (conversation
@@ -405,21 +442,55 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   // prior conversation's flag would be misread as an edge on entry.
   const prevActiveRef = useRef(browserSessionActive);
   const edgeScopeRef = useRef(scopeKey);
+  const clearStoredBrowserSnapshot = useCallback((key: string | undefined) => {
+    if (!key) return;
+    const stored = getLastViewer(key);
+    if (stored && new URLSearchParams(stored).get(VIEWER_PARAM) === 'browser') {
+      clearLastViewer(key);
+    }
+  }, []);
+  const pendingBrowserFallScopeRef = useRef<string | undefined>(undefined);
   const slotKind = slot.kind;
   useEffect(() => {
     if (edgeScopeRef.current !== scopeKey) {
       edgeScopeRef.current = scopeKey;
       prevActiveRef.current = browserSessionActive;
+      pendingBrowserFallScopeRef.current = undefined;
       return;
     }
     const prev = prevActiveRef.current;
     prevActiveRef.current = browserSessionActive;
-    if (!prev && browserSessionActive && slotKind === 'none') {
-      openBrowser();
-    } else if (prev && !browserSessionActive && slotKind === 'browser') {
-      clearSlot(false);
+    if (prev !== true && browserSessionActive === true && slotKind === 'none') {
+      if (restorationScheduledForScopeRef.current !== scopeKey) openBrowser();
+    } else if (prev === true && browserSessionActive === false && slotKind === 'browser') {
+      // The observed lifecycle fall closes the viewer immediately. Storage
+      // invalidation waits for authoritative conversation state so a cached
+      // row cannot erase a valid browser snapshot.
+      if (browserSessionStateLoaded) {
+        pendingBrowserFallScopeRef.current = undefined;
+        clearSlot(false);
+        clearStoredBrowserSnapshot(scopeKey);
+      } else {
+        pendingBrowserFallScopeRef.current = scopeKey;
+        clearSlot(false);
+      }
+    } else if (
+      pendingBrowserFallScopeRef.current === scopeKey
+      && browserSessionStateLoaded
+      && browserSessionActive === false
+    ) {
+      clearStoredBrowserSnapshot(scopeKey);
+      pendingBrowserFallScopeRef.current = undefined;
     }
-  }, [scopeKey, browserSessionActive, slotKind, openBrowser, clearSlot]);
+  }, [
+    scopeKey,
+    browserSessionActive,
+    browserSessionStateLoaded,
+    slotKind,
+    openBrowser,
+    clearSlot,
+    clearStoredBrowserSnapshot,
+  ]);
 
   const commands = useMemo<ViewerSlotCommands>(
     () => ({ openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, openCommissionReview, setPresentation, close }),
@@ -429,7 +500,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   return (
     <ViewerSlotCommandsContext.Provider value={commands}>
       <ViewerSlotDataContext.Provider value={slot}>
-        <ViewerSlotBrowserActiveContext.Provider value={browserSessionActive}>
+        <ViewerSlotBrowserActiveContext.Provider value={browserSessionStateLoaded && browserSessionActive === true}>
           {children}
         </ViewerSlotBrowserActiveContext.Provider>
       </ViewerSlotDataContext.Provider>

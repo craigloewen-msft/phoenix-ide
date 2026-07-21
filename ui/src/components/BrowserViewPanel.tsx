@@ -26,6 +26,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { ArrowLeft } from 'lucide-react';
 import { api } from '../api';
 
 const TAG_FRAME = 0x00;
@@ -49,14 +50,18 @@ interface BrowserViewPanelProps {
   conversationId: string;
   /** Click handler for the close button in the header. */
   onClose?: () => void;
-  /** When true, render with the inline split-pane chrome (no overlay). */
+  /** When true, render without overlay positioning. */
   inline?: boolean;
+  /** Inline narrow-layout takeover: use full-screen navigation chrome rather
+   *  than the compact split-pane close control. */
+  takeover?: boolean;
 }
 
 export function BrowserViewPanel({
   conversationId,
   onClose,
   inline,
+  takeover,
 }: BrowserViewPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -71,18 +76,49 @@ export function BrowserViewPanel({
   /** Bumping this triggers the connect effect to retear and reconnect. */
   const [reconnectNonce, setReconnectNonce] = useState(0);
   const [stopping, setStopping] = useState(false);
+  const stoppingRef = useRef(false);
+  const liveFrameSuppressedDuringStopRef = useRef(false);
+  const reconnectSuppressedDuringStopRef = useRef(false);
   const [stopError, setStopError] = useState<string | null>(null);
+
+  useEffect(() => {
+    stoppingRef.current = false;
+    liveFrameSuppressedDuringStopRef.current = false;
+    reconnectSuppressedDuringStopRef.current = false;
+    setStopping(false);
+    setStopError(null);
+  }, [conversationId]);
 
   const stopBrowserSession = useCallback(async () => {
     if (stopping) return;
-    setStopping(true);
+    const terminalBeforeRequest = statusRef.current.kind === 'no-session'
+      || statusRef.current.kind === 'error'
+      || (statusRef.current.kind === 'ended' && reconnectTimerRef.current === null);
+    stoppingRef.current = !terminalBeforeRequest;
+    liveFrameSuppressedDuringStopRef.current = false;
+    reconnectSuppressedDuringStopRef.current = false;
+    setStopping(!terminalBeforeRequest);
+    if (!terminalBeforeRequest && reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+      reconnectSuppressedDuringStopRef.current = true;
+    }
     setStopError(null);
     try {
       await api.stopConversationBrowserSession(conversationId);
+      // A successful response only means teardown was queued. Keep presenting
+      // the pending state until server lifecycle truth unmounts this viewer.
     } catch (err) {
-      setStopError(err instanceof Error ? err.message : 'Failed to stop browser session');
-    } finally {
+      stoppingRef.current = false;
       setStopping(false);
+      if (reconnectSuppressedDuringStopRef.current) {
+        setReconnectNonce((nonce) => nonce + 1);
+      } else if (liveFrameSuppressedDuringStopRef.current) {
+        setStatus({ kind: 'live' });
+      }
+      liveFrameSuppressedDuringStopRef.current = false;
+      reconnectSuppressedDuringStopRef.current = false;
+      setStopError(err instanceof Error ? err.message : 'Failed to stop browser session');
     }
   }, [conversationId, stopping]);
 
@@ -146,19 +182,35 @@ export function BrowserViewPanel({
         drawJpeg(jpeg);
         // Receiving a frame implies the screencast is live, regardless of
         // what status arrived earlier (or didn't).
-        setStatus((prev) => (prev.kind === 'live' ? prev : { kind: 'live' }));
+        if (stoppingRef.current) {
+          liveFrameSuppressedDuringStopRef.current = true;
+        } else {
+          setStatus((prev) => (prev.kind === 'live' ? prev : { kind: 'live' }));
+        }
       } else if (tag === TAG_URL) {
         const text = new TextDecoder('utf-8').decode(data.subarray(1));
         setUrl(text);
       } else if (tag === TAG_STATUS) {
         const text = new TextDecoder('utf-8').decode(data.subarray(1));
         if (text === 'no-session') {
+          stoppingRef.current = false;
+          liveFrameSuppressedDuringStopRef.current = false;
+          reconnectSuppressedDuringStopRef.current = false;
+          setStopping(false);
           setStatus({ kind: 'no-session' });
         } else if (text === 'started') {
           setStatus({ kind: 'live' });
         } else if (text === 'ended') {
+          stoppingRef.current = false;
+          liveFrameSuppressedDuringStopRef.current = false;
+          reconnectSuppressedDuringStopRef.current = false;
+          setStopping(false);
           setStatus({ kind: 'ended' });
         } else if (text.startsWith('error:')) {
+          stoppingRef.current = false;
+          liveFrameSuppressedDuringStopRef.current = false;
+          reconnectSuppressedDuringStopRef.current = false;
+          setStopping(false);
           setStatus({ kind: 'error', message: text.slice(6).trim() });
         }
       }
@@ -166,6 +218,10 @@ export function BrowserViewPanel({
 
     ws.onerror = () => {
       if (cancelled) return;
+      stoppingRef.current = false;
+      liveFrameSuppressedDuringStopRef.current = false;
+      reconnectSuppressedDuringStopRef.current = false;
+      setStopping(false);
       setStatus({ kind: 'error', message: 'connection error' });
     };
 
@@ -178,7 +234,14 @@ export function BrowserViewPanel({
       // race against that signal. Status stays at whatever the WS last
       // reported so the overlay doesn't flicker back to "Connecting…".
       const wasLive = statusRef.current.kind === 'live';
-      if (wasLive) {
+      if (stoppingRef.current && wasLive) {
+        reconnectSuppressedDuringStopRef.current = true;
+      } else if (stoppingRef.current) {
+        stoppingRef.current = false;
+        liveFrameSuppressedDuringStopRef.current = false;
+        reconnectSuppressedDuringStopRef.current = false;
+        setStopping(false);
+      } else if (wasLive) {
         setStatus({ kind: 'ended' });
         reconnectTimerRef.current = window.setTimeout(() => {
           reconnectTimerRef.current = null;
@@ -211,16 +274,29 @@ export function BrowserViewPanel({
 
   return (
     <div
-      className={`browser-view-panel${inline ? ' browser-view-panel--inline' : ''}`}
+      className={`browser-view-panel${inline ? ' browser-view-panel--inline' : ''}${takeover ? ' browser-view-panel--takeover' : ''}`}
       data-testid="browser-view-panel"
     >
       <div className="browser-view-panel__header">
+        {onClose && (!inline || takeover) && (
+          <button
+            type="button"
+            className="browser-view-panel__back"
+            onClick={onClose}
+            aria-label="Back to conversation"
+            title="Back to conversation"
+          >
+            <ArrowLeft size={20} aria-hidden="true" />
+          </button>
+        )}
         <span
           className="browser-view-panel__status"
-          data-status={status.kind}
-          aria-label={`Browser view status: ${status.kind}`}
+          data-status={stopping ? 'stopping' : status.kind}
+          aria-label={`Browser view status: ${stopping ? 'stopping' : status.kind}`}
           title={
-            status.kind === 'error'
+            stopping
+              ? 'Stopping browser…'
+              : status.kind === 'error'
               ? `Error: ${status.message}`
               : status.kind === 'no-session'
                 ? 'Agent has not opened the browser yet'
@@ -250,7 +326,7 @@ export function BrowserViewPanel({
         >
           {stopping ? 'Stopping…' : 'Stop browser'}
         </button>
-        {onClose && (
+        {onClose && inline && !takeover && (
           <button
             type="button"
             className="browser-view-panel__close"
@@ -276,10 +352,11 @@ export function BrowserViewPanel({
           // tooltip explains why.
           style={{ pointerEvents: 'none' }}
         />
-        {status.kind !== 'live' && (
+        {(stopping || status.kind !== 'live') && (
           <div className="browser-view-panel__overlay" role="status">
-            {status.kind === 'connecting' && 'Connecting…'}
-            {status.kind === 'no-session' && (
+            {stopping && 'Stopping browser…'}
+            {!stopping && status.kind === 'connecting' && 'Connecting…'}
+            {!stopping && status.kind === 'no-session' && (
               <>
                 <div>No browser yet.</div>
                 <div className="browser-view-panel__overlay-sub">
@@ -287,8 +364,8 @@ export function BrowserViewPanel({
                 </div>
               </>
             )}
-            {status.kind === 'ended' && 'Browser session ended.'}
-            {status.kind === 'error' && `Error: ${status.message}`}
+            {!stopping && status.kind === 'ended' && 'Browser session ended.'}
+            {!stopping && status.kind === 'error' && `Error: ${status.message}`}
           </div>
         )}
       </div>
