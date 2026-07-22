@@ -140,12 +140,6 @@
   color: var(--bg-primary);
 }
 
-.fe-tree-scroll {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow-y: auto;
-}
-
 .fe-refresh {
   margin-left: auto;
   display: flex;
@@ -164,4 +158,79 @@
 .fe-refresh:hover {
   color: var(--text-primary);
   background: var(--bg-tertiary);
+}
+
+.git-grounding-open-diff {
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 4px;
+  padding: 0;
+  cursor: pointer;
+}
+
+.git-grounding-open-diff:hover,
+.git-grounding-open-diff:focus-visible {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  outline: none;
+}
+
+.git-status-details {
+  padding: 9px 12px 11px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.git-status-checkout {
+  overflow: hidden;
+  margin-bottom: 7px;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-status-clean {
+  color: var(--accent-green);
+}
+
+.git-status-groups {
+  display: grid;
+  gap: 5px;
+  margin-top: 0;
+}
+
+.git-status-group {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.git-status-group span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-status-group strong {
+  flex: 0 0 auto;
+  font-weight: 600;
+}
+
+.git-status-group--staged {
+  color: var(--accent-green);
+}
+
+.git-status-group--unstaged,
+.git-status-group--untracked {
+  color: var(--accent-orange);
+}
+
+.git-status-group--conflicted {
+  color: var(--accent-red);
 }

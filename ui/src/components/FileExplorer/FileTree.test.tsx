@@ -253,6 +253,23 @@ describe('FileTree — reveal active file', () => {
     }
   });
 
+  it('uses one abortable root request per explicit refresh', async () => {
+    const fetchMock = vi.mocked(fetch);
+    const { rerender } = render(
+      <FileTree rootPath="/proj" onFileSelect={vi.fn()} refreshKey={0} />,
+    );
+    await screen.findByText('README.md');
+    fetchMock.mockClear();
+
+    rerender(<FileTree rootPath="/proj" onFileSelect={vi.fn()} refreshKey={1} />);
+    await waitFor(() => {
+      const rootRequests = fetchMock.mock.calls.filter(([url]) => (
+        new URL(String(url), 'http://localhost').searchParams.get('path') === '/proj'
+      ));
+      expect(rootRequests).toHaveLength(1);
+    });
+  });
+
   it('does not automatically retry a failed expanded directory load', async () => {
     const fetchMock = vi.mocked(fetch);
     let uiRequestCount = 0;
@@ -455,6 +472,197 @@ describe('FileTree — reveal active file', () => {
 
     resolveChildren({ ok: true, json: async () => ({ items: FS['/proj/ui']! }) });
     expect(await screen.findByText('src')).toBeInTheDocument();
+  });
+
+  it('drops an auto-refresh response from a previous root', async () => {
+    let resolveOld!: (response: Response) => void;
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const path = new URL(String(url), 'http://localhost').searchParams.get('path') || '';
+      if (path === '/old') return new Promise<Response>(resolve => { resolveOld = resolve; });
+      return { ok: true, json: async () => ({ items: [{ name: 'new.ts', path: '/new/new.ts', is_directory: false, viewer: TEXT('code'), is_gitignored: false }] }) } as Response;
+    });
+    const { rerender } = render(<FileTree rootPath="/old" onFileSelect={vi.fn()} />);
+    rerender(<FileTree rootPath="/new" onFileSelect={vi.fn()} />);
+    expect(await screen.findByText('new.ts')).toBeInTheDocument();
+
+    resolveOld({ ok: true, json: async () => ({ items: [{ name: 'old.ts', path: '/old/old.ts', is_directory: false, viewer: TEXT('code'), is_gitignored: false }] }) } as Response);
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.queryByText('old.ts')).not.toBeInTheDocument();
+  });
+
+  it('keeps the auto-refresh deadline stable while folders are expanded', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const onRefreshTick = vi.fn();
+
+    render(<FileTree rootPath="/proj" onFileSelect={vi.fn()} onRefreshTick={onRefreshTick} />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    fireEvent.click(screen.getByText('ui'));
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+
+    expect(onRefreshTick).toHaveBeenCalledTimes(1);
+    vi.mocked(Math.random).mockRestore();
+    vi.useRealTimers();
+  });
+
+  it('does not refresh git status while the document is hidden', async () => {
+    vi.useFakeTimers();
+    const onRefreshTick = vi.fn();
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+
+    render(<FileTree rootPath="/proj" onFileSelect={vi.fn()} onRefreshTick={onRefreshTick} />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(12_000);
+    });
+
+    expect(onRefreshTick).not.toHaveBeenCalled();
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    vi.useRealTimers();
+  });
+
+  it('decorates changed files and collapsed ancestor folders from one git snapshot', async () => {
+    render(
+      <FileTree
+        rootPath="/proj"
+        onFileSelect={vi.fn()}
+        gitStatus={{
+          kind: 'snapshot',
+          checkout_status: { kind: 'named_branch', branch_name: 'feature', head_oid: 'abc123', remote_status: { kind: 'no_known' } },
+          counts: { changed_paths: 2, staged_paths: 0, unstaged_paths: 1, untracked_paths: 1, conflicted_paths: 0 },
+          changed_paths: [
+            { kind: 'ordinary', path: 'README.md', index_status: 'unmodified', worktree_status: 'modified' },
+            { kind: 'untracked', path: 'ui/new.ts' },
+          ],
+        }}
+      />,
+    );
+
+    expect(await screen.findByText('README.md')).toBeInTheDocument();
+    expect(screen.getByLabelText('Git status modified')).toBeInTheDocument();
+    expect(screen.getByLabelText('1 changed descendant')).toBeInTheDocument();
+    expect(screen.getByText('ui').closest('.ft-item')?.querySelector('.ft-git-status')).toBeNull();
+  });
+
+  it('keys git decorations in the canonical file-list namespace', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation(async () => ({
+      ok: true,
+      json: async () => ({ items: [
+        { name: 'changed.ts', path: '/canonical/project/changed.ts', is_directory: false, viewer: TEXT('typescript'), is_gitignored: false },
+      ] }),
+    } as Response));
+
+    render(
+      <FileTree
+        rootPath="/symlink/project"
+        onFileSelect={vi.fn()}
+        gitStatus={{
+          kind: 'snapshot',
+          checkout_status: { kind: 'named_branch', branch_name: 'feature', head_oid: 'abc123', remote_status: { kind: 'no_known' } },
+          counts: { changed_paths: 1, staged_paths: 0, unstaged_paths: 1, untracked_paths: 0, conflicted_paths: 0 },
+          changed_paths: [{ kind: 'ordinary', path: 'changed.ts', index_status: 'unmodified', worktree_status: 'modified' }],
+        }}
+      />,
+    );
+
+    expect(await screen.findByText('changed.ts')).toBeInTheDocument();
+    expect(screen.getByLabelText('Git status modified')).toBeInTheDocument();
+  });
+
+  it('does not count copy source ancestors as dirty', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const path = new URL(String(url), 'http://localhost').searchParams.get('path') || '';
+      if (path === '/proj') return {
+        ok: true,
+        json: async () => ({ items: [
+          { name: 'ui', path: '/proj/ui', is_directory: true, viewer: DIR, is_gitignored: false },
+          { name: 'src', path: '/proj/src', is_directory: true, viewer: DIR, is_gitignored: false },
+        ] }),
+      } as Response;
+      return { ok: true, json: async () => ({ items: [] }) } as Response;
+    });
+    render(<FileTree rootPath="/proj" onFileSelect={vi.fn()} gitStatus={{
+      kind: 'snapshot',
+      checkout_status: { kind: 'named_branch', branch_name: 'feature', head_oid: 'abc', remote_status: { kind: 'no_known' } },
+      counts: { changed_paths: 1, staged_paths: 1, unstaged_paths: 0, untracked_paths: 0, conflicted_paths: 0 },
+      changed_paths: [{ kind: 'copied', path: 'ui/a.ts', source_path: 'src/a.ts', worktree_status: 'unmodified' }],
+    }} />);
+
+    await screen.findByText('src');
+    expect(screen.getAllByLabelText('1 changed descendant')).toHaveLength(1);
+    expect(screen.getByText('src').closest('.ft-item')).not.toHaveTextContent('1');
+  });
+
+  it('preserves duplicate statuses for the same visible path', async () => {
+    render(<FileTree rootPath="/proj" onFileSelect={vi.fn()} gitStatus={{
+      kind: 'snapshot',
+      checkout_status: { kind: 'named_branch', branch_name: 'feature', head_oid: 'abc', remote_status: { kind: 'no_known' } },
+      counts: { changed_paths: 2, staged_paths: 1, unstaged_paths: 0, untracked_paths: 1, conflicted_paths: 0 },
+      changed_paths: [
+        { kind: 'ordinary', path: 'README.md', index_status: 'deleted', worktree_status: 'unmodified' },
+        { kind: 'untracked', path: 'README.md' },
+      ],
+    }} />);
+
+    await screen.findByText('README.md');
+    expect(screen.getByLabelText('Git status deleted')).toBeInTheDocument();
+    expect(screen.getByLabelText('Git status untracked')).toBeInTheDocument();
+  });
+
+  it('counts a same-directory rename once on its parent', async () => {
+    render(<FileTree rootPath="/proj" onFileSelect={vi.fn()} gitStatus={{
+      kind: 'snapshot',
+      checkout_status: { kind: 'named_branch', branch_name: 'feature', head_oid: 'abc', remote_status: { kind: 'no_known' } },
+      counts: { changed_paths: 1, staged_paths: 1, unstaged_paths: 0, untracked_paths: 0, conflicted_paths: 0 },
+      changed_paths: [{ kind: 'renamed', path: 'ui/new.ts', previous_path: 'ui/old.ts', worktree_status: 'unmodified' }],
+    }} />);
+
+    await screen.findByText('ui');
+    expect(screen.getByLabelText('1 changed descendant')).toBeInTheDocument();
+    expect(screen.queryByLabelText('2 changed descendants')).not.toBeInTheDocument();
+  });
+
+  it('counts both source and destination ancestors for cross-directory renames', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const u = new URL(String(url), 'http://localhost');
+      if (u.pathname === '/api/files/list' && u.searchParams.get('path') === '/proj') {
+        return {
+          ok: true,
+          json: async () => ({ items: [
+            ...(FS['/proj'] ?? []),
+            { name: 'src', path: '/proj/src', is_directory: true, viewer: DIR, is_gitignored: false },
+          ] }),
+        } as Response;
+      }
+      return { ok: true, json: async () => ({ items: FS[u.searchParams.get('path') || ''] ?? [] }) } as Response;
+    });
+    render(
+      <FileTree
+        rootPath="/proj"
+        onFileSelect={vi.fn()}
+        gitStatus={{
+          kind: 'snapshot',
+          checkout_status: { kind: 'named_branch', branch_name: 'feature', head_oid: 'abc123', remote_status: { kind: 'no_known' } },
+          counts: { changed_paths: 1, staged_paths: 1, unstaged_paths: 0, untracked_paths: 0, conflicted_paths: 0 },
+          changed_paths: [{
+            kind: 'renamed',
+            path: 'ui/moved.ts',
+            previous_path: 'src/moved.ts',
+            worktree_status: 'unmodified',
+          }],
+        }}
+      />,
+    );
+
+    await screen.findByText('README.md');
+    expect(screen.getAllByLabelText('1 changed descendant')).toHaveLength(2);
   });
 
   it('opens image files and disables only non-viewable (opaque) files', async () => {

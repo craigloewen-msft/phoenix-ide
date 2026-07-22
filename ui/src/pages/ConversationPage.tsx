@@ -2639,6 +2639,7 @@ function ConversationPageContent({
           conversationId={conversation.id}
           onClose={() => setShowFileBrowser(false)}
           onFileSelect={handleFileSelect}
+          canOpenWorkspaceDiff={conversation.conv_mode_label === 'Work' || conversation.conv_mode_label === 'Branch'}
         />
       )}
 
