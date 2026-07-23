@@ -18,6 +18,8 @@ import { api, type TrajectoryExportPayload } from '../api';
 import type { UsageOverview } from '../generated/UsageOverview';
 import type { ConversationUsageDetail } from '../generated/ConversationUsageDetail';
 import type { Totals } from '../generated/Totals';
+import type { TtftSummaryRow } from '../generated/TtftSummaryRow';
+import type { TtftThresholdStat } from '../generated/TtftThresholdStat';
 import './UsagePage.css';
 
 function fmtTokens(n: number): string {
@@ -57,6 +59,20 @@ function fmtCostSummary(cost: Totals['cost']): string {
 
 function fmtPct(n: number): string {
   return `${(n * 100).toFixed(1)}%`;
+}
+
+function fmtRatioPct(n: number | null | undefined): string {
+  if (n === null || n === undefined) return '—';
+  return `${(n * 100).toFixed(1)}%`;
+}
+
+function attemptScopeLabel(scope: TtftSummaryRow['attempt_scope']): string {
+  return scope === 'first_attempt' ? 'First attempt' : 'Retry';
+}
+
+function fmtTtftSampleQuality(row: Pick<TtftSummaryRow, 'sample_count' | 'no_token_success_count' | 'cancellation_count' | 'error_count'>): string {
+  const observed = row.sample_count + row.no_token_success_count + row.cancellation_count + row.error_count;
+  return `${Math.round(row.sample_count)} TTFT samples · ${Math.round(row.no_token_success_count)} no-token successes · ${Math.round(row.cancellation_count)} cancellations · ${Math.round(row.error_count)} errors${observed > 0 ? ` · ${fmtRatioPct(row.sample_count / observed)} sampled` : ''}`;
 }
 
 // Recharts tooltip formatters receive `ValueType | undefined` (number, string,
@@ -153,6 +169,179 @@ function ChartCard({ title, hint, children }: { title: string; hint?: string; ch
   );
 }
 
+
+function TtftThresholdBadges({ thresholds }: { thresholds: TtftThresholdStat[] }) {
+  return (
+    <div className="usage-ttft-badges">
+      {thresholds.map((threshold) => (
+        <span key={threshold.threshold_ms} className="usage-ttft-badge">
+          &gt;{fmtLatency(threshold.threshold_ms)}: {Math.round(threshold.exceeded_count)} ({fmtRatioPct(threshold.exceeded_rate)})
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function TtftHero({ data }: { data: UsageOverview['ttft'] }) {
+  const firstAttemptRows = data.provider_rows.filter((row) => row.attempt_scope === 'first_attempt');
+  const retryRows = data.provider_rows.filter((row) => row.attempt_scope === 'retry');
+  const groupedRows = data.grouped_rows;
+  const trend = Array.from(new Set(data.daily_trend.map((row) => row.day))).map((day) => {
+    const firstAttempt = data.daily_trend.find(
+      (row) => row.day === day && row.attempt_scope === 'first_attempt',
+    );
+    const retry = data.daily_trend.find((row) => row.day === day && row.attempt_scope === 'retry');
+    return {
+      day,
+      firstAttemptP50: firstAttempt?.percentiles.p50_ms ?? null,
+      firstAttemptSamples: firstAttempt?.sample_count ?? 0,
+      retryP50: retry?.percentiles.p50_ms ?? null,
+      retrySamples: retry?.sample_count ?? 0,
+    };
+  });
+  const topFirstAttempt = firstAttemptRows[0] ?? null;
+  const topRetry = retryRows[0] ?? null;
+  const observed = data.sample_count + data.no_token_success_count + data.cancellation_count + data.error_count;
+
+  return (
+    <section className="usage-card usage-ttft-hero">
+      <div className="usage-card__head">
+        <div>
+          <h3>Time to first token</h3>
+          <span className="usage-card__hint">
+            Provider efficiency over the last {Math.round(data.window_days)} days. TTFT uses dispatch→first generation event and excludes no-token successes, cancellations, and failures from percentile math.
+          </span>
+        </div>
+      </div>
+
+      {observed === 0 ? (
+        <div className="settings-section__hint">No recent TTFT observations yet.</div>
+      ) : (
+        <div className="usage-ttft-grid">
+          <div className="usage-ttft-summary">
+            <div className="usage-export__summary">
+              <div><span>TTFT samples</span><strong>{Math.round(data.sample_count)}</strong></div>
+              <div><span>No-token success</span><strong>{Math.round(data.no_token_success_count)}</strong></div>
+              <div><span>Cancellations</span><strong>{Math.round(data.cancellation_count)}</strong></div>
+              <div><span>Errors</span><strong>{Math.round(data.error_count)}</strong></div>
+              <div><span>Sample quality</span><strong>{fmtRatioPct(observed > 0 ? data.sample_count / observed : null)}</strong></div>
+            </div>
+            {topFirstAttempt && (
+              <div className="usage-ttft-featured">
+                <h4>Best-covered first-attempt provider</h4>
+                <strong>{topFirstAttempt.provider}</strong>
+                <div className="usage-card__hint">{fmtTtftSampleQuality(topFirstAttempt)}</div>
+                <div className="usage-ttft-stats">
+                  <span>P50 {fmtLatency(topFirstAttempt.percentiles.p50_ms)}</span>
+                  <span>P95 {fmtLatency(topFirstAttempt.percentiles.p95_ms)}</span>
+                  <span>P99 {fmtLatency(topFirstAttempt.percentiles.p99_ms)}</span>
+                </div>
+                <TtftThresholdBadges thresholds={topFirstAttempt.thresholds} />
+              </div>
+            )}
+            {topRetry && (
+              <div className="usage-ttft-featured usage-ttft-featured--retry">
+                <h4>Retry behavior</h4>
+                <strong>{topRetry.provider}</strong>
+                <div className="usage-card__hint">{fmtTtftSampleQuality(topRetry)}</div>
+                <div className="usage-ttft-stats">
+                  <span>P50 {fmtLatency(topRetry.percentiles.p50_ms)}</span>
+                  <span>P95 {fmtLatency(topRetry.percentiles.p95_ms)}</span>
+                  <span>P99 {fmtLatency(topRetry.percentiles.p99_ms)}</span>
+                </div>
+                <TtftThresholdBadges thresholds={topRetry.thresholds} />
+              </div>
+            )}
+          </div>
+
+          <div>
+            <div className="usage-card__hint">Daily TTFT median trend</div>
+            <ResponsiveContainer width="100%" height={220}>
+              <LineChart data={trend} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                <CartesianGrid stroke={GRID} vertical={false} />
+                <XAxis dataKey="day" {...AXIS} minTickGap={32} />
+                <YAxis tickFormatter={(v: number) => fmtLatency(v)} width={56} {...AXIS} />
+                <Tooltip
+                  formatter={(
+                    v: unknown,
+                    name: unknown,
+                    item: {
+                      dataKey?: unknown;
+                      payload?: { firstAttemptSamples?: number; retrySamples?: number };
+                    },
+                  ) => {
+                    const samples =
+                      item.dataKey === 'retryP50'
+                        ? item.payload?.retrySamples
+                        : item.payload?.firstAttemptSamples;
+                    return [fmtLatency(numOf(v)), `${String(name)} · ${Math.round(samples ?? 0)} samples`];
+                  }}
+                  contentStyle={{ background: 'var(--bg-secondary)', border: `1px solid ${GRID}` }}
+                />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+                <Line
+                  type="monotone"
+                  dataKey="firstAttemptP50"
+                  name="First attempt"
+                  stroke="var(--accent-blue)"
+                  dot={false}
+                  connectNulls
+                />
+                <Line
+                  type="monotone"
+                  dataKey="retryP50"
+                  name="Retry"
+                  stroke="var(--accent-yellow)"
+                  dot={false}
+                  connectNulls
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div className="usage-ttft-table-wrap">
+            <div className="usage-card__hint">Provider comparison</div>
+            <div className="usage-ttft-table">
+              <div className="usage-ttft-table__row usage-ttft-table__row--head">
+                <span>Scope</span><span>Provider</span><span className="num">P50</span><span className="num">P95</span><span className="num">P99</span><span className="num">Samples</span>
+              </div>
+              {data.provider_rows.map((row) => (
+                <div key={`${row.attempt_scope}:${row.provider}`} className="usage-ttft-table__row">
+                  <span>{attemptScopeLabel(row.attempt_scope)}</span>
+                  <span>{row.provider}</span>
+                  <span className="num">{fmtLatency(row.percentiles.p50_ms)}</span>
+                  <span className="num">{fmtLatency(row.percentiles.p95_ms)}</span>
+                  <span className="num">{fmtLatency(row.percentiles.p99_ms)}</span>
+                  <span className="num">{Math.round(row.sample_count)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="usage-ttft-table-wrap">
+            <div className="usage-card__hint">Provider / model / transport comparison</div>
+            <div className="usage-ttft-table usage-ttft-table--wide">
+              <div className="usage-ttft-table__row usage-ttft-table__row--head">
+                <span>Scope</span><span>Provider</span><span>Model</span><span>Transport</span><span className="num">P50</span><span className="num">P95</span><span className="num">Samples</span>
+              </div>
+              {groupedRows.map((row) => (
+                <div key={`${row.attempt_scope}:${row.provider}:${row.model}:${row.transport}`} className="usage-ttft-table__row">
+                  <span>{attemptScopeLabel(row.attempt_scope)}</span>
+                  <span>{row.provider}</span>
+                  <span>{row.model ?? '—'}</span>
+                  <span>{row.transport ?? '—'}</span>
+                  <span className="num">{fmtLatency(row.percentiles.p50_ms)}</span>
+                  <span className="num">{fmtLatency(row.percentiles.p95_ms)}</span>
+                  <span className="num">{Math.round(row.sample_count)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
 
 function AnalyticsExportPreview({ id }: { id: string }) {
   const [open, setOpen] = useState(false);
@@ -473,10 +662,13 @@ export function UsagePage() {
 
           {error && <div className="settings-section__error">{error}</div>}
           {!data && loading && <div className="settings-section__hint">Loading…</div>}
-          {empty && <div className="settings-section__hint">No usage recorded yet.</div>}
+          {empty && <div className="settings-section__hint">No token usage recorded yet.</div>}
+
+          {data && <TtftHero data={data.ttft} />}
 
           {data && !empty && (
             <>
+
               <div className="usage-kpis">
                 <KpiCard label="Today" totals={data.windows.today} />
                 <KpiCard label="7 days" totals={data.windows.week} />

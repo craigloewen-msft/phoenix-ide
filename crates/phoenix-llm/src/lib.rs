@@ -78,6 +78,8 @@ pub use service::LlmServiceImpl;
 // and `phoenix_llm::X` paths resolve for downstream consumers.
 pub use phoenix_core::domain::llm_types::{self as types, *};
 
+mod stream_telemetry;
+
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -197,14 +199,14 @@ pub struct LoggingService {
     inner: Arc<dyn LlmService>,
     model_id: String,
     provider: &'static str,
-    streaming_transport: &'static str,
+    streaming_transport: LlmTransport,
 }
 
 impl LoggingService {
     pub fn new(
         inner: Arc<dyn LlmService>,
         provider: &'static str,
-        streaming_transport: &'static str,
+        streaming_transport: LlmTransport,
     ) -> Self {
         let model_id = inner.model_id().to_string();
         Self {
@@ -215,13 +217,13 @@ impl LoggingService {
         }
     }
 
-    fn transport_for(&self, streaming: bool) -> &'static str {
-        if self.streaming_transport == "in_process" {
-            "in_process"
+    fn fallback_transport_for(&self, streaming: bool) -> LlmTransport {
+        if self.streaming_transport == LlmTransport::InProcess {
+            LlmTransport::InProcess
         } else if streaming {
             self.streaming_transport
         } else {
-            "http_json"
+            LlmTransport::HttpJson
         }
     }
 }
@@ -233,7 +235,7 @@ impl LoggingService {
     /// local log filtering. Usage/error fields are `Empty` until the call
     /// resolves.
     fn request_span(&self, request: &LlmRequest, streaming: bool) -> tracing::Span {
-        let transport = self.transport_for(streaming);
+        let transport = self.fallback_transport_for(streaming);
         let telemetry = request.telemetry.as_ref();
         let generated_request_id = format!("llm-{}", rand::random::<u64>());
         let request_id = telemetry.map_or(generated_request_id.as_str(), |value| {
@@ -247,7 +249,7 @@ impl LoggingService {
             otel.status_code = tracing::field::Empty,
             model = %self.model_id,
             provider = self.provider,
-            transport,
+            transport = transport.as_str(),
             streaming,
             conv_id = telemetry.map(|value| value.conversation_id.as_str()),
             root_conv_id = telemetry.map(|value| value.root_conversation_id.as_str()),
@@ -258,7 +260,100 @@ impl LoggingService {
             cache_read_tokens = tracing::field::Empty,
             cache_creation_tokens = tracing::field::Empty,
             error.kind = tracing::field::Empty,
+            stream.first_provider_event_ms = tracing::field::Empty,
+            stream.first_generation_event_ms = tracing::field::Empty,
+            stream.first_visible_text_ms = tracing::field::Empty,
+            stream.provider_event_count = tracing::field::Empty,
+            stream.generation_event_count = tracing::field::Empty,
+            stream.visible_text_event_count = tracing::field::Empty,
+            stream.max_provider_gap_ms = tracing::field::Empty,
+            stream.max_generation_gap_ms = tracing::field::Empty,
+            stream.output_kind = tracing::field::Empty,
+            stream.completed = tracing::field::Empty,
         )
+    }
+
+    fn record_stream_telemetry(span: &tracing::Span, telemetry: &ProviderStreamTelemetry) {
+        if let Some(value) = telemetry.dispatch_to_first_provider_event_ms {
+            span.record(
+                "stream.first_provider_event_ms",
+                i64::try_from(value).unwrap_or(i64::MAX),
+            );
+        }
+        if let Some(value) = telemetry.dispatch_to_first_generation_event_ms {
+            span.record(
+                "stream.first_generation_event_ms",
+                i64::try_from(value).unwrap_or(i64::MAX),
+            );
+        }
+        if let Some(value) = telemetry.dispatch_to_first_visible_text_ms {
+            span.record(
+                "stream.first_visible_text_ms",
+                i64::try_from(value).unwrap_or(i64::MAX),
+            );
+        }
+        span.record(
+            "stream.provider_event_count",
+            telemetry.provider_event_count,
+        );
+        span.record(
+            "stream.generation_event_count",
+            telemetry.generation_event_count,
+        );
+        span.record(
+            "stream.visible_text_event_count",
+            telemetry.visible_text_event_count,
+        );
+        if let Some(value) = telemetry.max_provider_gap_ms {
+            span.record(
+                "stream.max_provider_gap_ms",
+                i64::try_from(value).unwrap_or(i64::MAX),
+            );
+        }
+        if let Some(value) = telemetry.max_generation_gap_ms {
+            span.record(
+                "stream.max_generation_gap_ms",
+                i64::try_from(value).unwrap_or(i64::MAX),
+            );
+        }
+        span.record("stream.output_kind", format!("{:?}", telemetry.output_kind));
+        span.record("stream.completed", telemetry.completed);
+    }
+
+    fn finalize_capture(
+        span: &tracing::Span,
+        request: &LlmRequest,
+        result: &Result<LlmResponse, LlmError>,
+    ) {
+        let Some(telemetry) = request.telemetry.as_ref() else {
+            return;
+        };
+        let outcome = match result {
+            Ok(_) => LlmAttemptOutcome::Success,
+            Err(e) => match e.kind {
+                LlmErrorKind::RateLimit => LlmAttemptOutcome::RateLimited,
+                LlmErrorKind::UsageLimitReached => LlmAttemptOutcome::UsageLimitReached,
+                LlmErrorKind::ServerError => LlmAttemptOutcome::ServerError,
+                LlmErrorKind::InvalidResponse => LlmAttemptOutcome::InvalidResponse,
+                LlmErrorKind::ServerOverloaded => LlmAttemptOutcome::ServerOverloaded,
+                LlmErrorKind::Network => LlmAttemptOutcome::NetworkError,
+                LlmErrorKind::ContextWindowExceeded => LlmAttemptOutcome::TokenBudgetExceeded,
+                LlmErrorKind::Auth => LlmAttemptOutcome::AuthError,
+                LlmErrorKind::InvalidRequest | LlmErrorKind::ContentFilter => {
+                    LlmAttemptOutcome::RequestRejected
+                }
+            },
+        };
+        let stream = match result {
+            Ok(response) => Some(response.stream_telemetry.clone()),
+            Err(_) => None,
+        };
+        let _ = telemetry
+            .attempt_capture
+            .finalize(LlmAttemptFinalization { stream, outcome });
+        if let Some(metrics) = telemetry.attempt_capture.finalized() {
+            Self::record_stream_telemetry(span, &metrics.stream);
+        }
     }
 
     fn record_outcome(span: &tracing::Span, result: &Result<LlmResponse, LlmError>) {
@@ -271,6 +366,7 @@ impl LoggingService {
                     "cache_creation_tokens",
                     response.usage.cache_creation_tokens,
                 );
+                Self::record_stream_telemetry(span, &response.stream_telemetry);
             }
             Err(e) => {
                 span.record("otel.status_code", "ERROR");
@@ -284,10 +380,21 @@ impl LoggingService {
 impl LlmService for LoggingService {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let span = self.request_span(request, false);
+        if self.streaming_transport == LlmTransport::InProcess {
+            if let Some(telemetry) = &request.telemetry {
+                telemetry.attempt_capture.begin(
+                    telemetry,
+                    self.provider,
+                    &self.model_id,
+                    self.fallback_transport_for(false),
+                );
+            }
+        }
         let start = std::time::Instant::now();
         let result = self.inner.complete(request).instrument(span.clone()).await;
         let duration = start.elapsed();
         Self::record_outcome(&span, &result);
+        Self::finalize_capture(&span, request, &result);
 
         match &result {
             Ok(response) => {
@@ -322,6 +429,16 @@ impl LlmService for LoggingService {
         chunk_tx: &mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         let span = self.request_span(request, true);
+        if self.streaming_transport == LlmTransport::InProcess {
+            if let Some(telemetry) = &request.telemetry {
+                telemetry.attempt_capture.begin(
+                    telemetry,
+                    self.provider,
+                    &self.model_id,
+                    self.fallback_transport_for(true),
+                );
+            }
+        }
         let start = std::time::Instant::now();
 
         let result = self
@@ -331,6 +448,7 @@ impl LlmService for LoggingService {
             .await;
         let duration = start.elapsed();
         Self::record_outcome(&span, &result);
+        Self::finalize_capture(&span, request, &result);
 
         match &result {
             Ok(response) => {
@@ -340,6 +458,16 @@ impl LlmService for LoggingService {
                     duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                     input_tokens = response.usage.input_tokens,
                     output_tokens = response.usage.output_tokens,
+                    first_provider_event_ms = response.stream_telemetry.dispatch_to_first_provider_event_ms,
+                    first_generation_event_ms = response.stream_telemetry.dispatch_to_first_generation_event_ms,
+                    first_visible_text_ms = response.stream_telemetry.dispatch_to_first_visible_text_ms,
+                    provider_event_count = response.stream_telemetry.provider_event_count,
+                    generation_event_count = response.stream_telemetry.generation_event_count,
+                    visible_text_event_count = response.stream_telemetry.visible_text_event_count,
+                    max_provider_gap_ms = response.stream_telemetry.max_provider_gap_ms,
+                    max_generation_gap_ms = response.stream_telemetry.max_generation_gap_ms,
+                    output_kind = ?response.stream_telemetry.output_kind,
+                    stream_completed = response.stream_telemetry.completed,
                     "LLM streaming request completed"
                 );
             }
@@ -349,6 +477,7 @@ impl LlmService for LoggingService {
                     model = %self.model_id,
                     duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                     error_kind = ?e.kind,
+                    stream_failure_kind = ?e.kind,
                     auto_retryable = e.kind.is_auto_retryable(),
                     user_resumable = e.kind.is_user_resumable(),
                     "LLM streaming request failed"
@@ -379,17 +508,18 @@ mod logging_tests {
 
     #[test]
     fn logging_transport_matches_the_actual_call_path() {
-        let http = LoggingService::new(Arc::new(MockLlmService), "anthropic", "http_sse");
-        assert_eq!(http.transport_for(false), "http_json");
-        assert_eq!(http.transport_for(true), "http_sse");
+        let http =
+            LoggingService::new(Arc::new(MockLlmService), "anthropic", LlmTransport::HttpSse);
+        assert_eq!(http.fallback_transport_for(false), LlmTransport::HttpJson);
+        assert_eq!(http.fallback_transport_for(true), LlmTransport::HttpSse);
 
         let codex =
-            LoggingService::new(Arc::new(MockLlmService), "openai", "websocket_or_http_sse");
-        assert_eq!(codex.transport_for(false), "http_json");
-        assert_eq!(codex.transport_for(true), "websocket_or_http_sse");
+            LoggingService::new(Arc::new(MockLlmService), "openai", LlmTransport::Websocket);
+        assert_eq!(codex.fallback_transport_for(false), LlmTransport::HttpJson);
+        assert_eq!(codex.fallback_transport_for(true), LlmTransport::Websocket);
 
-        let mock = LoggingService::new(Arc::new(MockLlmService), "mock", "in_process");
-        assert_eq!(mock.transport_for(false), "in_process");
-        assert_eq!(mock.transport_for(true), "in_process");
+        let mock = LoggingService::new(Arc::new(MockLlmService), "mock", LlmTransport::InProcess);
+        assert_eq!(mock.fallback_transport_for(false), LlmTransport::InProcess);
+        assert_eq!(mock.fallback_transport_for(true), LlmTransport::InProcess);
     }
 }

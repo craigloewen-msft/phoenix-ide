@@ -154,6 +154,7 @@ pub fn init(config: &LogConfig) -> std::io::Result<TracingHandles> {
 
 const OTEL_SPANS: &[(&str, &str)] = &[
     ("phoenix_ide::otel", "http"),
+    ("phoenix_ide::otel", "pr_status.refresh"),
     ("phoenix_ide::otel", "conversation.turn"),
     ("phoenix_ide::otel", "tool.execute"),
     ("phoenix_llm::otel", "llm.request"),
@@ -403,6 +404,7 @@ mod tests {
 
     static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn otel_filter_is_a_spans_only_allowlist() {
         use opentelemetry::trace::TracerProvider as _;
@@ -420,6 +422,15 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(layer);
 
         tracing::subscriber::with_default(subscriber, || {
+            let http = tracing::info_span!(target: "phoenix_ide::otel", "http");
+            let pr_refresh = tracing::info_span!(
+                target: "phoenix_ide::otel",
+                parent: &http,
+                "pr_status.refresh",
+                operation = "branch_and_work_change",
+            );
+            drop(pr_refresh);
+            drop(http);
             let llm = tracing::info_span!(
                 target: "phoenix_llm::otel",
                 "llm.request",
@@ -429,7 +440,9 @@ mod tests {
                 request_id = "request-123",
                 conv_id = "conversation-123",
                 retry_attempt = 2_u64,
+                stream.first_generation_event_ms = tracing::field::Empty,
             );
+            llm.record("stream.first_generation_event_ms", 1_234_i64);
             let _guard = llm.enter();
             tracing::debug!(target: "tokio_tungstenite", frame = "PAYLOAD_SENTINEL", "frame");
             tracing::info!(delta = "DELTA_SENTINEL", "response delta");
@@ -466,10 +479,30 @@ mod tests {
         provider.force_flush().expect("flush spans");
 
         let spans = exporter.get_finished_spans().expect("exported spans");
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].name, "llm.request");
-        assert!(spans[0].events.is_empty());
-        let attributes = format!("{:?}", spans[0].attributes);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.name.as_ref())
+                .collect::<Vec<_>>(),
+            ["pr_status.refresh", "http", "llm.request"]
+        );
+        assert!(spans.iter().all(|span| span.events.is_empty()));
+        let llm_span = spans
+            .iter()
+            .find(|span| span.name == "llm.request")
+            .expect("LLM span exported");
+        let attributes = format!("{:?}", llm_span.attributes);
+        let ttft = llm_span
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "stream.first_generation_event_ms")
+            .expect("numeric TTFT attribute exported");
+        assert!(
+            matches!(ttft.value, opentelemetry::Value::I64(1_234)),
+            "TTFT must remain numeric for TraceQL comparisons: {:?}",
+            ttft.value
+        );
         for required in [
             "gpt-test",
             "openai",

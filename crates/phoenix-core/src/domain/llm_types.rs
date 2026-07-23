@@ -3,6 +3,7 @@
 pub const LLM_SOURCE_HEADER: &str = "phoenix-ide";
 
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 
 /// Identifier for `OpenAI`'s `prompt_cache_key` Responses-API field. Required
 /// on every `LlmRequest` so callers must explicitly choose a caching strategy
@@ -62,6 +63,239 @@ pub struct LlmRequestTelemetry {
     pub root_conversation_id: String,
     pub request_id: String,
     pub retry_attempt: u32,
+    pub attempt_capture: LlmAttemptCapture,
+}
+
+/// Content-free summary of a provider streaming attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamTelemetryOutputKind {
+    None,
+    Text,
+    Reasoning,
+    Tool,
+    Structured,
+    Mixed,
+}
+
+/// Final, content-free snapshot of provider stream timing and shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderStreamTelemetry {
+    pub dispatch_to_first_provider_event_ms: Option<u64>,
+    pub dispatch_to_first_generation_event_ms: Option<u64>,
+    pub dispatch_to_first_visible_text_ms: Option<u64>,
+    pub provider_event_count: u32,
+    pub generation_event_count: u32,
+    pub visible_text_event_count: u32,
+    pub max_provider_gap_ms: Option<u64>,
+    pub max_generation_gap_ms: Option<u64>,
+    pub output_kind: StreamTelemetryOutputKind,
+    pub completed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmTransport {
+    HttpSse,
+    Websocket,
+    InProcess,
+    HttpJson,
+}
+
+impl LlmTransport {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HttpSse => "http_sse",
+            Self::Websocket => "websocket",
+            Self::InProcess => "in_process",
+            Self::HttpJson => "http_json",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmAttemptOutcome {
+    Success,
+    RateLimited,
+    UsageLimitReached,
+    ServerError,
+    InvalidResponse,
+    ServerOverloaded,
+    NetworkError,
+    TokenBudgetExceeded,
+    AuthError,
+    RequestRejected,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmAttemptMetrics {
+    pub conversation_id: String,
+    pub root_conversation_id: String,
+    pub request_id: String,
+    pub retry_attempt: u32,
+    pub provider: String,
+    pub model: String,
+    pub transport: LlmTransport,
+    pub total_duration_ms: u64,
+    pub stream: ProviderStreamTelemetry,
+    pub outcome: LlmAttemptOutcome,
+}
+
+#[derive(Debug, Clone)]
+pub struct LlmAttemptFinalization {
+    pub stream: Option<ProviderStreamTelemetry>,
+    pub outcome: LlmAttemptOutcome,
+}
+
+#[derive(Debug, Clone)]
+pub struct LlmAttemptCapture(Arc<Mutex<LlmAttemptCaptureState>>);
+
+#[derive(Debug, Clone, Default)]
+struct LlmAttemptCaptureState {
+    progress: Option<ProviderStreamTelemetry>,
+    transport: Option<LlmTransport>,
+    identity: Option<LlmAttemptIdentity>,
+    finalized: Option<LlmAttemptMetrics>,
+}
+
+#[derive(Debug, Clone)]
+struct LlmAttemptIdentity {
+    conversation_id: String,
+    root_conversation_id: String,
+    request_id: String,
+    retry_attempt: u32,
+    provider: String,
+    model: String,
+    fallback_transport: LlmTransport,
+    started_at: std::time::Instant,
+}
+
+impl Default for LlmAttemptCapture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LlmAttemptCapture {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(LlmAttemptCaptureState::default())))
+    }
+
+    pub fn publish_progress(&self, progress: ProviderStreamTelemetry) {
+        if let Ok(mut state) = self.0.lock() {
+            state.progress = Some(progress);
+        }
+    }
+
+    pub fn set_transport(&self, transport: LlmTransport) {
+        if let Ok(mut state) = self.0.lock() {
+            state.transport = Some(transport);
+        }
+    }
+
+    pub fn begin(
+        &self,
+        telemetry: &LlmRequestTelemetry,
+        provider: &str,
+        model: &str,
+        fallback_transport: LlmTransport,
+    ) {
+        if let Ok(mut state) = self.0.lock() {
+            state.identity = Some(LlmAttemptIdentity {
+                conversation_id: telemetry.conversation_id.clone(),
+                root_conversation_id: telemetry.root_conversation_id.clone(),
+                request_id: telemetry.request_id.clone(),
+                retry_attempt: telemetry.retry_attempt,
+                provider: provider.to_string(),
+                model: model.to_string(),
+                fallback_transport,
+                started_at: std::time::Instant::now(),
+            });
+        }
+    }
+
+    #[must_use]
+    pub fn finalize_cancelled(&self) -> Option<LlmAttemptMetrics> {
+        let mut state = self.0.lock().ok()?;
+        if let Some(metrics) = state.finalized.clone() {
+            return Some(metrics);
+        }
+        let identity = state.identity.clone()?;
+        let metrics = LlmAttemptMetrics {
+            conversation_id: identity.conversation_id,
+            root_conversation_id: identity.root_conversation_id,
+            request_id: identity.request_id,
+            retry_attempt: identity.retry_attempt,
+            provider: identity.provider,
+            model: identity.model,
+            transport: state.transport.unwrap_or(identity.fallback_transport),
+            total_duration_ms: u64::try_from(identity.started_at.elapsed().as_millis())
+                .unwrap_or(u64::MAX),
+            stream: state
+                .progress
+                .clone()
+                .unwrap_or_else(ProviderStreamTelemetry::non_streaming),
+            outcome: LlmAttemptOutcome::Cancelled,
+        };
+        state.finalized = Some(metrics.clone());
+        Some(metrics)
+    }
+
+    #[must_use]
+    pub fn progress(&self) -> Option<ProviderStreamTelemetry> {
+        self.0.lock().ok()?.progress.clone()
+    }
+
+    #[must_use]
+    pub fn finalized(&self) -> Option<LlmAttemptMetrics> {
+        self.0.lock().ok()?.finalized.clone()
+    }
+
+    #[must_use]
+    pub fn finalize(&self, finalization: LlmAttemptFinalization) -> Option<LlmAttemptMetrics> {
+        let mut state = self.0.lock().ok()?;
+        let identity = state.identity.clone()?;
+        let metrics = LlmAttemptMetrics {
+            conversation_id: identity.conversation_id,
+            root_conversation_id: identity.root_conversation_id,
+            request_id: identity.request_id,
+            retry_attempt: identity.retry_attempt,
+            provider: identity.provider,
+            model: identity.model,
+            transport: state.transport.unwrap_or(identity.fallback_transport),
+            total_duration_ms: u64::try_from(identity.started_at.elapsed().as_millis())
+                .unwrap_or(u64::MAX),
+            stream: finalization
+                .stream
+                .or_else(|| state.progress.clone())
+                .unwrap_or_else(ProviderStreamTelemetry::non_streaming),
+            outcome: finalization.outcome,
+        };
+        state.finalized = Some(metrics.clone());
+        Some(metrics)
+    }
+}
+
+impl ProviderStreamTelemetry {
+    #[must_use]
+    pub const fn non_streaming() -> Self {
+        Self {
+            dispatch_to_first_provider_event_ms: None,
+            dispatch_to_first_generation_event_ms: None,
+            dispatch_to_first_visible_text_ms: None,
+            provider_event_count: 0,
+            generation_event_count: 0,
+            visible_text_event_count: 0,
+            max_provider_gap_ms: None,
+            max_generation_gap_ms: None,
+            output_kind: StreamTelemetryOutputKind::None,
+            completed: false,
+        }
+    }
 }
 
 /// LLM request
@@ -337,9 +571,26 @@ pub struct LlmResponse {
     pub content: Vec<ContentBlock>,
     pub end_turn: bool,
     pub usage: Usage,
+    pub stream_telemetry: ProviderStreamTelemetry,
 }
 
 impl LlmResponse {
+    #[must_use]
+    pub fn non_streaming(content: Vec<ContentBlock>, end_turn: bool, usage: Usage) -> Self {
+        Self {
+            content,
+            end_turn,
+            usage,
+            stream_telemetry: ProviderStreamTelemetry::non_streaming(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_stream_telemetry(mut self, stream_telemetry: ProviderStreamTelemetry) -> Self {
+        self.stream_telemetry = stream_telemetry;
+        self
+    }
+
     /// Extract all tool use requests from the response
     #[must_use]
     pub fn tool_uses(&self) -> Vec<(&str, &str, &serde_json::Value)> {
@@ -413,3 +664,66 @@ impl Usage {
 // ContentBlock serde and tool_uses() invariants are covered by property tests
 // in src/llm/proptests.rs: prop_content_block_serde_round_trip,
 // prop_content_block_type_tag_valid, prop_tool_uses_only_returns_tool_use.
+
+#[cfg(test)]
+mod attempt_capture_tests {
+    use super::*;
+
+    #[test]
+    fn pre_dispatch_cancellation_is_not_a_provider_attempt() {
+        let capture = LlmAttemptCapture::new();
+
+        assert_eq!(capture.finalize_cancelled(), None);
+        assert_eq!(capture.finalized(), None);
+    }
+
+    #[test]
+    fn finalization_without_provider_dispatch_is_not_an_attempt() {
+        let capture = LlmAttemptCapture::new();
+
+        assert_eq!(
+            capture.finalize(LlmAttemptFinalization {
+                stream: None,
+                outcome: LlmAttemptOutcome::AuthError,
+            }),
+            None
+        );
+        assert_eq!(capture.finalized(), None);
+    }
+
+    #[test]
+    fn cancelled_attempt_preserves_partial_provider_progress() {
+        let capture = LlmAttemptCapture::new();
+        let telemetry = LlmRequestTelemetry {
+            conversation_id: "conv".to_string(),
+            root_conversation_id: "root".to_string(),
+            request_id: "request".to_string(),
+            retry_attempt: 2,
+            attempt_capture: capture.clone(),
+        };
+        capture.begin(&telemetry, "openai", "gpt-test", LlmTransport::HttpSse);
+        capture.set_transport(LlmTransport::Websocket);
+        capture.publish_progress(ProviderStreamTelemetry {
+            dispatch_to_first_provider_event_ms: Some(10),
+            dispatch_to_first_generation_event_ms: Some(20),
+            dispatch_to_first_visible_text_ms: None,
+            provider_event_count: 3,
+            generation_event_count: 1,
+            visible_text_event_count: 0,
+            max_provider_gap_ms: Some(10),
+            max_generation_gap_ms: None,
+            output_kind: StreamTelemetryOutputKind::Reasoning,
+            completed: false,
+        });
+
+        let metrics = capture.finalize_cancelled().expect("started attempt");
+        assert_eq!(metrics.outcome, LlmAttemptOutcome::Cancelled);
+        assert_eq!(metrics.transport, LlmTransport::Websocket);
+        assert_eq!(metrics.stream.provider_event_count, 3);
+        assert_eq!(
+            metrics.stream.dispatch_to_first_generation_event_ms,
+            Some(20)
+        );
+        assert!(!metrics.stream.completed);
+    }
+}

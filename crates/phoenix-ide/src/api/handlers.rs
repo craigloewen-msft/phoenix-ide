@@ -12103,6 +12103,7 @@ mod regenerate_conversation_name_tests {
                     content: vec![ContentBlock::text(*text)],
                     end_turn: true,
                     usage: Usage::default(),
+                    stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
                 }),
                 StubLlm::Err => Err(LlmError::server_error("temporary outage")),
             }
@@ -12311,6 +12312,7 @@ mod upgrade_model_state_guard_tests {
                 content: vec![ContentBlock::text("stub")],
                 end_turn: true,
                 usage: Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
             })
         }
         async fn complete_streaming(
