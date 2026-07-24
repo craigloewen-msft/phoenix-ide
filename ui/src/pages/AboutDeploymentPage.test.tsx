@@ -13,6 +13,7 @@ const { apiMock } = vi.hoisted(() => ({
     cleanupManagedWorktree: vi.fn(),
     revealPath: vi.fn(),
     releaseUpdateSnapshot: vi.fn(),
+    releaseUpdateTransaction: vi.fn(),
     approveReleaseUpdate: vi.fn(),
   },
 }));
@@ -212,6 +213,7 @@ describe('AboutDeploymentPage disk usage health', () => {
     apiMock.deploymentResources.mockReset();
     apiMock.cleanupManagedWorktree.mockReset();
     apiMock.revealPath.mockReset();
+    apiMock.releaseUpdateTransaction.mockReset().mockResolvedValue({ kind: 'none' });
     apiMock.releaseUpdateSnapshot.mockReset().mockResolvedValue({
       installation_ownership: { kind: 'development' },
       current_version: '0.1.0',
@@ -390,7 +392,61 @@ describe('AboutDeploymentPage disk usage health', () => {
     expect(screen.getByLabelText('Current route')).toHaveTextContent('/');
   });
 
-  it('page refresh supersedes an in-flight resource request while visible', async () => {
+  it('renders independent diagnostics when deployment facts are unavailable', async () => {
+    apiMock.deploymentInfo.mockRejectedValue(new Error('facts offline'));
+    apiMock.deploymentDiskInfo.mockResolvedValue(deploymentDisk({
+      disk: [{ category: 'database', label: 'Database', path: '/tmp/phoenix.db', size: { kind: 'measured', bytes: 128 } }],
+    }));
+    apiMock.deploymentResources.mockResolvedValue(resourcesSnapshot());
+    render(
+      <MemoryRouter>
+        <AboutDeploymentPage />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText(/deployment facts unavailable — facts offline/i)).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Phoenix release updates' })).toBeInTheDocument();
+    expect(await screen.findByText('Managed CPU over time')).toBeInTheDocument();
+    expect(await screen.findByText('Database')).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Network & TLS' })).not.toBeInTheDocument();
+  });
+
+  it('retains last-good deployment and disk snapshots when scoped refreshes fail', async () => {
+    renderPage(deployment(), deploymentDisk({
+      disk: [{
+        category: 'database', label: 'Database', path: '/tmp/phoenix.db',
+        size: { kind: 'measured', bytes: 128 },
+      }],
+    }));
+    await screen.findByText('Version 0.1.0');
+    apiMock.deploymentInfo.mockRejectedValueOnce(new Error('facts offline'));
+    apiMock.deploymentDiskInfo.mockRejectedValueOnce(new Error('disk offline'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh deployment facts' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh disk' }));
+
+    expect(await screen.findByText(/deployment facts are stale — facts offline/i)).toBeInTheDocument();
+    expect(await screen.findByText(/disk inventory is stale — disk offline/i)).toBeInTheDocument();
+    expect(screen.getByText('Version 0.1.0')).toBeInTheDocument();
+    expect(screen.getByText('Database')).toBeInTheDocument();
+  });
+
+  it('deployment refresh does not refresh disk or supersede resource sampling', async () => {
+    apiMock.deploymentResources.mockImplementation(() => new Promise(() => {}));
+    renderPage(deployment());
+    await screen.findByText('Version 0.1.0');
+    vi.clearAllMocks();
+    apiMock.deploymentInfo.mockResolvedValue(deployment({ sampled_at: '2026-06-01T00:01:00Z' }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh deployment facts' }));
+    await act(async () => {});
+
+    expect(apiMock.deploymentInfo).toHaveBeenCalledTimes(1);
+    expect(apiMock.deploymentDiskInfo).not.toHaveBeenCalled();
+    expect(apiMock.deploymentResources).not.toHaveBeenCalled();
+  });
+
+  it('resource refresh supersedes an in-flight resource request while visible', async () => {
     const signals: AbortSignal[] = [];
     apiMock.deploymentInfo.mockResolvedValue(deployment());
     apiMock.deploymentDiskInfo.mockResolvedValue(deploymentDisk());
@@ -411,9 +467,9 @@ describe('AboutDeploymentPage disk usage health', () => {
     );
 
     expect(apiMock.deploymentResources).toHaveBeenCalledTimes(1);
-    await screen.findByRole('button', { name: 'Refresh' });
+    await screen.findByRole('button', { name: 'Refresh resources now' });
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh resources now' }));
       await Promise.resolve();
     });
 
@@ -423,18 +479,18 @@ describe('AboutDeploymentPage disk usage health', () => {
     expect(screen.getByText(/Resource sample captured/)).not.toHaveTextContent('stale');
   });
 
-  it('page refresh respects hidden resource polling suspension', async () => {
+  it('deployment refresh respects hidden resource polling suspension', async () => {
     Object.defineProperty(document, 'visibilityState', { configurable: true, writable: true, value: 'hidden' });
     renderPage(deployment());
 
-    await screen.findByRole('button', { name: 'Refresh' });
+    await screen.findByRole('button', { name: 'Refresh deployment facts' });
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh deployment facts' }));
       await Promise.resolve();
     });
 
     expect(apiMock.deploymentInfo).toHaveBeenCalledTimes(2);
-    expect(apiMock.deploymentDiskInfo).toHaveBeenCalledTimes(2);
+    expect(apiMock.deploymentDiskInfo).toHaveBeenCalledTimes(1);
     expect(apiMock.deploymentResources).not.toHaveBeenCalled();
   });
 

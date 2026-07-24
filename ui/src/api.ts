@@ -5,11 +5,19 @@ import type { DeploymentDiskInfo } from './generated/DeploymentDiskInfo';
 import type { AboutResourcesSnapshot } from './generated/AboutResourcesSnapshot';
 import type { ManagedWorktreeCleanupResponse } from './generated/ManagedWorktreeCleanupResponse';
 import type { ReleaseUpdateSnapshot } from './generated/ReleaseUpdateSnapshot';
+import type { ReleaseTransactionStatus } from './generated/ReleaseTransactionStatus';
 import type { ApproveReleaseUpdateResponse } from './generated/ApproveReleaseUpdateResponse';
 import type { FileViewerKind } from './generated/FileViewerKind';
 import type { UsageOverview } from './generated/UsageOverview';
 import type { ConversationUsageDetail } from './generated/ConversationUsageDetail';
 // Phoenix API Client
+
+export class ApiResponseError extends Error {
+  constructor(message: string, readonly status: number, readonly code?: string) {
+    super(message);
+    this.name = 'ApiResponseError';
+  }
+}
 
 // SSE event types come from the runtime schemas in `./sseSchemas`, which
 // are typed against the Rust-generated wire shapes in `./generated/sse`
@@ -1240,6 +1248,12 @@ export const api = {
     return resp.json();
   },
 
+  async releaseUpdateTransaction(): Promise<ReleaseTransactionStatus> {
+    const resp = await fetch('/api/release-updates/transaction');
+    if (!resp.ok) throw new Error('Failed to load release transaction status');
+    return resp.json();
+  },
+
   async approveReleaseUpdate(tag: string, commit: string, assetName: string, assetSha256: string): Promise<ApproveReleaseUpdateResponse> {
     const resp = await fetch('/api/release-updates/approve', {
       method: 'POST',
@@ -1248,13 +1262,15 @@ export const api = {
     });
     if (!resp.ok) {
       let detail = 'Failed to start release update';
+      let code: string | undefined;
       try {
-        const body = (await resp.json()) as { error?: string };
+        const body = (await resp.json()) as { error?: string; code?: string };
         if (body.error) detail = body.error;
+        code = body.code;
       } catch {
         // keep fallback
       }
-      throw new Error(detail);
+      throw new ApiResponseError(detail, resp.status, code);
     }
     return resp.json();
   },

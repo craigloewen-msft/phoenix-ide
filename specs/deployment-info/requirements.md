@@ -144,6 +144,21 @@ needed for diagnosis.
 
 ---
 
+### REQ-DEPLOY-002C: Make diagnostic freshness and refresh scope explicit
+
+THE SYSTEM SHALL identify the freshness and sample time of deployment facts,
+resource observations, disk inventory, and release information independently.
+
+WHEN a refresh fails after a successful sample, THE SYSTEM SHALL retain the last
+good value and label it stale rather than removing it. WHEN no successful sample
+exists, THE SYSTEM SHALL label that diagnostic domain unavailable.
+
+THE SYSTEM SHALL label manual refresh controls by scope. Resource observations
+shall continue refreshing only while the page is visible; deployment facts and
+disk inventory shall refresh only on their corresponding explicit actions.
+
+---
+
 ### REQ-DEPLOY-003: Report network binding and TLS configuration
 
 THE SYSTEM SHALL display the address and port the server is bound to
@@ -420,13 +435,16 @@ the report and the wiring share one source of truth and cannot disagree.
 THE SYSTEM SHALL identify deployment snapshots, managed-resource samples, and
 disk samples as point-in-time measurements.
 
-WHEN the user requests a general refresh
-THE SYSTEM SHALL re-sample the general deployment snapshot and SHALL trigger a
-fresh managed-resource sample rather than serving cached values.
+WHEN the user requests a deployment-facts refresh
+THE SYSTEM SHALL re-sample the deployment snapshot without requiring resource or
+disk samples to reload.
 
-WHEN the user requests a disk-only refresh
-THE SYSTEM SHALL re-sample disk values without requiring the general deployment
-snapshot to reload.
+WHEN the user requests a disk refresh
+THE SYSTEM SHALL re-sample disk values without requiring deployment facts or
+resource samples to reload.
+
+WHILE the page is visible, THE SYSTEM SHALL refresh managed-resource samples on
+their demand-driven cadence independently of either manual refresh action.
 
 **Rationale:** Memory, CPU, and disk sizes drift continuously. A value with no
 notion of when it was taken invites the reader to trust a stale number. Sampled
