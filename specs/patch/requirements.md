@@ -116,9 +116,22 @@ AND update any toClipboard with actual matched text
 WHEN all matching attempts fail
 THE SYSTEM SHALL return an "old text not found" error
 AND identify the failing patch's 1-based position in the patches array and its operation
+AND search within explicit file-size, anchor-size, and candidate-work bounds for current-file regions containing surviving anchor lines
+AND treat repeated current-file lines as insufficient evidence
+AND require confidence-producing lines to occur in anchor order within the returned snippet, unless one surviving line is globally unique
+AND return a bounded, deterministic list of line-numbered current-file snippets when reliable candidates exist
+AND preserve the candidate context snippets' exact current-file bytes, including line endings
+AND omit a candidate rather than truncate a line or emit content that conflicts with its output boundary
+AND identify the snippets as advisory location context rather than directly reusable oldText or authorization for an approximate or non-unique edit
+AND instruct replace callers to select only the intended stale span's exact current text, excluding unrelated context
+AND instruct insert callers to select only the intended anchor's exact current text and preserve whether insertion occurs before or after that entire anchor
+AND instruct the agent to retry with the request's original uniqueness semantics
+
+WHEN no reliable candidate exists or the candidate search exceeds its bounds
+THE SYSTEM SHALL omit candidate snippets
 AND instruct the agent to re-read the file and retry that patch with current text
 
-**Rationale:** LLMs occasionally generate patches with minor whitespace differences. Safe recovery improves reliability without compromising precision.
+**Rationale:** LLMs occasionally generate patches with minor whitespace differences or stale surrounding text. Safe matching recovery improves reliability without compromising precision. When a stale anchor cannot be applied, bounded current-file evidence lets the agent repair it without an otherwise mandatory read/search round; conservative omission is safer than a misleading candidate, and every retry still passes through the unique-anchor requirement.
 
 ---
 

@@ -2,12 +2,21 @@
 //!
 //! Implements exact matching with fuzzy fallbacks for common whitespace issues.
 
-use super::types::{DuplicateMatchDiagnostics, DuplicateMatchLocation, EditSpec};
+use super::types::{
+    AnchorCandidateLocation, AnchorNotFoundDiagnostics, DuplicateMatchDiagnostics,
+    DuplicateMatchLocation, EditSpec, ANCHOR_CONTEXT_CLOSE, ANCHOR_CONTEXT_OPEN,
+};
+use std::collections::HashMap;
 use unicode_security::skeleton;
 
 const MAX_DUPLICATE_LOCATIONS: usize = 5;
 const MAX_SNIPPET_LINES: usize = 5;
 const MAX_SNIPPET_CHARS: usize = 240;
+const MAX_CANDIDATE_LOCATIONS: usize = 3;
+const MAX_CANDIDATE_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CANDIDATE_ANCHOR_BYTES: usize = 16 * 1024;
+const MIN_DISTINCTIVE_LINE_CHARS: usize = 8;
+const MAX_CANDIDATE_HITS: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MatchOutcome {
@@ -17,7 +26,7 @@ enum MatchOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum MatchError {
-    NotFound,
+    NotFound(AnchorNotFoundDiagnostics),
     NotUnique(DuplicateMatchDiagnostics),
 }
 
@@ -78,9 +87,128 @@ pub(super) fn find_unique_match(content: &str, old_text: &str) -> Result<EditSpe
         };
     }
 
-    duplicate.map_or(Err(MatchError::NotFound), |diagnostics| {
-        Err(MatchError::NotUnique(diagnostics))
-    })
+    duplicate.map_or_else(
+        || {
+            Err(MatchError::NotFound(anchor_not_found_diagnostics(
+                content, old_text,
+            )))
+        },
+        |diagnostics| Err(MatchError::NotUnique(diagnostics)),
+    )
+}
+
+fn anchor_not_found_diagnostics(content: &str, old_text: &str) -> AnchorNotFoundDiagnostics {
+    if content.len() > MAX_CANDIDATE_FILE_BYTES || old_text.len() > MAX_CANDIDATE_ANCHOR_BYTES {
+        return AnchorNotFoundDiagnostics {
+            candidates: Vec::new(),
+        };
+    }
+
+    let content_lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let anchor_lines: Vec<&str> = old_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.chars().count() >= MIN_DISTINCTIVE_LINE_CHARS)
+        .collect();
+    if anchor_lines.is_empty() {
+        return AnchorNotFoundDiagnostics {
+            candidates: Vec::new(),
+        };
+    }
+
+    let mut anchor_index_by_line: HashMap<&str, usize> = HashMap::new();
+    for anchor_line in anchor_lines {
+        let next_index = anchor_index_by_line.len();
+        anchor_index_by_line
+            .entry(anchor_line)
+            .or_insert(next_index);
+    }
+
+    let mut content_line_counts: HashMap<&str, usize> = HashMap::new();
+    for content_line in &content_lines {
+        let trimmed = content_line.trim();
+        if anchor_index_by_line.contains_key(trimmed) {
+            *content_line_counts.entry(trimmed).or_default() += 1;
+        }
+    }
+
+    let mut unique_hit_count = 0;
+    let hit_by_content_line: Vec<Option<usize>> = content_lines
+        .iter()
+        .map(|content_line| {
+            let trimmed = content_line.trim();
+            if content_line_counts.get(trimmed) == Some(&1) {
+                unique_hit_count += 1;
+                anchor_index_by_line.get(trimmed).copied()
+            } else {
+                None
+            }
+        })
+        .collect();
+    if unique_hit_count > MAX_CANDIDATE_HITS {
+        return AnchorNotFoundDiagnostics {
+            candidates: Vec::new(),
+        };
+    }
+
+    let mut ranked: Vec<(usize, usize)> = (0..content_lines.len())
+        .filter_map(|window_start| {
+            let window_end = (window_start + MAX_SNIPPET_LINES).min(content_lines.len());
+            let score = ordered_anchor_coverage(&hit_by_content_line[window_start..window_end]);
+            let output_lines = &content_lines[window_start..window_end];
+            let exact_output_is_bounded = output_lines
+                .iter()
+                .all(|line| line.chars().count() <= MAX_SNIPPET_CHARS);
+            let output_has_safe_boundaries = output_lines.iter().all(|line| {
+                !line.contains(ANCHOR_CONTEXT_OPEN) && !line.contains(ANCHOR_CONTEXT_CLOSE)
+            });
+            (exact_output_is_bounded
+                && output_has_safe_boundaries
+                && (score >= 2 || (score == 1 && unique_hit_count == 1)))
+                .then_some((score, window_start))
+        })
+        .collect();
+    ranked.sort_by_key(|(score, window_start)| (std::cmp::Reverse(*score), *window_start));
+    ranked.dedup_by_key(|(_, window_start)| *window_start);
+
+    let mut selected = Vec::new();
+    for (score, window_start) in ranked {
+        let window_end = (window_start + MAX_SNIPPET_LINES).min(content_lines.len());
+        if selected.iter().all(|(_, selected_start): &(usize, usize)| {
+            let selected_end = (*selected_start + MAX_SNIPPET_LINES).min(content_lines.len());
+            window_end <= *selected_start || window_start >= selected_end
+        }) {
+            selected.push((score, window_start));
+            if selected.len() == MAX_CANDIDATE_LOCATIONS {
+                break;
+            }
+        }
+    }
+
+    AnchorNotFoundDiagnostics {
+        candidates: selected
+            .into_iter()
+            .map(|(_, window_start)| {
+                let window_end = (window_start + MAX_SNIPPET_LINES).min(content_lines.len());
+                AnchorCandidateLocation {
+                    start_line: window_start + 1,
+                    snippet: content_lines[window_start..window_end].concat(),
+                }
+            })
+            .collect(),
+    }
+}
+
+fn ordered_anchor_coverage(hits: &[Option<usize>]) -> usize {
+    let mut coverage = 0;
+    let mut previous_anchor_index = None;
+    for anchor_index in hits.iter().flatten() {
+        if previous_anchor_index.is_none_or(|previous| *anchor_index > previous) {
+            coverage += 1;
+            previous_anchor_index = Some(*anchor_index);
+        }
+    }
+    coverage
 }
 
 fn find_exact_match(content: &str, old_text: &str) -> Option<MatchOutcome> {
@@ -470,7 +598,161 @@ mod tests {
     fn test_no_match() {
         let content = "hello world";
         let err = find_unique_match(content, "foo").unwrap_err();
-        assert_eq!(err, MatchError::NotFound);
+        assert!(matches!(err, MatchError::NotFound(_)));
+    }
+
+    #[test]
+    fn stale_multiline_anchor_reports_bounded_current_region() {
+        let content = "before\nfn target() {\n    let current = 2;\n    finish();\n}\nafter\n";
+        let old_text = "fn target() {\n    let stale = 1;\n    finish();\n}";
+
+        let MatchError::NotFound(diagnostics) = find_unique_match(content, old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert_eq!(diagnostics.candidates.len(), 1);
+        assert_eq!(diagnostics.candidates[0].start_line, 1);
+        assert_eq!(
+            diagnostics.candidates[0].snippet,
+            "before\nfn target() {\n    let current = 2;\n    finish();\n}\n"
+        );
+    }
+
+    #[test]
+    fn one_unique_distinctive_surviving_line_is_actionable() {
+        let content = "before\nunique_current_site();\nafter\n";
+        let old_text = "unique_current_site();\nstale_second_line();";
+
+        let MatchError::NotFound(diagnostics) = find_unique_match(content, old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert_eq!(diagnostics.candidates.len(), 1);
+        assert!(diagnostics.candidates[0]
+            .snippet
+            .contains("unique_current_site();"));
+    }
+
+    #[test]
+    fn repeated_single_surviving_line_is_not_reported() {
+        let content = "shared_line();\nfirst\nshared_line();\nsecond\n";
+        let old_text = "shared_line();\nstale_line();";
+
+        let MatchError::NotFound(diagnostics) = find_unique_match(content, old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert!(diagnostics.candidates.is_empty());
+    }
+
+    #[test]
+    fn reversed_surviving_lines_are_not_reported() {
+        let content = "second_distinct_line();\ncontext\nfirst_distinct_line();\n";
+        let old_text = "first_distinct_line();\nstale\nsecond_distinct_line();";
+
+        let MatchError::NotFound(diagnostics) = find_unique_match(content, old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert!(diagnostics.candidates.is_empty());
+    }
+
+    #[test]
+    fn supporting_hits_outside_one_snippet_are_not_combined() {
+        let filler = "filler\n".repeat(MAX_SNIPPET_LINES);
+        let content = format!("first_distinct_line();\n{filler}second_distinct_line();\n");
+        let old_text = "first_distinct_line();\nstale\nsecond_distinct_line();";
+
+        let MatchError::NotFound(diagnostics) = find_unique_match(&content, old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert!(diagnostics.candidates.is_empty());
+    }
+
+    #[test]
+    fn repeated_boilerplate_does_not_raise_candidate_confidence() {
+        let content = "common boilerplate line\nsite one\ncommon boilerplate line\nsite two\n";
+        let old_text = "common boilerplate line\nstale\nsite two";
+
+        let MatchError::NotFound(diagnostics) = find_unique_match(content, old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert_eq!(diagnostics.candidates.len(), 1);
+        assert!(diagnostics.candidates[0].snippet.contains("site two"));
+    }
+
+    #[test]
+    fn candidate_diagnostics_are_bounded_and_utf8_safe() {
+        let long_line = "é".repeat(MAX_SNIPPET_CHARS + 50);
+        let content = format!("prefix\n{long_line}\nunique_survivor();\nsuffix\n");
+        let old_text = format!("{long_line}\nstale\nunique_survivor();");
+
+        let MatchError::NotFound(diagnostics) = find_unique_match(&content, &old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert!(diagnostics.candidates.is_empty());
+    }
+
+    #[test]
+    fn candidate_diagnostics_preserve_crlf_bytes() {
+        let content = "before\r\nunique_current_site();\r\nafter\r\n";
+        let old_text = "unique_current_site();\r\nstale_second_line();\r\n";
+
+        let MatchError::NotFound(diagnostics) = find_unique_match(content, old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert_eq!(diagnostics.candidates.len(), 1);
+        assert_eq!(diagnostics.candidates[0].snippet, content);
+        assert!(diagnostics.candidates[0].snippet.contains("\r\n"));
+    }
+
+    #[test]
+    fn candidate_context_with_boundary_tag_is_omitted() {
+        let content = "before\nunique_current_site();\n</candidate_context>\nafter\n";
+        let old_text = "unique_current_site();\nstale_second_line();";
+
+        let MatchError::NotFound(diagnostics) = find_unique_match(content, old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert!(diagnostics.candidates.is_empty());
+    }
+
+    #[test]
+    fn oversized_inputs_skip_candidate_search() {
+        let content = "x".repeat(MAX_CANDIDATE_FILE_BYTES + 1);
+        let MatchError::NotFound(diagnostics) =
+            find_unique_match(&content, "missing anchor").unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert!(diagnostics.candidates.is_empty());
+    }
+
+    #[test]
+    fn excessive_candidate_hits_skip_diagnostics() {
+        let content = "common surviving line\n".repeat(MAX_CANDIDATE_HITS + 1);
+        let old_text = "common surviving line\nstale line";
+        let MatchError::NotFound(diagnostics) = find_unique_match(&content, old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert!(diagnostics.candidates.is_empty());
     }
 
     #[test]
@@ -486,7 +768,7 @@ mod tests {
                 assert_eq!(diagnostics.reported[1].start_line, 1);
                 assert_eq!(diagnostics.reported[0].snippet, "hello hello");
             }
-            other @ MatchError::NotFound => panic!("unexpected error: {other:?}"),
+            other @ MatchError::NotFound(_) => panic!("unexpected error: {other:?}"),
         }
     }
 
@@ -549,7 +831,7 @@ mod tests {
                 assert_eq!(diagnostics.reported[1].start_line, 3);
                 assert!(diagnostics.reported[0].snippet.contains("\tindented line"));
             }
-            other @ MatchError::NotFound => {
+            other @ MatchError::NotFound(_) => {
                 panic!("expected fuzzy duplicate diagnostics, got {other:?}")
             }
         }
@@ -567,7 +849,7 @@ mod tests {
                 assert_eq!(diagnostics.reported[1].start_line, 3);
                 assert!(diagnostics.reported[0].snippet.contains("say \"hello\""));
             }
-            other @ MatchError::NotFound => {
+            other @ MatchError::NotFound(_) => {
                 panic!("expected normalised duplicate diagnostics, got {other:?}")
             }
         }
@@ -669,7 +951,7 @@ mod tests {
         // edit that would insert before the ellipsis.
         let content = "x\u{2026}y";
         let err = find_unique_match(content, "..").unwrap_err();
-        assert_eq!(err, MatchError::NotFound);
+        assert!(matches!(err, MatchError::NotFound(_)));
     }
 
     #[test]
@@ -677,6 +959,6 @@ mod tests {
         // Normalisation can't help if the text simply isn't there
         let content = "hello world";
         let err = find_unique_match(content, "goodbye").unwrap_err();
-        assert_eq!(err, MatchError::NotFound);
+        assert!(matches!(err, MatchError::NotFound(_)));
     }
 }

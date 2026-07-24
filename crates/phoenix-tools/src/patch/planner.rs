@@ -5,7 +5,12 @@
 //! for property-based testing.
 
 use super::matching::{find_all_exact, find_unique_match, MatchError};
-use super::types::{Edit, Operation, PatchEffect, PatchError, PatchPlan, PatchRequest, Reindent};
+#[cfg(test)]
+use super::types::AnchorNotFoundDiagnostics;
+use super::types::{
+    AnchorRetryRequirement, Edit, Operation, PatchEffect, PatchError, PatchPlan, PatchRequest,
+    Reindent,
+};
 use similar::TextDiff;
 use std::collections::HashMap;
 use std::path::Path;
@@ -136,6 +141,17 @@ impl PatchPlanner {
         })
     }
 
+    fn retry_requirement(operation: Operation) -> AnchorRetryRequirement {
+        match operation {
+            Operation::Replace => AnchorRetryRequirement::Replace,
+            Operation::InsertBefore => AnchorRetryRequirement::InsertBefore,
+            Operation::InsertAfter => AnchorRetryRequirement::InsertAfter,
+            Operation::AppendEof | Operation::PrependBof | Operation::Overwrite => {
+                unreachable!("non-anchor operation cannot reach anchor matching")
+            }
+        }
+    }
+
     fn locate_anchor(
         original: &str,
         old_text: &str,
@@ -143,9 +159,11 @@ impl PatchPlanner {
         operation: Operation,
     ) -> Result<super::types::EditSpec, PatchError> {
         find_unique_match(original, old_text).map_err(|error| match error {
-            MatchError::NotFound => PatchError::AnchorNotFound {
+            MatchError::NotFound(diagnostics) => PatchError::AnchorNotFound {
                 patch_number,
                 operation,
+                diagnostics,
+                retry_requirement: Self::retry_requirement(operation),
             },
             MatchError::NotUnique(diagnostics) => PatchError::AnchorNotUnique {
                 patch_number,
@@ -153,6 +171,18 @@ impl PatchPlanner {
                 diagnostics,
             },
         })
+    }
+
+    fn replace_all_miss(original: &str, old_text: &str, patch_number: usize) -> PatchError {
+        match find_unique_match(original, old_text) {
+            Err(MatchError::NotFound(diagnostics)) => PatchError::AnchorNotFound {
+                patch_number,
+                operation: Operation::Replace,
+                diagnostics,
+                retry_requirement: AnchorRetryRequirement::ReplaceAll,
+            },
+            _ => PatchError::ReplaceAllInexact,
+        }
     }
 
     /// Build a list of edits from patch requests.
@@ -249,13 +279,7 @@ impl PatchPlanner {
                         // fuzzy/near match": replaceAll is exact-only, so a near
                         // match would otherwise surface as a misleading "not
                         // found". find_unique_match runs the full fuzzy cascade.
-                        return match find_unique_match(original, old_text) {
-                            Err(MatchError::NotFound) => Err(PatchError::AnchorNotFound {
-                                patch_number: patch_index + 1,
-                                operation: patch.operation,
-                            }),
-                            _ => Err(PatchError::ReplaceAllInexact),
-                        };
+                        return Err(Self::replace_all_miss(original, old_text, patch_index + 1));
                     }
                     for spec in specs {
                         edits.push(Edit {
@@ -896,8 +920,37 @@ mod tests {
             PatchError::AnchorNotFound {
                 patch_number: 1,
                 operation: Operation::Replace,
+                diagnostics: AnchorNotFoundDiagnostics {
+                    candidates: Vec::new(),
+                },
+                retry_requirement: AnchorRetryRequirement::ReplaceAll,
             }
         );
+    }
+
+    #[test]
+    fn replace_all_not_found_guidance_does_not_require_uniqueness() {
+        let mut planner = PatchPlanner::new();
+        let error = planner
+            .plan(
+                &path("test.txt"),
+                Some("before\nunique_current_site();\nafter\n"),
+                &[PatchRequest {
+                    operation: Operation::Replace,
+                    old_text: Some("unique_current_site();\nstale_line();".to_string()),
+                    new_text: Some("new".to_string()),
+                    replace_all: true,
+                    to_clipboard: None,
+                    from_clipboard: None,
+                    reindent: None,
+                }],
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("keep replaceAll enabled"), "{error}");
+        assert!(error.contains("uniqueness is not required"), "{error}");
+        assert!(!error.contains("requires one unique match"), "{error}");
     }
 
     #[test]
@@ -935,12 +988,49 @@ mod tests {
             PatchError::AnchorNotFound {
                 patch_number: 2,
                 operation: Operation::InsertAfter,
+                diagnostics: AnchorNotFoundDiagnostics {
+                    candidates: Vec::new(),
+                },
+                retry_requirement: AnchorRetryRequirement::InsertAfter,
             }
         );
         assert_eq!(
             err.to_string(),
-            "Patch 2 (insert_after) failed: oldText not found in file. Re-read the file and retry this patch with current text."
+            "Patch 2 (insert_after) failed: oldText not found in file. No reliable nearby current text was found. Re-read the file before retrying. Use the context to locate the intended anchor, then retry with only that anchor's exact current text as oldText. The insertion occurs immediately after the entire unique anchor."
         );
+    }
+
+    #[test]
+    fn insert_not_found_guidance_preserves_anchor_position() {
+        for (operation, position) in [
+            (Operation::InsertBefore, "immediately before"),
+            (Operation::InsertAfter, "immediately after"),
+        ] {
+            let mut planner = PatchPlanner::new();
+            let error = planner
+                .plan(
+                    &path("test.txt"),
+                    Some("before\nunique_anchor();\nafter\n"),
+                    &[PatchRequest {
+                        operation,
+                        old_text: Some("unique_anchor();\nstale".to_string()),
+                        new_text: Some("inserted".to_string()),
+                        replace_all: false,
+                        to_clipboard: None,
+                        from_clipboard: None,
+                        reindent: None,
+                    }],
+                )
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains(position), "{error}");
+            assert!(
+                error.contains("only that anchor's exact current text"),
+                "{error}"
+            );
+            assert!(error.contains("not oldText"), "{error}");
+        }
     }
 
     #[test]
