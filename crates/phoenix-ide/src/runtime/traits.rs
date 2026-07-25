@@ -282,6 +282,13 @@ pub trait ToolExecutor: Send + Sync {
         std::collections::HashSet::new()
     }
 
+    /// Frozen model IDs advertised by the conversation's `spawn_agents`
+    /// schema. Spawn-time validation uses this same snapshot so schema and
+    /// executor acceptance cannot drift if the live registry changes.
+    fn subagent_model_ids(&self) -> Arc<[String]> {
+        Arc::from(Vec::new())
+    }
+
     /// Replace the tool set (e.g., Explore -> Work mode transition).
     /// Default is a no-op for test doubles that don't need dynamic swapping.
     fn upgrade_to_work_mode(&self) {
@@ -554,6 +561,10 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
         language: crate::llm_language::LlmLanguage,
     ) -> Vec<phoenix_llm::ToolDefinition> {
         (**self).definitions_for_language(language).await
+    }
+
+    fn subagent_model_ids(&self) -> Arc<[String]> {
+        (**self).subagent_model_ids()
     }
 
     fn upgrade_to_work_mode(&self) {
@@ -930,6 +941,7 @@ pub struct ToolRegistryExecutor {
     /// against, instead of re-discovering the filesystem (REQ-AG-004/008).
     /// Empty for sub-agents.
     agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
+    model_ids: Arc<[String]>,
 }
 
 impl ToolRegistryExecutor {
@@ -944,6 +956,7 @@ impl ToolRegistryExecutor {
             registry: std::sync::RwLock::new(registry),
             mcp_manager: None,
             agent_catalog,
+            model_ids: Arc::from(Vec::new()),
         }
     }
 
@@ -954,11 +967,13 @@ impl ToolRegistryExecutor {
         registry: ToolRegistry,
         manager: Arc<crate::tools::mcp::McpClientManager>,
         agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
+        model_ids: Arc<[String]>,
     ) -> Self {
         Self {
             registry: std::sync::RwLock::new(registry),
             mcp_manager: Some(manager),
             agent_catalog,
+            model_ids,
         }
     }
 
@@ -1064,11 +1079,16 @@ impl ToolExecutor for ToolRegistryExecutor {
         defs
     }
 
+    fn subagent_model_ids(&self) -> Arc<[String]> {
+        self.model_ids.clone()
+    }
+
     fn upgrade_to_work_mode(&self) {
         // Reuse the frozen catalog so the upgraded registry advertises the same
         // agent_type enum the executor resolves against (REQ-AG-008).
         self.swap_registry(
-            ToolRegistry::direct(self.agent_catalog.to_vec()).with_commission_review(),
+            ToolRegistry::direct(self.agent_catalog.to_vec(), self.model_ids.to_vec())
+                .with_commission_review(),
         );
         tracing::info!("Tool registry upgraded to Work mode (full tool suite)");
     }
