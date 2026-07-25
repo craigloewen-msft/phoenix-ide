@@ -1,5 +1,7 @@
 # Projects — Technical Design
 
+> Legacy spEARS v1 design artifact. Retained until its requirements, behavioral rules, rationale, and status content are deliberately migrated to spEARS v2 artifacts. Normative requirements remain in `requirements.md`.
+
 ## Architecture Overview
 
 The Projects feature introduces a first-class `Project` concept that sits above

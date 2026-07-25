@@ -24,7 +24,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use phoenix_core::work_scope::WorkScope;
+use phoenix_core::work_scope::{ResourceAuthority, ResourceScopeKey};
 use tokio::sync::watch;
 use tokio::sync::{Mutex, RwLock};
 
@@ -33,7 +33,7 @@ use super::ring::{RingBuffer, RingLine};
 /// Default tombstone tail size (REQ-BASH-006: `TOMBSTONE_TAIL_LINES`).
 pub const TOMBSTONE_TAIL_LINES: usize = 2000;
 
-/// Stable handle identifier within a `WorkScope`.
+/// Stable handle identifier within a `ResourceScopeKey`.
 ///
 /// Format is implementation detail (sequential `b-1`, `b-2`, ...).
 /// The Allium contract is only that the pair `(work_scope, handle_id)`
@@ -168,7 +168,7 @@ pub enum ExitState {
 
 /// A bash handle: identity + lifecycle state + watch-channel for exit notification.
 ///
-/// The handle is owned by exactly one `WorkScopeHandles` registry entry.
+/// The handle is owned by exactly one `ResourceScopeKeyHandles` registry entry.
 /// `state` is `RwLock<Arc<HandleState>>` (ADR-002; `Handle` in
 /// `specs/bash/bash.allium`) so peek and wait readers can clone a stable
 /// snapshot without holding the outer lock while they shape responses.
@@ -178,8 +178,10 @@ pub enum ExitState {
 // would diverge from the spec.
 #[allow(clippy::struct_field_names)]
 pub struct Handle {
-    pub work_scope: WorkScope,
+    pub work_scope: ResourceScopeKey,
     pub handle_id: HandleId,
+    pub creator_conversation_id: String,
+    pub authority: ResourceAuthority,
     pub cmd: String,
     /// Optional human-readable annotation supplied at run-time. Echoed on
     /// every response carrying the handle and on each `live_handles[]`
@@ -225,8 +227,34 @@ impl Handle {
     #[allow(clippy::similar_names)]
     #[must_use]
     pub fn new_live(
-        work_scope: WorkScope,
+        work_scope: ResourceScopeKey,
         handle_id: HandleId,
+        cmd: String,
+        label: Option<String>,
+        pgid: i32,
+        pid: u32,
+        ring_bytes_cap: usize,
+    ) -> Arc<Self> {
+        Self::new_live_for_actor(
+            work_scope,
+            handle_id,
+            "system".to_string(),
+            ResourceAuthority::Work,
+            cmd,
+            label,
+            pgid,
+            pid,
+            ring_bytes_cap,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::similar_names)]
+    #[must_use]
+    pub fn new_live_for_actor(
+        work_scope: ResourceScopeKey,
+        handle_id: HandleId,
+        creator_conversation_id: String,
+        authority: ResourceAuthority,
         cmd: String,
         label: Option<String>,
         pgid: i32,
@@ -242,6 +270,8 @@ impl Handle {
         Arc::new(Self {
             work_scope,
             handle_id,
+            creator_conversation_id,
+            authority,
             cmd,
             label,
             started_at: SystemTime::now(),
@@ -474,9 +504,13 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    fn scope(id: &str) -> ResourceScopeKey {
+        ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse(id).unwrap())
+    }
+
     fn live_handle() -> Arc<Handle> {
         Handle::new_live(
-            WorkScope::Conversation("conv-1".into()),
+            scope("conv-1"),
             HandleId::new("b-1"),
             "echo hi".into(),
             None,

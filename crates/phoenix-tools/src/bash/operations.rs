@@ -16,7 +16,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::sync::RwLock;
 
@@ -27,11 +28,11 @@ use super::handle::{
     ExitState, ExitWatchPanicGuard, FinalCause, Handle, HandleId, HandleState, KillSignal,
     TOMBSTONE_TAIL_LINES,
 };
-use super::registry::{BashHandleError, LiveHandleSummary, WorkScopeHandles};
+use super::registry::{BashHandleError, LiveHandleSummary, ResourceScopeKeyHandles};
 use super::ring::{RingLine, WindowView};
 use super::sandbox::ExploreSandboxLauncher;
 use super::types::{BashOp, BashToolInput};
-use crate::{ToolContext, ToolOutput};
+use crate::{work_scope_identity, RegisterWakeInput, RegisteredWake, ToolContext, ToolOutput};
 use phoenix_core::domain::bash_progress::{BashProgressLine, BashToolProgress};
 use phoenix_core::domain::tool_wire::{
     BashErrorResponse, BashKillPendingKernelPayload, BashLiveHandleSummary, BashResponse,
@@ -60,6 +61,9 @@ pub const DEFAULT_PEEK_LINES: usize = 200;
 /// REQ-BASH-002 / REQ-BASH-010: soft cap on the optional run-call
 /// `label` length. Over-cap labels surface as `error: "label_too_long"`.
 pub const MAX_LABEL_LENGTH: usize = 64;
+
+/// Durable wake expiry bound for background bash handles.
+const BASH_WAKE_EXPIRY: Duration = Duration::from_secs(60 * 60 * 24);
 
 // Hint text for the cap-rejection envelope (REQ-BASH-005).
 const CAP_HINT: &str =
@@ -418,6 +422,15 @@ pub enum BashSpawnMode {
     ExploreReadOnly,
 }
 
+impl BashSpawnMode {
+    fn authority(self) -> phoenix_core::work_scope::ResourceAuthority {
+        match self {
+            Self::Direct => phoenix_core::work_scope::ResourceAuthority::Work,
+            Self::ExploreReadOnly => phoenix_core::work_scope::ResourceAuthority::Restricted,
+        }
+    }
+}
+
 /// Run a bash request end-to-end and produce the `ToolOutput`.
 pub async fn dispatch(input: Value, ctx: ToolContext) -> ToolOutput {
     dispatch_with_spawn_mode(input, ctx, BashSpawnMode::Direct).await
@@ -432,6 +445,8 @@ async fn dispatch_with_spawn_mode(
     ctx: ToolContext,
     spawn_mode: BashSpawnMode,
 ) -> ToolOutput {
+    // Dispatch kind, not caller convention, selects effective Bash authority.
+    let ctx = ctx.with_resource_authority(spawn_mode.authority());
     let request = match parse_request(input) {
         Ok(r) => r,
         Err(e) => return e.into_tool_output(),
@@ -595,11 +610,11 @@ fn spawn_child(
     let mut command = match spawn_mode {
         BashSpawnMode::Direct => {
             let mut command = Command::new("bash");
-            command.arg("-c").arg(cmd).current_dir(&ctx.working_dir);
+            command.arg("-c").arg(cmd).current_dir(ctx.working_dir());
             command
         }
         BashSpawnMode::ExploreReadOnly => {
-            let sandbox_command = ExploreSandboxLauncher::command(cmd, &ctx.working_dir)?;
+            let sandbox_command = ExploreSandboxLauncher::command(cmd, ctx.working_dir())?;
             sandbox_scratch_dir = Some(sandbox_command.scratch_dir);
             Command::from(sandbox_command.command)
         }
@@ -639,9 +654,11 @@ fn spawn_child(
     // pgid == pid because we made the child a process group leader.
     let pgid = i32::try_from(pid).unwrap_or(0);
 
-    let handle = Handle::new_live(
+    let handle = Handle::new_live_for_actor(
         ctx.work_scope.clone(),
         handle_id,
+        ctx.resource_access.conversation_id().to_string(),
+        ctx.resource_access.authority(),
         cmd.to_string(),
         label,
         pgid,
@@ -1082,7 +1099,7 @@ async fn race_run_response(
             // Run cancellation: treat as still_running — the agent
             // can choose to peek/kill the handle later. We do not
             // proactively kill: that's what kill is for.
-            background_run_response(&handle, started.elapsed(), &read_args, cmd).await
+            background_run_response(&handle, started.elapsed(), &read_args, cmd, ctx, false).await
         }
         Ok(()) = exit_rx.changed() => {
             // Process exited (or waiter panicked). Either way, build the
@@ -1090,7 +1107,7 @@ async fn race_run_response(
             terminal_or_panic_response(&handle, &read_args, true, false, Some(cmd)).await
         }
         () = tokio::time::sleep(Duration::from_secs(wait_seconds)) => {
-            background_run_response(&handle, Duration::from_secs(wait_seconds), &read_args, cmd).await
+            background_run_response(&handle, Duration::from_secs(wait_seconds), &read_args, cmd, ctx, true).await
         }
     }
 }
@@ -1272,20 +1289,30 @@ fn send_signal_to_group(_pgid: i32, _signal: KillSignal) {
 // ---------------------------------------------------------------------------
 
 async fn lookup_handle(ctx: &ToolContext, handle_id: &str) -> Result<Arc<Handle>, BashError> {
-    let handles_arc: Arc<RwLock<WorkScopeHandles>> = ctx.bash_handles().await.map_err(|e| {
-        // The accessor is currently infallible (returns Ok), but if it
-        // ever fails we surface as handle_not_found-shaped. Use the
-        // BashHandleError debug for the message.
-        BashError::HandleNotFound {
-            handle_id: format!("{handle_id} (registry error: {e:?})"),
-        }
-    })?;
+    let handles_arc: Arc<RwLock<ResourceScopeKeyHandles>> =
+        ctx.bash_handles().await.map_err(|e| {
+            // The accessor is currently infallible (returns Ok), but if it
+            // ever fails we surface as handle_not_found-shaped. Use the
+            // BashHandleError debug for the message.
+            BashError::HandleNotFound {
+                handle_id: format!("{handle_id} (registry error: {e:?})"),
+            }
+        })?;
     let handles = handles_arc.read().await;
-    handles
+    let handle = handles
         .get(&HandleId::new(handle_id.to_string()))
         .ok_or_else(|| BashError::HandleNotFound {
             handle_id: handle_id.to_string(),
-        })
+        })?;
+    if !ctx
+        .resource_access
+        .can_control(&handle.creator_conversation_id, handle.authority)
+    {
+        return Err(BashError::HandleNotFound {
+            handle_id: handle_id.to_string(),
+        });
+    }
+    Ok(handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -1455,8 +1482,149 @@ async fn background_run_response(
     elapsed: Duration,
     read_args: &ReadArgs,
     cmd: &str,
+    ctx: &ToolContext,
+    register_wake: bool,
 ) -> ToolOutput {
-    still_running_response(handle, elapsed, read_args, cmd).await
+    let mut response = still_running_response(handle, elapsed, read_args, cmd).await;
+    if !register_wake {
+        return response;
+    }
+    let Some(registrar) = ctx.wake_registrar() else {
+        return response;
+    };
+    let Some(tool_use_id) = ctx.tool_use_id() else {
+        return response;
+    };
+
+    let registration_scope = match work_scope_identity(&ctx.work_scope) {
+        Ok(scope) => scope,
+        Err(error) => return ToolOutput::error(error),
+    };
+    let resource = phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(
+        phoenix_workflow::wake_profile::BashResourceIdentity {
+            work_scope: registration_scope.clone(),
+            handle_id: handle.handle_id.to_string(),
+        },
+    );
+    let contract_id = format!("bash:{}:{}", tool_use_id, handle.handle_id);
+    let expires_at = now_timestamp().saturating_add_duration(BASH_WAKE_EXPIRY);
+    let prepared_fingerprint = prepare_bash_wake_fingerprint(
+        &ctx.conversation_id,
+        &ctx.root_conversation_id,
+        tool_use_id,
+        &contract_id,
+        &registration_scope,
+        &resource,
+    );
+    if ctx.cancel.is_cancelled() {
+        return response;
+    }
+    let register_input = RegisterWakeInput {
+        contract_id: contract_id.clone(),
+        conversation_id: ctx.conversation_id.clone(),
+        root_conversation_id: ctx.root_conversation_id.clone(),
+        registering_tool_use_id: tool_use_id.to_string(),
+        registration_scope,
+        resource,
+        expires_at,
+        prepared_fingerprint,
+    };
+
+    let registration = registrar.register(register_input).await;
+    if ctx.cancel.is_cancelled() {
+        if let Ok(registered) = &registration {
+            if let Some(workflow_id) = registered.workflow_id() {
+                let _ = registrar
+                    .cancel(crate::CancelWakeInput {
+                        workflow_id,
+                        timestamp: phoenix_workflow::Timestamp(
+                            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
+                        ),
+                        reason:
+                            phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
+                    })
+                    .await;
+            }
+        }
+        return response;
+    }
+    match registration {
+        Ok(
+            RegisteredWake::Registered { workflow_id } | RegisteredWake::Replayed { workflow_id },
+        ) => {
+            if let Some(display) = response.display_data().cloned() {
+                let mut enriched = display;
+                if let Value::Object(obj) = &mut enriched {
+                    obj.entry("wake_registration").or_insert_with(|| {
+                        json!({
+                            "workflow_id": workflow_id.0,
+                            "contract_id": contract_id,
+                        })
+                    });
+                }
+                let provider_output = serde_json::to_string(&enriched)
+                    .unwrap_or_else(|error| format!("failed to serialize bash response: {error}"));
+                response = response.with_output(provider_output).with_display(enriched);
+            }
+            response
+        }
+        Ok(RegisteredWake::Conflict) => response.clone().with_output(format!(
+            "{}\nWARNING: durable wake registration conflicted; retain this handle for manual inspection",
+            response.output()
+        )),
+        Ok(other) => response.clone().with_output(format!(
+            "{}\nWARNING: unexpected durable wake registration outcome: {other:?}",
+            response.output()
+        )),
+        Err(error) => response.clone().with_output(format!(
+            "{}\nWARNING: durable wake registration failed: {error}; retain this handle for manual inspection",
+            response.output()
+        )),
+    }
+}
+
+fn prepare_bash_wake_fingerprint(
+    conversation_id: &str,
+    root_conversation_id: &str,
+    tool_use_id: &str,
+    contract_id: &str,
+    registration_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+    resource: &phoenix_workflow::wake_profile::WakeResourceIdentity,
+) -> String {
+    let canonical = json!({
+        "conversation_id": conversation_id,
+        "root_conversation_id": root_conversation_id,
+        "registering_tool_use_id": tool_use_id,
+        "contract_id": contract_id,
+        "registration_scope": registration_scope,
+        "resource": resource,
+        "profile": {
+            "profile_kind": phoenix_workflow::wake_profile::profile().profile_kind,
+            "profile_version": phoenix_workflow::wake_profile::profile().profile_version,
+        },
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string().as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn now_timestamp() -> phoenix_workflow::Timestamp {
+    phoenix_workflow::Timestamp(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+}
+
+trait TimestampExt {
+    fn saturating_add_duration(self, duration: Duration) -> Self;
+}
+
+impl TimestampExt for phoenix_workflow::Timestamp {
+    fn saturating_add_duration(self, duration: Duration) -> Self {
+        Self(self.0.saturating_add(duration.as_secs()))
+    }
 }
 
 /// Build a `still_running` response for run/wait/cancel paths. `elapsed`
@@ -1741,62 +1909,86 @@ mod tests {
     use crate::bash::handle::{Handle, HandleId};
     use crate::bash::registry::BashLifecyclePhase;
     use crate::bash::ring::{RingBuffer, PARTIAL_IDLE_FLUSH_SECONDS, RING_BUFFER_BYTES};
-    use crate::WakeRegistrar;
-    use phoenix_core::work_scope::WorkScope;
+    use crate::{CancelWakeInput, RegisterWakeInput, RegisteredWake, WakeRegistrar};
+    use phoenix_core::work_scope::ResourceScopeKey;
     use std::pin::Pin;
     use std::sync::Mutex;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, ReadBuf};
 
+    fn scope(id: &str) -> ResourceScopeKey {
+        ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse(id).unwrap())
+    }
+
+    #[derive(Debug, Clone)]
+    enum RegistrarBehavior {
+        Registered(u64),
+        Replayed(u64),
+        Conflict,
+        Error(&'static str),
+    }
+
     #[derive(Default)]
     struct MockWakeRegistrar {
-        register_calls: Mutex<usize>,
+        register_calls: Mutex<Vec<RegisterWakeInput>>,
+        cancel_calls: Mutex<Vec<CancelWakeInput>>,
+        behavior: Mutex<Vec<RegistrarBehavior>>,
     }
 
     impl MockWakeRegistrar {
-        fn new() -> Arc<Self> {
+        fn with_behaviors(behaviors: Vec<RegistrarBehavior>) -> Arc<Self> {
             Arc::new(Self {
-                register_calls: Mutex::new(0),
+                register_calls: Mutex::new(Vec::new()),
+                cancel_calls: Mutex::new(Vec::new()),
+                behavior: Mutex::new(behaviors),
             })
         }
 
-        fn register_calls(&self) -> usize {
-            *self.register_calls.lock().expect("register_calls lock")
+        fn register_calls(&self) -> Vec<RegisterWakeInput> {
+            self.register_calls
+                .lock()
+                .expect("register_calls lock")
+                .clone()
         }
     }
 
     #[async_trait::async_trait]
     impl WakeRegistrar for MockWakeRegistrar {
-        async fn register(
-            &self,
-            _input: crate::RegisterWakeInput,
-        ) -> Result<crate::RegisteredWake, String> {
-            *self.register_calls.lock().expect("register_calls lock") += 1;
-            Ok(crate::RegisteredWake::Registered {
-                workflow_id: phoenix_workflow::WorkflowId(1),
-            })
+        async fn register(&self, input: RegisterWakeInput) -> Result<RegisteredWake, String> {
+            self.register_calls
+                .lock()
+                .expect("register_calls lock")
+                .push(input);
+            match self.behavior.lock().expect("behavior lock").remove(0) {
+                RegistrarBehavior::Registered(id) => Ok(RegisteredWake::Registered {
+                    workflow_id: phoenix_workflow::WorkflowId(id),
+                }),
+                RegistrarBehavior::Replayed(id) => Ok(RegisteredWake::Replayed {
+                    workflow_id: phoenix_workflow::WorkflowId(id),
+                }),
+                RegistrarBehavior::Conflict => Ok(RegisteredWake::Conflict),
+                RegistrarBehavior::Error(msg) => Err(msg.to_string()),
+            }
         }
 
-        async fn cancel(
-            &self,
-            _input: crate::CancelWakeInput,
-        ) -> Result<crate::RegisteredWake, String> {
-            Ok(crate::RegisteredWake::CancelStale)
+        async fn cancel(&self, input: CancelWakeInput) -> Result<RegisteredWake, String> {
+            self.cancel_calls
+                .lock()
+                .expect("cancel_calls lock")
+                .push(input);
+            Ok(RegisteredWake::CancelStale)
         }
     }
 
     fn ctx_with_registrar(
-        work_scope: &WorkScope,
+        work_scope: &ResourceScopeKey,
         registrar: Option<Arc<dyn WakeRegistrar>>,
     ) -> ToolContext {
-        let worktree_path = match work_scope {
-            WorkScope::Worktree(path) => Some(std::path::PathBuf::from(path)),
-            WorkScope::Conversation(_) | WorkScope::Global => None,
-        };
+        let worktree_path = None;
         let conversation_id = match work_scope {
-            WorkScope::Conversation(id) => id.clone(),
-            WorkScope::Worktree(_) => "conv-wake".to_string(),
-            WorkScope::Global => "conv-global".to_string(),
+            ResourceScopeKey::Work(id) => id.as_str().to_string(),
+            ResourceScopeKey::Coordinator => "coordinator".to_string(),
+            ResourceScopeKey::GlobalTerminal => "conv-global".to_string(),
         };
         let mut ctx = crate::ToolContext::new(
             tokio_util::sync::CancellationToken::new(),
@@ -1808,21 +2000,22 @@ mod tests {
             phoenix_terminal::ActiveTerminals::default(),
             Arc::new(crate::tmux::registry::TmuxRegistry::new()),
             worktree_path,
+            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         )
         .with_root_conversation_id("root-wake".to_string())
         .with_tool_use_id("tool-wake");
         if let Some(registrar) = registrar {
             ctx = ctx.with_wake_registrar(Some(registrar));
         }
-        if matches!(work_scope, WorkScope::Global) {
-            ctx.work_scope = WorkScope::Global;
+        if matches!(work_scope, ResourceScopeKey::GlobalTerminal) {
+            ctx.work_scope = ResourceScopeKey::GlobalTerminal;
         }
         ctx
     }
 
     fn live_handle() -> Arc<Handle> {
         Handle::new_live(
-            WorkScope::Conversation("conv-ops".into()),
+            scope("conv-ops"),
             HandleId::new("b-1"),
             "emitter".into(),
             None,
@@ -2045,12 +2238,9 @@ mod tests {
         task.abort();
     }
     #[tokio::test]
-    async fn background_run_does_not_register_or_acknowledge_wake() {
-        let registrar = MockWakeRegistrar::new();
-        let ctx = ctx_with_registrar(
-            &WorkScope::Conversation("conv-wake".into()),
-            Some(registrar.clone()),
-        );
+    async fn background_run_registers_before_acknowledging_response() {
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(42)]);
+        let ctx = ctx_with_registrar(&scope("conv-wake"), Some(registrar.clone()));
         let output = run_run(
             "sleep 10",
             None,
@@ -2063,19 +2253,62 @@ mod tests {
         assert!(output.is_success(), "{}", output.output());
         let value = output.display_data().cloned().expect("display data");
         assert_eq!(value["status"], "still_running");
-        assert!(value.get("wake_registration").is_none());
+        assert_eq!(registrar.register_calls().len(), 1);
+        assert_eq!(value["wake_registration"]["workflow_id"], 42);
         let provider_value: Value = serde_json::from_str(output.output()).expect("provider JSON");
-        assert!(provider_value.get("wake_registration").is_none());
-        assert_eq!(registrar.register_calls(), 0);
+        assert_eq!(provider_value["wake_registration"]["workflow_id"], 42);
+        assert!(value["wake_registration"]["contract_id"]
+            .as_str()
+            .expect("contract id")
+            .starts_with("bash:tool-wake:b-"));
+    }
+
+    #[tokio::test]
+    async fn registration_error_returns_no_background_acknowledgment() {
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Error("boom")]);
+        let ctx = ctx_with_registrar(&scope("conv-wake"), Some(registrar.clone()));
+        let output = run_run(
+            "sleep 10",
+            None,
+            0,
+            ReadArgs::default(),
+            &ctx,
+            BashSpawnMode::Direct,
+        )
+        .await;
+        assert!(output.is_success());
+        assert!(output
+            .output()
+            .contains("durable wake registration failed: boom"));
+        assert!(output.output().contains("handle"));
+        assert_eq!(registrar.register_calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_replay_is_accepted() {
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Replayed(77)]);
+        let ctx = ctx_with_registrar(&scope("conv-wake"), Some(registrar.clone()));
+        let output = run_run(
+            "sleep 10",
+            None,
+            0,
+            ReadArgs::default(),
+            &ctx,
+            BashSpawnMode::Direct,
+        )
+        .await;
+        assert!(output.is_success(), "{}", output.output());
+        let value = output.display_data().cloned().expect("display data");
+        assert_eq!(value["wake_registration"]["workflow_id"], 77);
+        let provider_value: Value = serde_json::from_str(output.output()).expect("provider JSON");
+        assert_eq!(provider_value["wake_registration"]["workflow_id"], 77);
+        assert_eq!(registrar.register_calls().len(), 1);
     }
 
     #[tokio::test]
     async fn synchronous_run_does_not_register_wake() {
-        let registrar = MockWakeRegistrar::new();
-        let ctx = ctx_with_registrar(
-            &WorkScope::Conversation("conv-wake".into()),
-            Some(registrar.clone()),
-        );
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(1)]);
+        let ctx = ctx_with_registrar(&scope("conv-wake"), Some(registrar.clone()));
         let output = run_run(
             "printf hi",
             None,
@@ -2088,12 +2321,33 @@ mod tests {
         assert!(output.is_success(), "{}", output.output());
         let value: serde_json::Value = serde_json::from_str(output.output()).expect("json");
         assert_eq!(value["status"], "exited");
-        assert_eq!(registrar.register_calls(), 0);
+        assert!(registrar.register_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn global_scope_is_rejected() {
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(1)]);
+        let ctx = ctx_with_registrar(&ResourceScopeKey::GlobalTerminal, Some(registrar.clone()));
+        let output = run_run(
+            "sleep 10",
+            None,
+            0,
+            ReadArgs::default(),
+            &ctx,
+            BashSpawnMode::Direct,
+        )
+        .await;
+        assert!(!output.is_success());
+        assert_eq!(
+            output.output(),
+            "global terminal scope cannot own a durable wake"
+        );
+        assert!(registrar.register_calls().is_empty());
     }
 
     #[tokio::test]
     async fn missing_registrar_preserves_background_behavior() {
-        let ctx = ctx_with_registrar(&WorkScope::Conversation("conv-wake".into()), None);
+        let ctx = ctx_with_registrar(&scope("conv-wake"), None);
         let output = run_run(
             "sleep 10",
             None,
@@ -2111,13 +2365,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_cancellation_does_not_register_durable_wake() {
-        let registrar = MockWakeRegistrar::new();
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(1)]);
         let cancel = tokio_util::sync::CancellationToken::new();
         cancel.cancel();
-        let mut ctx = ctx_with_registrar(
-            &WorkScope::Conversation("conv-wake".into()),
-            Some(registrar.clone()),
-        );
+        let mut ctx = ctx_with_registrar(&scope("conv-wake"), Some(registrar.clone()));
         ctx.cancel = cancel;
         let output = run_run(
             "sleep 10",
@@ -2132,7 +2383,26 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(output.output()).expect("json");
         assert_eq!(value["status"], "still_running");
         assert!(value.get("wake_registration").is_none());
-        assert_eq!(registrar.register_calls(), 0);
+        assert!(registrar.register_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn registration_conflict_returns_error_without_acknowledgment() {
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Conflict]);
+        let ctx = ctx_with_registrar(&scope("conv-wake"), Some(registrar.clone()));
+        let output = run_run(
+            "sleep 10",
+            None,
+            0,
+            ReadArgs::default(),
+            &ctx,
+            BashSpawnMode::Direct,
+        )
+        .await;
+        assert!(output.is_success());
+        assert!(output.output().contains("wake registration conflicted"));
+        assert!(output.output().contains("handle"));
+        assert_eq!(registrar.register_calls().len(), 1);
     }
 
     #[tokio::test]
@@ -2153,6 +2423,7 @@ mod tests {
                 socket_dir.path().to_path_buf(),
             )),
             None,
+            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         );
 
         // The `trap '' TERM` sets SIGTERM to SIG_IGN, inherited by the child

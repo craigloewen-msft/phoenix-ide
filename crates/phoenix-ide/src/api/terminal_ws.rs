@@ -17,7 +17,8 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use nix::sys::wait::waitpid;
-use phoenix_core::work_scope::WorkScope;
+use phoenix_core::domain::db_schema::ConvMode;
+use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_terminal::relay::{run_relay, PtyMasterIo, RelayConfig, RelayExit};
 use phoenix_terminal::session::{ActiveTerminals, Dims, StopReason, TerminalHandle};
 use phoenix_terminal::spawn::{set_nonblocking, set_winsize_raw, spawn_pty, PtyExecPlan};
@@ -49,23 +50,55 @@ pub async fn terminal_ws_handler(
     let db = state.db.clone();
     let runtime = Arc::clone(&state.runtime);
     ws.on_upgrade(move |socket| async move {
-        let (cwd, scope) = match db.get_conversation(&conversation_id).await {
+        let (cwd, scope, teardown_on_terminal, legacy_worktree_path) =
+            match db.get_conversation(&conversation_id).await {
             Ok(conv) => {
-                // worktree_path drives WorkScope keying (task 03001 / Phase 2):
-                // typed on `ConvMode` for Work, Branch, and managed Explore.
-                // Sub-agent Explore returns None and never reaches this code
-                // (no user PTY), so no fallback is needed. Direct returns None
-                // (resolves to WorkScope::Conversation).
-                let wt = conv.conv_mode.worktree_path().map(std::path::PathBuf::from);
-                let scope = WorkScope::resolve(&conversation_id, wt.as_deref());
-                (std::path::PathBuf::from(&conv.cwd), scope)
+                if conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
+                    tracing::warn!(
+                        conv_id = %conversation_id,
+                        "Terminal: Coordinator has no filesystem environment"
+                    );
+                    return;
+                }
+                if conv.runtime_role == crate::work_scope::RuntimeRole::SubAgent {
+                    tracing::warn!(
+                        conv_id = %conversation_id,
+                        "Terminal: sub-agent denied conversation terminal access"
+                    );
+                    return;
+                }
+                // Scope comes from the conversation's persisted durable identity.
+                let scope = ResourceScopeKey::Work(
+                    conv.work_scope_id
+                        .expect("persisted conversation has work scope"),
+                );
+                let legacy_worktree_path = conv
+                    .conv_mode
+                    .worktree_path()
+                    .map(std::path::PathBuf::from);
+                (
+                    std::path::PathBuf::from(&conv.cwd),
+                    scope,
+                    matches!(conv.conv_mode, ConvMode::Direct),
+                    legacy_worktree_path,
+                )
             }
             Err(e) => {
                 tracing::warn!(conv_id = %conversation_id, error = %e, "Terminal: conversation not found");
                 return;
             }
         };
-        handle_socket(socket, scope, cwd, conversation_id, terminals, runtime).await;
+        handle_socket(
+            socket,
+            scope,
+            cwd,
+            conversation_id,
+            teardown_on_terminal,
+            legacy_worktree_path,
+            terminals,
+            runtime,
+        )
+        .await;
     })
 }
 
@@ -81,14 +114,16 @@ pub async fn terminal_ws_global_handler(
 ) -> impl IntoResponse {
     let terminals = state.terminals.clone();
     let runtime = Arc::clone(&state.runtime);
-    // cwd per specs/terminal/terminal.allium (WorkScope::Global -> $HOME).
+    // The global terminal starts in the home directory.
     let cwd = state.runtime_env.home().to_path_buf();
     ws.on_upgrade(move |socket| {
         handle_socket(
             socket,
-            WorkScope::Global,
+            ResourceScopeKey::GlobalTerminal,
             cwd,
             "global".to_string(),
+            false,
+            None,
             terminals,
             runtime,
         )
@@ -96,11 +131,14 @@ pub async fn terminal_ws_global_handler(
 }
 
 #[allow(clippy::too_many_lines)] // inherently dense PTY lifecycle; see relay.rs for the testable core
+#[allow(clippy::too_many_arguments)]
 async fn handle_socket(
     socket: WebSocket,
-    scope: WorkScope,
+    scope: ResourceScopeKey,
     cwd: std::path::PathBuf,
     id_label: String,
+    teardown_on_terminal: bool,
+    legacy_worktree_path: Option<std::path::PathBuf>,
     terminals: ActiveTerminals,
     runtime: Arc<RuntimeManager>,
 ) {
@@ -126,6 +164,7 @@ async fn handle_socket(
         &scope,
         &terminals,
         &cwd,
+        legacy_worktree_path.as_deref(),
         initial_dims,
         &mut ws_sender,
         &runtime,
@@ -170,12 +209,7 @@ async fn handle_socket(
     let _ = arc_handle.stop_tx.send(StopReason::Running);
     let stop_rx = arc_handle.stop_tx.subscribe();
 
-    // REQ-TERM-012 (per-scope): the conversation-end teardown only applies
-    // to Conversation-scoped terminals. Worktree-scoped terminals survive
-    // across conversation continuations and tear down only via the
-    // worktree cleanup cascade (REQ-TERM-WS-001, REQ-TMUX-WS-002). Global
-    // terminals never tear down on conversation lifecycle.
-    if matches!(scope, WorkScope::Conversation(_)) {
+    if teardown_on_terminal {
         let teardown_stop = arc_handle.stop_tx.clone();
         let teardown_conv_id = conversation_id.clone();
         if let Ok(mut bcast_rx) = runtime.subscribe(&conversation_id).await {
@@ -183,7 +217,7 @@ async fn handle_socket(
                 loop {
                     match bcast_rx.recv().await {
                         Ok(SseEvent::ConversationBecameTerminal { .. }) => {
-                            tracing::debug!(conv_id = %teardown_conv_id, "Terminal: conversation ended, tearing down PTY");
+                            tracing::debug!(conv_id = %teardown_conv_id, "Terminal: Direct conversation ended, tearing down PTY");
                             let _ = teardown_stop.send(StopReason::TearDown);
                             break;
                         }
@@ -294,11 +328,13 @@ async fn handle_socket(
 ///      winner so the caller still gets an attached session.
 ///   3. `acquire_owned()` the permit — available immediately since the
 ///      handle is fresh and nobody holds it yet.
+#[allow(clippy::too_many_arguments)]
 async fn acquire_handle(
     conversation_id: &str,
-    scope: &WorkScope,
+    scope: &ResourceScopeKey,
     terminals: &ActiveTerminals,
     cwd: &std::path::Path,
+    legacy_worktree_path: Option<&std::path::Path>,
     initial_dims: Dims,
     ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     runtime: &Arc<RuntimeManager>,
@@ -315,7 +351,7 @@ async fn acquire_handle(
     // (REQ-TMUX-004 / design.md §"Terminal Attach Path"). `cwd` is
     // forwarded so a fresh tmux server starts its pane in the
     // conversation's project directory rather than Phoenix's own CWD.
-    let plan = resolve_exec_plan(conversation_id, scope, cwd, runtime).await;
+    let plan = resolve_exec_plan(conversation_id, scope, cwd, legacy_worktree_path, runtime).await;
 
     let cwd_owned = cwd.to_path_buf();
     let handle = match tokio::task::spawn_blocking(move || {
@@ -370,24 +406,24 @@ async fn acquire_handle(
 /// (REQ-TMUX-002), reuses it after Phoenix restart (REQ-TMUX-005), and
 /// recreates over a stale socket (REQ-TMUX-006).
 ///
-/// The caller's already-resolved `scope` is passed in directly so the
-/// tmux socket selection matches the terminal's ownership scope
-/// (REQ-TERM-WS-001). Re-resolving here from `(conversation_id,
-/// worktree_path)` would silently downgrade `WorkScope::Global` to
-/// `Conversation("global")`, breaking the singleton tmux session — and
-/// would also drop the disjointness between Worktree and Conversation
-/// scopes that share an inner string.
+/// The caller's persisted `scope` is passed in directly so tmux socket
+/// selection matches terminal ownership (REQ-TERM-WS-001). The global terminal
+/// remains structurally separate from durable conversation work scopes.
 async fn resolve_exec_plan(
     conversation_id: &str,
-    scope: &WorkScope,
+    scope: &ResourceScopeKey,
     cwd: &std::path::Path,
+    legacy_worktree_path: Option<&std::path::Path>,
     runtime: &Arc<RuntimeManager>,
 ) -> PtyExecPlan {
     let registry = runtime.tmux_registry();
     if !registry.binary_available() {
         return PtyExecPlan::Shell;
     }
-    match registry.ensure_live(scope, cwd).await {
+    match registry
+        .ensure_live(scope, cwd, legacy_worktree_path, Some(conversation_id))
+        .await
+    {
         Ok(server_arc) => {
             let server = server_arc.read().await;
             PtyExecPlan::Tmux {
@@ -458,7 +494,7 @@ async fn acquire_permit(
 async fn full_teardown(
     terminals: &ActiveTerminals,
     conversation_id: &str,
-    scope: &WorkScope,
+    scope: &ResourceScopeKey,
     arc_handle: Arc<TerminalHandle>,
     child_pid: nix::unistd::Pid,
 ) {

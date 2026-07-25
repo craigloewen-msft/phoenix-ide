@@ -67,6 +67,10 @@ fn refresh_commission_review_approval_for_outcome(
     {
         return;
     }
+    if context.execution_environment.working_dir().is_none() {
+        context.commission_review_approval = None;
+        return;
+    }
 
     context.commission_review_approval = Some(resolve_commission_review_approval(context));
 }
@@ -101,7 +105,7 @@ fn resolve_commission_review_approval(
     context: &ConvContext,
 ) -> CommissionReviewApprovalAvailability {
     resolve_commission_review_approval_from_parts(
-        &context.working_dir,
+        context.filesystem_root(),
         context.mode_context.as_ref(),
     )
 }
@@ -2414,14 +2418,9 @@ where
             return;
         }
 
-        let scope = phoenix_core::work_scope::WorkScope::resolve(
-            self.context.conversation_id.clone(),
-            self.context.work_scope_worktree.as_deref(),
-        );
-        let phoenix_core::work_scope::WorkScope::Worktree(worktree_path) = scope else {
+        let Some(worktree_path) = self.context.work_scope_worktree.clone() else {
             return;
         };
-        let worktree_path = std::path::PathBuf::from(worktree_path);
         if !worktree_path.exists() {
             return;
         }
@@ -3715,13 +3714,13 @@ where
         for (task, &(agent, mode)) in input.tasks.iter().zip(&resolved_tasks) {
             let cwd_override = nonblank(task.cwd.as_deref());
             let cwd_path = cwd_override.map_or_else(
-                || self.context.working_dir.clone(),
+                || self.context.filesystem_root().to_path_buf(),
                 |cwd| {
                     let path = std::path::Path::new(cwd);
                     if path.is_absolute() {
                         path.to_path_buf()
                     } else {
-                        self.context.working_dir.join(path)
+                        self.context.filesystem_root().join(path)
                     }
                 },
             );
@@ -4495,7 +4494,11 @@ where
         let context_window = self.context.context_window;
         let root_conv_id = self.context.root_conversation_id.clone();
         let model_id = self.context.model_id.clone();
-        let working_dir = self.context.working_dir.clone();
+        let working_dir = self
+            .context
+            .execution_environment
+            .working_dir()
+            .map(Path::to_path_buf);
         let tasks_dir_name = self.context.tasks_dir_name.clone();
         let is_sub_agent = self.context.is_sub_agent;
         let mode_context = self.context.mode_context.clone();
@@ -4620,11 +4623,13 @@ where
             // Build tool definitions before the mode prompt so Explore prose can
             // describe the same tool surface the model receives.
             let mut available_tools = tool_executor.definitions_for_language(llm_language).await;
-            let _commission_review_approval = maybe_precompute_commission_review_tools(
-                &working_dir,
-                mode_context.as_ref(),
-                &mut available_tools,
-            );
+            let _commission_review_approval = working_dir.as_deref().and_then(|working_dir| {
+                maybe_precompute_commission_review_tools(
+                    working_dir,
+                    mode_context.as_ref(),
+                    &mut available_tools,
+                )
+            });
             let explore_bash_capability =
                 if matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. })) {
                     explore_bash
@@ -4638,7 +4643,7 @@ where
                 crate::system_prompt::build_coordinator_system_prompt(llm_language)
             } else {
                 build_system_prompt(
-                    &working_dir,
+                    working_dir.as_deref().expect("filesystem conversation has cwd"),
                     &tasks_dir_name,
                     is_sub_agent,
                     mode_context.as_ref(),
@@ -4903,6 +4908,7 @@ where
         tx
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn dispatch_tool_execution(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
         // Special handling for spawn_agents tool
         if tool.name() == "spawn_agents" {
@@ -4969,17 +4975,34 @@ where
                 });
         });
         let llm_metrics_tx = self.create_tool_llm_metrics_sink();
-        let tool_ctx = ToolContext::new(
-            cancel_token,
-            self.context.conversation_id.clone(),
-            self.context.working_dir.clone(),
-            self.browser_sessions.clone(),
-            self.bash_handles.clone(),
-            self.llm_registry.clone(),
-            self.terminals.clone(),
-            self.tmux_registry.clone(),
-            scope_worktree,
-        )
+        let tool_ctx = match &self.context.execution_environment {
+            phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                working_dir,
+            } => ToolContext::new_with_resource_scope(
+                cancel_token,
+                self.context.conversation_id.clone(),
+                working_dir.clone(),
+                self.browser_sessions.clone(),
+                self.bash_handles.clone(),
+                self.llm_registry.clone(),
+                self.terminals.clone(),
+                self.tmux_registry.clone(),
+                scope_worktree,
+                self.context.resource_scope.clone(),
+                self.context.resource_authority,
+            ),
+            phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem => {
+                ToolContext::new_without_filesystem(
+                    cancel_token,
+                    self.context.conversation_id.clone(),
+                    self.browser_sessions.clone(),
+                    self.bash_handles.clone(),
+                    self.llm_registry.clone(),
+                    self.terminals.clone(),
+                    self.tmux_registry.clone(),
+                )
+            }
+        }
         .with_bash_progress_sink(bash_progress_sink)
         .with_root_conversation_id(self.context.root_conversation_id.clone())
         .with_tool_use_id(tool.id.clone())
@@ -5173,8 +5196,11 @@ where
         // the conversation's working_dir. The stored path is relative to the
         // repository root so the spawn/review surface resolves it regardless of
         // which worktree or subdir the origin ran in.
-        let normalized_task_file =
-            normalize_task_file_repo_relative(&self.context.working_dir, &task_file, &proposal_id);
+        let normalized_task_file = normalize_task_file_repo_relative(
+            self.context.filesystem_root(),
+            &task_file,
+            &proposal_id,
+        );
 
         let conv_id = self.context.conversation_id.clone();
 
@@ -5633,7 +5659,7 @@ where
         priority: crate::task_source::Priority,
         plan: String,
     ) -> Result<(), String> {
-        let cwd = self.context.working_dir.clone();
+        let cwd = self.context.filesystem_root().to_path_buf();
         // The spec invariant WorktreePathDerivedFromConversation requires
         // the worktree path to be rooted at the repo root, not at cwd.
         // For Managed conversations cwd IS the Explore worktree; for legacy
@@ -5688,7 +5714,11 @@ where
                         .expect("task_title from task approval must be non-empty"),
                 };
                 storage
-                    .update_conversation_mode(&self.context.conversation_id, &work_mode)
+                    .update_conversation_mode_and_cwd(
+                        &self.context.conversation_id,
+                        &work_mode,
+                        &approval_result.worktree_path,
+                    )
                     .await?;
 
                 // Legitimate cwd mutation (task 13012, in-place promotion).
@@ -5697,79 +5727,7 @@ where
                 // this write is a no-op — worktree_path == conv.cwd already.
                 // For legacy Managed conversations whose cwd was the repo root,
                 // this is load-bearing: it moves cwd to the new worktree path.
-                storage
-                    .update_conversation_cwd_recovery_only(
-                        &self.context.conversation_id,
-                        crate::conversation_cwd::validate_conversation_cwd(
-                            &approval_result.worktree_path,
-                        )
-                        .map_err(|e| e.to_string())?
-                        .raw(),
-                    )
-                    .await?;
-                self.context.working_dir = std::path::PathBuf::from(&approval_result.worktree_path);
-
-                // Refresh in-memory mode_context so downstream checks
-                // (e.g. spawn_agents Work-parent guard) observe Work mode
-                // for the rest of this runtime's lifetime. Without this,
-                // mode_context stays the Explore value set at runtime start.
-                self.context.mode_context = Some(ModeContext::Work {
-                    branch_name: approval_result.branch_name.clone(),
-                    base_branch: approval_result.base_branch.clone(),
-                    worktree_path: approval_result.worktree_path.clone(),
-                });
-
-                // Refresh the cached scope-defining worktree so in-runtime tool
-                // calls (bash/tmux/browser) key resources under the same
-                // `WorkScope` the DB-facing inventory/cleanup resolve. Approval
-                // promotes Explore (no worktree -> `WorkScope::Conversation`) to
-                // Work (owns a worktree -> `WorkScope::Worktree`); leaving the
-                // cached value stale would split the two sides until restart.
-                // The post-approval `conv_mode` is Work, whose
-                // `worktree_path()` is the path just created, mirroring how
-                // construction seeds this from `conv_mode.worktree_path()`.
-                //
-                // The scope flips here from `old_scope` (pre-approval) to
-                // `new_scope` (post-approval). Resources opened pre-approval
-                // (bash/browser/tmux) are keyed under `old_scope`; migrate them
-                // to `new_scope` below so the inventory and idle/cleanup paths
-                // resolve them under the same scope the cache now uses.
-                let old_scope = phoenix_core::work_scope::WorkScope::resolve(
-                    self.context.conversation_id.clone(),
-                    self.context.work_scope_worktree.as_deref(),
-                );
-                self.context.work_scope_worktree =
-                    Some(std::path::PathBuf::from(&approval_result.worktree_path));
-                let new_scope = phoenix_core::work_scope::WorkScope::resolve(
-                    self.context.conversation_id.clone(),
-                    self.context.work_scope_worktree.as_deref(),
-                );
-
-                // Migrate WorkScope-keyed resources opened before approval from
-                // the conversation scope to the worktree scope. Each rekey moves
-                // the in-memory lookup key only — the underlying process /
-                // session / server is untouched. A no-op when nothing was opened
-                // pre-approval (the common case) or when the scope did not flip
-                // (a top-level Explore that already owned a worktree).
-                let bash_moved = self.bash_handles.rekey_scope(&old_scope, &new_scope).await;
-                let browser_moved = self
-                    .browser_sessions
-                    .rekey_scope(&old_scope, &new_scope)
-                    .await;
-                let tmux_moved = self.tmux_registry.rekey_scope(&old_scope, &new_scope).await;
-
-                // If anything migrated, nudge the work-scope bridge to
-                // re-broadcast `new_scope`'s inventory so the panel reflects the
-                // moved resources without waiting for its next poll. The bridge
-                // assembles the full (bash + tmux + browser) inventory from the
-                // affected scope, so a single emit on any registry sink covers
-                // all three kinds; bash is used as the carrier.
-                if bash_moved || browser_moved || tmux_moved {
-                    self.bash_handles.emit_lifecycle(
-                        &new_scope,
-                        phoenix_tools::bash::BashLifecyclePhase::Spawned,
-                    );
-                }
+                promote_runtime_context_to_work(&mut self.context, &approval_result);
 
                 // Upgrade tool registry from Explore to Work mode so the agent
                 // gets bash, patch, etc. for the rest of this conversation.
@@ -5836,13 +5794,7 @@ where
                             conv_mode_label: Some("Work".to_string()),
                             base_branch: Some(approval_result.base_branch.clone()),
                             task_title: Some(approval_result.task_title.clone()),
-                            work_scope_key: Some(
-                                crate::work_scope::WorkScope::resolve(
-                                    &self.context.conversation_id,
-                                    Some(std::path::Path::new(&approval_result.worktree_path)),
-                                )
-                                .stable_key(),
-                            ),
+                            work_scope_key: Some(self.context.resource_scope.stable_key()),
                             model: None,
                         },
                     });
@@ -5904,7 +5856,7 @@ where
         priority: crate::task_source::Priority,
         plan: String,
     ) -> Result<Option<Event>, String> {
-        let cwd = self.context.working_dir.clone();
+        let cwd = self.context.filesystem_root().to_path_buf();
         let repo_root =
             crate::git_ops::repo_root_from_phoenix_worktree(&cwd).unwrap_or_else(|| cwd.clone());
         let conv_id = self.context.conversation_id.clone();
@@ -5994,6 +5946,18 @@ where
             successor_conv_id: response.successor_conv_id,
         }))
     }
+}
+
+fn promote_runtime_context_to_work(context: &mut ConvContext, approval: &TaskApprovalResult) {
+    let worktree_path = std::path::PathBuf::from(&approval.worktree_path);
+    context.set_filesystem_root(worktree_path.clone());
+    context.resource_authority = crate::work_scope::ResourceAuthority::Work;
+    context.work_scope_worktree = Some(worktree_path);
+    context.mode_context = Some(ModeContext::Work {
+        branch_name: approval.branch_name.clone(),
+        base_branch: approval.base_branch.clone(),
+        worktree_path: approval.worktree_path.clone(),
+    });
 }
 
 /// Result of a successful task approval
@@ -9649,183 +9613,53 @@ mod explore_prompt_cache_shape_tests {
     }
 }
 
-// ============================================================
-// Mode-context refresh on Explore -> Work promotion
-// ============================================================
-//
-// Regression test for task 03002: after a Managed conversation
-// approves its task and is promoted to Work mode, the in-memory
-// `context.mode_context` must reflect Work (not the stale Explore
-// value from runtime startup). The `spawn_agents` Work-parent guard
-// reads this field; a stale Explore value rejects legitimate
-// `mode: "work"` sub-agent requests from a Work-mode parent.
-
 #[cfg(test)]
-mod approve_task_refreshes_mode_context_tests {
-    use super::test_git_helpers::{add_explore_worktree, init_repo};
+mod runtime_context_promotion_tests {
     use super::*;
-    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
-    use crate::state_machine::{ConvContext, ConvState, Effect};
-    use crate::system_prompt::ModeContext;
-    use crate::tools::BrowserSessionManager;
-    use phoenix_llm::ModelRegistry;
-    use std::sync::Arc;
-    use tokio::sync::mpsc;
 
-    #[tokio::test]
-    // End-to-end approval flow: repo setup, task creation, approval, and
-    // post-conditions read clearer as one linear scenario than split apart.
-    #[allow(clippy::too_many_lines)]
-    async fn approve_task_sets_mode_context_to_work() {
-        let (_tmp, repo_root) = init_repo();
-        let conv_id = "mode-ctx-refresh-1";
-        let base_branch = "main";
-
-        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
-        let tasks_dir = explore_wt.join("tasks");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-        let task_filename = "12345-p2-ready--spawn-work-subagents.md";
-        std::fs::write(
-            tasks_dir.join(task_filename),
-            "# Spawn work subagents\n\n1. Plan\n2. Spawn\n",
-        )
-        .unwrap();
-
-        let storage = Arc::new(InMemoryStorage::new());
-        let mut context = ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000);
+    #[test]
+    fn promotion_refreshes_filesystem_and_resource_context() {
+        let old_root = std::path::PathBuf::from("/repo");
+        let mut context = ConvContext::new("conv", old_root, "model", 200_000);
+        context.resource_authority = crate::work_scope::ResourceAuthority::Restricted;
+        context.work_scope_worktree = None;
         context.mode_context = Some(ModeContext::Explore {
             next_taskmd_id_hint: None,
         });
-        context.desired_base_branch = Some(base_branch.to_string());
-        // Pre-approval Explore owns no scope-defining worktree (the
-        // sub-agent-Explore shape that keys tool resources under
-        // `WorkScope::Conversation`). Approval must refresh this cache.
-        context.work_scope_worktree = None;
+        let approval = TaskApprovalResult {
+            task_id: "123".to_string(),
+            task_title: "Approved task".to_string(),
+            branch_name: "task-123-approved".to_string(),
+            first_task: true,
+            task_file: "tasks/123-p1-ready--approved.md".to_string(),
+            worktree_path: "/repo/.phoenix/worktrees/conv".to_string(),
+            base_branch: "main".to_string(),
+        };
 
-        let (_event_tx, event_rx) = mpsc::channel(32);
-        let event_tx_dup = mpsc::channel::<Event>(1).0;
-        let broadcaster = SseBroadcaster::new(128, 0);
+        promote_runtime_context_to_work(&mut context, &approval);
 
-        // Seed a bash handle under the pre-approval conversation scope —
-        // the sub-agent-Explore shape keys resources under
-        // `WorkScope::Conversation(conv_id)`. After approval it must be
-        // reachable under the worktree scope (and gone from the old scope).
-        let bash_handles = Arc::new(crate::tools::BashHandleRegistry::new());
-        let old_scope = crate::work_scope::WorkScope::Conversation(conv_id.to_string());
-        {
-            use phoenix_tools::bash::handle::{Handle, HandleId};
-            use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
-            let table = bash_handles.get_or_create(&old_scope).await;
-            table.write().await.insert(Handle::new_live(
-                old_scope.clone(),
-                HandleId::new("b-1"),
-                "echo pre-approval".to_string(),
-                None,
-                12345,
-                12345,
-                RING_BUFFER_BYTES,
-            ));
-        }
-
-        let mut rt = ConversationRuntime::new(
-            context,
-            ConvState::AwaitingTaskApproval {
-                task_file: format!("tasks/{task_filename}"),
-                title: "Spawn work subagents".to_string(),
-                priority: crate::task_source::Priority::P2,
-                plan: "Plan and spawn".to_string(),
-            },
-            storage,
-            Arc::new(MockLlmClient::new("test-model")),
-            Arc::new(MockToolExecutor::new()),
-            Arc::new(BrowserSessionManager::default()),
-            bash_handles.clone(),
-            Arc::new(crate::tools::TmuxRegistry::new()),
-            Arc::new(ModelRegistry::new_empty()),
-            crate::terminal::ActiveTerminals::new(),
-            event_rx,
-            event_tx_dup,
-            broadcaster,
+        let promoted_path = std::path::PathBuf::from(&approval.worktree_path);
+        assert_eq!(
+            context.execution_environment.working_dir(),
+            Some(promoted_path.as_path())
         );
-
-        rt.execute_effect(Effect::ApproveTask {
-            task_file: format!("tasks/{task_filename}"),
-            title: "Spawn work subagents".to_string(),
-            priority: crate::task_source::Priority::P2,
-            plan: "Plan and spawn".to_string(),
-        })
-        .await
-        .expect("approve task effect failed");
-
-        match rt.context.mode_context.as_ref() {
+        assert_eq!(
+            context.resource_authority,
+            crate::work_scope::ResourceAuthority::Work
+        );
+        assert_eq!(context.work_scope_worktree.as_ref(), Some(&promoted_path));
+        assert!(matches!(
+            context.mode_context,
             Some(ModeContext::Work {
                 branch_name,
-                base_branch: bb,
+                base_branch,
                 worktree_path,
-            }) => {
-                assert!(
-                    !branch_name.is_empty(),
-                    "branch_name must be populated post-approval"
-                );
-                assert_eq!(bb, base_branch, "base_branch must round-trip");
-                assert_eq!(
-                    worktree_path,
-                    &explore_wt.to_string_lossy().to_string(),
-                    "worktree_path must equal the in-place-promoted Explore worktree"
-                );
-            }
-            other => panic!(
-                "mode_context must be refreshed to Work after approval; got {other:?}. \
-                 Stale Explore here is the task-03002 bug: spawn_agents rejects \
-                 mode: \"work\" sub-agents because parent_allows_work is false."
-            ),
-        }
-
-        // The cached scope-defining worktree must follow the promotion: a
-        // stale `None` would key in-runtime tool resources under
-        // `WorkScope::Conversation` while DB-facing cleanup resolves
-        // `WorkScope::Worktree`, splitting the panel/cleanup until restart.
-        assert_eq!(
-            rt.context.work_scope_worktree.as_deref(),
-            Some(explore_wt.as_path()),
-            "work_scope_worktree must be refreshed to the post-approval Work worktree"
-        );
-
-        // The pre-approval bash handle, opened under the conversation scope,
-        // must follow the scope flip: reachable under the new worktree scope
-        // and gone from the old conversation scope. Without the rekey it would
-        // be orphaned — invisible to the inventory and reapable by the idle
-        // reaper as an abandoned conversation scope.
-        let new_scope =
-            crate::work_scope::WorkScope::Worktree(explore_wt.to_string_lossy().into_owned());
-        assert!(
-            bash_handles.get_existing(&old_scope).await.is_none(),
-            "old conversation scope must be empty after approval rekey"
-        );
-        let migrated = bash_handles
-            .get_existing(&new_scope)
-            .await
-            .expect("bash handle table must be reachable under the new worktree scope");
-        assert!(
-            migrated
-                .read()
-                .await
-                .get(&phoenix_tools::bash::handle::HandleId::new("b-1"))
-                .is_some(),
-            "the pre-approval handle must be present under the worktree scope"
-        );
+            }) if branch_name == approval.branch_name
+                && base_branch == approval.base_branch
+                && worktree_path == approval.worktree_path
+        ));
     }
 }
-
-// ============================================================
-// Steering queue multi-drain detectors (Phase 2)
-// ============================================================
-//
-// These tests exercise the executor-level drain logic in
-// `apply_transition_result` for `SteerDrainedUserMessages`. They drive
-// synthetic `TransitionResult`s so the detectors are isolated from the
-// transition machinery (which is tested separately in
-// state_machine/transition.rs).
 
 #[cfg(test)]
 mod steer_drain_detector_tests {

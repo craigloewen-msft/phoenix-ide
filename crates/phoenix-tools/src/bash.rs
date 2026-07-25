@@ -28,7 +28,7 @@ pub mod sandbox;
 pub use reaper::{install_reaper, shutdown_kill_tree};
 pub use registry::{
     BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecyclePhase, BashLifecycleSink,
-    WorkScopeHandles,
+    ResourceScopeKeyHandles,
 };
 // `types` (BashOp, BashToolInput) moved to phoenix-core. Alias the module back
 // as `types` and re-export the items so existing paths resolve unchanged.
@@ -273,10 +273,15 @@ mod tests {
             phoenix_terminal::ActiveTerminals::new(),
             Arc::new(crate::TmuxRegistry::new()),
             None,
+            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         )
     }
 
-    fn ctx_for(conversation_id: &str, registry: Arc<BashHandleRegistry>) -> ToolContext {
+    fn ctx_for(
+        conversation_id: &str,
+        work_scope_id: &str,
+        registry: Arc<BashHandleRegistry>,
+    ) -> ToolContext {
         ToolContext::new(
             CancellationToken::new(),
             conversation_id.to_string(),
@@ -287,6 +292,27 @@ mod tests {
             phoenix_terminal::ActiveTerminals::new(),
             Arc::new(crate::TmuxRegistry::new()),
             None,
+            phoenix_core::work_scope::WorkScopeId::parse(work_scope_id).unwrap(),
+        )
+    }
+
+    fn restricted_ctx_for(
+        conversation_id: &str,
+        work_scope_id: &str,
+        registry: Arc<BashHandleRegistry>,
+    ) -> ToolContext {
+        ToolContext::new_with_resource_access(
+            CancellationToken::new(),
+            conversation_id.to_string(),
+            temp_dir(),
+            Arc::new(BrowserSessionManager::default()),
+            registry,
+            Arc::new(crate::NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            Arc::new(crate::TmuxRegistry::new()),
+            None,
+            phoenix_core::work_scope::WorkScopeId::parse(work_scope_id).unwrap(),
+            phoenix_core::work_scope::ResourceAuthority::Restricted,
         )
     }
 
@@ -634,8 +660,10 @@ mod tests {
 
         let bash_pid = {
             use crate::bash::handle::HandleId;
-            use phoenix_core::work_scope::WorkScope;
-            let scope = WorkScope::Conversation("test-conv".to_string());
+            use phoenix_core::work_scope::ResourceScopeKey;
+            let scope = ResourceScopeKey::Work(
+                phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
+            );
             let table = registry.get_or_create(&scope).await;
             let h = table
                 .read()
@@ -733,8 +761,8 @@ mod tests {
     async fn cross_conversation_handle_access_returns_handle_not_found() {
         let tool = BashTool;
         let registry = Arc::new(BashHandleRegistry::new());
-        let conv_a = ctx_for("conv-a", registry.clone());
-        let conv_b = ctx_for("conv-b", registry);
+        let conv_a = ctx_for("conv-a", "scope-a", registry.clone());
+        let conv_b = ctx_for("conv-b", "scope-b", registry);
 
         let spawn = tool
             .run(
@@ -760,6 +788,45 @@ mod tests {
             .run(
                 json!({"op": "kill", "handle": handle, "signal": "KILL"}),
                 conv_a,
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn restricted_child_cannot_control_work_handle_in_shared_scope() {
+        let work_tool = BashTool;
+        let restricted_tool = SandboxedBashTool;
+        let registry = Arc::new(BashHandleRegistry::new());
+        let work_parent = ctx_for("work-parent", "shared-scope", registry.clone());
+        let restricted_child =
+            restricted_ctx_for("explore-child", "shared-scope", registry.clone());
+
+        let spawn = work_tool
+            .run(
+                json!({"op": "run", "cmd": "sleep 10", "wait_seconds": 0}),
+                work_parent.clone(),
+            )
+            .await;
+        let handle = parse_response(&spawn)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        for op in ["peek", "wait", "kill"] {
+            let input = if op == "kill" {
+                json!({"op": op, "handle": handle, "signal": "KILL"})
+            } else {
+                json!({"op": op, "handle": handle})
+            };
+            let denied = restricted_tool.run(input, restricted_child.clone()).await;
+            assert!(!denied.is_success(), "{op} unexpectedly succeeded");
+            assert_eq!(parse_response(&denied)["error"], "handle_not_found");
+        }
+
+        let _ = work_tool
+            .run(
+                json!({"op": "kill", "handle": handle, "signal": "KILL"}),
+                work_parent,
             )
             .await;
     }
@@ -1106,6 +1173,7 @@ mod tests {
             phoenix_terminal::ActiveTerminals::new(),
             Arc::new(crate::TmuxRegistry::new()),
             None,
+            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         );
 
         let tool_future = tool.run(

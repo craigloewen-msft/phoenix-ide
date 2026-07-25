@@ -152,6 +152,10 @@ async fn configure_mcp_manager(db: &Database) -> Arc<crate::tools::mcp::McpClien
 ///
 /// Returns an error if validation/bootstrap fails or the runtime does not reach
 /// a stable state within the requested timeout.
+///
+/// # Panics
+/// Panics only if a persisted ordinary conversation violates the database
+/// runtime-role invariant by lacking its required work-scope identifier.
 pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurnError> {
     let cwd = request.validate()?;
     install_crypto_provider();
@@ -219,11 +223,25 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
         started,
     )
     .await;
-    let work_scope = phoenix_core::work_scope::WorkScope::Conversation(conversation_id.clone());
+    let conversation = db
+        .get_conversation(&conversation_id)
+        .await
+        .map_err(|error| DriveTurnError::Database(error.to_string()))?;
+    let work_scope = phoenix_core::work_scope::ResourceScopeKey::Work(
+        conversation
+            .work_scope_id
+            .expect("persisted conversation has work scope"),
+    );
     let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
         manager.tmux_registry(),
         &work_scope,
         None,
+        conversation
+            .conv_mode
+            .worktree_path()
+            .map(std::path::Path::new),
+        matches!(conversation.conv_mode, crate::db::ConvMode::Direct)
+            .then_some(conversation.id.as_str()),
     )
     .await;
     if tmux_report.kill_server_error.is_some() || tmux_report.unlink_error.is_some() {

@@ -26,7 +26,7 @@ pub mod work_scope_inventory;
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::{
     BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecycleSink, BashOp, BashTool,
-    BashToolInput, SandboxedBashTool, WorkScopeHandles as BashWorkScopeHandles,
+    BashToolInput, ResourceScopeKeyHandles as BashResourceScopeKeyHandles, SandboxedBashTool,
 };
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
@@ -53,7 +53,7 @@ pub use tmux::{
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -63,10 +63,9 @@ use phoenix_core::domain::bash_progress::BashToolProgress;
 use phoenix_core::domain::sm_state::ExploreBashCapability;
 use phoenix_core::llm_service::LlmSelector;
 use phoenix_core::platform::PlatformCapability;
-use phoenix_core::work_scope::WorkScope;
+use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_workflow::wake_profile::{
     WakeCancellationReason, WakeRegistrationIntent, WakeResourceIdentity, WorkScopeIdentity,
-    WorkScopeKind,
 };
 use phoenix_workflow::{Timestamp, WorkflowId};
 
@@ -129,6 +128,7 @@ impl RegisterWakeInput {
         WakeRegistrationIntent {
             contract_id: self.contract_id,
             conversation_id: self.conversation_id,
+            root_conversation_id: self.root_conversation_id,
             registration_scope: self.registration_scope,
             resource: self.resource,
             registering_tool_use_id: self.registering_tool_use_id,
@@ -171,24 +171,20 @@ pub trait WakeRegistrar: Send + Sync {
     async fn cancel(&self, input: CancelWakeInput) -> Result<RegisteredWake, String>;
 }
 
-/// Converts a runtime scope to a scope that may own a durable wake.
+/// Converts a resource scope to the persisted identity that may own a durable wake.
 ///
 /// # Errors
-/// Returns an error for global scope, which has no durable conversation/worktree owner.
-pub fn work_scope_identity(scope: &WorkScope) -> Result<WorkScopeIdentity, String> {
-    Ok(match scope {
-        WorkScope::Worktree(path) => WorkScopeIdentity {
-            kind: WorkScopeKind::Worktree,
-            stable_key: path.clone(),
-        },
-        WorkScope::Conversation(id) => WorkScopeIdentity {
-            kind: WorkScopeKind::Conversation,
-            stable_key: id.clone(),
-        },
-        WorkScope::Global => {
-            return Err("global work scope cannot own a durable wake".to_string());
+/// Returns an error for the global terminal namespace, which has no durable work owner.
+pub fn work_scope_identity(scope: &ResourceScopeKey) -> Result<WorkScopeIdentity, String> {
+    match scope {
+        ResourceScopeKey::Work(id) => Ok(WorkScopeIdentity(id.as_str().to_string())),
+        ResourceScopeKey::Coordinator => {
+            Err("coordinator scope cannot own a durable wake".to_string())
         }
-    })
+        ResourceScopeKey::GlobalTerminal => {
+            Err("global terminal scope cannot own a durable wake".to_string())
+        }
+    }
 }
 
 /// Typed image data for LLM consumption.
@@ -348,6 +344,12 @@ impl ToolOutput {
 ///
 /// REQ-BASH-010, REQ-BT-012: Stateless Tools with Context Injection
 #[derive(Clone)]
+enum ToolExecutionEnvironment {
+    Filesystem(PathBuf),
+    NoFilesystem,
+}
+
+#[derive(Clone)]
 pub struct ToolContext {
     /// Cancellation signal for long-running operations
     pub cancel: CancellationToken,
@@ -355,17 +357,19 @@ pub struct ToolContext {
     /// The conversation this tool is executing within
     pub conversation_id: String,
 
+    /// Actor identity and effective authority for same-scope resources.
+    pub resource_access: phoenix_core::work_scope::EffectiveResourceAccess,
+
     /// Root conversation for trace correlation across sub-agents.
     pub root_conversation_id: String,
 
-    /// Working directory for file operations
-    pub working_dir: PathBuf,
+    execution_environment: ToolExecutionEnvironment,
 
     /// Browser session manager (access via `browser()` method)
     browser_sessions: Arc<BrowserSessionManager>,
 
     /// Per-process bash handle registry (access via `bash_handles()` method).
-    /// Owns the per-`WorkScope` handle tables, ring buffers, tombstones,
+    /// Owns the per-`ResourceScopeKey` handle tables, ring buffers, tombstones,
     /// and live-handle cap enforcement (REQ-BASH-005, REQ-BASH-006,
     /// REQ-BASH-014). Reached by tools through `bash_handles()` /
     /// `bash_handle_registry()`.
@@ -391,17 +395,14 @@ pub struct ToolContext {
     /// REQ-TMUX-013.
     tmux_registry: Arc<TmuxRegistry>,
 
-    /// The worktree path for this conversation, if in Work/Branch/Explore
-    /// mode. `None` for Direct-mode conversations. Used by `tmux()` to
-    /// key the socket to the worktree rather than the conversation ID so
-    /// the session survives context-exhaustion continuations (task 03001).
+    /// Concrete worktree path from the normalized environment, when allocated.
     pub worktree_path: Option<PathBuf>,
 
     /// Durable owner for work-affine resources created by this tool call.
     /// Worktree-backed conversations scope to the worktree path so resources
     /// survive context-exhaustion continuations; Direct conversations fall
     /// back to the conversation id.
-    pub work_scope: WorkScope,
+    pub work_scope: ResourceScopeKey,
 
     /// Optional sink for typed ephemeral bash progress snapshots.
     bash_progress_sink: Option<Arc<dyn BashProgressSink>>,
@@ -422,14 +423,126 @@ impl ToolContext {
         terminals: phoenix_terminal::ActiveTerminals,
         tmux_registry: Arc<TmuxRegistry>,
         worktree_path: Option<PathBuf>,
+        work_scope_id: phoenix_core::work_scope::WorkScopeId,
+    ) -> Self {
+        Self::new_with_resource_access(
+            cancel,
+            conversation_id,
+            working_dir,
+            browser_sessions,
+            bash_handles,
+            llm_selector,
+            terminals,
+            tmux_registry,
+            worktree_path,
+            work_scope_id,
+            phoenix_core::work_scope::ResourceAuthority::Work,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_resource_access(
+        cancel: CancellationToken,
+        conversation_id: String,
+        working_dir: PathBuf,
+        browser_sessions: Arc<BrowserSessionManager>,
+        bash_handles: Arc<BashHandleRegistry>,
+        llm_selector: Arc<dyn LlmSelector>,
+        terminals: phoenix_terminal::ActiveTerminals,
+        tmux_registry: Arc<TmuxRegistry>,
+        worktree_path: Option<PathBuf>,
+        work_scope_id: phoenix_core::work_scope::WorkScopeId,
+        authority: phoenix_core::work_scope::ResourceAuthority,
+    ) -> Self {
+        Self::new_with_resource_scope(
+            cancel,
+            conversation_id,
+            working_dir,
+            browser_sessions,
+            bash_handles,
+            llm_selector,
+            terminals,
+            tmux_registry,
+            worktree_path,
+            ResourceScopeKey::Work(work_scope_id),
+            authority,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_without_filesystem(
+        cancel: CancellationToken,
+        conversation_id: String,
+        browser_sessions: Arc<BrowserSessionManager>,
+        bash_handles: Arc<BashHandleRegistry>,
+        llm_selector: Arc<dyn LlmSelector>,
+        terminals: phoenix_terminal::ActiveTerminals,
+        tmux_registry: Arc<TmuxRegistry>,
     ) -> Self {
         let root_conversation_id = conversation_id.clone();
-        let work_scope = WorkScope::resolve(&conversation_id, worktree_path.as_deref());
+        Self {
+            cancel,
+            resource_access: phoenix_core::work_scope::EffectiveResourceAccess::new(
+                conversation_id.clone(),
+                phoenix_core::work_scope::ResourceAuthority::Work,
+            ),
+            conversation_id,
+            root_conversation_id,
+            execution_environment: ToolExecutionEnvironment::NoFilesystem,
+            browser_sessions,
+            bash_handles,
+            llm_selector,
+            terminals,
+            tmux_registry,
+            worktree_path: None,
+            work_scope: ResourceScopeKey::Coordinator,
+            bash_progress_sink: None,
+            tool_use_id: None,
+            wake_registrar: None,
+            llm_metrics_tx: None,
+        }
+    }
+
+    /// Returns the filesystem root required by filesystem-capable tools.
+    ///
+    /// # Panics
+    /// Panics for a filesystem-free context. Its registry must not expose
+    /// filesystem-capable tools.
+    #[must_use]
+    pub fn working_dir(&self) -> &Path {
+        match &self.execution_environment {
+            ToolExecutionEnvironment::Filesystem(path) => path,
+            ToolExecutionEnvironment::NoFilesystem => {
+                panic!("filesystem capability required by tool")
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_resource_scope(
+        cancel: CancellationToken,
+        conversation_id: String,
+        working_dir: PathBuf,
+        browser_sessions: Arc<BrowserSessionManager>,
+        bash_handles: Arc<BashHandleRegistry>,
+        llm_selector: Arc<dyn LlmSelector>,
+        terminals: phoenix_terminal::ActiveTerminals,
+        tmux_registry: Arc<TmuxRegistry>,
+        worktree_path: Option<PathBuf>,
+        work_scope: ResourceScopeKey,
+        authority: phoenix_core::work_scope::ResourceAuthority,
+    ) -> Self {
+        let root_conversation_id = conversation_id.clone();
+        let resource_access = phoenix_core::work_scope::EffectiveResourceAccess::new(
+            conversation_id.clone(),
+            authority,
+        );
         Self {
             cancel,
             conversation_id,
+            resource_access,
             root_conversation_id,
-            working_dir,
+            execution_environment: ToolExecutionEnvironment::Filesystem(working_dir),
             browser_sessions,
             bash_handles,
             llm_selector,
@@ -484,7 +597,7 @@ impl ToolContext {
     }
 
     /// Get or create the browser session for this conversation's
-    /// `WorkScope`.
+    /// `ResourceScopeKey`.
     ///
     /// Lazily initializes Chrome on first call. Subsequent calls — including
     /// from a continuation that resolves to the same scope — return the
@@ -497,13 +610,24 @@ impl ToolContext {
     /// Returns [`BrowserError`] when Chrome cannot be launched or the
     /// session fails to initialize on first use.
     pub async fn browser(&self) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
-        self.browser_sessions.get_session(&self.work_scope).await
+        self.browser_sessions
+            .get_session_for_actor(&self.work_scope, &self.resource_access)
+            .await
     }
 
-    /// Get the per-`WorkScope` bash handle table.
+    #[must_use]
+    pub fn with_resource_authority(
+        mut self,
+        authority: phoenix_core::work_scope::ResourceAuthority,
+    ) -> Self {
+        self.resource_access = self.resource_access.with_authority(authority);
+        self
+    }
+
+    /// Get the per-`ResourceScopeKey` bash handle table.
     ///
     /// Lazily creates the scope entry on first call; subsequent calls that
-    /// resolve to the same `WorkScope` — including from a continuation that
+    /// resolve to the same `ResourceScopeKey` — including from a continuation that
     /// inherits the same worktree — return the same `Arc<RwLock<...>>`, so a
     /// continuation chain on one worktree shares one handle table
     /// (REQ-BASH-WS-001). Returns a `Result` for shape-parity with
@@ -511,13 +635,15 @@ impl ToolContext {
     /// surface accepts future failure modes (e.g. registry resource
     /// exhaustion) without reshaping every callsite.
     ///
-    /// REQ-BASH-014: Stateless Tool with Per-`WorkScope` Handle Registry.
+    /// REQ-BASH-014: Stateless Tool with Per-`ResourceScopeKey` Handle Registry.
     ///
     /// # Errors
     /// Returns [`BashHandleError`] to keep shape-parity with [`Self::browser`].
     /// `get_or_create` is currently infallible, so this presently always
     /// returns `Ok`.
-    pub async fn bash_handles(&self) -> Result<Arc<RwLock<BashWorkScopeHandles>>, BashHandleError> {
+    pub async fn bash_handles(
+        &self,
+    ) -> Result<Arc<RwLock<BashResourceScopeKeyHandles>>, BashHandleError> {
         Ok(self.bash_handles.get_or_create(&self.work_scope).await)
     }
 
@@ -566,14 +692,13 @@ impl ToolContext {
         // `new-session -c` when a fresh server is spawned so the pane
         // shell starts in the conversation's project. Ignored on
         // re-attach (see `ensure_live` doc).
-        //
-        // `worktree_path` controls socket keying: worktree-scoped for
-        // Work/Branch/Explore, conv-scoped for Direct (task 03001). The
-        // ToolContext computes `work_scope` from this at construction time;
-        // tmux ownership is keyed off the scope rather than re-deciding
-        // the worktree-vs-conversation fallback at each callsite.
         self.tmux_registry
-            .ensure_live(&self.work_scope, &self.working_dir)
+            .ensure_live(
+                &self.work_scope,
+                self.working_dir(),
+                self.worktree_path.as_deref(),
+                Some(&self.conversation_id),
+            )
             .await
     }
 
@@ -1458,6 +1583,7 @@ mod wake_registrar_seam_tests {
             phoenix_terminal::ActiveTerminals::new(),
             Arc::new(TmuxRegistry::new()),
             None,
+            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         )
     }
 

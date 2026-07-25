@@ -2,7 +2,7 @@
 //!
 //! REQ-BT-010: Implicit Session Model
 //! REQ-BT-011: State Persistence
-//! REQ-BROWSER-WS-001: Sessions keyed by `WorkScope` so continuations share Chrome.
+//! REQ-BROWSER-WS-001: Sessions keyed by `ResourceScopeKey` so continuations share Chrome.
 
 use chromiumoxide::{
     browser::{Browser, BrowserConfig},
@@ -24,16 +24,12 @@ use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
-use phoenix_core::work_scope::WorkScope;
+use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceAuthority, ResourceScopeKey};
 
-/// Derive a Chrome user data dir from a `WorkScope::stable_key()`.
+/// Derive a Chrome user data dir from a `ResourceScopeKey::stable_key()`.
 ///
-/// The `stable_key` embeds the worktree path for `Worktree` scopes, which can
-/// easily exceed Chrome's per-component path length limit (and the `SUN_PATH`
-/// max for any unix-domain socket Chrome opens beneath the profile dir) on
-/// deep checkouts. Hash the key to a bounded 16-hex-char prefix instead —
-/// same trick `socket_path_for_worktree` uses for tmux sockets — so the
-/// resulting path is filesystem-safe and bounded regardless of input length.
+/// Hash the stable key to a bounded filesystem-safe component while preserving
+/// deterministic profile reuse for the same resource scope.
 ///
 /// SHA-256 is used (rather than `DefaultHasher`) so the derivation is
 /// stable across Rust/Phoenix releases — a toolchain upgrade must not
@@ -101,6 +97,9 @@ pub enum BrowserError {
 
     #[error("Browser session init timed out after {0:?}")]
     InitTimeout(Duration),
+
+    #[error("browser session access denied for this actor")]
+    AccessDenied,
 }
 
 impl From<chromiumoxide::error::CdpError> for BrowserError {
@@ -385,7 +384,7 @@ impl BrowserSession {
     }
 
     /// Build a `BrowserConfig` with optional explicit Chrome executable path.
-    /// `scope_key` is a `WorkScope::stable_key()` value — a string that
+    /// `scope_key` is a `ResourceScopeKey::stable_key()` value — a string that
     /// uniquely identifies the durable owner of this session. The Chrome
     /// user data dir is derived from it so a continuation that resolves to
     /// the same scope reuses the same on-disk profile.
@@ -812,7 +811,7 @@ impl Drop for BrowserSessionGuard<'_> {
 /// archive / abandon / mark-merged / delete drop the Chrome process the same
 /// way they drop bash and tmux (REQ-BROWSER-WS-003).
 ///
-/// `inheritor_scope`: the resolved `WorkScope` of the continuation, if any.
+/// `inheritor_scope`: the resolved `ResourceScopeKey` of the continuation, if any.
 /// Preservation is scope equality — when the inheritor resolves to the
 /// *same* scope, the Chrome window is still in use and we skip the kill.
 /// Different-scope or no inheritor falls through to teardown. The
@@ -824,14 +823,14 @@ impl Drop for BrowserSessionGuard<'_> {
 /// REQ-BROWSER-WS-003, REQ-BROWSER-WS-002.
 pub async fn cascade_browser_on_delete(
     manager: &Arc<BrowserSessionManager>,
-    work_scope: &WorkScope,
-    inheritor_scope: Option<&WorkScope>,
+    work_scope: &ResourceScopeKey,
+    actor: &EffectiveResourceAccess,
+    inheritor_scope: Option<&ResourceScopeKey>,
 ) {
     if inheritor_scope == Some(work_scope) {
-        tracing::debug!(
-            work_scope = %work_scope,
-            "browser: skipping session kill — scope inherited by continuation"
-        );
+        if actor.authority() == ResourceAuthority::Restricted {
+            manager.kill_session_for_actor(work_scope, actor).await;
+        }
         return;
     }
     manager.kill_session(work_scope).await;
@@ -842,13 +841,20 @@ pub async fn cascade_browser_on_delete(
 /// streams so the UI can show "browser session live" state without inferring
 /// it from message history.
 ///
-/// Carries the `WorkScope` rather than a single `conversation_id` because a
+/// Carries the `ResourceScopeKey` rather than a single `conversation_id` because a
 /// `Worktree`-scoped session may be shared across continuation members; the
 /// bridge fans out to every live runtime handle whose conversation resolves
 /// to this scope (REQ-BROWSER-WS-002).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserSessionAudience {
+    Scope,
+    Conversation(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct BrowserSessionLifecycleEvent {
-    pub work_scope: WorkScope,
+    pub work_scope: ResourceScopeKey,
+    pub audience: BrowserSessionAudience,
     /// `true` on session creation, `false` on session removal (kill or
     /// idle cleanup).
     pub active: bool,
@@ -860,7 +866,7 @@ pub struct BrowserSessionLifecycleEvent {
 pub type BrowserSessionLifecycleSink =
     tokio::sync::mpsc::UnboundedSender<BrowserSessionLifecycleEvent>;
 
-/// Predicate answering "does this `WorkScope` still own a live (non-terminal)
+/// Predicate answering "does this `ResourceScopeKey` still own a live (non-terminal)
 /// conversation?". Injected by the runtime after construction (the manager is
 /// built inside `RuntimeManager::new`, before the runtime `Arc` exists, so the
 /// hook cannot be a constructor argument). Async because the only authoritative
@@ -870,13 +876,18 @@ pub type BrowserSessionLifecycleSink =
 /// When unset, idle cleanup reaps purely on `last_activity` age (the historical
 /// behavior), so tool-level tests and any caller that never wires a runtime are
 /// unaffected.
-pub type ScopeLivenessHook =
-    Arc<dyn Fn(WorkScope) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
+pub type ScopeLivenessHook = Arc<
+    dyn Fn(ResourceScopeKey, Option<String>) -> futures::future::BoxFuture<'static, bool>
+        + Send
+        + Sync,
+>;
 
-/// Map entry: the `WorkScope` (carried for idle-cleanup lifecycle emission)
+/// Map entry: the `ResourceScopeKey` (carried for idle-cleanup lifecycle emission)
 /// plus the live session arc.
 struct ScopedSession {
-    scope: WorkScope,
+    scope: ResourceScopeKey,
+    creator_conversation_id: String,
+    authority: ResourceAuthority,
     session: Arc<RwLock<BrowserSession>>,
     user_data_key: String,
     kill_done: Arc<Notify>,
@@ -889,18 +900,24 @@ enum KillSessionOutcome {
     AlreadyRequested { key: String, done: Arc<Notify> },
 }
 
+fn session_key(work_scope: &ResourceScopeKey, actor: &EffectiveResourceAccess) -> String {
+    actor.restricted_private_key().map_or_else(
+        || work_scope.stable_key(),
+        |private_key| format!("{}:restricted:{private_key}", work_scope.stable_key()),
+    )
+}
+
 /// Global manager for all browser sessions
 pub struct BrowserSessionManager {
-    /// Keyed by `WorkScope::stable_key()`. Storing the `WorkScope` alongside
+    /// Keyed by `ResourceScopeKey::stable_key()`. Storing the `ResourceScopeKey` alongside
     /// the session lets idle cleanup emit lifecycle events with the original
-    /// scope rather than parsing the string key back into a `WorkScope`.
+    /// scope rather than parsing the string key back into a `ResourceScopeKey`.
     sessions: RwLock<HashMap<String, ScopedSession>>,
-    cleanup_task: Option<JoinHandle<()>>,
     /// Optional lifecycle event sink. Populated by [`RuntimeManager::new`]
     /// so session create/destroy edges flow into per-conversation SSE
     /// streams. Stays `None` for tool-level tests.
     lifecycle_sink: Option<BrowserSessionLifecycleSink>,
-    /// Set-once predicate gating idle reaping on `WorkScope` liveness. The
+    /// Set-once predicate gating idle reaping on `ResourceScopeKey` liveness. The
     /// runtime installs it via [`Self::set_scope_liveness_hook`] when it wires
     /// the lifecycle bridges. Unset (the test/default case) means idle cleanup
     /// reaps on age alone.
@@ -922,7 +939,6 @@ impl BrowserSessionManager {
     pub fn with_lifecycle_sink(sink: Option<BrowserSessionLifecycleSink>) -> Arc<Self> {
         let manager = Arc::new(Self {
             sessions: RwLock::new(HashMap::new()),
-            cleanup_task: None,
             lifecycle_sink: sink,
             scope_liveness_hook: std::sync::OnceLock::new(),
         });
@@ -945,7 +961,7 @@ impl BrowserSessionManager {
         manager
     }
 
-    /// Install the predicate that gates idle reaping on `WorkScope` liveness.
+    /// Install the predicate that gates idle reaping on `ResourceScopeKey` liveness.
     ///
     /// Set-once: a second call is a no-op (returns the supplied hook unused via
     /// the `OnceLock` semantics — the first writer wins). The runtime calls
@@ -960,22 +976,40 @@ impl BrowserSessionManager {
     /// Whether a live session currently exists for `work_scope`.
     /// The `HashMap` is the single source of truth for session liveness —
     /// callers must not maintain a parallel bool.
-    pub async fn is_active(&self, work_scope: &WorkScope) -> bool {
+    pub async fn is_active(&self, work_scope: &ResourceScopeKey) -> bool {
         self.sessions
             .read()
             .await
-            .contains_key(&work_scope.stable_key())
+            .values()
+            .any(|entry| entry.scope == *work_scope)
+    }
+
+    pub async fn is_active_for_actor(
+        &self,
+        work_scope: &ResourceScopeKey,
+        actor: &EffectiveResourceAccess,
+    ) -> bool {
+        self.sessions
+            .read()
+            .await
+            .contains_key(&session_key(work_scope, actor))
     }
 
     /// Publish a lifecycle edge if a sink is wired. Best-effort: dropped
     /// receivers / closed channels are logged at `debug` (capability gap)
     /// and do not affect session correctness.
-    fn emit_lifecycle(&self, work_scope: &WorkScope, active: bool) {
+    fn emit_lifecycle(
+        &self,
+        work_scope: &ResourceScopeKey,
+        audience: BrowserSessionAudience,
+        active: bool,
+    ) {
         let Some(sink) = self.lifecycle_sink.as_ref() else {
             return;
         };
         let event = BrowserSessionLifecycleEvent {
             work_scope: work_scope.clone(),
+            audience,
             active,
         };
         if let Err(e) = sink.send(event) {
@@ -1006,10 +1040,24 @@ impl BrowserSessionManager {
         }
     }
 
+    /// Actor-authorized session access. A restricted actor cannot attach to a
+    /// Work session merely because it shares the scope. Work actors retain the
+    /// one-session-per-scope semantics and may control either authority kind.
+    /// # Errors
+    /// Returns [`BrowserError::AccessDenied`] when the actor cannot control an
+    /// existing session, or a browser launch/initialization error when creating one.
+    pub async fn get_session_for_actor(
+        &self,
+        work_scope: &ResourceScopeKey,
+        actor: &EffectiveResourceAccess,
+    ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
+        self.get_session_with_creator(work_scope, actor).await
+    }
+
     /// Get a session for a `work_scope` (creates if needed).
     /// Returns Arc to the session - caller manages locking.
     ///
-    /// Sessions are keyed by `WorkScope::stable_key()`: continuations of a
+    /// Sessions are keyed by `ResourceScopeKey::stable_key()`: continuations of a
     /// worktree-backed conversation resolve to the same scope and therefore
     /// inherit the same Chrome window (REQ-BROWSER-WS-001), while Direct
     /// conversations fall back to per-conversation scoping (no shared owner
@@ -1020,9 +1068,18 @@ impl BrowserSessionManager {
     /// not-yet-existing session.
     pub async fn get_session(
         &self,
-        work_scope: &WorkScope,
+        work_scope: &ResourceScopeKey,
     ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
-        let key = work_scope.stable_key();
+        let system = EffectiveResourceAccess::new("browser-manager", ResourceAuthority::Work);
+        self.get_session_with_creator(work_scope, &system).await
+    }
+
+    async fn get_session_with_creator(
+        &self,
+        work_scope: &ResourceScopeKey,
+        actor: &EffectiveResourceAccess,
+    ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
+        let key = session_key(work_scope, actor);
 
         let mut sessions = loop {
             {
@@ -1033,6 +1090,9 @@ impl BrowserSessionManager {
                         drop(sessions);
                         self.wait_for_kill_completion(&key, kill_done).await;
                         continue;
+                    }
+                    if !actor.can_control(&entry.creator_conversation_id, entry.authority) {
+                        return Err(BrowserError::AccessDenied);
                     }
                     return Ok(entry.session.clone());
                 }
@@ -1045,6 +1105,9 @@ impl BrowserSessionManager {
                     drop(sessions);
                     self.wait_for_kill_completion(&key, kill_done).await;
                     continue;
+                }
+                if !actor.can_control(&entry.creator_conversation_id, entry.authority) {
+                    return Err(BrowserError::AccessDenied);
                 }
                 return Ok(entry.session.clone());
             }
@@ -1089,6 +1152,8 @@ impl BrowserSessionManager {
             key.clone(),
             ScopedSession {
                 scope: work_scope.clone(),
+                creator_conversation_id: actor.conversation_id().to_string(),
+                authority: actor.authority(),
                 session: session_arc.clone(),
                 user_data_key: key.clone(),
                 kill_done: Arc::new(Notify::new()),
@@ -1099,51 +1164,33 @@ impl BrowserSessionManager {
         // sessions read lock to confirm state, and we don't want to hold
         // the write lock across that.
         drop(sessions);
-        self.emit_lifecycle(work_scope, true);
+        let audience = match actor.authority() {
+            ResourceAuthority::Work => BrowserSessionAudience::Scope,
+            ResourceAuthority::Restricted => {
+                BrowserSessionAudience::Conversation(actor.conversation_id().to_string())
+            }
+        };
+        self.emit_lifecycle(work_scope, audience, true);
 
         Ok(session_arc)
     }
-
-    /// Move a `work_scope`'s session from `old` to `new`.
-    ///
-    /// Used at an Explore→Work approval, where the conversation's scope flips
-    /// from `WorkScope::Conversation(id)` to `WorkScope::Worktree(path)`: a
-    /// Chrome session opened pre-approval is stored under `old` and must follow
-    /// the scope so the inventory and idle reaper resolve it under `new`. The
-    /// underlying Chrome process (and its on-disk profile dir, which is keyed by
-    /// the old `stable_key`) are untouched — only the in-memory lookup key and
-    /// the `ScopedSession::scope` tag move.
-    ///
-    /// Returns `true` if a session was moved. No-ops (returns `false`) when:
-    /// - `old == new` (nothing to do), or
-    /// - there is no session under `old`, or
-    /// - `new` is already occupied — the pre-existing `new` session is
-    ///   preserved and `old` is left in place (NOT clobbered), with a WARN.
-    ///   At approval `new` is a freshly created worktree scope, so occupancy is
-    ///   not expected.
-    pub async fn rekey_scope(&self, old: &WorkScope, new: &WorkScope) -> bool {
-        if old == new {
-            return false;
-        }
-        let old_key = old.stable_key();
-        let new_key = new.stable_key();
-        let mut sessions = self.sessions.write().await;
-        if sessions.contains_key(&new_key) {
-            if sessions.contains_key(&old_key) {
-                tracing::warn!(
-                    old = %old,
-                    new = %new,
-                    "browser: refusing to rekey session — destination scope already occupied; leaving both sessions in place"
-                );
-            }
-            return false;
-        }
-        let Some(mut entry) = sessions.remove(&old_key) else {
-            return false;
+    /// # Errors
+    /// Returns [`BrowserError::AccessDenied`] when an existing session belongs
+    /// to an actor with stronger or different restricted authority.
+    pub async fn get_existing_for_actor(
+        &self,
+        work_scope: &ResourceScopeKey,
+        actor: &EffectiveResourceAccess,
+    ) -> Result<Option<Arc<RwLock<BrowserSession>>>, BrowserError> {
+        let key = session_key(work_scope, actor);
+        let sessions = self.sessions.read().await;
+        let Some(entry) = sessions.get(&key) else {
+            return Ok(None);
         };
-        entry.scope = new.clone();
-        sessions.insert(new_key, entry);
-        true
+        if !actor.can_control(&entry.creator_conversation_id, entry.authority) {
+            return Err(BrowserError::AccessDenied);
+        }
+        Ok(Some(entry.session.clone()))
     }
 
     /// Get the session for a `work_scope` **without creating one**.
@@ -1157,11 +1204,13 @@ impl BrowserSessionManager {
     /// logging per REQ-BROWSER-WS-004).
     pub async fn get_existing(
         &self,
-        work_scope: &WorkScope,
+        work_scope: &ResourceScopeKey,
     ) -> Option<Arc<RwLock<BrowserSession>>> {
-        let key = work_scope.stable_key();
         let sessions = self.sessions.read().await;
-        let hit = sessions.get(&key).map(|e| e.session.clone());
+        let hit = sessions
+            .values()
+            .find(|entry| entry.scope == *work_scope)
+            .map(|entry| entry.session.clone());
         if hit.is_none() {
             tracing::debug!(
                 work_scope = %work_scope,
@@ -1187,8 +1236,11 @@ impl BrowserSessionManager {
     /// lock-free so concurrent `get_session` / `get_existing` /
     /// `is_active` calls on unrelated scopes are not blocked for the
     /// duration of fs deletion + Chrome shutdown.
-    async fn spawn_kill_session(self: &Arc<Self>, work_scope: &WorkScope) -> KillSessionOutcome {
-        let key = work_scope.stable_key();
+    async fn spawn_kill_session_by_key(
+        self: &Arc<Self>,
+        key: String,
+        work_scope: ResourceScopeKey,
+    ) -> KillSessionOutcome {
         let Some((session, kill_requested, kill_done)) = ({
             let sessions = self.sessions.read().await;
             sessions.get(&key).map(|entry| {
@@ -1210,7 +1262,7 @@ impl BrowserSessionManager {
             };
         }
 
-        let requested_scope = work_scope.clone();
+        let requested_scope = work_scope;
         let manager = Arc::clone(self);
         KillSessionOutcome::Started(tokio::spawn(async move {
             tracing::info!(work_scope = %requested_scope, "Killing browser session");
@@ -1256,19 +1308,67 @@ impl BrowserSessionManager {
                 return;
             };
             let removed_scope = entry.scope.clone();
+            let audience = match entry.authority {
+                ResourceAuthority::Work => BrowserSessionAudience::Scope,
+                ResourceAuthority::Restricted => {
+                    BrowserSessionAudience::Conversation(entry.creator_conversation_id.clone())
+                }
+            };
             drop(entry);
-
-            manager.emit_lifecycle(&removed_scope, false);
+            manager.emit_lifecycle(&removed_scope, audience, false);
             kill_done.notify_waiters();
         }))
+    }
+
+    pub async fn request_kill_session_for_actor(
+        self: &Arc<Self>,
+        work_scope: &ResourceScopeKey,
+        actor: &EffectiveResourceAccess,
+    ) {
+        let key = session_key(work_scope, actor);
+        let _ = self
+            .spawn_kill_session_by_key(key, work_scope.clone())
+            .await;
     }
 
     /// Request session kill and return as soon as teardown has been queued.
     /// The session remains tracked as live until the spawned teardown task has
     /// actually terminated Chrome, removed the manager entry, and emitted the
     /// lifecycle false edge.
-    pub async fn request_kill_session(self: &Arc<Self>, work_scope: &WorkScope) {
-        let _ = self.spawn_kill_session(work_scope).await;
+    pub async fn request_kill_session(self: &Arc<Self>, work_scope: &ResourceScopeKey) {
+        let keys: Vec<String> = self
+            .sessions
+            .read()
+            .await
+            .iter()
+            .filter(|(_, entry)| entry.scope == *work_scope)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            let _ = self
+                .spawn_kill_session_by_key(key, work_scope.clone())
+                .await;
+        }
+    }
+
+    pub async fn kill_session_for_actor(
+        self: &Arc<Self>,
+        work_scope: &ResourceScopeKey,
+        actor: &EffectiveResourceAccess,
+    ) {
+        let key = session_key(work_scope, actor);
+        match self
+            .spawn_kill_session_by_key(key, work_scope.clone())
+            .await
+        {
+            KillSessionOutcome::Absent => {}
+            KillSessionOutcome::Started(handle) => {
+                let _ = handle.await;
+            }
+            KillSessionOutcome::AlreadyRequested { key, done } => {
+                self.wait_for_kill_completion(&key, done).await;
+            }
+        }
     }
 
     /// Kill a session and wait for teardown to complete.
@@ -1277,16 +1377,29 @@ impl BrowserSessionManager {
     /// going away; user-facing Stop browser endpoints use
     /// [`Self::request_kill_session`] so they do not block behind an in-flight
     /// browser tool guard.
-    pub async fn kill_session(self: &Arc<Self>, work_scope: &WorkScope) {
-        match self.spawn_kill_session(work_scope).await {
-            KillSessionOutcome::Absent => {}
-            KillSessionOutcome::Started(handle) => {
-                if let Err(err) = handle.await {
-                    tracing::warn!(work_scope = %work_scope, error = %err, "browser kill task failed");
+    pub async fn kill_session(self: &Arc<Self>, work_scope: &ResourceScopeKey) {
+        let keys: Vec<String> = self
+            .sessions
+            .read()
+            .await
+            .iter()
+            .filter(|(_, entry)| entry.scope == *work_scope)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            match self
+                .spawn_kill_session_by_key(key, work_scope.clone())
+                .await
+            {
+                KillSessionOutcome::Absent => {}
+                KillSessionOutcome::Started(handle) => {
+                    if let Err(err) = handle.await {
+                        tracing::warn!(work_scope = %work_scope, error = %err, "browser kill task failed");
+                    }
                 }
-            }
-            KillSessionOutcome::AlreadyRequested { key, done } => {
-                self.wait_for_kill_completion(&key, done).await;
+                KillSessionOutcome::AlreadyRequested { key, done } => {
+                    self.wait_for_kill_completion(&key, done).await;
+                }
             }
         }
     }
@@ -1307,11 +1420,14 @@ impl BrowserSessionManager {
     /// hook every idle candidate is reapable — the historical age-only
     /// behavior. Factored out of [`Self::cleanup_idle_sessions`] so the
     /// liveness gate is unit-testable without a live chromium process.
-    async fn filter_reapable(&self, idle_candidates: Vec<(String, WorkScope)>) -> Vec<String> {
+    async fn filter_reapable(
+        &self,
+        idle_candidates: Vec<(String, ResourceScopeKey, Option<String>)>,
+    ) -> Vec<String> {
         let mut to_remove = Vec::new();
-        for (key, scope) in idle_candidates {
+        for (key, scope, restricted_creator) in idle_candidates {
             if let Some(hook) = self.scope_liveness_hook.get() {
-                if hook(scope.clone()).await {
+                if hook(scope.clone(), restricted_creator).await {
                     tracing::debug!(
                         work_scope = %scope,
                         "browser: skipping idle reap — scope still owns a live conversation"
@@ -1328,7 +1444,7 @@ impl BrowserSessionManager {
     ///
     /// Idle age (`last_activity` older than [`IDLE_TIMEOUT`]) is necessary but
     /// not sufficient to reap: when a scope-liveness hook is installed, a scope
-    /// whose `WorkScope` still owns a non-terminal conversation is preserved
+    /// whose `ResourceScopeKey` still owns a non-terminal conversation is preserved
     /// even past the timeout. `last_activity` only resets on a browser
     /// tool-call guard drop, so a conversation that is alive in the UI but has
     /// not issued a browser tool call in 30 minutes would otherwise lose its
@@ -1338,7 +1454,7 @@ impl BrowserSessionManager {
     /// terminal is reaped on the next pass.
     async fn cleanup_idle_sessions(&self) {
         let now = Instant::now();
-        let mut idle_candidates: Vec<(String, WorkScope)> = Vec::new();
+        let mut idle_candidates: Vec<(String, ResourceScopeKey, Option<String>)> = Vec::new();
 
         // Find idle sessions
         {
@@ -1346,33 +1462,46 @@ impl BrowserSessionManager {
             for (key, entry) in sessions.iter() {
                 if let Ok(guard) = entry.session.try_read() {
                     if now.duration_since(guard.last_activity) > IDLE_TIMEOUT {
-                        idle_candidates.push((key.clone(), entry.scope.clone()));
+                        let restricted_creator =
+                            matches!(entry.authority, ResourceAuthority::Restricted)
+                                .then(|| entry.creator_conversation_id.clone());
+                        idle_candidates.push((
+                            key.clone(),
+                            entry.scope.clone(),
+                            restricted_creator,
+                        ));
                     }
                 }
             }
         }
 
         // Gate each idle candidate on scope liveness. A live scope (its
-        // `WorkScope` still owns a non-terminal conversation) is skipped — the
+        // `ResourceScopeKey` still owns a non-terminal conversation) is skipped — the
         // timer re-checks it next interval. No hook means reap on age alone.
         let to_remove = self.filter_reapable(idle_candidates).await;
 
         // Remove idle sessions
         if !to_remove.is_empty() {
-            let mut removed_scopes = Vec::new();
+            let mut removed_sessions = Vec::new();
             {
                 let mut sessions = self.sessions.write().await;
                 for key in to_remove {
                     tracing::info!(scope_key = %key, "Cleaning up idle browser session");
                     if let Some(entry) = sessions.remove(&key) {
-                        removed_scopes.push(entry.scope);
+                        let audience = match entry.authority {
+                            ResourceAuthority::Work => BrowserSessionAudience::Scope,
+                            ResourceAuthority::Restricted => BrowserSessionAudience::Conversation(
+                                entry.creator_conversation_id.clone(),
+                            ),
+                        };
+                        removed_sessions.push((entry.scope, audience));
                     }
                 }
             }
             // Emit outside the write lock so receivers don't deadlock if
             // they re-enter the manager.
-            for scope in &removed_scopes {
-                self.emit_lifecycle(scope, false);
+            for (scope, audience) in removed_sessions {
+                self.emit_lifecycle(&scope, audience, false);
             }
         }
     }
@@ -1396,21 +1525,9 @@ impl Default for BrowserSessionManager {
     fn default() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
-            cleanup_task: None,
             lifecycle_sink: None,
             scope_liveness_hook: std::sync::OnceLock::new(),
         }
-    }
-}
-
-impl Drop for BrowserSessionManager {
-    fn drop(&mut self) {
-        // Cancel cleanup task if running
-        if let Some(task) = self.cleanup_task.take() {
-            task.abort();
-        }
-        // Note: sessions will be dropped automatically
-        tracing::info!("BrowserSessionManager dropped - all sessions will be closed");
     }
 }
 
@@ -1422,10 +1539,12 @@ mod lifecycle_hook_tests {
     //! tests in `super::tests`.
 
     use super::{
-        BrowserSession, BrowserSessionLifecycleEvent, BrowserSessionLifecycleSink,
-        BrowserSessionManager,
+        BrowserSession, BrowserSessionAudience, BrowserSessionLifecycleEvent,
+        BrowserSessionLifecycleSink, BrowserSessionManager,
     };
-    use phoenix_core::work_scope::WorkScope;
+    use phoenix_core::work_scope::{
+        EffectiveResourceAccess, ResourceAuthority, ResourceScopeKey, WorkScopeId,
+    };
     use std::sync::Arc;
     use std::time::Instant;
     use tokio::sync::RwLock;
@@ -1441,12 +1560,8 @@ mod lifecycle_hook_tests {
         (BrowserSessionManager::with_lifecycle_sink(Some(tx)), rx)
     }
 
-    fn scope_conv(id: &str) -> WorkScope {
-        WorkScope::Conversation(id.to_string())
-    }
-
-    fn scope_wt(path: &str) -> WorkScope {
-        WorkScope::Worktree(path.to_string())
+    fn scope(id: &str) -> ResourceScopeKey {
+        ResourceScopeKey::Work(WorkScopeId::parse(id).unwrap())
     }
 
     /// `kill_session` on a manager that never had a session for this scope
@@ -1455,7 +1570,7 @@ mod lifecycle_hook_tests {
     #[tokio::test]
     async fn kill_session_no_op_does_not_emit() {
         let (manager, mut rx) = install_sink();
-        let scope = scope_conv("conv-never-existed");
+        let scope = scope("conv-never-existed");
         manager.kill_session(&scope).await;
         assert!(
             rx.try_recv().is_err(),
@@ -1470,45 +1585,61 @@ mod lifecycle_hook_tests {
     /// bash/tmux registries, which test those branches with constructible
     /// entries; a real `BrowserSession` needs a live chromium, so it cannot be
     /// staged here.)
-    #[tokio::test]
-    async fn rekey_scope_no_session_is_noop() {
-        let (manager, _rx) = install_sink();
-        let old = scope_conv("conv-explore");
-        let new = scope_wt("/tmp/wt-approved");
-        assert!(!manager.rekey_scope(&old, &new).await);
-        assert!(!manager.is_active(&new).await);
-    }
-
-    #[tokio::test]
-    async fn rekey_scope_same_scope_is_noop() {
-        let (manager, _rx) = install_sink();
-        let s = scope_wt("/tmp/wt");
-        assert!(!manager.rekey_scope(&s, &s).await);
-    }
-
     /// `is_active` must reflect the underlying `HashMap`. We can't create a
     /// real `BrowserSession` without chrome, so this just exercises the
     /// "absent" branch for both scope variants.
     #[tokio::test]
     async fn is_active_reflects_hashmap_membership() {
         let (manager, _rx) = install_sink();
-        assert!(!manager.is_active(&scope_conv("conv-1")).await);
-        assert!(!manager.is_active(&scope_wt("/tmp/wt-1")).await);
+        assert!(!manager.is_active(&scope("conv-1")).await);
+        assert!(!manager.is_active(&scope("/tmp/wt-1")).await);
     }
 
-    /// Worktree and Conversation scopes with the same inner string occupy
-    /// disjoint namespaces; a present worktree session must not satisfy an
-    /// `is_active` query for the same-string conversation scope.
+    /// Distinct opaque work IDs and the structurally separate global terminal
+    /// occupy disjoint resource namespaces.
     #[tokio::test]
     async fn is_active_disjoint_namespaces() {
         let (manager, _rx) = install_sink();
-        let conv = scope_conv("/tmp/x");
-        let wt = scope_wt("/tmp/x");
-        assert!(!manager.is_active(&conv).await);
-        assert!(!manager.is_active(&wt).await);
-        // Same string, different scope kinds: their stable_key values must
-        // differ so a hit on one cannot satisfy the other.
-        assert_ne!(conv.stable_key(), wt.stable_key());
+        let first = scope("opaque-a");
+        let second = scope("opaque-b");
+        let global = ResourceScopeKey::GlobalTerminal;
+        assert!(!manager.is_active(&first).await);
+        assert!(!manager.is_active(&second).await);
+        assert!(!manager.is_active(&global).await);
+        assert_ne!(first.stable_key(), second.stable_key());
+        assert_ne!(first.stable_key(), global.stable_key());
+        assert_ne!(second.stable_key(), global.stable_key());
+    }
+
+    #[test]
+    fn restricted_actors_receive_isolated_keys_in_shared_scope() {
+        let shared = scope("shared-work-scope");
+        let work = EffectiveResourceAccess::new("work-parent", ResourceAuthority::Work);
+        let restricted_a =
+            EffectiveResourceAccess::new("explore-child-a", ResourceAuthority::Restricted);
+        let restricted_b =
+            EffectiveResourceAccess::new("explore-child-b", ResourceAuthority::Restricted);
+
+        let work_key = super::session_key(&shared, &work);
+        let first_child_key = super::session_key(&shared, &restricted_a);
+        let sibling_key = super::session_key(&shared, &restricted_b);
+
+        assert_ne!(work_key, first_child_key);
+        assert_ne!(first_child_key, sibling_key);
+        assert_eq!(first_child_key, super::session_key(&shared, &restricted_a));
+    }
+
+    #[test]
+    fn actor_specific_stop_targets_only_restricted_actor_key() {
+        let shared = scope("shared-stop-scope");
+        let restricted_a =
+            EffectiveResourceAccess::new("explore-child-a", ResourceAuthority::Restricted);
+        let restricted_b =
+            EffectiveResourceAccess::new("explore-child-b", ResourceAuthority::Restricted);
+        assert_ne!(
+            super::session_key(&shared, &restricted_a),
+            super::session_key(&shared, &restricted_b)
+        );
     }
 
     /// Test the full create-emit + kill-emit pair end-to-end using a
@@ -1519,11 +1650,11 @@ mod lifecycle_hook_tests {
     #[tokio::test]
     async fn emit_lifecycle_round_trips_through_sink() {
         let (manager, mut rx) = install_sink();
-        let a = scope_conv("conv-A");
-        let b = scope_conv("conv-B");
-        manager.emit_lifecycle(&a, true);
-        manager.emit_lifecycle(&a, false);
-        manager.emit_lifecycle(&b, true);
+        let a = scope("conv-A");
+        let b = scope("conv-B");
+        manager.emit_lifecycle(&a, BrowserSessionAudience::Scope, true);
+        manager.emit_lifecycle(&a, BrowserSessionAudience::Scope, false);
+        manager.emit_lifecycle(&b, BrowserSessionAudience::Scope, true);
 
         let e1 = rx.try_recv().expect("first event missing");
         assert_eq!(e1.work_scope, a);
@@ -1542,8 +1673,8 @@ mod lifecycle_hook_tests {
     #[tokio::test]
     async fn emit_lifecycle_without_sink_is_no_op() {
         let manager = BrowserSessionManager::default();
-        let scope = scope_conv("conv-X");
-        manager.emit_lifecycle(&scope, true);
+        let scope = scope("conv-X");
+        manager.emit_lifecycle(&scope, BrowserSessionAudience::Scope, true);
         assert!(!manager.is_active(&scope).await);
     }
 
@@ -1560,8 +1691,8 @@ mod lifecycle_hook_tests {
     async fn filter_reapable_without_hook_reaps_all() {
         let manager = BrowserSessionManager::default();
         let candidates = vec![
-            ("k1".to_string(), scope_conv("conv-1")),
-            ("k2".to_string(), scope_wt("/tmp/wt-2")),
+            ("k1".to_string(), scope("conv-1"), None),
+            ("k2".to_string(), scope("/tmp/wt-2"), None),
         ];
         let reap = manager.filter_reapable(candidates).await;
         assert_eq!(reap, vec!["k1".to_string(), "k2".to_string()]);
@@ -1573,18 +1704,23 @@ mod lifecycle_hook_tests {
     #[tokio::test]
     async fn filter_reapable_skips_live_scope_reaps_dead_scope() {
         let manager = BrowserSessionManager::default();
-        let live = scope_conv("alive");
-        let dead = scope_conv("abandoned");
+        let live = scope("alive");
+        let dead = scope("abandoned");
 
         // Stub predicate: only `alive` is live.
         let live_key = live.stable_key();
-        let hook: super::ScopeLivenessHook = Arc::new(move |scope: WorkScope| {
-            let is_live = scope.stable_key() == live_key;
-            Box::pin(async move { is_live }) as futures::future::BoxFuture<'static, bool>
-        });
+        let hook: super::ScopeLivenessHook = Arc::new(
+            move |scope: ResourceScopeKey, _restricted_creator: Option<String>| {
+                let is_live = scope.stable_key() == live_key;
+                Box::pin(async move { is_live }) as futures::future::BoxFuture<'static, bool>
+            },
+        );
         manager.set_scope_liveness_hook(hook);
 
-        let candidates = vec![("k-alive".to_string(), live), ("k-dead".to_string(), dead)];
+        let candidates = vec![
+            ("k-alive".to_string(), live, None),
+            ("k-dead".to_string(), dead, None),
+        ];
         let reap = manager.filter_reapable(candidates).await;
 
         // Live scope preserved, dead scope reaped.
@@ -1595,23 +1731,47 @@ mod lifecycle_hook_tests {
         );
     }
 
+    #[tokio::test]
+    async fn filter_reapable_checks_restricted_creator_not_shared_scope() {
+        let manager = BrowserSessionManager::default();
+        let shared = scope("shared");
+        let hook: super::ScopeLivenessHook = Arc::new(
+            |_scope: ResourceScopeKey, restricted_creator: Option<String>| {
+                Box::pin(async move { restricted_creator.as_deref() == Some("live-child") })
+                    as futures::future::BoxFuture<'static, bool>
+            },
+        );
+        manager.set_scope_liveness_hook(hook);
+
+        let candidates = vec![
+            ("live".into(), shared.clone(), Some("live-child".into())),
+            ("done".into(), shared, Some("done-child".into())),
+        ];
+
+        assert_eq!(manager.filter_reapable(candidates).await, vec!["done"]);
+    }
+
     /// `set_scope_liveness_hook` is set-once: the first install wins and a
     /// second call is a silent no-op (does not panic, does not replace).
     #[tokio::test]
     async fn scope_liveness_hook_is_set_once() {
         let manager = BrowserSessionManager::default();
         // First hook: everything live (nothing reapable).
-        let first: super::ScopeLivenessHook = Arc::new(|_scope: WorkScope| {
-            Box::pin(async { true }) as futures::future::BoxFuture<'static, bool>
-        });
+        let first: super::ScopeLivenessHook = Arc::new(
+            |_scope: ResourceScopeKey, _restricted_creator: Option<String>| {
+                Box::pin(async { true }) as futures::future::BoxFuture<'static, bool>
+            },
+        );
         manager.set_scope_liveness_hook(first);
         // Second hook would say nothing is live — must be ignored.
-        let second: super::ScopeLivenessHook = Arc::new(|_scope: WorkScope| {
-            Box::pin(async { false }) as futures::future::BoxFuture<'static, bool>
-        });
+        let second: super::ScopeLivenessHook = Arc::new(
+            |_scope: ResourceScopeKey, _restricted_creator: Option<String>| {
+                Box::pin(async { false }) as futures::future::BoxFuture<'static, bool>
+            },
+        );
         manager.set_scope_liveness_hook(second);
 
-        let candidates = vec![("k".to_string(), scope_conv("c"))];
+        let candidates = vec![("k".to_string(), scope("c"), None)];
         let reap = manager.filter_reapable(candidates).await;
         assert!(
             reap.is_empty(),

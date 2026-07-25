@@ -1,154 +1,363 @@
 use std::fmt;
-use std::path::Path;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-/// Durable owner for work-affine resources.
-///
-/// `conversation_id` identifies a transcript/runtime instance. A `WorkScope`
-/// identifies the unit of work the resource belongs to and is independent of
-/// any single transcript: managed/branch worktrees survive context-exhaustion
-/// continuations, so the scope must too. Direct-mode conversations have no
-/// durable owner beyond the transcript itself, so they fall back to keying
-/// on the conversation id. The `Global` variant is a singleton scope used
-/// by surfaces that want a work-affine resource not bound to any single
-/// conversation — currently the `/new` page's global terminal
-/// (REQ-TERM-WS-001).
-///
-/// Resources that adopt this primitive should construct it from existing
-/// fields rather than threading both a worktree path and a conversation id
-/// through their callsites. See REQ-PROJ-WS-001, REQ-TMUX-WS-001,
-/// REQ-TERM-WS-001.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "value")]
-pub enum WorkScope {
-    Worktree(String),
-    Conversation(String),
-    Global,
-}
+/// Opaque durable identifier for a unit of work.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorkScopeId(String);
 
-impl WorkScope {
-    pub fn resolve(conversation_id: impl Into<String>, worktree_path: Option<&Path>) -> Self {
-        match worktree_path {
-            Some(path) => Self::Worktree(path.to_string_lossy().into_owned()),
-            None => Self::Conversation(conversation_id.into()),
-        }
+impl WorkScopeId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4().to_string())
     }
 
-    /// Stable string form for use as a registry/map key. Worktree,
-    /// conversation, and global namespaces are kept disjoint so values
-    /// that happen to look alike across variants cannot collide.
+    /// # Errors
+    /// Returns [`WorkScopeIdError`] when the supplied identifier is empty.
+    pub fn parse(value: impl Into<String>) -> Result<Self, WorkScopeIdError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(WorkScopeIdError::Empty);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for WorkScopeId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for WorkScopeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for WorkScopeId {
+    type Err = WorkScopeIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+/// Namespace key for persisted work and structurally separate global actors.
+/// Coordinator scope is routing-only: its tool registry exposes no ordinary
+/// work-affine resources.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum ResourceScopeKey {
+    Work(WorkScopeId),
+    Coordinator,
+    GlobalTerminal,
+}
+
+impl ResourceScopeKey {
     #[must_use]
     pub fn stable_key(&self) -> String {
         match self {
-            Self::Worktree(path) => format!("worktree:{path}"),
-            Self::Conversation(id) => format!("conversation:{id}"),
-            Self::Global => "global:".to_string(),
+            Self::Work(id) => format!("work:{}", id.as_str()),
+            Self::Coordinator => "coordinator".to_string(),
+            Self::GlobalTerminal => "global_terminal".to_string(),
         }
     }
 
-    /// Inverse of [`Self::stable_key`]: parse a `stable_key()`-shaped string
-    /// back into a `WorkScope`. Used by surfaces that receive a scope key as
-    /// an opaque path segment (e.g. the work-scope inventory endpoint) and
-    /// must reconstruct the scope to query the in-memory registries.
-    ///
-    /// Returns `None` when the prefix is not one of the three known
-    /// namespaces. The inner value is taken verbatim after the first `:`,
-    /// so worktree paths or conversation ids containing a `:` round-trip
-    /// faithfully (the namespace prefix never collides with the body
-    /// because `stable_key` splits on the *first* colon).
     #[must_use]
     pub fn from_stable_key(key: &str) -> Option<Self> {
-        if let Some(path) = key.strip_prefix("worktree:") {
-            Some(Self::Worktree(path.to_string()))
-        } else if let Some(id) = key.strip_prefix("conversation:") {
-            Some(Self::Conversation(id.to_string()))
-        } else if key == "global:" {
-            Some(Self::Global)
-        } else {
-            None
+        if key == "global_terminal" {
+            return Some(Self::GlobalTerminal);
+        }
+        if key == "coordinator" {
+            return Some(Self::Coordinator);
+        }
+        key.strip_prefix("work:")
+            .and_then(|id| WorkScopeId::parse(id).ok())
+            .map(Self::Work)
+    }
+
+    #[must_use]
+    pub fn work_scope_id(&self) -> Option<&WorkScopeId> {
+        match self {
+            Self::Work(id) => Some(id),
+            Self::Coordinator | Self::GlobalTerminal => None,
         }
     }
 }
 
-impl fmt::Display for WorkScope {
+impl fmt::Display for ResourceScopeKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.stable_key())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeRole {
+    #[default]
+    User,
+    SubAgent,
+    Coordinator,
+}
+
+impl RuntimeRole {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::Worktree(path) => write!(f, "worktree:{path}"),
-            Self::Conversation(id) => write!(f, "conversation:{id}"),
-            Self::Global => write!(f, "global:"),
+            Self::User => "user",
+            Self::SubAgent => "sub_agent",
+            Self::Coordinator => "coordinator",
+        }
+    }
+
+    #[must_use]
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "user" => Self::User,
+            "sub_agent" => Self::SubAgent,
+            "coordinator" => Self::Coordinator,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorityKind {
+    RestrictedExplore,
+    Work,
+}
+
+impl AuthorityKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RestrictedExplore => "restricted_explore",
+            Self::Work => "work",
         }
     }
 }
+
+/// Authority stamped onto same-scope process and browser resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResourceAuthority {
+    Restricted,
+    Work,
+}
+
+/// The actor identity and effective authority presented to a resource manager.
+/// Scope routing remains independent: this value only decides whether an actor
+/// may control the resource found at that scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveResourceAccess {
+    conversation_id: String,
+    authority: ResourceAuthority,
+    restricted_private: bool,
+}
+
+impl EffectiveResourceAccess {
+    #[must_use]
+    pub fn new(conversation_id: impl Into<String>, authority: ResourceAuthority) -> Self {
+        Self {
+            conversation_id: conversation_id.into(),
+            authority,
+            restricted_private: authority == ResourceAuthority::Restricted,
+        }
+    }
+
+    #[must_use]
+    pub fn shared_restricted(conversation_id: impl Into<String>) -> Self {
+        Self {
+            conversation_id: conversation_id.into(),
+            authority: ResourceAuthority::Restricted,
+            restricted_private: false,
+        }
+    }
+
+    #[must_use]
+    pub fn conversation_id(&self) -> &str {
+        &self.conversation_id
+    }
+
+    #[must_use]
+    pub fn authority(&self) -> ResourceAuthority {
+        self.authority
+    }
+
+    /// Work actors control resources in their scope. Restricted actors may
+    /// control only restricted resources they created themselves.
+    #[must_use]
+    pub fn can_control(
+        &self,
+        creator_conversation_id: &str,
+        resource_authority: ResourceAuthority,
+    ) -> bool {
+        self.authority == ResourceAuthority::Work
+            || (resource_authority == ResourceAuthority::Restricted
+                && self.conversation_id == creator_conversation_id)
+    }
+
+    #[must_use]
+    pub fn with_authority(&self, authority: ResourceAuthority) -> Self {
+        Self {
+            conversation_id: self.conversation_id.clone(),
+            authority,
+            restricted_private: authority == ResourceAuthority::Restricted
+                && self.restricted_private,
+        }
+    }
+
+    /// Stable key for resources private to restricted sub-agents. User-facing
+    /// Explore conversations return `None` and therefore share scope resources.
+    #[must_use]
+    pub fn restricted_private_key(&self) -> Option<&str> {
+        self.restricted_private
+            .then_some(self.conversation_id.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkScopeLifecycle {
+    Active,
+    Retired,
+}
+
+impl WorkScopeLifecycle {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Retired => "retired",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EnvironmentContext {
+    AllocatedWorktree {
+        cwd: String,
+        worktree_path: String,
+        branch_name: Option<String>,
+        base_branch: Option<String>,
+    },
+    UnownedCwd {
+        cwd: String,
+    },
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkScopeRecord {
+    pub id: WorkScopeId,
+    pub authority_kind: AuthorityKind,
+    pub lifecycle: WorkScopeLifecycle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkScopeEnvironmentRecord {
+    pub work_scope_id: WorkScopeId,
+    pub context: EnvironmentContext,
+}
+
+/// Proof that the runtime inspected every in-memory resource registry for one
+/// scope and found no live resource. Its private field prevents database-only
+/// callers from manufacturing retirement authority from durable state alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkScopeRetirementPrecondition {
+    scope_id: WorkScopeId,
+}
+
+impl WorkScopeRetirementPrecondition {
+    /// Construct the proof after the runtime has inventoried bash, tmux,
+    /// terminal, and browser registries and established that none is live.
+    #[must_use]
+    pub fn after_runtime_inventory_found_no_live_resource(scope_id: WorkScopeId) -> Self {
+        Self { scope_id }
+    }
+
+    #[must_use]
+    pub fn scope_id(&self) -> &WorkScopeId {
+        &self.scope_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkScopeRetirementOutcome {
+    Retired,
+    AlreadyRetired,
+    Blocked(WorkScopeRetirementBlocker),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkScopeRetirementBlocker {
+    CurrentUserOwner,
+    UserSuccessor,
+    ActiveSubAgent,
+    PendingWakeOrWorkflow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkScopeIdError {
+    Empty,
+}
+
+impl fmt::Display for WorkScopeIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("work scope id must not be empty"),
+        }
+    }
+}
+
+impl std::error::Error for WorkScopeIdError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
-    fn resolve_with_worktree_picks_worktree_scope() {
-        let path = PathBuf::from("/tmp/wt-x");
-        let scope = WorkScope::resolve("conv-1", Some(path.as_path()));
-        assert_eq!(scope, WorkScope::Worktree("/tmp/wt-x".to_string()));
-    }
-
-    #[test]
-    fn resolve_without_worktree_falls_back_to_conversation() {
-        let scope = WorkScope::resolve("conv-1", None);
-        assert_eq!(scope, WorkScope::Conversation("conv-1".to_string()));
-    }
-
-    #[test]
-    fn stable_key_namespaces_are_disjoint() {
-        let conv = WorkScope::Conversation("/tmp/wt-x".to_string());
-        let wt = WorkScope::Worktree("/tmp/wt-x".to_string());
-        assert_ne!(conv.stable_key(), wt.stable_key());
-        assert_ne!(conv.stable_key(), WorkScope::Global.stable_key());
-        assert_ne!(wt.stable_key(), WorkScope::Global.stable_key());
-        assert_eq!(conv.stable_key(), "conversation:/tmp/wt-x");
-        assert_eq!(wt.stable_key(), "worktree:/tmp/wt-x");
-        assert_eq!(WorkScope::Global.stable_key(), "global:");
-    }
-
-    #[test]
-    fn from_stable_key_round_trips_every_variant() {
-        let cases = [
-            WorkScope::Worktree("/tmp/wt-x".to_string()),
-            // A worktree path containing a colon must round-trip — the
-            // namespace split is on the FIRST colon only.
-            WorkScope::Worktree("/tmp/odd:path".to_string()),
-            WorkScope::Conversation("conv-1".to_string()),
-            WorkScope::Conversation("id:with:colons".to_string()),
-            WorkScope::Global,
-        ];
-        for scope in cases {
-            let key = scope.stable_key();
-            assert_eq!(
-                WorkScope::from_stable_key(&key),
-                Some(scope.clone()),
-                "round-trip failed for {scope:?} (key={key})"
-            );
-        }
-    }
-
-    #[test]
-    fn from_stable_key_rejects_unknown_namespace() {
-        assert_eq!(WorkScope::from_stable_key("bogus:foo"), None);
-        assert_eq!(WorkScope::from_stable_key(""), None);
-        // `global` without the trailing colon is not the singleton key.
-        assert_eq!(WorkScope::from_stable_key("global"), None);
-    }
-
-    #[test]
-    fn display_matches_stable_key() {
-        let conv = WorkScope::Conversation("c1".to_string());
-        let wt = WorkScope::Worktree("/tmp/x".to_string());
-        assert_eq!(format!("{conv}"), conv.stable_key());
-        assert_eq!(format!("{wt}"), wt.stable_key());
+    fn resource_namespaces_are_structurally_disjoint() {
+        let work = ResourceScopeKey::Work(WorkScopeId::parse("opaque").unwrap());
+        assert_eq!(work.stable_key(), "work:opaque");
+        assert_eq!(ResourceScopeKey::from_stable_key("work:opaque"), Some(work));
         assert_eq!(
-            format!("{}", WorkScope::Global),
-            WorkScope::Global.stable_key()
+            ResourceScopeKey::from_stable_key("global_terminal"),
+            Some(ResourceScopeKey::GlobalTerminal)
         );
+        assert_eq!(
+            ResourceScopeKey::from_stable_key("conversation:opaque"),
+            None
+        );
+    }
+
+    #[test]
+    fn generated_ids_are_non_empty_and_distinct() {
+        let a = WorkScopeId::new();
+        let b = WorkScopeId::new();
+        assert!(!a.as_str().is_empty());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn parse_rejects_empty_or_blank() {
+        assert_eq!(WorkScopeId::parse(""), Err(WorkScopeIdError::Empty));
+        assert_eq!(WorkScopeId::parse("  \t"), Err(WorkScopeIdError::Empty));
+    }
+
+    #[test]
+    fn parse_accepts_opaque_non_empty_text() {
+        let id = WorkScopeId::parse("scope-opaque").unwrap();
+        assert_eq!(id.as_str(), "scope-opaque");
     }
 }

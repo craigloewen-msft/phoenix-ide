@@ -33,7 +33,7 @@ impl ReadImageTool {
         if path.is_absolute() {
             path.to_path_buf()
         } else {
-            ctx.working_dir.join(path)
+            ctx.working_dir().join(path)
         }
     }
 
@@ -171,6 +171,7 @@ mod tests {
             phoenix_terminal::ActiveTerminals::new(),
             Arc::new(crate::TmuxRegistry::new()),
             None,
+            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         )
     }
 

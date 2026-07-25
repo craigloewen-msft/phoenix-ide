@@ -578,7 +578,10 @@ pub(crate) async fn abandon_task(
         None
     };
 
-    let pr_scope = crate::work_scope::WorkScope::resolve(&id, Some(StdPath::new(&worktree_path)));
+    let pr_scope = conv
+        .work_scope_id
+        .as_ref()
+        .expect("persisted conversation has work scope");
     if StdPath::new(&worktree_path).is_dir() {
         let refresh_worktree = PathBuf::from(&worktree_path);
         let refresh_branch = branch_name.clone();
@@ -595,7 +598,7 @@ pub(crate) async fn abandon_task(
             Ok(refresh) if !refresh.observations.is_empty() => {
                 if let Err(e) = state
                     .db
-                    .upsert_work_scope_pr_observations(&pr_scope, &refresh.observations)
+                    .upsert_work_scope_pr_observations(pr_scope, &refresh.observations)
                     .await
                 {
                     tracing::warn!(error = %e, "Best-effort PR association refresh before abandon failed");
@@ -627,7 +630,7 @@ pub(crate) async fn abandon_task(
     let mode_label = if is_work_mode { "Work" } else { "Branch" };
     let pr_hint = state
         .db
-        .primary_work_scope_pr_association(&pr_scope)
+        .primary_work_scope_pr_association(pr_scope)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
         .map(|pr| format!(" PR #{} preserves history.", pr.pr_number))
@@ -793,6 +796,8 @@ mod tests {
     fn fixture(id: &str, continued_in_conv_id: Option<String>) -> Conversation {
         let ts = Utc.with_ymd_and_hms(2026, 4, 23, 12, 0, 0).unwrap();
         Conversation {
+            work_scope_id: Some(crate::work_scope::WorkScopeId::parse("test-work").unwrap()),
+            runtime_role: crate::work_scope::RuntimeRole::User,
             id: id.to_string(),
             slug: Some(format!("slug-{id}")),
             title: Some(format!("Title {id}")),

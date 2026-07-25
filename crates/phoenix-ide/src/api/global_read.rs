@@ -179,9 +179,15 @@ SELECT c.id AS current_conversation_id,
        json_extract(c.state, '$.type') AS state,
        c.state_updated_at, c.updated_at, c.continued_in_conv_id,
        c.archived, c.user_initiated, c.parent_conversation_id,
-       c.cm_task_id, c.cm_task_title, c.cm_branch_name, c.cm_base_branch
+       c.cm_task_id, c.cm_task_title,
+       environment.branch_name AS cm_branch_name,
+       environment.base_branch AS cm_base_branch
 FROM leaves JOIN conversations c ON c.id = leaves.current_id
-WHERE leaves.root_id NOT IN (SELECT conversation_id FROM coordinator)
+LEFT JOIN work_scope_environments environment
+  ON environment.work_scope_id = c.work_scope_id
+WHERE leaves.root_id NOT IN (
+  SELECT id FROM conversations WHERE coordinator_head = 1
+)
 ORDER BY CASE WHEN json_extract(c.state, '$.type') IN
   ('llm_request','llm_stream','tool_execution','executing','sub_agents_running')
   THEN 0 ELSE 1 END,

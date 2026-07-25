@@ -13,6 +13,26 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
+fn scope(id: &str) -> phoenix_core::work_scope::ResourceScopeKey {
+    phoenix_core::work_scope::ResourceScopeKey::Work(
+        phoenix_core::work_scope::WorkScopeId::parse(id).unwrap(),
+    )
+}
+
+fn work_actor(id: &str) -> phoenix_core::work_scope::EffectiveResourceAccess {
+    phoenix_core::work_scope::EffectiveResourceAccess::new(
+        id,
+        phoenix_core::work_scope::ResourceAuthority::Work,
+    )
+}
+
+fn restricted_actor(id: &str) -> phoenix_core::work_scope::EffectiveResourceAccess {
+    phoenix_core::work_scope::EffectiveResourceAccess::new(
+        id,
+        phoenix_core::work_scope::ResourceAuthority::Restricted,
+    )
+}
+
 /// Check if Chrome is available or obtainable.
 ///
 /// `dev.py check` classifies the environment up front and sets internal
@@ -98,6 +118,7 @@ fn test_context(conversation_id: &str) -> (ToolContext, Arc<BrowserSessionManage
         phoenix_terminal::ActiveTerminals::new(),
         Arc::new(crate::TmuxRegistry::new()),
         None,
+        phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
     );
     (ctx, manager)
 }
@@ -625,9 +646,14 @@ async fn test_eval_promise_chain_awaited() {
 
     let (ctx, manager) = test_context("test-eval-promise");
     let nav_tool = BrowserNavigateTool;
-    nav_tool
+    let navigation = nav_tool
         .run(json!({"url": server.url()}), ctx.clone())
         .await;
+    assert!(
+        navigation.is_success(),
+        "Navigation failed: {}",
+        navigation.output()
+    );
 
     let eval_tool = BrowserEvalTool;
 
@@ -701,9 +727,7 @@ async fn test_browser_console_logs_local() {
 
     {
         let session = manager
-            .get_existing(&phoenix_core::work_scope::WorkScope::Conversation(
-                "test-console-local".to_string(),
-            ))
+            .get_existing(&scope("test-work"))
             .await
             .expect("session should exist after navigate");
         tokio::time::timeout(
@@ -2078,9 +2102,7 @@ async fn test_screencast_attach_emits_frames_and_url() {
     assert!(nav.is_success(), "navigate failed: {}", nav.output());
 
     let session_arc = manager
-        .get_existing(&phoenix_core::work_scope::WorkScope::Conversation(
-            "test-screencast-frames".to_string(),
-        ))
+        .get_existing(&scope("test-work"))
         .await
         .expect("session should exist after navigate");
 
@@ -3101,13 +3123,9 @@ setTimeout(function () {
     shutdown_test(manager, server).await;
 }
 
-// ============================================================================
-// WorkScope ownership tests (REQ-BROWSER-WS-001 / REQ-BROWSER-WS-002)
-// ============================================================================
-
-/// Worktree-scoped sessions are shared across continuations: two
-/// `get_session` calls with the same `WorkScope::Worktree` return the
-/// same `Arc<RwLock<BrowserSession>>`. This is the structural backing
+/// Sessions are shared across continuations in one durable work scope: two
+/// `get_session` calls with the same key return the same
+/// `Arc<RwLock<BrowserSession>>`. This is the structural backing
 /// for REQ-BROWSER-WS-002 inheritance — agents driving a continuation
 /// see the predecessor's tabs and cookies because they're literally the
 /// same Chrome instance.
@@ -3116,8 +3134,7 @@ async fn worktree_scope_shared_across_continuations() {
     require_chrome!();
 
     let manager = Arc::new(BrowserSessionManager::default());
-    let scope =
-        phoenix_core::work_scope::WorkScope::Worktree("/tmp/phoenix-ws-shared-test".to_string());
+    let scope = scope("shared-continuation");
 
     let first = manager
         .get_session(&scope)
@@ -3130,60 +3147,28 @@ async fn worktree_scope_shared_across_continuations() {
 
     assert!(
         Arc::ptr_eq(&first, &second),
-        "WorkScope::Worktree sessions must share the same Arc — \
+        "sessions in one durable work scope must share the same Arc — \
          continuation inheritance depends on it"
     );
 
     manager.shutdown_all().await;
 }
 
-/// Conversation-scoped sessions are isolated per conversation id:
-/// `WorkScope::Conversation("a")` and `WorkScope::Conversation("b")`
-/// resolve to different Chrome instances. Direct continuations always
-/// fall here (they each have their own scope), so this proves
-/// per-conversation isolation for the Direct-mode case.
+/// Distinct durable work scopes resolve to different Chrome instances.
 #[tokio::test]
 async fn conversation_scope_isolated_per_id() {
     require_chrome!();
 
     let manager = Arc::new(BrowserSessionManager::default());
-    let scope_a = phoenix_core::work_scope::WorkScope::Conversation("ws-conv-a".to_string());
-    let scope_b = phoenix_core::work_scope::WorkScope::Conversation("ws-conv-b".to_string());
+    let scope_a = scope("ws-conv-a");
+    let scope_b = scope("ws-conv-b");
 
     let a = manager.get_session(&scope_a).await.expect("session a");
     let b = manager.get_session(&scope_b).await.expect("session b");
 
     assert!(
         !Arc::ptr_eq(&a, &b),
-        "different Conversation scopes must produce isolated sessions"
-    );
-
-    manager.shutdown_all().await;
-}
-
-/// Worktree and Conversation scopes with the same inner string land in
-/// disjoint namespaces (`stable_key` prefix). This guards against a path
-/// that happens to look like a conversation id colliding with a real
-/// Conversation-scoped session, and vice versa.
-#[tokio::test]
-async fn worktree_and_conversation_namespaces_disjoint() {
-    require_chrome!();
-
-    let manager = Arc::new(BrowserSessionManager::default());
-    let shared = "/tmp/phoenix-ws-namespace-test";
-    let wt = phoenix_core::work_scope::WorkScope::Worktree(shared.to_string());
-    let conv = phoenix_core::work_scope::WorkScope::Conversation(shared.to_string());
-
-    let wt_session = manager.get_session(&wt).await.expect("worktree session");
-    let conv_session = manager
-        .get_session(&conv)
-        .await
-        .expect("conversation session");
-
-    assert!(
-        !Arc::ptr_eq(&wt_session, &conv_session),
-        "Worktree and Conversation scopes with equal inner strings \
-         must occupy disjoint namespaces"
+        "different durable work scopes must produce isolated sessions"
     );
 
     manager.shutdown_all().await;
@@ -3197,15 +3182,19 @@ async fn cascade_preserves_when_inheritor_scope_matches() {
     require_chrome!();
 
     let manager = Arc::new(BrowserSessionManager::default());
-    let scope = phoenix_core::work_scope::WorkScope::Worktree(
-        "/tmp/phoenix-ws-cascade-preserve".to_string(),
-    );
+    let scope = scope("cascade-preserve");
 
     let original = manager.get_session(&scope).await.expect("create");
     assert!(manager.is_active(&scope).await);
 
     // Continuation inherits the same scope.
-    crate::browser::session::cascade_browser_on_delete(&manager, &scope, Some(&scope)).await;
+    crate::browser::session::cascade_browser_on_delete(
+        &manager,
+        &scope,
+        &work_actor("owner"),
+        Some(&scope),
+    )
+    .await;
 
     assert!(
         manager.is_active(&scope).await,
@@ -3230,18 +3219,46 @@ async fn cascade_tears_down_when_no_inheritor() {
     require_chrome!();
 
     let manager = Arc::new(BrowserSessionManager::default());
-    let scope =
-        phoenix_core::work_scope::WorkScope::Conversation("ws-cascade-teardown".to_string());
+    let scope = scope("ws-cascade-teardown");
 
     let _ = manager.get_session(&scope).await.expect("create");
     assert!(manager.is_active(&scope).await);
 
-    crate::browser::session::cascade_browser_on_delete(&manager, &scope, None).await;
+    crate::browser::session::cascade_browser_on_delete(
+        &manager,
+        &scope,
+        &work_actor("owner"),
+        None,
+    )
+    .await;
 
     assert!(
         !manager.is_active(&scope).await,
         "no-inheritor cascade must tear the session down"
     );
+}
+
+#[tokio::test]
+async fn cascade_last_restricted_owner_tears_down_every_scope_session() {
+    require_chrome!();
+
+    let manager = Arc::new(BrowserSessionManager::default());
+    let scope = scope("cascade-restricted-last-owner");
+    let owner = restricted_actor("owner");
+    let sibling = restricted_actor("finished-sub-agent");
+
+    let _ = manager
+        .get_session_for_actor(&scope, &owner)
+        .await
+        .expect("owner session");
+    let _ = manager
+        .get_session_for_actor(&scope, &sibling)
+        .await
+        .expect("sibling session");
+
+    crate::browser::session::cascade_browser_on_delete(&manager, &scope, &owner, None).await;
+
+    assert!(!manager.is_active(&scope).await);
 }
 
 /// Direct continuations resolve to a *different* `Conversation` scope
@@ -3254,13 +3271,19 @@ async fn cascade_tears_down_when_inheritor_scope_differs() {
     require_chrome!();
 
     let manager = Arc::new(BrowserSessionManager::default());
-    let parent = phoenix_core::work_scope::WorkScope::Conversation("ws-cascade-parent".to_string());
-    let child = phoenix_core::work_scope::WorkScope::Conversation("ws-cascade-child".to_string());
+    let parent = scope("ws-cascade-parent");
+    let child = scope("ws-cascade-child");
 
     let _ = manager.get_session(&parent).await.expect("create parent");
     assert!(manager.is_active(&parent).await);
 
-    crate::browser::session::cascade_browser_on_delete(&manager, &parent, Some(&child)).await;
+    crate::browser::session::cascade_browser_on_delete(
+        &manager,
+        &parent,
+        &work_actor("owner"),
+        Some(&child),
+    )
+    .await;
 
     assert!(
         !manager.is_active(&parent).await,
