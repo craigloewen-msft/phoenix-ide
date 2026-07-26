@@ -286,7 +286,73 @@ const MIGRATIONS: &[Migration] = &[
         name: "work_scope_owns_environment",
         sql: MIGRATION_054,
     },
+    Migration {
+        version: 55,
+        name: "create_authoritative_direct_turns",
+        sql: MIGRATION_055,
+    },
 ];
+
+const MIGRATION_055: &str = r"
+INSERT INTO workflow_global_sequences (sequence_name, next_value)
+VALUES ('direct_turn', 1)
+ON CONFLICT(sequence_name) DO NOTHING;
+
+CREATE TABLE durable_turns (
+    turn_id INTEGER PRIMARY KEY,
+    workflow_id INTEGER NOT NULL UNIQUE REFERENCES workflows(workflow_id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    client_turn_key TEXT NOT NULL CHECK (client_turn_key <> ''),
+    prepared_fingerprint TEXT NOT NULL,
+    prepared_payload BLOB NOT NULL,
+    disposition TEXT NOT NULL CHECK (disposition IN ('Runtime', 'Steering')),
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    terminal_kind TEXT CHECK (terminal_kind IN ('Completed', 'Cancelled', 'Failed')),
+    terminal_reason TEXT,
+    owns_conversation INTEGER NOT NULL CHECK (owns_conversation IN (0, 1)),
+    canonical_message_id TEXT,
+    UNIQUE (conversation_id, client_turn_key),
+    CHECK (owns_conversation = (disposition = 'Runtime' AND terminal_kind IS NULL)),
+    CHECK (
+        (terminal_kind = 'Failed' AND terminal_reason IS NOT NULL)
+        OR (terminal_kind IS NULL AND terminal_reason IS NULL)
+        OR (terminal_kind IN ('Completed', 'Cancelled') AND terminal_reason IS NULL)
+    )
+);
+
+CREATE UNIQUE INDEX messages_conversation_message_id_unique
+    ON messages(conversation_id, message_id);
+
+CREATE TRIGGER durable_turns_delete_owned_workflow
+AFTER DELETE ON durable_turns
+BEGIN
+    DELETE FROM workflows WHERE workflow_id = OLD.workflow_id;
+END;
+
+CREATE UNIQUE INDEX durable_turns_one_live_owner
+    ON durable_turns(conversation_id)
+    WHERE owns_conversation = 1;
+
+CREATE INDEX durable_turns_discoverable_nonterminal
+    ON durable_turns(conversation_id, disposition, turn_id)
+    WHERE terminal_kind IS NULL;
+
+CREATE TRIGGER durable_turns_canonical_message_guard
+BEFORE UPDATE OF canonical_message_id ON durable_turns
+WHEN NEW.canonical_message_id IS NOT NULL
+ AND NOT EXISTS (
+    SELECT 1 FROM messages
+    WHERE messages.conversation_id = NEW.conversation_id
+      AND messages.message_id = NEW.canonical_message_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'direct-turn canonical message missing from conversation');
+END;
+
+CREATE UNIQUE INDEX durable_turns_canonical_message_unique
+    ON durable_turns(canonical_message_id)
+    WHERE canonical_message_id IS NOT NULL;
+";
 
 const MIGRATION_052: &str = r"
 CREATE TABLE IF NOT EXISTS llm_request_metrics (
@@ -4491,7 +4557,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+        let expected_pending = u32::try_from(
+            MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version > 51)
+                .count(),
+        )
+        .unwrap();
+        assert_eq!(
+            run_pending_migrations(&pool).await.unwrap(),
+            expected_pending
+        );
 
         let columns: Vec<String> = sqlx::query("PRAGMA table_info(work_scopes)")
             .fetch_all(&pool)
