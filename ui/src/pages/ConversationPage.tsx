@@ -52,7 +52,10 @@ import { useToast } from '../hooks/useToast';
 import { Toast } from '../components/Toast';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { ConnectedStateBar } from '../components/StateBar';
-import { OPEN_MESSAGE_VIEWER_EVENT } from '../components/MessageContextMenu';
+import {
+  OPEN_MESSAGE_VIEWER_EVENT,
+  type OpenMessageViewerEventDetail,
+} from '../components/MessageContextMenu';
 import { ConversationReturnBreadcrumb } from '../components/ConversationReturnBreadcrumb';
 import { RenderProfiler } from '../dev/renderProfiler';
 import { ErrorBanner } from '../components/ErrorBanner';
@@ -1807,9 +1810,10 @@ function ConversationPageContent({
 
   useEffect(() => {
     const handler = (e: Event) => {
-      const sequenceId = (e as CustomEvent<{ sequenceId: number }>).detail?.sequenceId;
+      const { sequenceId, presentation } = (e as CustomEvent<OpenMessageViewerEventDetail>).detail ?? {};
       if (!Number.isSafeInteger(sequenceId) || sequenceId <= 0) return;
-      handleOpenMessageViewer(sequenceId);
+      if (presentation !== 'pane' && presentation !== 'fullscreen') return;
+      handleOpenMessageViewer(sequenceId, presentation);
     };
     window.addEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
     return () => window.removeEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
@@ -2220,10 +2224,8 @@ function ConversationPageContent({
     </div>
   ) : null;
 
-  // Split-pane viewer: rendered inside `#app` as a sibling of
-  // .conversation-column when wide-desktop and a viewer (file OR diff)
-  // is open. CSS in .app-split-pane (index.css) flexes children
-  // horizontally.
+  // Wide-desktop pane presentations render beside .conversation-column.
+  // Fullscreen message presentations use the takeover branch below.
   const splitPanePrs = openFileState;
   const showSplitPaneViewer =
     isDesktop
@@ -2233,7 +2235,7 @@ function ConversationPageContent({
       || paneDiffOpen
       || browserViewerOpen
       || inspectViewerOpen
-      || messageViewerOpen
+      || (messageViewerOpen && messageSlot?.presentation === 'pane')
       || commissionReviewViewerOpen
     );
 
@@ -2315,6 +2317,7 @@ function ConversationPageContent({
         filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
         workScopeKey={isArchived ? undefined : conversation.work_scope_key}
         enableMessageSidepanel={canOpenMessageSidepanel}
+        enableMessageFullscreen={canOpenMessageSidepanel && isWideDesktop}
         conversationId={conversationId}
         slug={slug}
         systemPrompt={atom.systemPrompt ?? undefined}
