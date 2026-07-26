@@ -10,6 +10,10 @@ use phoenix_core::domain::db_schema::{
 };
 use phoenix_core::domain::llm_error_kind::LlmAttemptReason;
 use phoenix_core::domain::llm_types::ContentBlock;
+use phoenix_core::domain::sm_event::{
+    DirectTurnAttemptAuthority, PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
+    SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
+};
 use serde_json::Value;
 use std::fmt;
 use std::path::Path;
@@ -105,6 +109,11 @@ pub enum Effect {
         /// effect may be re-emitted after crash recovery (e.g., steering-queue
         /// re-drain). Default `false` for normal write paths to avoid the
         /// extra `message_exists` query.
+        idempotent: bool,
+    },
+    PersistAuthoritativeUserMessage {
+        payload: PreparedDirectTurnPayload,
+        authority: DirectTurnAttemptAuthority,
         idempotent: bool,
     },
 
@@ -251,6 +260,13 @@ pub enum Effect {
     ClearSteeringQueueEntries { message_ids: Vec<String> },
 }
 
+#[must_use]
+pub fn prepared_direct_turn_content(
+    payload: &PreparedDirectTurnPayload,
+) -> (MessageContent, Option<Value>) {
+    payload.message_content_and_display_data()
+}
+
 impl Effect {
     #[allow(clippy::too_many_arguments)]
     pub fn persist_user_message(
@@ -264,36 +280,30 @@ impl Effect {
         idempotent: bool,
     ) -> Self {
         let text = text.into();
-        let content = if let Some(invocation) = skill_invocation {
-            MessageContent::Skill(phoenix_core::domain::db_schema::SkillContent {
-                name: invocation.name,
-                body: invocation.body,
-                trigger: text,
-                files,
-            })
-        } else {
-            match llm_text {
-                Some(expanded) => MessageContent::User(
-                    phoenix_core::domain::db_schema::UserContent::with_expansion(
-                        text, expanded, images, files,
-                    ),
-                ),
-                None => {
-                    if images.is_empty() && files.is_empty() {
-                        MessageContent::user(text)
-                    } else {
-                        MessageContent::user_with_attachments(text, images, files)
-                    }
-                }
-            }
+        let submitted = SubmittedDirectTurnIdentity {
+            text: text.clone(),
+            images: images.clone(),
+            files: files.clone().into_iter().map(Into::into).collect(),
+            message_id,
+            user_agent: user_agent.clone(),
+            skill_invocation: skill_invocation.clone(),
+            expansion_policy: SubmittedDirectTurnExpansionPolicy::ExpandReferences,
         };
-        // Store user_agent in display_data for UI to show device icon
-        let display_data = user_agent.map(|ua| serde_json::json!({ "user_agent": ua }));
+        let delivery = PreparedDirectTurnDelivery {
+            text,
+            llm_text,
+            images,
+            files,
+            user_agent,
+            skill_invocation,
+        };
+        let payload = PreparedDirectTurnPayload::from_parts(submitted, delivery);
+        let (content, display_data) = prepared_direct_turn_content(&payload);
         Effect::PersistMessage {
             content,
             display_data,
             usage_data: None,
-            message_id,
+            message_id: payload.message_id().to_string(),
             idempotent,
         }
     }

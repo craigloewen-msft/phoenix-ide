@@ -1861,6 +1861,10 @@ where
     /// Task 24684 was originally numbered 24679 in commit history — see
     /// the task file for the rebase-time renumbering note.
     parent_tool_cycle_count: u32,
+    active_direct_turn: Option<Box<crate::runtime::traits::ActiveDirectTurn>>,
+    pending_direct_turn_terminal: Option<Box<crate::runtime::traits::ActiveDirectTurnTerminal>>,
+    direct_turn_cancellation_initiated: bool,
+    direct_turn_materialization_aborted: bool,
     /// Cap on `parent_tool_cycle_count` before the runtime halts and emits
     /// a system message. `0` disables the cap. Read once at construction
     /// time from `PHOENIX_PARENT_TOOL_CYCLE_CAP`, with
@@ -1987,6 +1991,10 @@ where
             grace_turn_granted: false,
             grace_turn_started_at: None,
             parent_tool_cycle_count: 0,
+            direct_turn_materialization_aborted: false,
+            active_direct_turn: None,
+            pending_direct_turn_terminal: None,
+            direct_turn_cancellation_initiated: false,
             parent_tool_cycle_cap: parent_tool_cycle_cap_from_env(),
             credential_helper: None,
             agent_catalog: Arc::from(Vec::new()),
@@ -2068,6 +2076,14 @@ where
         self
     }
 
+    pub fn with_active_direct_turn(
+        mut self,
+        active: Option<crate::runtime::traits::ActiveDirectTurn>,
+    ) -> Self {
+        self.active_direct_turn = active.map(Box::new);
+        self
+    }
+
     /// Set the parent event channel (for sub-agents)
     pub fn with_parent(mut self, parent_tx: mpsc::Sender<Event>) -> Self {
         self.parent_event_tx = Some(parent_tx);
@@ -2111,8 +2127,12 @@ where
         self
     }
 
-    #[allow(clippy::too_many_lines)] // Sequential event loop; splitting hurts readability
-    pub async fn run(mut self) {
+    pub fn run(self) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + Send + 'static>> {
+        Box::pin(self.run_inner())
+    }
+
+    #[allow(clippy::too_many_lines)] // Sequential event loop owns the runtime state.
+    async fn run_inner(mut self) {
         tracing::info!(conv_id = %self.context.conversation_id, "Starting conversation runtime");
 
         // Check if we need to resume an interrupted operation
@@ -2597,9 +2617,8 @@ where
         self.execute_effect(Effect::RequestLlm).await.map(|_| ())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
-        // A fresh user turn always resets the parent tool-cycle counter
-        // (task 24680). Cap logic lives in the `Effect::RequestLlm` handler.
         if matches!(event, Event::UserMessage { .. }) {
             self.parent_tool_cycle_count = 0;
         }
@@ -2692,6 +2711,9 @@ where
             }
 
             // Pure state transition
+            let terminal_event = current_event.clone();
+            let authoritative_event =
+                matches!(current_event, Event::AuthoritativeUserMessage { .. });
             let result = match transition(&self.state, &self.context, current_event) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2712,6 +2734,10 @@ where
                 }
             };
 
+            if authoritative_event {
+                self.parent_tool_cycle_count = 0;
+            }
+            self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
             let generated_events = self.apply_transition_result(result).await?;
             events_to_process.extend(generated_events);
         }
@@ -2792,11 +2818,13 @@ where
     /// Updates state, drains sub-agent buffer if entering `AwaitingSubAgents`,
     /// dispatches effects. Returns any synchronously generated events
     /// (e.g., from `SpawnAgentsComplete`).
+    #[allow(clippy::too_many_lines)]
     async fn apply_transition_result(
         &mut self,
         result: crate::state_machine::transition::TransitionResult,
     ) -> Result<Vec<Event>, String> {
         let mut generated_events = Vec::new();
+        self.direct_turn_materialization_aborted = false;
 
         // Update state. Bump the entry timestamp on phase change so every
         // SseEvent::StateChange the executor subsequently emits carries a
@@ -2804,6 +2832,7 @@ where
         // (specs/working-phase-visibility/ REQ-WPV-001). `persist_state_effect`
         // threads this same value into the DB write, so the persisted row and
         // the SSE value match exactly.
+        let old_state_updated_at = self.state_updated_at;
         let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
         // Only stamp a fresh entry time when the phase actually changes.
         // Several events absorb as no-ops (Terminal absorbs unknown events;
@@ -2945,11 +2974,30 @@ where
                 .await?;
         } else {
             for effect in result.effects {
+                let is_authoritative_persist =
+                    matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
                 if let Some(gen_event) = self.execute_effect(effect).await? {
                     generated_events.push(gen_event);
                 }
+                if is_authoritative_persist && self.direct_turn_materialization_aborted {
+                    break;
+                }
             }
         }
+
+        if self.direct_turn_materialization_aborted {
+            self.state = old_state;
+            self.state_updated_at = old_state_updated_at;
+            if let Some(tx) = &self.state_watcher {
+                let _ = tx.send(self.state.clone());
+            }
+            if let Some(drain_event) = self.maybe_drain_steering_queue(&self.state.clone(), false) {
+                Box::pin(self.process_event(drain_event)).await?;
+            }
+            return Ok(Vec::new());
+        }
+
+        self.terminate_pending_direct_turn().await?;
 
         // Publish the final state to any live-state observer after all effects
         // (including any inline steering drain) have completed. Publishing here
@@ -3001,8 +3049,13 @@ where
                     _ => {}
                 }
             }
+            let is_authoritative_persist =
+                matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
             if let Some(gen_event) = self.execute_effect(effect).await? {
                 generated_events.push(gen_event);
+            }
+            if is_authoritative_persist && self.direct_turn_materialization_aborted {
+                break;
             }
         }
 
@@ -3888,9 +3941,135 @@ where
     }
 
     /// Execute an effect and optionally return a generated event
+    fn classify_active_direct_turn_terminal(&mut self, event: &Event, new_state: &ConvState) {
+        if self.active_direct_turn.is_none() {
+            return;
+        }
+        if matches!(event, Event::UserCancel { .. }) {
+            self.direct_turn_cancellation_initiated = true;
+        }
+        if matches!(new_state, ConvState::Idle) {
+            if self.direct_turn_cancellation_initiated {
+                self.pending_direct_turn_terminal = Some(Box::new(
+                    crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled,
+                ));
+            } else {
+                self.pending_direct_turn_terminal = Some(Box::new(
+                    crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
+                ));
+            }
+            return;
+        }
+        if matches!(
+            new_state,
+            ConvState::Error { .. } | ConvState::ContextExhausted { .. }
+        ) {
+            let reason = match event {
+                Event::LlmError { message, .. } | Event::CredentialHelperFailed { message } => {
+                    message.clone()
+                }
+                _ => format!("conversation entered terminal error state after {event:?}"),
+            };
+            self.pending_direct_turn_terminal = Some(Box::new(
+                crate::runtime::traits::ActiveDirectTurnTerminal::Failed { reason },
+            ));
+            return;
+        }
+        if new_state.is_terminal() {
+            self.pending_direct_turn_terminal = Some(Box::new(
+                crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
+            ));
+        }
+    }
+
+    async fn terminate_pending_direct_turn(&mut self) -> Result<(), String> {
+        let (Some(active), Some(terminal)) = (
+            self.active_direct_turn.as_deref().cloned(),
+            self.pending_direct_turn_terminal.take(),
+        ) else {
+            return Ok(());
+        };
+        if let Err(error) = self
+            .storage
+            .terminate_active_direct_turn(&active, terminal.as_ref().clone())
+            .await
+        {
+            self.pending_direct_turn_terminal = Some(terminal);
+            return Err(error);
+        }
+        self.active_direct_turn = None;
+        self.direct_turn_cancellation_initiated = false;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn execute_effect(&mut self, effect: Effect) -> Result<Option<Event>, String> {
         match effect {
+            Effect::PersistAuthoritativeUserMessage {
+                payload, authority, ..
+            } => {
+                let now = chrono::Utc::now()
+                    .timestamp()
+                    .try_into()
+                    .unwrap_or_default();
+                match self
+                    .storage
+                    .preflight_authoritative_user_message(
+                        &authority,
+                        &payload,
+                        phoenix_workflow::Timestamp(now),
+                    )
+                    .await?
+                {
+                    phoenix_db::workflow::DirectTurnMaterializationEligibility::Fresh => {}
+                    phoenix_db::workflow::DirectTurnMaterializationEligibility::ExactReplay
+                    | phoenix_db::workflow::DirectTurnMaterializationEligibility::StaleAuthority => {
+                        self.direct_turn_materialization_aborted = true;
+                        return Ok(None);
+                    }
+                }
+                let (reserved_broadcast_range, reserved_seqs) =
+                    self.broadcast_tx.reserve_next_persisted_message_range(1);
+                let _reserved_broadcast_range = reserved_broadcast_range;
+                let materialization = self
+                    .storage
+                    .materialize_authoritative_user_message(
+                        &crate::runtime::traits::AuthoritativeUserMessageAdoptionInput {
+                            authority,
+                            payload,
+                            sequence_id: reserved_seqs[0],
+                            created_at: phoenix_workflow::Timestamp(now),
+                            accepted_state: self.state.clone(),
+                            state_updated_at: self.state_updated_at,
+                            now: phoenix_workflow::Timestamp(now),
+                        },
+                    )
+                    .await;
+                let materialization = match materialization {
+                    Ok(materialization) => materialization,
+                    Err(error) => {
+                        self.direct_turn_materialization_aborted = true;
+                        tracing::warn!(conversation_id = %self.context.conversation_id, %error, "direct-turn materialization failed; restoring reducer state for retry");
+                        return Ok(None);
+                    }
+                };
+                match materialization {
+                    crate::runtime::traits::AuthoritativeUserMessageMaterialization::Materialized {
+                        message,
+                        active,
+                    } => {
+                        self.active_direct_turn = Some(Box::new(active));
+                        let _ = self.broadcast_tx.send_message(*message);
+                        Ok(None)
+                    }
+                    crate::runtime::traits::AuthoritativeUserMessageMaterialization::ExactReplay
+                    | crate::runtime::traits::AuthoritativeUserMessageMaterialization::StaleAuthority => {
+                        self.direct_turn_materialization_aborted = true;
+                        Ok(None)
+                    }
+                }
+            }
+
             Effect::PersistMessage {
                 content,
                 display_data,
@@ -8304,6 +8483,397 @@ mod test_git_helpers {
 /// The effect is dispatched through the real `execute_effect` match arm
 /// (not a private helper) so the handler's full transition-time behaviour
 /// is exercised end-to-end.
+#[cfg(test)]
+mod authoritative_user_message_effect_tests {
+    use super::*;
+    use crate::db::{Message, MessageContent, MessageType};
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::runtime::traits::AuthoritativeUserMessageMaterialization;
+    use crate::tools::BrowserSessionManager;
+    use phoenix_core::domain::sm_event::{DirectTurnAttemptAuthority, PreparedDirectTurnPayload};
+    use phoenix_db::workflow::DirectTurnMaterializationEligibility;
+    use phoenix_llm::ModelRegistry;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::{broadcast, mpsc};
+
+    fn assert_no_broadcast(rx: &mut broadcast::Receiver<SseEvent>) {
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    fn payload(message_id: &str) -> PreparedDirectTurnPayload {
+        PreparedDirectTurnPayload::from_parts(
+            phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                text: "hello".to_string(),
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: message_id.to_owned(),
+                user_agent: None,
+                skill_invocation: None,
+                expansion_policy: phoenix_core::domain::sm_event::SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+            },
+            phoenix_core::domain::sm_event::PreparedDirectTurnDelivery {
+                text: "hello".to_string(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+        )
+    }
+
+    fn authority() -> DirectTurnAttemptAuthority {
+        DirectTurnAttemptAuthority::new(1, 1, 1, 1, 1, 0, 1)
+    }
+
+    fn message(message_id: &str, sequence_id: i64) -> Message {
+        Message {
+            message_id: message_id.to_string(),
+            conversation_id: "conv-direct".to_string(),
+            sequence_id,
+            message_type: MessageType::User,
+            content: MessageContent::user("hello"),
+            display_data: None,
+            usage_data: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn runtime(
+        preflight: DirectTurnMaterializationEligibility,
+        materialize: AuthoritativeUserMessageMaterialization,
+    ) -> (
+        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>,
+        Arc<InMemoryStorage>,
+        broadcast::Receiver<SseEvent>,
+    ) {
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.queue_preflight_authoritative_user_message(preflight);
+        storage.queue_materialize_authoritative_user_message(materialize);
+        let context = ConvContext::new("conv-direct", PathBuf::from("/tmp"), "test-model", 200_000);
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let broadcaster = SseBroadcaster::new(128, 0);
+        let broadcast_rx = broadcaster.subscribe();
+        (
+            ConversationRuntime::new(
+                context,
+                ConvState::Idle,
+                storage.clone(),
+                Arc::new(MockLlmClient::new("test-model")),
+                Arc::new(MockToolExecutor::new()),
+                Arc::new(BrowserSessionManager::default()),
+                Arc::new(crate::tools::BashHandleRegistry::new()),
+                Arc::new(crate::tools::TmuxRegistry::new()),
+                Arc::new(ModelRegistry::new_empty()),
+                crate::terminal::ActiveTerminals::new(),
+                event_rx,
+                event_tx_dup,
+                broadcaster,
+            ),
+            storage,
+            broadcast_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn replay_preflight_does_not_reserve_sequence_or_emit() {
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::ExactReplay,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+
+        rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
+            payload: payload("msg-direct"),
+            authority: authority(),
+            idempotent: true,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(rt.broadcast_tx.current_seq(), 0);
+        assert_no_broadcast(&mut rx);
+        assert_eq!(
+            storage
+                .recorded_materialize_authoritative_user_message_calls()
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_preflight_does_not_reserve_sequence_or_emit() {
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+
+        rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
+            payload: payload("msg-direct"),
+            authority: authority(),
+            idempotent: true,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(rt.broadcast_tx.current_seq(), 0);
+        assert_no_broadcast(&mut rx);
+        assert_eq!(
+            storage
+                .recorded_materialize_authoritative_user_message_calls()
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_materialized_emits_one_persisted_reserved_message() {
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::Materialized {
+                message: Box::new(message("msg-direct", 1)),
+                active: crate::runtime::traits::ActiveDirectTurn {
+                    turn_id: phoenix_workflow::TurnAuthorityId(1),
+                    generation: 0,
+                },
+            },
+        );
+
+        rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
+            payload: payload("msg-direct"),
+            authority: authority(),
+            idempotent: true,
+        })
+        .await
+        .unwrap();
+
+        let event = rx.try_recv().expect("persisted message broadcast");
+        let SseEvent::Message { message } = event else {
+            panic!("expected message event")
+        };
+        assert_eq!(message.message_id, "msg-direct");
+        assert_eq!(message.sequence_id, 1);
+        assert_eq!(rt.broadcast_tx.current_seq(), 1);
+        let materialize_calls = storage.recorded_materialize_authoritative_user_message_calls();
+        assert_eq!(materialize_calls.len(), 1);
+        assert_eq!(materialize_calls[0].sequence_id, 1);
+        assert_no_broadcast(&mut rx);
+        assert_eq!(
+            rt.active_direct_turn,
+            Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+                turn_id: phoenix_workflow::TurnAuthorityId(1),
+                generation: 0,
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn seeded_active_direct_turn_completes_after_state_persistence() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let active = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(8),
+            generation: 0,
+        };
+        rt = rt.with_active_direct_turn(Some(active.clone()));
+        rt.state = ConvState::LlmRequesting { attempt: 1 };
+
+        rt.process_event(Event::LlmResponse {
+            content: Vec::new(),
+            tool_calls: Vec::new(),
+            end_turn: true,
+            usage: phoenix_llm::Usage::default(),
+            request_id: "response".to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            storage.recorded_terminate_active_direct_turn_calls(),
+            vec![(
+                active,
+                crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
+            )]
+        );
+        assert_eq!(rt.active_direct_turn, None);
+        assert_eq!(rt.pending_direct_turn_terminal, None);
+    }
+
+    #[tokio::test]
+    async fn active_direct_turn_terminal_classification_releases_exactly_once() {
+        for (event, new_state, expected) in [
+            (
+                Event::LlmResponse {
+                    content: Vec::new(),
+                    tool_calls: Vec::new(),
+                    end_turn: true,
+                    usage: phoenix_llm::Usage::default(),
+                    request_id: "response".to_string(),
+                },
+                ConvState::Idle,
+                crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
+            ),
+            (
+                Event::TaskResolved {
+                    system_message: "done".to_string(),
+                    repo_root: "/tmp".to_string(),
+                },
+                ConvState::HandedOff {
+                    successor_conv_id: "next".to_string(),
+                },
+                crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
+            ),
+            (
+                Event::LlmError {
+                    message: "provider failed".to_string(),
+                    error_kind: crate::db::ErrorKind::InvalidRequest,
+                    attempt: 1,
+                    recovery_in_progress: false,
+                    resets_at: None,
+                },
+                ConvState::Error {
+                    message: "provider failed".to_string(),
+                    error_kind: crate::db::ErrorKind::InvalidRequest,
+                    resets_at: None,
+                },
+                crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                    reason: "provider failed".to_string(),
+                },
+            ),
+        ] {
+            let (mut rt, storage, _rx) = runtime(
+                DirectTurnMaterializationEligibility::StaleAuthority,
+                AuthoritativeUserMessageMaterialization::StaleAuthority,
+            );
+            rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+                turn_id: phoenix_workflow::TurnAuthorityId(9),
+                generation: 0,
+            }));
+            rt.classify_active_direct_turn_terminal(&event, &new_state);
+            rt.terminate_pending_direct_turn().await.unwrap();
+            rt.terminate_pending_direct_turn().await.unwrap();
+            assert_eq!(
+                storage.recorded_terminate_active_direct_turn_calls(),
+                vec![(
+                    crate::runtime::traits::ActiveDirectTurn {
+                        turn_id: phoenix_workflow::TurnAuthorityId(9),
+                        generation: 0,
+                    },
+                    expected,
+                )]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn active_direct_turn_cancellation_latches_until_idle() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(10),
+            generation: 0,
+        }));
+        rt.classify_active_direct_turn_terminal(
+            &Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            },
+            &ConvState::LlmRequesting { attempt: 1 },
+        );
+        rt.classify_active_direct_turn_terminal(
+            &Event::ToolAborted {
+                tool_use_id: "tool".to_string(),
+            },
+            &ConvState::Idle,
+        );
+        rt.terminate_pending_direct_turn().await.unwrap();
+        assert!(matches!(
+            storage
+                .recorded_terminate_active_direct_turn_calls()
+                .as_slice(),
+            [(
+                _,
+                crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled
+            )]
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_or_replay_materialization_aborts_without_request_llm_or_state_persist() {
+        for preflight in [
+            DirectTurnMaterializationEligibility::ExactReplay,
+            DirectTurnMaterializationEligibility::StaleAuthority,
+        ] {
+            let (mut rt, storage, mut rx) = runtime(
+                preflight,
+                AuthoritativeUserMessageMaterialization::StaleAuthority,
+            );
+
+            let result =
+                crate::state_machine::transition::TransitionResult::new(ConvState::LlmRequesting {
+                    attempt: 1,
+                })
+                .with_effect(Effect::PersistAuthoritativeUserMessage {
+                    payload: payload("msg-direct"),
+                    authority: authority(),
+                    idempotent: false,
+                })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::RequestLlm);
+
+            rt.apply_transition_result(result).await.unwrap();
+
+            assert_eq!(
+                storage
+                    .recorded_materialize_authoritative_user_message_calls()
+                    .len(),
+                0
+            );
+            assert_eq!(storage.get_current_state("conv-direct"), None);
+            assert!(rt.llm_task_handle.is_none());
+            assert!(matches!(rt.state, ConvState::Idle));
+            assert_no_broadcast(&mut rx);
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_then_replay_or_stale_materialization_aborts_without_broadcast() {
+        for materialize in [
+            AuthoritativeUserMessageMaterialization::ExactReplay,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        ] {
+            let (mut rt, storage, mut rx) =
+                runtime(DirectTurnMaterializationEligibility::Fresh, materialize);
+
+            rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: true,
+            })
+            .await
+            .unwrap();
+
+            assert_no_broadcast(&mut rx);
+            assert_eq!(
+                storage
+                    .recorded_materialize_authoritative_user_message_calls()
+                    .len(),
+                1
+            );
+            assert!(rt.direct_turn_materialization_aborted);
+        }
+    }
+}
+
 #[cfg(test)]
 mod context_exhausted_preserves_worktree_tests {
     use super::test_git_helpers::{add_worktree, branch_exists, init_repo};

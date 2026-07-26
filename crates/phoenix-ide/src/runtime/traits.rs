@@ -6,8 +6,49 @@ use crate::db::{ConvMode, Message, MessageContent, UsageData};
 use crate::state_machine::ConvState;
 use crate::tools::ToolOutput;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use phoenix_llm::{LlmError, LlmRequest, LlmResponse};
 use serde_json::Value;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveDirectTurn {
+    pub turn_id: phoenix_workflow::TurnAuthorityId,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedActiveDirectTurn {
+    pub active: ActiveDirectTurn,
+    pub materialized: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum AuthoritativeUserMessageMaterialization {
+    Materialized {
+        message: Box<Message>,
+        active: ActiveDirectTurn,
+    },
+    ExactReplay,
+    StaleAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveDirectTurnTerminal {
+    Completed,
+    Cancelled,
+    Failed { reason: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthoritativeUserMessageAdoptionInput {
+    pub authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
+    pub payload: phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
+    pub sequence_id: i64,
+    pub created_at: phoenix_workflow::Timestamp,
+    pub accepted_state: ConvState,
+    pub state_updated_at: DateTime<Utc>,
+    pub now: phoenix_workflow::Timestamp,
+}
 
 /// Storage for conversation messages
 #[async_trait]
@@ -91,6 +132,33 @@ pub trait MessageStore: Send + Sync {
         Ok(crate::db::CreationCasOutcome::ClaimLost)
     }
 
+    async fn preflight_authoritative_user_message(
+        &self,
+        _authority: &phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
+        _payload: &phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
+        _now: phoenix_workflow::Timestamp,
+    ) -> Result<phoenix_db::workflow::DirectTurnMaterializationEligibility, String> {
+        Ok(phoenix_db::workflow::DirectTurnMaterializationEligibility::StaleAuthority)
+    }
+
+    async fn materialize_authoritative_user_message(
+        &self,
+        _input: &AuthoritativeUserMessageAdoptionInput,
+    ) -> Result<AuthoritativeUserMessageMaterialization, String> {
+        Ok(AuthoritativeUserMessageMaterialization::StaleAuthority)
+    }
+
+    async fn load_active_direct_turn(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<LoadedActiveDirectTurn>, String>;
+
+    async fn terminate_active_direct_turn(
+        &self,
+        turn: &ActiveDirectTurn,
+        terminal: ActiveDirectTurnTerminal,
+    ) -> Result<(), String>;
+
     /// Update `display_data` for an existing message
     async fn update_message_display_data(
         &self,
@@ -146,7 +214,7 @@ pub trait StateStore: Send + Sync {
         &self,
         conv_id: &str,
         state: &ConvState,
-        state_updated_at: chrono::DateTime<chrono::Utc>,
+        state_updated_at: DateTime<Utc>,
     ) -> Result<(), String>;
 
     /// Get the current conversation state
@@ -389,6 +457,39 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         (**self).complete_creation_job(job_id, claim).await
     }
 
+    async fn preflight_authoritative_user_message(
+        &self,
+        authority: &phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
+        payload: &phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
+        now: phoenix_workflow::Timestamp,
+    ) -> Result<phoenix_db::workflow::DirectTurnMaterializationEligibility, String> {
+        (**self)
+            .preflight_authoritative_user_message(authority, payload, now)
+            .await
+    }
+
+    async fn materialize_authoritative_user_message(
+        &self,
+        input: &AuthoritativeUserMessageAdoptionInput,
+    ) -> Result<AuthoritativeUserMessageMaterialization, String> {
+        (**self).materialize_authoritative_user_message(input).await
+    }
+
+    async fn load_active_direct_turn(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<LoadedActiveDirectTurn>, String> {
+        (**self).load_active_direct_turn(conversation_id).await
+    }
+
+    async fn terminate_active_direct_turn(
+        &self,
+        turn: &ActiveDirectTurn,
+        terminal: ActiveDirectTurnTerminal,
+    ) -> Result<(), String> {
+        (**self).terminate_active_direct_turn(turn, terminal).await
+    }
+
     async fn update_message_display_data(
         &self,
         message_id: &str,
@@ -444,7 +545,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         &self,
         conv_id: &str,
         state: &ConvState,
-        state_updated_at: chrono::DateTime<chrono::Utc>,
+        state_updated_at: DateTime<Utc>,
     ) -> Result<(), String> {
         (**self)
             .update_state(conv_id, state, state_updated_at)
@@ -709,6 +810,122 @@ impl MessageStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
+    async fn preflight_authoritative_user_message(
+        &self,
+        authority: &phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
+        payload: &phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
+        now: phoenix_workflow::Timestamp,
+    ) -> Result<phoenix_db::workflow::DirectTurnMaterializationEligibility, String> {
+        use phoenix_db::workflow::{PreflightDirectTurnMaterializationInput, WorkflowRepository};
+        use phoenix_workflow::TurnAuthorityId;
+        let repo = WorkflowRepository::new(self.db.pool().clone());
+        let local_authority = direct_turn_local_authority(authority);
+        repo.preflight_direct_turn_materialization(&PreflightDirectTurnMaterializationInput {
+            turn_id: TurnAuthorityId(authority.turn_id.0),
+            authority: local_authority,
+            prepared: payload.clone(),
+            now,
+        })
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    async fn materialize_authoritative_user_message(
+        &self,
+        input: &AuthoritativeUserMessageAdoptionInput,
+    ) -> Result<AuthoritativeUserMessageMaterialization, String> {
+        use phoenix_db::workflow::{MaterializeAuthoritativeTurnInput, WorkflowRepository};
+        use phoenix_workflow::{AuthorityOutcome, TurnAuthorityId, TurnOutcome};
+        let repo = WorkflowRepository::new(self.db.pool().clone());
+        let local_authority = direct_turn_local_authority(&input.authority);
+        let materialized = repo
+            .materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
+                turn_id: TurnAuthorityId(input.authority.turn_id.0),
+                authority: local_authority,
+                prepared: input.payload.clone(),
+                sequence_id: input.sequence_id,
+                created_at: input.created_at,
+                accepted_state: input.accepted_state.clone(),
+                state_updated_at: input.state_updated_at,
+                now: input.now,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        match (
+            materialized.authority_outcome,
+            materialized.outcome,
+            materialized.message,
+        ) {
+            (AuthorityOutcome::Authorized, TurnOutcome::Materialized { .. }, Some(message)) => {
+                Ok(AuthoritativeUserMessageMaterialization::Materialized {
+                    message: Box::new(message),
+                    active: ActiveDirectTurn {
+                        turn_id: materialized.canonical_turn.id,
+                        generation: materialized.canonical_turn.generation,
+                    },
+                })
+            }
+            (AuthorityOutcome::Authorized, TurnOutcome::MaterializationReplay { .. }, Some(_)) => {
+                Ok(AuthoritativeUserMessageMaterialization::ExactReplay)
+            }
+            (AuthorityOutcome::Authorized, TurnOutcome::MaterializationReplay { .. }, None) => {
+                Err("direct-turn replay did not return canonical message".to_string())
+            }
+            _ => Ok(AuthoritativeUserMessageMaterialization::StaleAuthority),
+        }
+    }
+
+    async fn load_active_direct_turn(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<LoadedActiveDirectTurn>, String> {
+        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        repo.load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+            conversation_id.to_string(),
+        ))
+        .await
+        .map(|turn| {
+            turn.map(|turn| LoadedActiveDirectTurn {
+                materialized: matches!(
+                    turn.materialization,
+                    phoenix_workflow::Materialization::Materialized { .. }
+                ),
+                active: ActiveDirectTurn {
+                    turn_id: turn.id,
+                    generation: turn.generation,
+                },
+            })
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    async fn terminate_active_direct_turn(
+        &self,
+        turn: &ActiveDirectTurn,
+        terminal: ActiveDirectTurnTerminal,
+    ) -> Result<(), String> {
+        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        let command = match terminal {
+            ActiveDirectTurnTerminal::Completed => phoenix_workflow::TurnCommand::Complete {
+                turn_id: turn.turn_id,
+                expected_generation: turn.generation,
+            },
+            ActiveDirectTurnTerminal::Cancelled => phoenix_workflow::TurnCommand::Cancel {
+                turn_id: turn.turn_id,
+                expected_generation: turn.generation,
+            },
+            ActiveDirectTurnTerminal::Failed { reason } => phoenix_workflow::TurnCommand::Fail {
+                turn_id: turn.turn_id,
+                expected_generation: turn.generation,
+                reason,
+            },
+        };
+        repo.terminate_authoritative_turn(command)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     async fn update_message_display_data(
         &self,
         message_id: &str,
@@ -762,13 +979,30 @@ impl MessageStore for DatabaseStorage {
     }
 }
 
+fn direct_turn_local_authority(
+    authority: &phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
+) -> phoenix_db::LocalAttemptAuthority {
+    use phoenix_workflow::{
+        AttemptId, EffectId, Generation, ProcessIncarnation, Version, WorkflowId,
+    };
+
+    phoenix_db::LocalAttemptAuthority {
+        workflow_id: WorkflowId(authority.workflow_id.0),
+        declared_workflow_version: Version(authority.declared_workflow_version.0),
+        generation: Generation(authority.generation.0),
+        effect_id: EffectId(authority.effect_id.0),
+        attempt_id: AttemptId(authority.attempt_id.0),
+        process_incarnation: ProcessIncarnation(authority.process_incarnation.0),
+    }
+}
+
 #[async_trait]
 impl StateStore for DatabaseStorage {
     async fn update_state(
         &self,
         conv_id: &str,
         state: &ConvState,
-        state_updated_at: chrono::DateTime<chrono::Utc>,
+        state_updated_at: DateTime<Utc>,
     ) -> Result<(), String> {
         self.db
             .update_conversation_state_at(conv_id, state, state_updated_at)

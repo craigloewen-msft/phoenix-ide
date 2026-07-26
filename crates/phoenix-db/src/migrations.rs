@@ -291,13 +291,66 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_authoritative_direct_turns",
         sql: MIGRATION_055,
     },
+    Migration {
+        version: 56,
+        name: "seed_workflow_global_sequences",
+        sql: MIGRATION_056,
+    },
+    Migration {
+        version: 57,
+        name: "normalize_direct_turn_attachments",
+        sql: MIGRATION_057,
+    },
 ];
 
-const MIGRATION_055: &str = r"
-INSERT INTO workflow_global_sequences (sequence_name, next_value)
-VALUES ('direct_turn', 1)
-ON CONFLICT(sequence_name) DO NOTHING;
+const MIGRATION_057: &str = r"
+CREATE TABLE IF NOT EXISTS durable_turn_submitted_images (
+    turn_id INTEGER NOT NULL REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0), media_type TEXT NOT NULL, data TEXT NOT NULL,
+    PRIMARY KEY (turn_id, ordinal)
+);
+CREATE TABLE IF NOT EXISTS durable_turn_submitted_files (
+    turn_id INTEGER NOT NULL REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0), original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL, size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0), stored_path TEXT NOT NULL,
+    PRIMARY KEY (turn_id, ordinal)
+);
+CREATE TABLE IF NOT EXISTS durable_turn_delivery_images (
+    turn_id INTEGER NOT NULL REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0), media_type TEXT NOT NULL, data TEXT NOT NULL,
+    PRIMARY KEY (turn_id, ordinal)
+);
+CREATE TABLE IF NOT EXISTS durable_turn_delivery_files (
+    turn_id INTEGER NOT NULL REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0), original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL, size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0), stored_path TEXT NOT NULL,
+    PRIMARY KEY (turn_id, ordinal)
+);
+";
 
+const MIGRATION_056: &str = r"
+INSERT OR IGNORE INTO workflow_global_sequences (sequence_name, next_value)
+SELECT 'workflow', COALESCE(MAX(workflow_id), 0) + 1 FROM workflows;
+
+UPDATE workflow_global_sequences
+SET next_value = MAX(
+    next_value,
+    (SELECT COALESCE(MAX(workflow_id), 0) + 1 FROM workflows)
+)
+WHERE sequence_name = 'workflow';
+
+INSERT OR IGNORE INTO workflow_global_sequences (sequence_name, next_value)
+SELECT 'direct_turn', COALESCE(MAX(turn_id), 0) + 1 FROM durable_turns;
+
+UPDATE workflow_global_sequences
+SET next_value = MAX(
+    next_value,
+    (SELECT COALESCE(MAX(turn_id), 0) + 1 FROM durable_turns)
+)
+WHERE sequence_name = 'direct_turn';
+";
+
+const MIGRATION_055: &str = r"
 CREATE TABLE durable_turns (
     turn_id INTEGER PRIMARY KEY,
     workflow_id INTEGER NOT NULL UNIQUE REFERENCES workflows(workflow_id) ON DELETE CASCADE,
@@ -317,7 +370,45 @@ CREATE TABLE durable_turns (
         (terminal_kind = 'Failed' AND terminal_reason IS NOT NULL)
         OR (terminal_kind IS NULL AND terminal_reason IS NULL)
         OR (terminal_kind IN ('Completed', 'Cancelled') AND terminal_reason IS NULL)
-    )
+    ),
+    FOREIGN KEY (conversation_id, canonical_message_id)
+        REFERENCES messages(conversation_id, message_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE durable_turn_submitted_images (
+    turn_id INTEGER NOT NULL REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    media_type TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (turn_id, ordinal)
+);
+
+CREATE TABLE durable_turn_submitted_files (
+    turn_id INTEGER NOT NULL REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+    stored_path TEXT NOT NULL,
+    PRIMARY KEY (turn_id, ordinal)
+);
+
+CREATE TABLE durable_turn_delivery_images (
+    turn_id INTEGER NOT NULL REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    media_type TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (turn_id, ordinal)
+);
+
+CREATE TABLE durable_turn_delivery_files (
+    turn_id INTEGER NOT NULL REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+    stored_path TEXT NOT NULL,
+    PRIMARY KEY (turn_id, ordinal)
 );
 
 CREATE UNIQUE INDEX messages_conversation_message_id_unique
@@ -334,24 +425,10 @@ CREATE UNIQUE INDEX durable_turns_one_live_owner
     WHERE owns_conversation = 1;
 
 CREATE INDEX durable_turns_discoverable_nonterminal
-    ON durable_turns(conversation_id, disposition, turn_id)
-    WHERE terminal_kind IS NULL;
-
-CREATE TRIGGER durable_turns_canonical_message_guard
-BEFORE UPDATE OF canonical_message_id ON durable_turns
-WHEN NEW.canonical_message_id IS NOT NULL
- AND NOT EXISTS (
-    SELECT 1 FROM messages
-    WHERE messages.conversation_id = NEW.conversation_id
-      AND messages.message_id = NEW.canonical_message_id
- )
-BEGIN
-    SELECT RAISE(ABORT, 'direct-turn canonical message missing from conversation');
-END;
-
-CREATE UNIQUE INDEX durable_turns_canonical_message_unique
-    ON durable_turns(canonical_message_id)
-    WHERE canonical_message_id IS NOT NULL;
+    ON durable_turns(turn_id, workflow_id)
+    WHERE disposition = 'Runtime'
+      AND terminal_kind IS NULL
+      AND canonical_message_id IS NULL;
 ";
 
 const MIGRATION_052: &str = r"
@@ -2929,6 +3006,74 @@ mod tests {
 
     async fn setup_conversations_table(pool: &SqlitePool) {
         setup_legacy_conversations_table(pool).await;
+    }
+
+    #[tokio::test]
+    async fn migration_055_creates_direct_turn_attachment_tables() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE workflows (workflow_id INTEGER PRIMARY KEY);
+             CREATE TABLE conversations (id TEXT PRIMARY KEY);
+             CREATE TABLE messages (conversation_id TEXT NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY (conversation_id, message_id));",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_055).execute(&pool).await.unwrap();
+
+        for table in [
+            "durable_turn_submitted_images",
+            "durable_turn_submitted_files",
+            "durable_turn_delivery_images",
+            "durable_turn_delivery_files",
+        ] {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(exists, 1, "missing table {table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_056_advances_global_sequences_without_regression() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE workflows (workflow_id INTEGER PRIMARY KEY);
+             CREATE TABLE durable_turns (turn_id INTEGER PRIMARY KEY);
+             CREATE TABLE workflow_global_sequences (
+                 sequence_name TEXT PRIMARY KEY,
+                 next_value INTEGER NOT NULL
+             );
+             INSERT INTO workflows (workflow_id) VALUES (7);
+             INSERT INTO durable_turns (turn_id) VALUES (11);
+             INSERT INTO workflow_global_sequences (sequence_name, next_value)
+             VALUES ('workflow', 3), ('direct_turn', 20);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_056).execute(&pool).await.unwrap();
+
+        let workflow: i64 = sqlx::query_scalar(
+            "SELECT next_value FROM workflow_global_sequences WHERE sequence_name = 'workflow'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let direct_turn: i64 = sqlx::query_scalar(
+            "SELECT next_value FROM workflow_global_sequences WHERE sequence_name = 'direct_turn'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(workflow, 8);
+        assert_eq!(direct_turn, 20);
     }
 
     #[tokio::test]
