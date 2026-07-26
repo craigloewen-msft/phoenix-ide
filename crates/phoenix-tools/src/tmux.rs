@@ -14,6 +14,9 @@ pub mod probe;
 pub mod registry;
 pub mod run;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_server;
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const EXIT_MARKER_SENTINEL: &str = "__PHOENIX_EXIT__";
@@ -434,6 +437,7 @@ fn error_envelope(error_id: &str, message: &str) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tmux::test_server::TestTmuxServerOwner;
     use crate::{BashHandleRegistry, BrowserSessionManager};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -536,15 +540,13 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         // Use a directory that's NOT the test process's cwd so the
         // assertion catches the pre-fix "tmux inherits Phoenix's CWD"
         // behavior.
         let cwd_tmp = TempDir::new().unwrap();
         let cwd = cwd_tmp.path().canonicalize().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let ctx = ToolContext::new(
             CancellationToken::new(),
             "conv-cwd-test".to_string(),
@@ -574,13 +576,7 @@ mod tests {
             .unwrap_or_else(|_| std::path::PathBuf::from(stdout));
         assert_eq!(actual, cwd, "pane should start in {cwd:?}, got {stdout:?}");
 
-        // Cleanup.
-        let sock = test_work_scope_socket(socket_tmp.path());
-        let _ = tokio::process::Command::new("tmux")
-            .args(["-S", &sock.to_string_lossy(), "kill-server"])
-            .env_remove("TMUX")
-            .status()
-            .await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -588,9 +584,9 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let tmp = TempDir::new().unwrap();
-        let socket_dir = tmp.path().to_path_buf();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(socket_dir.clone()));
+        let owner = TestTmuxServerOwner::new();
+        let socket_dir = owner.socket_dir().to_path_buf();
+        let registry = Arc::new(owner.registry());
         let ctx = ctx_with_registry_for("conv-fresh", registry.clone());
 
         let result = TmuxTool.run(json!({"args": ["list-sessions"]}), ctx).await;
@@ -608,12 +604,7 @@ mod tests {
         let sock = test_work_scope_socket(&socket_dir);
         assert!(sock.exists(), "socket file should exist at {sock:?}");
 
-        // Cleanup: kill the spawned tmux server.
-        let _ = tokio::process::Command::new("tmux")
-            .args(["-S", &sock.to_string_lossy(), "kill-server"])
-            .env_remove("TMUX")
-            .status()
-            .await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -621,8 +612,8 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(tmp.path().to_path_buf()));
+        let owner = TestTmuxServerOwner::new();
+        let registry = Arc::new(owner.registry());
         let ctx = ctx_with_registry_for("conv-reuse", registry.clone());
 
         let _ = TmuxTool
@@ -632,7 +623,7 @@ mod tests {
         // Drop in-memory registry entry to simulate a Phoenix restart;
         // the on-disk socket persists and the OS-owned tmux server keeps
         // running. The next operation must probe `Live` and re-use it.
-        let registry2 = Arc::new(TmuxRegistry::with_socket_dir(tmp.path().to_path_buf()));
+        let registry2 = Arc::new(owner.registry());
         let ctx2 = ctx_with_registry_for("conv-reuse", registry2.clone());
 
         let result = TmuxTool.run(json!({"args": ["list-sessions"]}), ctx2).await;
@@ -640,14 +631,7 @@ mod tests {
         let v = parse_response(&result);
         assert_eq!(v["status"], "ok");
         assert!(v["stdout"].as_str().unwrap().contains("main"));
-
-        // Cleanup.
-        let sock = test_work_scope_socket(tmp.path());
-        let _ = tokio::process::Command::new("tmux")
-            .args(["-S", &sock.to_string_lossy(), "kill-server"])
-            .env_remove("TMUX")
-            .status()
-            .await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -655,15 +639,15 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let tmp = TempDir::new().unwrap();
-        let socket_dir = tmp.path().to_path_buf();
+        let owner = TestTmuxServerOwner::new();
+        let socket_dir = owner.socket_dir().to_path_buf();
         std::fs::create_dir_all(&socket_dir).unwrap();
         // Pre-create a stale, non-tmux file at the durable work-scope
         // socket path. `tmux ls` against it will fail.
         let stale = test_work_scope_socket(&socket_dir);
         std::fs::write(&stale, b"junk").unwrap();
 
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(socket_dir.clone()));
+        let registry = Arc::new(owner.registry());
         let ctx = ctx_with_registry_for("conv-stale", registry);
 
         let result = TmuxTool.run(json!({"args": ["list-sessions"]}), ctx).await;
@@ -671,13 +655,7 @@ mod tests {
         let v = parse_response(&result);
         assert_eq!(v["status"], "ok");
         assert!(v["stdout"].as_str().unwrap().contains("main"));
-
-        // Cleanup.
-        let _ = tokio::process::Command::new("tmux")
-            .args(["-S", &stale.to_string_lossy(), "kill-server"])
-            .env_remove("TMUX")
-            .status()
-            .await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -685,9 +663,9 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let tmp = TempDir::new().unwrap();
-        let socket_dir = tmp.path().to_path_buf();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(socket_dir.clone()));
+        let owner = TestTmuxServerOwner::new();
+        let socket_dir = owner.socket_dir().to_path_buf();
+        let registry = Arc::new(owner.registry());
         let ctx = ctx_with_registry_for("conv-dashL", registry);
 
         // Phoenix prepends `-S <sock>`. The agent's `-L weird` follows.
@@ -705,8 +683,8 @@ mod tests {
 
         let scope_sock = test_work_scope_socket(&socket_dir);
         let scope_socket_name = scope_sock.file_name().unwrap().to_string_lossy();
-        // Permitted entries in the socket dir: the work scope's own socket
-        // and the Phoenix-shipped tmux config file. Anything
+        // Permitted entries in the owner root: the work scope's own socket,
+        // the Phoenix-shipped tmux config, and the watchdog's armed marker. Anything
         // else (e.g. a `weird`-labeled socket the agent tried to coerce
         // tmux into creating) is a structural escape and fails the
         // test.
@@ -716,23 +694,20 @@ mod tests {
             .filter(|entry| {
                 let name = entry.file_name();
                 let s = name.to_string_lossy();
-                !(s == "_phoenix.tmux.conf" || s.starts_with(scope_socket_name.as_ref()))
+                !(s == ".armed"
+                    || s == ".parent-heartbeat"
+                    || s == "_phoenix.tmux.conf"
+                    || s.starts_with(scope_socket_name.as_ref()))
             })
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert!(
             unexpected.is_empty(),
-            "only the work-scope socket + Phoenix tmux config should appear under {socket_dir:?}; \
+            "only owner metadata, the work-scope socket, and Phoenix tmux config should appear under {socket_dir:?}; \
              unexpected entries: {unexpected:?}"
         );
 
-        // The cleanup applies to whichever socket actually got
-        // created — the scope's path, never an agent-controlled one.
-        let _ = tokio::process::Command::new("tmux")
-            .args(["-S", &scope_sock.to_string_lossy(), "kill-server"])
-            .env_remove("TMUX")
-            .status()
-            .await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -740,8 +715,8 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(tmp.path().to_path_buf()));
+        let owner = TestTmuxServerOwner::new();
+        let registry = Arc::new(owner.registry());
         let cancel = CancellationToken::new();
         let ctx = ToolContext::new(
             cancel.clone(),
@@ -781,14 +756,7 @@ mod tests {
         // both leave the response in `cancelled` state because the
         // cancel branch in run_with_timeout is `biased` first.
         assert_eq!(v["status"], "cancelled", "got: {v}");
-
-        // Cleanup.
-        let sock = test_work_scope_socket(tmp.path());
-        let _ = tokio::process::Command::new("tmux")
-            .args(["-S", &sock.to_string_lossy(), "kill-server"])
-            .env_remove("TMUX")
-            .status()
-            .await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -796,9 +764,8 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let tmp = TempDir::new().unwrap();
-        let socket_dir = tmp.path().to_path_buf();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(socket_dir.clone()));
+        let owner = TestTmuxServerOwner::new();
+        let registry = Arc::new(owner.registry());
         let ctx = ctx_with_registry_for("conv-trunc", registry.clone());
 
         // Spawn `main` first so subsequent commands have a target.
@@ -839,13 +806,6 @@ mod tests {
         let stderr = v["stderr"].as_str().unwrap();
         assert!(stdout.len() + stderr.len() <= TMUX_OUTPUT_MAX_BYTES + 4096);
         let _ = v["truncated"];
-
-        // Cleanup.
-        let sock = test_work_scope_socket(&socket_dir);
-        let _ = tokio::process::Command::new("tmux")
-            .args(["-S", &sock.to_string_lossy(), "kill-server"])
-            .env_remove("TMUX")
-            .status()
-            .await;
+        owner.shutdown();
     }
 }

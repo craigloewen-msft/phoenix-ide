@@ -238,6 +238,7 @@ pub struct TmuxRegistry {
     /// so transitions flow into the work-scope push bridge; `None` for
     /// tool-level tests. Mirrors `BashHandleRegistry::lifecycle_sink`.
     lifecycle_sink: Option<TmuxLifecycleSink>,
+    contain_test_spawns: bool,
 }
 
 impl TmuxRegistry {
@@ -263,6 +264,7 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: None,
+            contain_test_spawns: false,
         }
     }
 
@@ -312,6 +314,7 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: None,
+            contain_test_spawns: false,
         }
     }
 
@@ -332,7 +335,24 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: sink,
+            contain_test_spawns: false,
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_test_spawn_containment(mut self) -> Self {
+        self.contain_test_spawns = true;
+        self
+    }
+
+    async fn spawn_owned_session(&self, socket_path: &Path, cwd: &Path) -> Result<(), TmuxError> {
+        spawn_session_owned(
+            socket_path,
+            &self.config_path(),
+            cwd,
+            self.contain_test_spawns,
+        )
+        .await
     }
 
     /// Cached `which("tmux")` result (REQ-TMUX-003). Discovered once at
@@ -531,7 +551,7 @@ impl TmuxRegistry {
                 reused_live = true;
             }
             ProbeResult::NoSocket => {
-                spawn_session(&server.socket_path, &self.config_path(), cwd).await?;
+                self.spawn_owned_session(&server.socket_path, cwd).await?;
                 server.server_token = read_server_token(&server.socket_path)
                     .await
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -546,7 +566,7 @@ impl TmuxRegistry {
                     "tmux: stale socket detected, unlinking and respawning"
                 );
                 let _ = tokio::fs::remove_file(&server.socket_path).await;
-                spawn_session(&server.socket_path, &self.config_path(), cwd).await?;
+                self.spawn_owned_session(&server.socket_path, cwd).await?;
                 server.server_token = read_server_token(&server.socket_path)
                     .await
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -1130,6 +1150,135 @@ async fn refresh_companion_if_stale(socket_path: &Path) {
 /// any in-app terminal that later attaches) in the Phoenix repo
 /// instead of the conversation's project directory.
 ///
+type TestCreatorHandoff = (PathBuf, PathBuf, PathBuf);
+
+fn tmux_spawn_command(
+    socket_path: &Path,
+    tmux_args: &[String],
+    contain_test_spawn: bool,
+) -> (tokio::process::Command, Option<TestCreatorHandoff>) {
+    let Some(root) = socket_path.parent().filter(|_| contain_test_spawn) else {
+        let mut command = tokio::process::Command::new("tmux");
+        command.args(tmux_args);
+        return (command, None);
+    };
+    let marker = root.join(format!(".creating-{}", uuid::Uuid::new_v4()));
+    let gate = root.join(format!(".creator-gate-{}", uuid::Uuid::new_v4()));
+    let wrapper = r#"
+import fcntl
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+parent = int(sys.argv[1])
+gate = Path(sys.argv[2])
+marker = Path(sys.argv[3])
+locked = marker.with_suffix(".locked")
+root = marker.parent
+while (
+    root.exists()
+    and not (root / ".cleanup-request").exists()
+    and not gate.exists()
+    and os.getppid() == parent
+):
+    time.sleep(0.01)
+if not gate.exists():
+    sys.exit(1)
+with marker.open("r+") as marker_file:
+    fcntl.flock(marker_file, fcntl.LOCK_EX)
+    locked.touch()
+    child = subprocess.Popen(sys.argv[4:], start_new_session=True)
+    try:
+        sys.exit(child.wait(timeout=5))
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        child.wait()
+        sys.exit(124)
+    finally:
+        locked.unlink(missing_ok=True)
+        gate.unlink(missing_ok=True)
+        marker.unlink(missing_ok=True)
+"#;
+    let mut command = tokio::process::Command::new("python3");
+    command
+        .arg("-c")
+        .arg(wrapper)
+        .arg(std::process::id().to_string())
+        .arg(&gate)
+        .arg(&marker)
+        .arg("tmux");
+    command.args(tmux_args);
+    let locked = marker.with_extension("locked");
+    (command, Some((marker, gate, locked)))
+}
+
+/// # Errors
+/// Returns a [`TmuxError`] when the `tmux new-session` process fails to
+/// spawn or exits non-zero.
+async fn contained_spawn_failure(
+    child: &mut tokio::process::Child,
+    socket_path: &Path,
+    reason: String,
+) -> TmuxError {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    TmuxError::SpawnFailed {
+        socket_path: socket_path.to_path_buf(),
+        reason,
+    }
+}
+
+async fn publish_creator_handoff(
+    child: &mut tokio::process::Child,
+    socket_path: &Path,
+    handoff: TestCreatorHandoff,
+) -> Result<(), TmuxError> {
+    let (marker, gate, locked) = handoff;
+    let pending = marker.with_extension("pending");
+    if let Err(error) = std::fs::write(&pending, child.id().unwrap_or_default().to_string()) {
+        return Err(contained_spawn_failure(
+            child,
+            socket_path,
+            format!("failed to write creator identity: {error}"),
+        )
+        .await);
+    }
+    if let Err(error) = std::fs::rename(pending, marker) {
+        return Err(contained_spawn_failure(
+            child,
+            socket_path,
+            format!("failed to publish creator identity: {error}"),
+        )
+        .await);
+    }
+    if let Err(error) = std::fs::write(gate, []) {
+        return Err(contained_spawn_failure(
+            child,
+            socket_path,
+            format!("failed to release creator gate: {error}"),
+        )
+        .await);
+    }
+    if let Err(error) = tokio::time::timeout(Duration::from_secs(2), async {
+        while !locked.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    {
+        return Err(contained_spawn_failure(
+            child,
+            socket_path,
+            format!("creator ownership lock was not acquired: {error}"),
+        )
+        .await);
+    }
+    Ok(())
+}
+
 /// # Errors
 /// Returns a [`TmuxError`] when the `tmux new-session` process fails to
 /// spawn or exits non-zero.
@@ -1138,30 +1287,49 @@ pub async fn spawn_session(
     config_path: &Path,
     cwd: &Path,
 ) -> Result<(), TmuxError> {
-    let mut cmd = tokio::process::Command::new("tmux");
-    cmd.args([
-        "-f",
-        &config_path.to_string_lossy(),
-        "-S",
-        &socket_path.to_string_lossy(),
-        "new-session",
-        "-d",
-        "-c",
-        &cwd.to_string_lossy(),
-        "-s",
-        TMUX_DEFAULT_SESSION,
-    ]);
+    spawn_session_owned(socket_path, config_path, cwd, false).await
+}
+
+async fn spawn_session_owned(
+    socket_path: &Path,
+    config_path: &Path,
+    cwd: &Path,
+    contain_test_spawn: bool,
+) -> Result<(), TmuxError> {
+    let tmux_args = [
+        "-f".to_string(),
+        config_path.to_string_lossy().into_owned(),
+        "-S".to_string(),
+        socket_path.to_string_lossy().into_owned(),
+        "new-session".to_string(),
+        "-d".to_string(),
+        "-c".to_string(),
+        cwd.to_string_lossy().into_owned(),
+        "-s".to_string(),
+        TMUX_DEFAULT_SESSION.to_string(),
+    ];
+    let (mut cmd, creator_handoff) =
+        tmux_spawn_command(socket_path, &tmux_args, contain_test_spawn);
     // A tmux pane shell inherits the tmux *server's* environment, captured here.
     // Build it explicitly (base + PtyEnvInjection + safe-var allowlist) rather
     // than inheriting Phoenix's env, which would leak server secrets into every
     // pane and diverge from the direct-shell path. env_clear also drops TMUX, so
     // an outer-tmux invocation does not trip tmux's nesting refusal.
     set_tmux_server_env(&mut cmd);
-    let output = cmd
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
+        .map_err(|e| TmuxError::SpawnFailed {
+            socket_path: socket_path.to_path_buf(),
+            reason: format!("failed to invoke tmux: {e}"),
+        })?;
+    if let Some(handoff) = creator_handoff {
+        publish_creator_handoff(&mut child, socket_path, handoff).await?;
+    }
+    let output = child
+        .wait_with_output()
         .await
         .map_err(|e| TmuxError::SpawnFailed {
             socket_path: socket_path.to_path_buf(),
@@ -1241,6 +1409,7 @@ fn default_socket_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tmux::test_server::TestTmuxServerOwner;
     use tempfile::TempDir;
 
     fn scope(id: &str) -> ResourceScopeKey {
@@ -1399,26 +1568,28 @@ mod tests {
         );
     }
 
-    /// First `ensure_live` for a scope must emit a work-scope update whose
-    /// status reflects the SETTLED state after probe/spawn (`live`), never
-    /// the transient `not_probed` seen at insertion. (Regression for the
-    /// emit-on-create ordering, where the create emit fired at `not_probed`
-    /// and the later create→live transition was suppressed, stranding the
-    /// inventory at `not_probed` until a manual refresh.) Requires a real
-    /// tmux binary to drive the spawn; skipped otherwise.
+    #[test]
+    fn production_style_registry_ignores_owner_marker_for_spawn_dispatch() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".armed"), []).unwrap();
+        let registry = TmuxRegistry::with_socket_dir(tmp.path().to_path_buf());
+        assert!(!registry.contain_test_spawns);
+        let owned = registry.with_test_spawn_containment();
+        assert!(owned.contain_test_spawns);
+    }
+
     #[tokio::test]
     async fn first_ensure_live_emits_settled_live_status() {
         if which::which("tmux").is_err() {
             return;
         }
-        let tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let reg =
-            TmuxRegistry::with_socket_dir_binary_and_sink(tmp.path().to_path_buf(), true, Some(tx));
+        let reg = owner.registry_with_sink(Some(tx));
 
         let scope = scope("conv-first-ensure");
         let arc = reg
-            .ensure_live(&scope, tmp.path(), None, None)
+            .ensure_live(&scope, owner.path(), None, None)
             .await
             .expect("first ensure_live should materialize a live server");
 
@@ -1439,7 +1610,7 @@ mod tests {
         // A second ensure_live on an already-live server is a probe-noop:
         // no status change → no spurious re-emit.
         let _ = reg
-            .ensure_live(&scope, tmp.path(), None, None)
+            .ensure_live(&scope, owner.path(), None, None)
             .await
             .expect("noop");
         assert!(
@@ -1447,7 +1618,7 @@ mod tests {
             "probe-noop on a live server must not re-emit"
         );
 
-        kill_socket(&socket_path_for(tmp.path(), "conv-first-ensure")).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1455,12 +1626,12 @@ mod tests {
         if which::which("tmux").is_err() {
             return;
         }
-        let tmp = TempDir::new().unwrap();
-        let reg = TmuxRegistry::with_socket_dir(tmp.path().to_path_buf());
+        let owner = TestTmuxServerOwner::new();
+        let reg = owner.registry();
         let scope = scope("conv-rotate-server-token");
 
         let first = reg
-            .ensure_live(&scope, tmp.path(), None, None)
+            .ensure_live(&scope, owner.path(), None, None)
             .await
             .expect("first ensure_live should succeed");
         let socket_path = first.read().await.socket_path.clone();
@@ -1469,7 +1640,7 @@ mod tests {
         kill_socket(&socket_path).await;
 
         let second = reg
-            .ensure_live(&scope, tmp.path(), None, None)
+            .ensure_live(&scope, owner.path(), None, None)
             .await
             .expect("respawn ensure_live should succeed");
         let second_token = second.read().await.server_token.clone();
@@ -1478,7 +1649,7 @@ mod tests {
             first_token, second_token,
             "respawning a missing/dead tmux server must rotate its token so stale wake bindings are fenced"
         );
-        kill_socket(&socket_path).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1486,19 +1657,19 @@ mod tests {
         if which::which("tmux").is_err() {
             return;
         }
-        let tmp = TempDir::new().unwrap();
-        let legacy_worktree = tmp.path().join("legacy-worktree");
+        let owner = TestTmuxServerOwner::new();
+        let legacy_worktree = owner.path().join("legacy-worktree");
         std::fs::create_dir_all(&legacy_worktree).unwrap();
-        let legacy_socket = socket_path_for_worktree(tmp.path(), &legacy_worktree);
+        let legacy_socket = socket_path_for_worktree(owner.path(), &legacy_worktree);
         spawn_session(
             &legacy_socket,
-            &tmp.path().join("missing.conf"),
+            &owner.path().join("missing.conf"),
             &legacy_worktree,
         )
         .await
         .unwrap();
 
-        let reg = TmuxRegistry::with_socket_dir(tmp.path().to_path_buf());
+        let reg = owner.registry();
         let opaque_scope = scope("opaque-after-migration");
         let server = reg
             .ensure_live(
@@ -1511,7 +1682,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(server.read().await.socket_path, legacy_socket);
-        kill_socket(&legacy_socket).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1519,11 +1690,11 @@ mod tests {
         if which::which("tmux").is_err() {
             return;
         }
-        let tmp = TempDir::new().unwrap();
-        let reg = TmuxRegistry::with_socket_dir(tmp.path().to_path_buf());
+        let owner = TestTmuxServerOwner::new();
+        let reg = owner.registry();
         let scope = scope("conv-token-fenced-kill");
         let first = reg
-            .ensure_live(&scope, tmp.path(), None, None)
+            .ensure_live(&scope, owner.path(), None, None)
             .await
             .unwrap();
         let socket_path = first.read().await.socket_path.clone();
@@ -1531,7 +1702,7 @@ mod tests {
         kill_socket(&socket_path).await;
 
         let replacement = reg
-            .ensure_live(&scope, tmp.path(), None, None)
+            .ensure_live(&scope, owner.path(), None, None)
             .await
             .unwrap();
         let replacement_token = replacement.read().await.server_token.clone();
@@ -1568,7 +1739,7 @@ mod tests {
         reg.kill_exact_window(&scope, &replacement_token, &window_id)
             .await
             .unwrap();
-        kill_socket(&socket_path).await;
+        owner.shutdown();
     }
 
     async fn kill_socket(socket_path: &Path) {
