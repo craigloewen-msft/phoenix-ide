@@ -106,6 +106,12 @@ export type TerminalScope =
   | { kind: 'conversation'; conversationId: string }
   | { kind: 'global' };
 
+export interface TerminalPanelStatus {
+  activity: 'idle' | 'running' | 'disconnected';
+  unreadLines: number;
+  cwd: string;
+}
+
 interface TerminalPanelProps {
   scope: TerminalScope;
   /** Total height in px (including header strip) */
@@ -147,6 +153,8 @@ interface TerminalPanelProps {
    * (task 02672). Empty-selection presses are silently no-op'd here.
    */
   onSendSelectionToDraft?: (selection: string) => void;
+  /** Reports launcher-safe terminal status to a parent presentation surface. */
+  onStatusChange?: (status: TerminalPanelStatus) => void;
 }
 
 type ActivityState = 'idle' | 'running' | 'disconnected';
@@ -305,6 +313,7 @@ export function TerminalPanel({
   onAssistSetup,
   showError,
   onSendSelectionToDraft,
+  onStatusChange,
 }: TerminalPanelProps) {
   const scopeId = scopeKey(scope);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -1035,6 +1044,19 @@ export function TerminalPanel({
 
   // For the rich HUD: prefer reported_cwd, fall back to conversation cwd.
   const effectiveCwd = reportedCwd ?? cwd ?? '';
+  const launcherActivity: TerminalPanelStatus['activity'] = isDisconnected
+    ? 'disconnected'
+    : currentCommand !== null
+      ? 'running'
+      : activity;
+
+  useEffect(() => {
+    onStatusChange?.({
+      activity: launcherActivity,
+      unreadLines: unreadDisplay,
+      cwd: effectiveCwd,
+    });
+  }, [effectiveCwd, launcherActivity, onStatusChange, unreadDisplay]);
 
   const snippet: ShellSnippet | null = getSnippetForShell(shell);
   const shellLabel = shellDisplayName(shell);

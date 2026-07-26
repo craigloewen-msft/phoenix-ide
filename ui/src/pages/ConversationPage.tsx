@@ -31,6 +31,7 @@ import {
 } from '../conversation/renderUnits';
 import { ConnectedInputArea } from '../components/InputArea';
 import type { ComposerQuickAction, InputAreaHandle } from '../components/InputArea';
+import type { TerminalPanelStatus } from '../components/TerminalPanel';
 import { ExploreOnboardingBanner } from '../components/ExploreOnboardingBanner';
 import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
@@ -444,6 +445,15 @@ function ConversationPageContent({
   // a file just rewrites `?file=...&root=...` on the current URL, which
   // means an iOS PWA cold reload restores the exact view.
   const [showFileBrowser, setShowFileBrowser] = useState(false);
+  const [showMobileTerminal, setShowMobileTerminal] = useState(false);
+  const [terminalStatus, setTerminalStatus] = useState<TerminalPanelStatus>({
+    activity: 'disconnected',
+    unreadLines: 0,
+    cwd: '',
+  });
+  const terminalLauncherRef = useRef<HTMLButtonElement>(null);
+  const terminalCloseRef = useRef<HTMLButtonElement>(null);
+  const mobileTerminalSheetRef = useRef<HTMLDivElement>(null);
 
   const sendingMessagesRef = useRef<Set<string>>(new Set());
   const inputRef = useRef<InputAreaHandle>(null);
@@ -514,6 +524,8 @@ function ConversationPageContent({
     setError(null);
     setDeletingConversation(false);
     setShowFileBrowser(false);
+    setShowMobileTerminal(false);
+    setTerminalStatus({ activity: 'disconnected', unreadLines: 0, cwd: '' });
     setImages([]);
     setFiles([]);
     setShowTaskApproval(false);
@@ -1913,6 +1925,13 @@ function ConversationPageContent({
   const handleOpenFiles = useCallback(() => {
     if (fileRootPath) setShowFileBrowser(true);
   }, [fileRootPath]);
+  const handleOpenMobileTerminal = useCallback(() => {
+    setShowMobileTerminal(true);
+  }, []);
+  const handleCloseMobileTerminal = useCallback(() => {
+    setShowMobileTerminal(false);
+    requestAnimationFrame(() => terminalLauncherRef.current?.focus({ preventScroll: true }));
+  }, []);
   useEffect(() => {
     if (!fileRootPath) setShowFileBrowser(false);
   }, [fileRootPath]);
@@ -1928,6 +1947,69 @@ function ConversationPageContent({
       : { phase: 'unavailable' as const },
     [isArchived, convStateForChildren.type, handleTriggerContinuation],
   );
+  const showTerminal =
+    !!conversationId &&
+    routePrefix !== '/global' &&
+    !isArchived &&
+    convStateForChildren.type !== 'terminal' &&
+    convStateForChildren.type !== 'handed_off' &&
+    convStateForChildren.type !== 'provisioning' &&
+    convStateForChildren.type !== 'creation_failed' &&
+    convStateForChildren.type !== 'creation_cancelled' &&
+    convStateForChildren.type !== 'context_exhausted';
+
+  useEffect(() => {
+    if (isDesktop || !showTerminal) setShowMobileTerminal(false);
+  }, [isDesktop, showTerminal]);
+
+  useEffect(() => {
+    if (showMobileTerminal) terminalCloseRef.current?.focus({ preventScroll: true });
+  }, [showMobileTerminal]);
+
+  useEffect(() => {
+    if (!showMobileTerminal) return;
+    const sheet = mobileTerminalSheetRef.current;
+    const parent = sheet?.parentElement;
+    if (!sheet || !parent) return;
+    const background = Array.from(parent.children).filter(
+      (child): child is HTMLElement => child instanceof HTMLElement && child !== sheet && !child.inert,
+    );
+    background.forEach((element) => { element.inert = true; });
+    return () => background.forEach((element) => { element.inert = false; });
+  }, [showMobileTerminal]);
+
+  useEffect(() => {
+    if (!showMobileTerminal) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        handleCloseMobileTerminal();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const sheet = mobileTerminalSheetRef.current;
+      if (!sheet) return;
+      const focusable = Array.from(sheet.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      )).filter((element) => element.getAttribute('aria-hidden') !== 'true');
+      if (focusable.length === 0) {
+        event.preventDefault();
+        sheet.focus();
+        return;
+      }
+      const first = focusable[0]!;
+      const last = focusable[focusable.length - 1]!;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
+  }, [handleCloseMobileTerminal, showMobileTerminal]);
 
   const openExistingContinuation = useCallback(async () => {
     if (!conversation?.id || convStateForChildren.type !== 'context_exhausted') return;
@@ -2094,16 +2176,6 @@ function ConversationPageContent({
     }
   }
 
-  const showTerminal =
-    !!conversationId &&
-    !isArchived &&
-    convStateForChildren.type !== 'terminal' &&
-    convStateForChildren.type !== 'handed_off' &&
-    convStateForChildren.type !== 'provisioning' &&
-    convStateForChildren.type !== 'creation_failed' &&
-    convStateForChildren.type !== 'creation_cancelled' &&
-    convStateForChildren.type !== 'context_exhausted';
-
   // Derived: model context window is a pure function of the current model's
   // spec. Falls back to 200_000 for legacy surfaces when availableModels hasn't
   // loaded yet or the model isn't in the registry.
@@ -2165,7 +2237,7 @@ function ConversationPageContent({
       || commissionReviewViewerOpen
     );
 
-  const terminalSplitPane = showTerminal && routePrefix !== '/global' ? (
+  const terminalSplitPane = showTerminal ? (
     <>
       <PaneDivider
         orientation="horizontal"
@@ -2560,7 +2632,6 @@ function ConversationPageContent({
         </RenderProfiler>
         </>
       ) : null}
-      {!isDesktop && terminalSplitPane}
       <WakeStatusBar conversationId={conversationId!} />
       <RenderProfiler id="StateBar">
       <ConnectedStateBar
@@ -2581,6 +2652,14 @@ function ConversationPageContent({
         firstByteRequestId={atom.firstByteRequestId}
         turnRetryContext={atom.turnRetryContext}
         onOpenFiles={isDesktop || !fileRootPath ? undefined : handleOpenFiles}
+        terminalLauncher={!isDesktop && showTerminal ? {
+          status: {
+            ...terminalStatus,
+            cwd: terminalStatus.cwd || conversation.cwd,
+          },
+          onOpen: handleOpenMobileTerminal,
+          buttonRef: terminalLauncherRef,
+        } : undefined}
         workActionsAvailable={!isArchived}
         prStatusHandle={prStatusHandle}
       />
@@ -2590,6 +2669,50 @@ function ConversationPageContent({
       {/* Terminal split-pane (REQ-TERM-001) — collapsed = 32px header strip.
           Lazy-loaded so xterm (~200KB) stays out of the main bundle. */}
       {isDesktop && terminalSplitPane}
+
+      {!isDesktop && showTerminal && (
+        <div
+          className={`mobile-terminal-sheet${showMobileTerminal ? ' mobile-terminal-sheet--open' : ''}`}
+          ref={mobileTerminalSheetRef}
+          role={showMobileTerminal ? 'dialog' : undefined}
+          aria-modal={showMobileTerminal ? true : undefined}
+          aria-label={showMobileTerminal ? 'Terminal' : undefined}
+          aria-hidden={!showMobileTerminal}
+          tabIndex={showMobileTerminal ? -1 : undefined}
+        >
+          <div className="mobile-terminal-sheet-header">
+            <strong>Terminal</strong>
+            <button
+              type="button"
+              className="mobile-terminal-sheet-close"
+              ref={terminalCloseRef}
+              onClick={handleCloseMobileTerminal}
+              aria-label="Close terminal"
+            >
+              ×
+            </button>
+          </div>
+          <div className="mobile-terminal-sheet-content">
+            <Suspense fallback={null}>
+              <TerminalPanel
+                scope={{ kind: 'conversation', conversationId: conversationId! }}
+                height={window.innerHeight}
+                collapsed={!showMobileTerminal}
+                onExpand={handleOpenMobileTerminal}
+                onCollapse={handleCloseMobileTerminal}
+                standalone
+                cwd={conversation.cwd}
+                shell={conversation.shell ?? undefined}
+                homeDir={conversation.home_dir ?? undefined}
+                onAssistSetup={handleAssistShellSetup}
+                showError={showError}
+                onSendSelectionToDraft={handleSendTerminalSelection}
+                onStatusChange={setTerminalStatus}
+              />
+            </Suspense>
+          </div>
+        </div>
+      )}
 
       {/* Task approval overlay — browser back navigates away; SSE restores state on return. */}
       {showTaskApproval && !isArchived && atom.phase.type === 'awaiting_task_approval' && (
