@@ -337,8 +337,8 @@ function BrowserRow({
   onStopped,
   onError,
 }: {
-  state: 'live' | 'torn_down';
-  idleMs: number;
+  state: 'live' | 'teardown_pending' | 'teardown_failed' | 'torn_down';
+  idleMs: number | null;
   scopeKey: string;
   conversationId: string;
   inspectable: boolean;
@@ -346,13 +346,17 @@ function BrowserRow({
   onError: (message: string) => void;
 }) {
   // "idle" is a client-side display over idle_ms; the wire state stays live.
-  const idle = state === 'live' && idleMs >= BROWSER_IDLE_THRESHOLD_MS;
+  const idle = state === 'live' && idleMs !== null && idleMs >= BROWSER_IDLE_THRESHOLD_MS;
   const display =
     state === 'torn_down'
       ? { glyph: '○', cls: 'ws-glyph--muted', text: 'torn down' }
-      : idle
-        ? { glyph: '○', cls: 'ws-glyph--warn', text: `idle ${formatDuration(idleMs)}` }
-        : { glyph: '●', cls: 'ws-glyph--live', text: 'live' };
+      : state === 'teardown_pending'
+        ? { glyph: '…', cls: 'ws-glyph--warn', text: 'stopping' }
+        : state === 'teardown_failed'
+          ? { glyph: '✗', cls: 'ws-glyph--err', text: 'stop failed' }
+          : idle
+          ? { glyph: '○', cls: 'ws-glyph--warn', text: `idle ${formatDuration(idleMs)}` }
+          : { glyph: '●', cls: 'ws-glyph--live', text: 'live' };
   return (
     <div className={`ws-row${state === 'torn_down' ? ' ws-row--dead' : ''}`}>
       <div className="ws-row-main ws-row-main--static">
@@ -362,7 +366,7 @@ function BrowserRow({
         <span className="ws-row-label">browser</span>
         <span className="ws-row-meta">{display.text}</span>
         {state === 'live' && inspectable && <BrowserOpenButton />}
-        {state === 'live' && <BrowserStopButton scopeKey={scopeKey} conversationId={conversationId} onStopped={onStopped} onError={onError} />}
+        {state !== 'torn_down' && <BrowserStopButton scopeKey={scopeKey} conversationId={conversationId} onStopped={onStopped} onError={onError} />}
       </div>
     </div>
   );
@@ -398,12 +402,12 @@ function BrowserRow({
  * slower than the poll interval still completes and applies rather than being
  * perpetually superseded (and discarded) by the next interval's fetch.
  *
- * Two gates, deliberately separate. `pollActive` gates the inventory poll;
- * `visible` gates the per-second elapsed-time tick. They coincide for the
- * SSE-backed section (both = expanded), but the SSE-less chain dock keeps
- * `pollActive` true while collapsed (so the badge can settle with no push
- * channel) while leaving `visible` false — an off-screen dock polls but never
- * runs the elapsed timer.
+ * Two gates, deliberately separate. `pollActive` gates ordinary live-resource
+ * polling; `visible` gates the per-second elapsed-time tick. Pending browser
+ * teardown overrides `pollActive` so every collapsed surface observes its
+ * terminal state even if a lifecycle edge is delayed. The SSE-less chain dock
+ * also keeps `pollActive` true while collapsed so its badge can settle without
+ * a push channel, while leaving `visible` false.
  */
 function useWorkScopeInventory(
   scopeKey: string,
@@ -499,12 +503,12 @@ function useWorkScopeInventory(
   }, [visible]);
 
   // Live-resource poll: while the surface is active and the scope owns ANY
-  // live resource — a running bash handle, a tmux server entry, or a live
-  // browser session. Gated on `displayed` so it stops once everything is
-  // terminal and starts as soon as any resource appears. Covers values with
-  // no dedicated push edge (browser `idle_ms`) and is belt-and-suspenders for
-  // tmux, whose entry can be created off the conversation's own SSE channel.
-  const pollRunning = pollActive && hasLiveResource(displayed);
+  // live resource. Pending browser teardown remains poll-active even on a
+  // collapsed SSE-backed surface, until inventory reaches failed or absent.
+  // This closes the gap where a delayed terminal lifecycle edge would otherwise
+  // leave the collapsed summary stuck at "stopping".
+  const browserTeardownPending = displayed?.browser?.state === 'teardown_pending';
+  const pollRunning = (pollActive || browserTeardownPending) && hasLiveResource(displayed);
   useEffect(() => {
     if (!pollRunning) return;
     const id = setInterval(() => {
@@ -621,6 +625,8 @@ function summarizeWorkScope(inv: WorkScopeInventory | null, count: number): stri
   if (terminal > 0) parts.push(`${terminal} done`);
   if (inv.tmux?.status === 'live') parts.push('tmux');
   if (inv.browser?.state === 'live') parts.push(isBrowserIdle(inv.browser) ? 'browser idle' : 'browser live');
+  if (inv.browser?.state === 'teardown_pending') parts.push('browser stopping');
+  if (inv.browser?.state === 'teardown_failed') parts.push('browser stop failed');
   return parts.join(' · ') || 'no live resources';
 }
 
@@ -652,15 +658,17 @@ export function WorkScopeSection({ scopeKey, conversationId, liveInventory, expa
   const count = workScopeLiveCount(inventory);
   const freshHealth = healthIsFresh(inventory?.health_sampled_at, now) ? inventory?.health : undefined;
   const healthWarning = useHealthAttention(freshHealth);
+  const resourceSummary = summarizeWorkScope(inventory, count);
+  const summary = healthWarning ? `${healthWarning} · ${resourceSummary}` : resourceSummary;
 
   return (
     <GroundingSection
       icon="●"
       title="Work"
-      summary={error ? 'inventory unavailable' : healthWarning ?? summarizeWorkScope(inventory, count)}
+      summary={error ? 'inventory unavailable' : summary}
       count={count}
       expanded={expanded}
-      attention={Boolean(healthWarning) || Boolean(error)}
+      attention={Boolean(healthWarning) || Boolean(error) || inventory?.browser?.state === 'teardown_failed'}
       onToggle={() => onToggleExpanded(!expanded)}
     >
       <div className={`ws-section-panel${expanded ? ' is-expanded' : ''}`}>
@@ -676,14 +684,12 @@ export function WorkScopeSection({ scopeKey, conversationId, liveInventory, expa
  * live-count badge rail; expanded it shows the shared resource body.
  */
 export function WorkScopePanel({ scopeKey, conversationId, liveInventory, collapsed, onToggle, width }: Props) {
-  // An SSE-less surface (no `liveInventory`) must keep polling even while
-  // collapsed so the count badge can settle: with no push channel, a resource
-  // live at collapse and then exited/reaped would otherwise read as running
-  // forever until expand. The poll self-limits — `pollRunning = pollActive &&
-  // hasLiveResource` — so it stops once nothing is live. An SSE-backed surface
-  // still pauses when collapsed (its push channel keeps the badge fresh).
-  // `visible` (the elapsed-tick gate) stays `!collapsed` regardless, so an
-  // off-screen dock never runs the 1s timer even while it polls.
+  // An SSE-less surface (no `liveInventory`) keeps ordinary resource polling
+  // active while collapsed so the count badge can settle without a push
+  // channel. An SSE-backed surface pauses ordinary polling while collapsed;
+  // `useWorkScopeInventory` still polls browser teardown_pending through a
+  // terminal state. `visible` stays `!collapsed`, so an off-screen dock never
+  // runs the 1s elapsed timer even while it polls.
   const pollActive = !collapsed || liveInventory == null;
   const { inventory, error, now, retry } = useWorkScopeInventory(
     scopeKey,
@@ -693,7 +699,14 @@ export function WorkScopePanel({ scopeKey, conversationId, liveInventory, collap
     !collapsed,
   );
   const count = workScopeLiveCount(inventory);
-  const browserGlyph = inventory?.browser?.state === 'live' ? '◉' : null;
+  const browserGlyph =
+    inventory?.browser?.state === 'live'
+      ? { glyph: '◉', title: 'browser session live' }
+      : inventory?.browser?.state === 'teardown_pending'
+        ? { glyph: '…', title: 'browser session stopping' }
+        : inventory?.browser?.state === 'teardown_failed'
+          ? { glyph: '✗', title: 'browser stop failed — expand to retry' }
+          : null;
   const tmuxLive = inventory?.tmux?.status === 'live';
 
   if (collapsed) {
@@ -711,8 +724,8 @@ export function WorkScopePanel({ scopeKey, conversationId, liveInventory, collap
             {count}
           </button>
           {browserGlyph && (
-            <span className="ws-collapsed-ind" title="browser session live">
-              {browserGlyph}
+            <span className="ws-collapsed-ind" title={browserGlyph.title}>
+              {browserGlyph.glyph}
             </span>
           )}
           {tmuxLive && (

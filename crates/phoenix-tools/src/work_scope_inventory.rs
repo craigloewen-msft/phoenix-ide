@@ -19,7 +19,7 @@ use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceScopeKey};
 
 use crate::bash::handle::{Handle, HandleState};
 use crate::bash::registry::BashHandleRegistry;
-use crate::browser::session::BrowserSessionManager;
+use crate::browser::session::{BrowserInventoryState, BrowserSessionManager};
 use crate::tmux::registry::{ServerStatus, TmuxRegistry};
 
 /// Assemble the full inventory for `work_scope` from the live registries.
@@ -141,27 +141,30 @@ fn project_tmux_status(status: ServerStatus) -> TmuxServerStatus {
     }
 }
 
-/// Project browser liveness + idle time. `None` when no session is live for
-/// the scope. `idle_ms` is derived from the session's monotonic last-activity
-/// `Instant` at assembly time.
+/// Project browser liveness + idle time. `None` when no session is tracked for
+/// the scope. Live-session `idle_ms` is derived from the session's monotonic
+/// last-activity `Instant`; teardown states report it as unavailable.
 async fn assemble_browser(
     work_scope: &ResourceScopeKey,
     actor: Option<&EffectiveResourceAccess>,
     browser_sessions: &Arc<BrowserSessionManager>,
 ) -> Option<BrowserInventory> {
-    let session = match actor {
+    let metadata = match actor {
         Some(access) => browser_sessions
-            .get_existing_for_actor(work_scope, access)
+            .inventory_metadata_for_actor(work_scope, access)
             .await
             .ok()??,
-        None => browser_sessions.get_existing(work_scope).await?,
+        None => browser_sessions.inventory_metadata(work_scope).await?,
     };
-    let last_activity = session.read().await.last_activity;
-    let idle_ms = u64::try_from(last_activity.elapsed().as_millis()).unwrap_or(u64::MAX);
-    Some(BrowserInventory {
-        state: BrowserSessionLiveness::Live,
-        idle_ms,
-    })
+    let state = match metadata.state {
+        BrowserInventoryState::Live => BrowserSessionLiveness::Live,
+        BrowserInventoryState::TeardownPending => BrowserSessionLiveness::TeardownPending,
+        BrowserInventoryState::TeardownFailed => BrowserSessionLiveness::TeardownFailed,
+    };
+    let idle_ms = metadata
+        .idle
+        .map(|idle| u64::try_from(idle.as_millis()).unwrap_or(u64::MAX));
+    Some(BrowserInventory { state, idle_ms })
 }
 
 #[cfg(test)]

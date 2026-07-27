@@ -125,18 +125,34 @@ push.
 ### REQ-WSUI-004: Browser Session Inventory
 
 WHEN the inventory includes a browser section
-THE SYSTEM SHALL report the session `state` (one of `live`, `torn_down`) and
-`idle_ms`, the elapsed milliseconds since the session's last activity.
+THE SYSTEM SHALL report the session `state` (one of `live`, `teardown_pending`,
+`teardown_failed`, `torn_down`) and `idle_ms`, which is the elapsed milliseconds
+since the session's last activity when that value is available.
 
-THE wire `state` SHALL be sourced from
-`BrowserSessionManager::is_active(work_scope)`: membership maps to `live`,
-absence maps to `torn_down`. `idle` SHALL NOT be a wire state; it is a frontend
-presentation derived from `idle_ms` (see REQ-WSUI-010).
+THE wire `state` SHALL be sourced from `BrowserSessionManager` membership and
+teardown state: a reusable entry maps to `live`, an entry with an outstanding
+teardown attempt maps to `teardown_pending`, a retained entry whose teardown
+failed maps to `teardown_failed`, and absence maps to `torn_down`. `idle` SHALL
+NOT be a wire state; it is a frontend presentation derived from `idle_ms` (see
+REQ-WSUI-010).
 
+WHEN state is `teardown_pending`
+THE SYSTEM SHALL keep polling until teardown reaches `teardown_failed` or `torn_down`.
+
+WHEN state is `teardown_failed`
+THE SYSTEM SHALL stop automatic polling, visibly report the failure in collapsed and expanded surfaces, and keep the stop action available for retry
+AND SHALL NOT expose the retained session for browser reuse or viewer opening.
+
+WHEN state is `live`
 THE SYSTEM SHALL compute `idle_ms` at assembly time as the elapsed duration
-since the live `BrowserSession`'s last activity (a monotonic `Instant`). The
-inventory SHALL NOT report a wall-clock last-activity timestamp, because the
-source has no absolute-clock value.
+since the live `BrowserSession`'s last activity (a monotonic `Instant`).
+
+WHEN state is `teardown_pending`, `teardown_failed`, or `torn_down`
+THE SYSTEM SHALL report `idle_ms` as unavailable rather than fabricate an
+elapsed duration while teardown may own the session lock or no session exists.
+
+THE inventory SHALL NOT report a wall-clock last-activity timestamp, because
+the source has no absolute-clock value.
 
 WHEN no browser session exists for the scope
 THE SYSTEM SHALL report the browser section as absent (equivalently, state
@@ -318,8 +334,8 @@ frontend-chosen threshold
 THE section MAY present the browser row as "idle" — a purely client-side
 rendering derived from `idle_ms`, distinct from the wire `state` (REQ-WSUI-004).
 
-WHEN the browser row reports `state` `live`
-THE section and standalone dock SHALL expose a stop action that invokes REQ-WSUI-006b with the inventory's `scope_key`. The conversation-page section MAY also expose an open action for the live browser viewer; the standalone dock SHALL NOT require a viewer slot in order to stop the session.
+WHEN the browser row reports `state` `live`, `teardown_pending`, or `teardown_failed`
+THE section and standalone dock SHALL expose a stop action that invokes REQ-WSUI-006b with the inventory's `scope_key`. The conversation-page section MAY expose an open action only for a `live` browser viewer; the standalone dock SHALL NOT require a viewer slot in order to stop or retry teardown.
 
 **Rationale:** The right side of the layout is reserved for the meta viewer
 (prose/diff/browser); the work scope is an always-present resource view, so it

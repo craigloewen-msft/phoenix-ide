@@ -3106,19 +3106,31 @@ async fn stop_conversation_browser_session(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
     let work_scope = conversation_work_scope(&conversation)?;
-    let actor = crate::work_scope::EffectiveResourceAccess::new(
+    let current_actor = crate::work_scope::EffectiveResourceAccess::new(
         conversation.id.clone(),
         match conversation.conv_mode {
             crate::db::ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
             _ => crate::work_scope::ResourceAuthority::Work,
         },
     );
-
-    state
-        .runtime
-        .browser_sessions()
-        .request_kill_session_for_actor(&work_scope, &actor)
+    let browser_sessions = state.runtime.browser_sessions();
+    browser_sessions
+        .request_kill_session_for_actor(&work_scope, &current_actor)
         .await;
+
+    let conversation_scope = crate::work_scope::ResourceScopeKey::Work(
+        crate::work_scope::WorkScopeId::parse(conversation.id.clone())
+            .map_err(|error| AppError::Internal(error.to_string()))?,
+    );
+    if conversation_scope != work_scope {
+        let pre_rekey_actor = crate::work_scope::EffectiveResourceAccess::new(
+            conversation.id,
+            crate::work_scope::ResourceAuthority::Restricted,
+        );
+        browser_sessions
+            .request_kill_session_for_actor(&conversation_scope, &pre_rekey_actor)
+            .await;
+    }
 
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -4531,6 +4543,42 @@ async fn scope_still_owned_after_delete(
     }))
 }
 
+async fn cleanup_browser_with_retry(
+    state: &AppState,
+    conv: &crate::db::Conversation,
+    work_scope: &crate::work_scope::ResourceScopeKey,
+    inheritor_scope: Option<&crate::work_scope::ResourceScopeKey>,
+) {
+    let browser_manager = state.runtime.browser_sessions();
+    let browser_actor = crate::work_scope::EffectiveResourceAccess::new(
+        conv.id.clone(),
+        match conv.conv_mode {
+            crate::db::ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
+            _ => crate::work_scope::ResourceAuthority::Work,
+        },
+    );
+    let cleanup = || {
+        crate::tools::browser::session::cascade_browser_on_delete(
+            browser_manager,
+            work_scope,
+            &browser_actor,
+            inheritor_scope,
+        )
+    };
+    if let Err(first_error) = cleanup().await {
+        if let Err(retry_error) = cleanup().await {
+            let retained_browser_cleanup = browser_manager.cleanup_identifiers(work_scope).await;
+            tracing::warn!(
+                conv_id = %conv.id,
+                ?retained_browser_cleanup,
+                %first_error,
+                %retry_error,
+                "browser cleanup failed after bounded retry; lifecycle transition will continue"
+            );
+        }
+    }
+}
+
 /// REQ-BED-032 steps 2-5 (bash + tmux + projects + browser cleanup),
 /// factored out so hard-delete, archive, abandon, and mark-merged share the
 /// exact same resource teardown. Authoritative failures (worktree-removal,
@@ -4657,21 +4705,7 @@ pub(super) async fn run_resource_cleanup_cascade(
 
     // Step 6: browser session. Same any-live-owner rule as tmux
     // (REQ-BROWSER-WS-002, REQ-BROWSER-WS-003).
-    crate::tools::browser::session::cascade_browser_on_delete(
-        state.runtime.browser_sessions(),
-        &work_scope,
-        &crate::work_scope::EffectiveResourceAccess::new(
-            conv.id.clone(),
-            match conv.conv_mode {
-                crate::db::ConvMode::Explore { .. } => {
-                    crate::work_scope::ResourceAuthority::Restricted
-                }
-                _ => crate::work_scope::ResourceAuthority::Work,
-            },
-        ),
-        inheritor_scope,
-    )
-    .await;
+    cleanup_browser_with_retry(state, conv, &work_scope, inheritor_scope).await;
 
     Ok(())
 }
@@ -4855,7 +4889,7 @@ async fn retire_work_scope_after_hard_delete(state: &AppState, deleted: &crate::
             .is_some_and(|tmux| tmux.status != TmuxServerStatus::Gone)
         || inventory
             .browser
-            .is_some_and(|browser| browser.state == BrowserSessionLiveness::Live)
+            .is_some_and(|browser| browser.state != BrowserSessionLiveness::TornDown)
         || state.terminals.get(&scope).is_some();
     if live_resource {
         tracing::debug!(work_scope = %scope_id, "work scope retirement blocked by live runtime resource");

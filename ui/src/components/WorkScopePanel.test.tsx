@@ -126,7 +126,7 @@ describe('hasLiveResource', () => {
     expect(hasLiveResource(inv([]))).toBe(false);
     expect(hasLiveResource(inv([bash({ state: 'tombstoned' })]))).toBe(false);
     expect(hasLiveResource(inv([], { tmux: { status: 'gone' } }))).toBe(false);
-    expect(hasLiveResource(inv([], { browser: { state: 'torn_down', idle_ms: 0 } }))).toBe(false);
+    expect(hasLiveResource(inv([], { browser: { state: 'torn_down', idle_ms: null } }))).toBe(false);
   });
 
   it('is true for a running bash handle (bash-only)', () => {
@@ -141,6 +141,11 @@ describe('hasLiveResource', () => {
 
   it('is true for a live browser session (browser-only)', () => {
     expect(hasLiveResource(inv([], { browser: { state: 'live', idle_ms: 120_000 } }))).toBe(true);
+  });
+
+  it('polls while browser teardown is pending but stops after stable failure', () => {
+    expect(hasLiveResource(inv([], { browser: { state: 'teardown_pending', idle_ms: null } }))).toBe(true);
+    expect(hasLiveResource(inv([], { browser: { state: 'teardown_failed', idle_ms: null } }))).toBe(false);
   });
 });
 
@@ -207,7 +212,7 @@ describe('WorkScopeSection resource health', () => {
 
     await renderExpanded();
     expect(screen.getByText('245% · 128.0 MB · 4p')).toBeTruthy();
-    expect(screen.getByText('high CPU')).toBeTruthy();
+    expect(screen.getByText(/high CPU/)).toBeTruthy();
     openBashDetail();
     expect(screen.getByText('health')).toBeTruthy();
   });
@@ -551,10 +556,34 @@ describe('WorkScopePanel collapsed standalone dock keeps polling without SSE (RE
     expect(getInv.mock.calls.length).toBe(callsAfterSettle);
   });
 
-  it('an SSE-backed collapsed surface does NOT poll (its push keeps the badge fresh)', async () => {
-    // WorkScopeSection is SSE-backed; collapsed (expanded=false) it must stay
-    // inert — no poll — relying on the push channel. Guards against the
-    // SSE-less fix leaking into the SSE-backed surface.
+  it('an SSE-backed collapsed surface polls pending browser teardown until terminal', async () => {
+    const pending = inv([], { browser: { state: 'teardown_pending', idle_ms: null } });
+    const failed = inv([], { browser: { state: 'teardown_failed', idle_ms: null } });
+    getInv.mockResolvedValueOnce(pending).mockResolvedValueOnce(failed);
+
+    await act(async () => {
+      render(sectionCollapsedTree({ scopeKey: 'ws-1', liveInventory: pending }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const callsAfterMount = getInv.mock.calls.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+    expect(getInv.mock.calls.length).toBeGreaterThan(callsAfterMount);
+
+    const callsAfterFailure = getInv.mock.calls.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(getInv.mock.calls.length).toBe(callsAfterFailure);
+  });
+
+  it('an SSE-backed collapsed surface does not poll an ordinary live resource', async () => {
+    // WorkScopeSection is SSE-backed; collapsed ordinary resources rely on the
+    // push channel. Only teardown_pending overrides this gate.
     getInv.mockResolvedValue(inv([bash({ state: 'running' })]));
 
     await act(async () => {
@@ -570,7 +599,7 @@ describe('WorkScopePanel collapsed standalone dock keeps polling without SSE (RE
     await act(async () => {
       await vi.advanceTimersByTimeAsync(10_000);
     });
-    // No additional polls while collapsed + SSE-backed.
+    // No additional polls while collapsed + SSE-backed without pending teardown.
     expect(getInv.mock.calls.length).toBe(callsAfterMount);
   });
 });
@@ -708,6 +737,23 @@ describe('browser open affordance (Phase 3)', () => {
     expect(stopBrowser).toHaveBeenCalledWith('ws-1', 'conv-1');
   });
 
+  it('a teardown-failed browser remains visible and retryable but cannot be opened', async () => {
+    const failedBrowser = inv([], { browser: { state: 'teardown_failed', idle_ms: null } });
+    getInv.mockResolvedValue(failedBrowser);
+
+    await act(async () => {
+      render(browserSectionTree({ inventory: failedBrowser, onSlot: () => {} }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('stop failed')).toBeTruthy();
+    expect(screen.getByTestId('browser-stop-button')).toBeTruthy();
+    expect(screen.queryByTestId('browser-open-button')).toBeNull();
+    expect(document.querySelector('.ws-glyph--err')).toBeTruthy();
+  });
+
   it('browser stop uses the live inventory scope rather than the requested prop scope', async () => {
     const liveBrowser = inv([], {
       scope_key: 'worktree:/tmp/promoted',
@@ -752,7 +798,7 @@ describe('browser open affordance (Phase 3)', () => {
   });
 
   it('a torn_down browser does NOT render open → (even though rows are inspectable)', async () => {
-    const deadBrowser = inv([], { browser: { state: 'torn_down', idle_ms: 0 } });
+    const deadBrowser = inv([], { browser: { state: 'torn_down', idle_ms: null } });
     getInv.mockResolvedValue(deadBrowser);
 
     await act(async () => {

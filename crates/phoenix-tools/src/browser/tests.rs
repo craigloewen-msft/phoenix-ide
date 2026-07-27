@@ -105,7 +105,7 @@ macro_rules! require_network {
     };
 }
 
-/// Create a test context with a fresh browser session manager
+/// Create a test context with a fresh browser session manager and profile identity.
 fn test_context(conversation_id: &str) -> (ToolContext, Arc<BrowserSessionManager>) {
     let manager = Arc::new(BrowserSessionManager::default());
     let ctx = ToolContext::new(
@@ -118,9 +118,23 @@ fn test_context(conversation_id: &str) -> (ToolContext, Arc<BrowserSessionManage
         phoenix_terminal::ActiveTerminals::new(),
         Arc::new(crate::TmuxRegistry::new()),
         None,
-        phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
+        phoenix_core::work_scope::WorkScopeId::parse(format!(
+            "browser-test-{}-{conversation_id}",
+            std::process::id()
+        ))
+        .expect("test conversation ID should form a valid browser scope"),
     );
     (ctx, manager)
+}
+
+#[test]
+fn test_contexts_have_isolated_and_rediscoverable_browser_scopes() {
+    let (first, _) = test_context("first");
+    let (first_again, _) = test_context("first");
+    let (second, _) = test_context("second");
+
+    assert_eq!(first.work_scope, first_again.work_scope);
+    assert_ne!(first.work_scope, second.work_scope);
 }
 
 // Vendored React UMD bundles + the shared test app, inlined into the
@@ -227,7 +241,7 @@ impl TestServer {
 /// Shut down browser sessions before the test server so Chrome releases its
 /// connections first, preventing `server.shutdown()` from hanging.
 async fn shutdown_test(manager: Arc<BrowserSessionManager>, server: TestServer) {
-    manager.shutdown_all().await;
+    manager.shutdown_all().await.expect("browser shutdown");
     server.shutdown().await;
 }
 
@@ -727,7 +741,7 @@ async fn test_browser_console_logs_local() {
 
     {
         let session = manager
-            .get_existing(&scope("test-work"))
+            .get_existing(&ctx.work_scope)
             .await
             .expect("session should exist after navigate");
         tokio::time::timeout(
@@ -942,7 +956,7 @@ async fn test_browser_navigate_remote() {
     require_chrome!();
     require_network!();
 
-    let (ctx, _manager) = test_context("test-navigate-remote");
+    let (ctx, manager) = test_context("test-navigate-remote");
 
     // Navigate to a real website
     let nav_tool = BrowserNavigateTool;
@@ -979,6 +993,8 @@ async fn test_browser_navigate_remote() {
         "Wrong h1: {}",
         result.output()
     );
+
+    manager.shutdown_all().await.expect("browser shutdown");
 }
 
 // ============================================================================
@@ -989,7 +1005,7 @@ async fn test_browser_navigate_remote() {
 async fn test_browser_eval_before_navigate() {
     require_chrome!();
 
-    let (ctx, _manager) = test_context("test-eval-no-nav");
+    let (ctx, manager) = test_context("test-eval-no-nav");
 
     // Try to eval without navigating first - should still work on about:blank
     let eval_tool = BrowserEvalTool;
@@ -1004,6 +1020,8 @@ async fn test_browser_eval_before_navigate() {
         "Wrong result: {}",
         result.output()
     );
+
+    manager.shutdown_all().await.expect("browser shutdown");
 }
 
 #[tokio::test]
@@ -2102,7 +2120,7 @@ async fn test_screencast_attach_emits_frames_and_url() {
     assert!(nav.is_success(), "navigate failed: {}", nav.output());
 
     let session_arc = manager
-        .get_existing(&scope("test-work"))
+        .get_existing(&ctx.work_scope)
         .await
         .expect("session should exist after navigate");
 
@@ -2252,7 +2270,7 @@ async fn test_browser_profile_help_no_browser() {
         result.output().contains("RAW per-run"),
         "help must state the raw-samples constraint"
     );
-    manager.shutdown_all().await;
+    manager.shutdown_all().await.expect("browser shutdown");
 }
 
 /// REQ-BT-019.14 / Allium `RunScenarioRejectsInlineNavigation`: a
@@ -2306,7 +2324,7 @@ async fn test_browser_profile_rejects_inline_navigation() {
         rel.output()
     );
 
-    manager.shutdown_all().await;
+    manager.shutdown_all().await.expect("browser shutdown");
 }
 
 /// Gated end-to-end test: `metrics` returns numbers, and `run_scenario`
@@ -2489,7 +2507,7 @@ async fn test_browser_profile_methodology_warnings_intact_raw_samples() {
         );
     }
 
-    manager.shutdown_all().await;
+    manager.shutdown_all().await.expect("browser shutdown");
 }
 
 /// Gated (chrome + network): the React `measured` path end-to-end.
@@ -2681,7 +2699,7 @@ async fn test_browser_profile_cpu_start_stop_real_profile_serde() {
         summ.output()
     );
 
-    manager.shutdown_all().await;
+    manager.shutdown_all().await.expect("browser shutdown");
 }
 
 /// Gated (chrome only): real Tracing long-task extraction.
@@ -2760,7 +2778,7 @@ async fn test_browser_profile_trace_stop_long_task_real() {
         stop.output()
     );
 
-    manager.shutdown_all().await;
+    manager.shutdown_all().await.expect("browser shutdown");
 }
 
 /// Gated (chrome only): real heap snapshot streaming + diff.
@@ -2882,7 +2900,7 @@ async fn test_browser_profile_heap_snapshot_streaming_and_diff() {
         "display_data must carry detached_dom_nodes.post: {display}"
     );
 
-    manager.shutdown_all().await;
+    manager.shutdown_all().await.expect("browser shutdown");
 }
 
 /// Gated (chrome + network): the React `no_profiling_build` tri-state
@@ -3151,7 +3169,7 @@ async fn worktree_scope_shared_across_continuations() {
          continuation inheritance depends on it"
     );
 
-    manager.shutdown_all().await;
+    manager.shutdown_all().await.expect("browser shutdown");
 }
 
 /// Distinct durable work scopes resolve to different Chrome instances.
@@ -3171,7 +3189,7 @@ async fn conversation_scope_isolated_per_id() {
         "different durable work scopes must produce isolated sessions"
     );
 
-    manager.shutdown_all().await;
+    manager.shutdown_all().await.expect("browser shutdown");
 }
 
 /// Cleanup-cascade preservation: when the inheritor's scope equals the
@@ -3194,7 +3212,8 @@ async fn cascade_preserves_when_inheritor_scope_matches() {
         &work_actor("owner"),
         Some(&scope),
     )
-    .await;
+    .await
+    .expect("browser cascade");
 
     assert!(
         manager.is_active(&scope).await,
@@ -3207,7 +3226,7 @@ async fn cascade_preserves_when_inheritor_scope_matches() {
          have torn down and relaunched"
     );
 
-    manager.shutdown_all().await;
+    manager.shutdown_all().await.expect("browser shutdown");
 }
 
 /// Cleanup-cascade teardown: no inheritor (or different inheritor scope)
@@ -3230,7 +3249,8 @@ async fn cascade_tears_down_when_no_inheritor() {
         &work_actor("owner"),
         None,
     )
-    .await;
+    .await
+    .expect("browser cascade");
 
     assert!(
         !manager.is_active(&scope).await,
@@ -3256,7 +3276,9 @@ async fn cascade_last_restricted_owner_tears_down_every_scope_session() {
         .await
         .expect("sibling session");
 
-    crate::browser::session::cascade_browser_on_delete(&manager, &scope, &owner, None).await;
+    crate::browser::session::cascade_browser_on_delete(&manager, &scope, &owner, None)
+        .await
+        .expect("browser cascade");
 
     assert!(!manager.is_active(&scope).await);
 }
@@ -3283,7 +3305,8 @@ async fn cascade_tears_down_when_inheritor_scope_differs() {
         &work_actor("owner"),
         Some(&child),
     )
-    .await;
+    .await
+    .expect("browser cascade");
 
     assert!(
         !manager.is_active(&parent).await,
