@@ -723,6 +723,7 @@ THE Explore bash sandbox SHALL provide:
   rejected when it overlaps protected repo/Git/Phoenix paths
 - inherited `PATH` preservation
 - blocked network access
+- process isolation that prevents signaling unrelated host processes while permitting control of processes created inside the same sandbox
 - a reduced environment that strips ambient SCM/OAuth, LLM-provider, and
   cloud/vendor credential variables
 
@@ -734,6 +735,18 @@ THE SYSTEM SHALL return the kernel error (for example EACCES or EPERM) in the
 ring buffer output as the command saw it
 AND the tool description SHALL include a clear explanation of sandbox
 constraints
+
+WHEN the Coordinator exposes `bash`
+THE SYSTEM SHALL reuse the same Explore read-only sandbox execution path
+AND SHALL require each `op="run"` call to provide an active persisted `WorkScope` ID
+AND SHALL resolve and canonicalize that `WorkScope`'s execution directory server-side
+AND SHALL NOT assign the Coordinator a default cwd
+AND SHALL store the process solely under the selected `WorkScope`
+AND SHALL retain Coordinator continuation control as handle authorization metadata
+AND SHALL keep background-command handles available to Coordinator continuations for manual `peek`, `wait`, and `kill` without registering a durable WorkScope wake
+AND SHALL keep Coordinator-controlled terminal events from triggering branch-observation reconciliation
+AND SHALL include the process in the owning WorkScope's inventory, lifecycle broadcasts, inspection, health attribution, and teardown
+AND SHALL use one globally unique opaque handle ID for tool operations, wakes, events, APIs, UI, logs, and inspection
 
 WHEN conversation is in Direct, Work, or Branch mode
 THE SYSTEM SHALL NOT apply the Explore read-only sandbox to bash
@@ -747,7 +760,7 @@ user-selected paths, so sandboxed bash follows the same broad-read model. Readab
 credential files, Phoenix data files, procfs process environments, and other
 ordinary readable filesystem content are part of that accepted read model; protecting
 sensitive reads is a separate feature with its own threat model. The sandbox
-constrains writes, network, and the ambient environment
+constrains writes, network, unrelated-process signaling, and the ambient environment
 it directly passes to the child process. `nono` is the sandbox abstraction; it
 uses the platform's supported backend (Landlock on Linux, Seatbelt on macOS) and
 reports support at startup.
@@ -757,10 +770,11 @@ reports support at startup.
 ### REQ-BASH-013: Fail-Closed Explore Bash Availability
 
 WHEN `nono::Sandbox::support_info()` reports that no enforceable sandbox backend
-with network-block support is available
+with network-block and unrelated-process isolation support is available
 THE SYSTEM SHALL detect this at startup
-AND SHALL NOT expose `bash` in top-level Explore mode
-AND SHALL continue to expose the read-only/planning Explore tool set
+AND SHALL NOT expose `bash` in top-level Explore mode or the Coordinator
+AND SHALL tell the Coordinator that Bash is unavailable rather than presenting invocation guidance for an absent tool
+AND SHALL continue to expose the remaining read-only/planning tools for those modes
 
 WHEN degraded mode is active
 THE SYSTEM SHALL still apply command safety checks (REQ-BASH-011) to modes that
@@ -814,6 +828,9 @@ THE handle registry SHALL key its per-scope handle tables by `WorkScope`, not
 by conversation id — matching the terminal, browser, and tmux registries
 (REQ-TERM-WS-001, REQ-BROWSER-WS-001).
 
+THE registry SHALL fence new Bash spawn admission before tearing down a `WorkScope`
+AND SHALL wait for already admitted spawn reservations to commit or abort before removing that WorkScope's handle table.
+
 WHEN two conversations resolve to the same `WorkScope` (a continuation chain on
 one worktree)
 THE SYSTEM SHALL give them the same handle table, so a handle spawned before a
@@ -821,10 +838,9 @@ continuation boundary remains addressable for peek/wait/kill after it
 AND count both conversations' live handles against the one per-`WorkScope`
 `LIVE_HANDLE_CAP` (REQ-BASH-005)
 
-WHEN a handle id owned by one `WorkScope` is presented in a call running under a
-different `WorkScope`
-THE SYSTEM SHALL return `error: "handle_not_found"` (no cross-scope leakage of
-handle existence)
+WHEN a caller presents a globally unique handle ID
+THE SYSTEM SHALL resolve its owning `WorkScope`
+AND SHALL return `error: "handle_not_found"` unless the handle's controller metadata authorizes that caller
 
 **Rationale:** A backgrounded process is a `WorkScope`-level resource, like the
 tmux server and browser session that share its worktree. Conversation-keying

@@ -17,8 +17,8 @@ use phoenix_core::domain::work_scope_inventory::{
 };
 use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceScopeKey};
 
-use crate::bash::handle::{Handle, HandleState};
-use crate::bash::registry::BashHandleRegistry;
+use crate::bash::handle::HandleState;
+use crate::bash::registry::{BashHandleRegistry, RegisteredHandle};
 use crate::browser::session::{BrowserInventoryState, BrowserSessionManager};
 use crate::tmux::registry::{ServerStatus, TmuxRegistry};
 
@@ -54,25 +54,19 @@ pub async fn assemble_inventory(
 /// [`BashHandleInventory`]. Empty when the scope has no handle table.
 async fn assemble_bash(
     work_scope: &ResourceScopeKey,
-    actor: Option<&EffectiveResourceAccess>,
+    _actor: Option<&EffectiveResourceAccess>,
     bash_handles: &Arc<BashHandleRegistry>,
 ) -> Vec<BashHandleInventory> {
-    let Some(table) = bash_handles.get_existing(work_scope).await else {
-        return Vec::new();
-    };
-    let table = table.read().await;
-    let mut out = Vec::new();
-    for handle in table.all() {
-        if actor.is_none_or(|access| {
-            access.can_control(&handle.creator_conversation_id, handle.authority)
-        }) {
-            out.push(project_handle(handle).await);
-        }
+    let handles = bash_handles.owner_handles(work_scope).await;
+    let mut out = Vec::with_capacity(handles.len());
+    for registered in &handles {
+        out.push(project_handle(registered).await);
     }
     out
 }
 
-async fn project_handle(handle: &Arc<Handle>) -> BashHandleInventory {
+async fn project_handle(registered: &RegisteredHandle) -> BashHandleInventory {
+    let handle = &registered.handle;
     let started_at: DateTime<Utc> = handle.started_at.into();
     let state_arc = handle.state().await;
     match state_arc.as_ref() {
@@ -196,7 +190,6 @@ mod tests {
     #[tokio::test]
     async fn live_handle_projects_running_with_pid_and_ring() {
         let bash = Arc::new(BashHandleRegistry::new());
-        let table = bash.get_or_create(&scope()).await;
         let handle = Handle::new_live(
             scope(),
             HandleId::new("b-1"),
@@ -206,7 +199,7 @@ mod tests {
             1234,
             RING_BUFFER_BYTES,
         );
-        table.write().await.insert(handle);
+        bash.register_existing_handle(&scope(), handle).await;
 
         let tmux = Arc::new(TmuxRegistry::with_socket_dir(
             "/tmp/phoenix-inv-test".into(),
@@ -228,23 +221,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restricted_actor_inventory_hides_sibling_handle() {
+    async fn inventory_finds_handle_by_lifecycle_scope_across_control_scope() {
         use phoenix_core::work_scope::ResourceAuthority;
 
         let bash = Arc::new(BashHandleRegistry::new());
-        let table = bash.get_or_create(&scope()).await;
-        for actor in ["sibling-a", "sibling-b"] {
-            table.write().await.insert(Handle::new_live_for_actor(
-                scope(),
-                HandleId::new(format!("b-{actor}")),
-                actor.to_string(),
-                ResourceAuthority::Restricted,
-                format!("secret-{actor}"),
+        bash.register_existing_handle(
+            &scope(),
+            Handle::new_live_for_actor_with_owner(
+                ResourceScopeKey::Coordinator,
+                HandleId::new("b-coordinator"),
+                "coordinator".to_string(),
+                ResourceAuthority::Work,
+                "git status".to_string(),
                 None,
-                1,
-                1,
+                4321,
+                1234,
                 RING_BUFFER_BYTES,
-            ));
+            ),
+        )
+        .await;
+        let tmux = Arc::new(TmuxRegistry::with_socket_dir(
+            "/tmp/phoenix-inv-test".into(),
+        ));
+        let browser = BrowserSessionManager::new();
+
+        let inventory = assemble_inventory(&scope(), None, true, &bash, &tmux, &browser).await;
+
+        assert_eq!(inventory.bash.len(), 1);
+        assert_eq!(inventory.bash[0].handle_id, "b-coordinator");
+    }
+
+    #[tokio::test]
+    async fn owner_inventory_includes_all_owned_handles() {
+        use phoenix_core::work_scope::ResourceAuthority;
+
+        let bash = Arc::new(BashHandleRegistry::new());
+        for actor in ["sibling-a", "sibling-b"] {
+            bash.register_existing_handle(
+                &scope(),
+                Handle::new_live_for_actor(
+                    scope(),
+                    HandleId::new(format!("b-{actor}")),
+                    actor.to_string(),
+                    ResourceAuthority::Restricted,
+                    format!("secret-{actor}"),
+                    None,
+                    1,
+                    1,
+                    RING_BUFFER_BYTES,
+                ),
+            )
+            .await;
         }
         let tmux = Arc::new(TmuxRegistry::with_socket_dir(
             "/tmp/phoenix-inv-test".into(),
@@ -255,14 +282,21 @@ mod tests {
         let inventory =
             assemble_inventory(&scope(), Some(&actor), false, &bash, &tmux, &browser).await;
 
-        assert_eq!(inventory.bash.len(), 1);
-        assert_eq!(inventory.bash[0].cmd, "secret-sibling-a");
+        assert_eq!(inventory.bash.len(), 2);
+        let commands = inventory
+            .bash
+            .iter()
+            .map(|handle| handle.cmd.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            commands,
+            std::collections::HashSet::from(["secret-sibling-a", "secret-sibling-b"])
+        );
     }
 
     #[tokio::test]
     async fn kill_pending_handle_projects_kill_pending_kernel() {
         let bash = Arc::new(BashHandleRegistry::new());
-        let table = bash.get_or_create(&scope()).await;
         let handle = Handle::new_live(
             scope(),
             HandleId::new("b-1"),
@@ -275,7 +309,7 @@ mod tests {
         handle
             .mark_kill_pending_kernel(KillSignal::Term, SystemTime::now())
             .await;
-        table.write().await.insert(handle);
+        bash.register_existing_handle(&scope(), handle).await;
 
         let tmux = Arc::new(TmuxRegistry::with_socket_dir(
             "/tmp/phoenix-inv-test".into(),
@@ -288,7 +322,6 @@ mod tests {
     #[tokio::test]
     async fn tombstoned_handle_projects_terminal_fields() {
         let bash = Arc::new(BashHandleRegistry::new());
-        let table = bash.get_or_create(&scope()).await;
         let handle = Handle::new_live(
             scope(),
             HandleId::new("b-1"),
@@ -306,7 +339,7 @@ mod tests {
                 crate::bash::handle::TOMBSTONE_TAIL_LINES,
             )
             .await;
-        table.write().await.insert(handle);
+        bash.register_existing_handle(&scope(), handle).await;
 
         let tmux = Arc::new(TmuxRegistry::with_socket_dir(
             "/tmp/phoenix-inv-test".into(),
@@ -328,7 +361,6 @@ mod tests {
     #[tokio::test]
     async fn tombstoned_killed_handle_projects_signal_outcome() {
         let bash = Arc::new(BashHandleRegistry::new());
-        let table = bash.get_or_create(&scope()).await;
         let handle = Handle::new_live(
             scope(),
             HandleId::new("b-1"),
@@ -349,7 +381,7 @@ mod tests {
                 crate::bash::handle::TOMBSTONE_TAIL_LINES,
             )
             .await;
-        table.write().await.insert(handle);
+        bash.register_existing_handle(&scope(), handle).await;
 
         let tmux = Arc::new(TmuxRegistry::with_socket_dir(
             "/tmp/phoenix-inv-test".into(),

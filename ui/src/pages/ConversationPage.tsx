@@ -2139,7 +2139,6 @@ function ConversationPageContent({
         <div id="app">
           <Suspense fallback={null}>
             <ProcessInspectorPanel
-              scopeKey={inspectSlot.scopeKey}
               handleId={inspectSlot.handleId}
               conversationId={conversationId}
               onClose={handleCloseInspector}
@@ -2828,7 +2827,6 @@ function ConversationPageContent({
       {inspectViewerOpen && inspectSlot && !showSplitPaneViewer && (
         <Suspense fallback={null}>
           <ProcessInspectorPanel
-            scopeKey={inspectSlot.scopeKey}
             handleId={inspectSlot.handleId}
             conversationId={conversationId}
             onClose={handleCloseInspector}
@@ -2930,7 +2928,6 @@ function ConversationPageContent({
                 />
               ) : inspectViewerOpen && inspectSlot ? (
                 <ProcessInspectorPanel
-                  scopeKey={inspectSlot.scopeKey}
                   handleId={inspectSlot.handleId}
                   conversationId={conversationId}
                   onClose={handleCloseInspector}

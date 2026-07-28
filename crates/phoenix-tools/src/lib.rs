@@ -25,8 +25,10 @@ pub mod work_scope_inventory;
 
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::{
-    BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecycleSink, BashOp, BashTool,
-    BashToolInput, ResourceScopeKeyHandles as BashResourceScopeKeyHandles, SandboxedBashTool,
+    BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecyclePhase, BashLifecycleSink,
+    BashOp, BashTerminalEffect, BashTool, BashToolInput,
+    ResourceScopeKeyHandles as BashResourceScopeKeyHandles, SandboxedBashTool,
+    SharedSandboxedBashRequest, ValidatedBashSpawnTarget,
 };
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
@@ -935,9 +937,9 @@ impl ToolRegistry {
     }
 
     /// Bounded registry for the global Coordinator. The host supplies global
-    /// read tools and the singular cross-conversation text-message action.
-    /// Filesystem, browser, shell, MCP, repository, task, project, creation,
-    /// approval, workspace, and other lifecycle tools are structurally absent.
+    /// read tools, optional cwd-resolved sandboxed bash, and the singular
+    /// cross-conversation text-message action. Browser, MCP, task, project,
+    /// creation, approval, workspace, and other lifecycle tools are absent.
     #[must_use]
     pub fn coordinator(mut global_read_tools: Vec<Arc<dyn Tool>>) -> Self {
         let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(ThinkTool)];

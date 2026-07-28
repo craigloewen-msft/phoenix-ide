@@ -19,7 +19,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
-use tokio::sync::RwLock;
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -28,11 +27,15 @@ use super::handle::{
     ExitState, ExitWatchPanicGuard, FinalCause, Handle, HandleId, HandleState, KillSignal,
     TOMBSTONE_TAIL_LINES,
 };
-use super::registry::{BashHandleError, LiveHandleSummary, ResourceScopeKeyHandles};
+use super::registry::{BashHandleError, BashTerminalEffect, LiveHandleSummary};
 use super::ring::{RingLine, WindowView};
 use super::sandbox::ExploreSandboxLauncher;
 use super::types::{BashOp, BashToolInput};
-use crate::{work_scope_identity, RegisterWakeInput, RegisteredWake, ToolContext, ToolOutput};
+use super::{SharedSandboxedBashRequest, ValidatedBashSpawnTarget};
+use crate::{
+    work_scope_identity, RegisterWakeInput, RegisteredWake, ResourceScopeKey, ToolContext,
+    ToolOutput,
+};
 use phoenix_core::domain::bash_progress::{BashProgressLine, BashToolProgress};
 use phoenix_core::domain::tool_wire::{
     BashErrorResponse, BashKillPendingKernelPayload, BashLiveHandleSummary, BashResponse,
@@ -186,6 +189,11 @@ impl BashError {
                     cap,
                     live_handles: live,
                     hint: CAP_HINT.to_string(),
+                }
+            }
+            BashError::HandleCapReached(BashHandleError::SpawnFenced) => {
+                BashErrorResponse::SpawnFailed {
+                    error_message: BashHandleError::SpawnFenced.to_string(),
                 }
             }
             BashError::WaitSecondsOutOfRange { provided, max } => {
@@ -420,12 +428,22 @@ fn resolve_wait_seconds(raw: Option<i64>) -> Result<u64, BashError> {
 pub enum BashSpawnMode {
     Direct,
     ExploreReadOnly,
+    SharedReadOnly,
+}
+
+#[derive(Debug, Clone)]
+struct SpawnContext {
+    working_dir: std::path::PathBuf,
+    lifecycle_scope: ResourceScopeKey,
+    terminal_effect: BashTerminalEffect,
 }
 
 impl BashSpawnMode {
     fn authority(self) -> phoenix_core::work_scope::ResourceAuthority {
         match self {
-            Self::Direct => phoenix_core::work_scope::ResourceAuthority::Work,
+            Self::Direct | Self::SharedReadOnly => {
+                phoenix_core::work_scope::ResourceAuthority::Work
+            }
             Self::ExploreReadOnly => phoenix_core::work_scope::ResourceAuthority::Restricted,
         }
     }
@@ -433,17 +451,31 @@ impl BashSpawnMode {
 
 /// Run a bash request end-to-end and produce the `ToolOutput`.
 pub async fn dispatch(input: Value, ctx: ToolContext) -> ToolOutput {
-    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::Direct).await
+    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::Direct, None).await
 }
 
 pub async fn dispatch_sandboxed(input: Value, ctx: ToolContext) -> ToolOutput {
-    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::ExploreReadOnly).await
+    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::ExploreReadOnly, None).await
+}
+
+pub async fn dispatch_shared_sandboxed(
+    request: SharedSandboxedBashRequest,
+    ctx: ToolContext,
+) -> ToolOutput {
+    dispatch_with_spawn_mode(
+        request.input,
+        ctx,
+        BashSpawnMode::SharedReadOnly,
+        request.spawn_target,
+    )
+    .await
 }
 
 async fn dispatch_with_spawn_mode(
     input: Value,
     ctx: ToolContext,
     spawn_mode: BashSpawnMode,
+    spawn_target: Option<ValidatedBashSpawnTarget>,
 ) -> ToolOutput {
     // Dispatch kind, not caller convention, selects effective Bash authority.
     let ctx = ctx.with_resource_authority(spawn_mode.authority());
@@ -458,7 +490,37 @@ async fn dispatch_with_spawn_mode(
             label,
             wait_seconds,
             read_args,
-        } => run_run(&cmd, label, wait_seconds, read_args, &ctx, spawn_mode).await,
+        } => {
+            let spawn_context = match spawn_mode {
+                BashSpawnMode::Direct | BashSpawnMode::ExploreReadOnly => SpawnContext {
+                    working_dir: ctx.working_dir().to_path_buf(),
+                    lifecycle_scope: ctx.work_scope.clone(),
+                    terminal_effect: BashTerminalEffect::InventoryAndBranchReconcile,
+                },
+                BashSpawnMode::SharedReadOnly => match spawn_target {
+                    Some(target) => SpawnContext {
+                        working_dir: target.working_dir,
+                        lifecycle_scope: ResourceScopeKey::Work(target.lifecycle_scope),
+                        terminal_effect: BashTerminalEffect::InventoryOnly,
+                    },
+                    None => SpawnContext {
+                        working_dir: ctx.working_dir().to_path_buf(),
+                        lifecycle_scope: ctx.work_scope.clone(),
+                        terminal_effect: BashTerminalEffect::InventoryOnly,
+                    },
+                },
+            };
+            run_run(
+                &cmd,
+                label,
+                wait_seconds,
+                read_args,
+                &ctx,
+                &spawn_context,
+                spawn_mode,
+            )
+            .await
+        }
         BashRequest::Peek {
             handle_id,
             read_args,
@@ -492,6 +554,7 @@ async fn run_run(
     wait_seconds: u64,
     read_args: ReadArgs,
     ctx: &ToolContext,
+    spawn_context: &SpawnContext,
     spawn_mode: BashSpawnMode,
 ) -> ToolOutput {
     // REQ-BASH-011: command safety is enforced upstream by the permission seam
@@ -499,73 +562,143 @@ async fn run_run(
     // not here — see `crate::bash_check`, which the seam invokes. No second
     // check at the tool boundary keeps enforcement single-homed.
 
+    if !matches!(spawn_context.lifecycle_scope, ResourceScopeKey::Work(_)) {
+        return BashError::SpawnFailed {
+            error_message: "bash processes require a WorkScope owner".to_string(),
+        }
+        .into_tool_output();
+    }
+
     let registry = ctx.bash_handle_registry().clone();
-    let handles_arc = match ctx.bash_handles().await {
-        Ok(h) => h,
-        Err(e) => {
+    let mut reservation = match registry.reserve_spawn(&spawn_context.lifecycle_scope).await {
+        Ok(reservation) => reservation,
+        Err(BashHandleError::HandleCapReached { cap, live_handles }) => {
+            return BashError::HandleCapReached(BashHandleError::HandleCapReached {
+                cap,
+                live_handles,
+            })
+            .into_tool_output();
+        }
+        Err(BashHandleError::SpawnFenced) => {
             return BashError::SpawnFailed {
-                error_message: format!("could not access bash handle registry: {e}"),
+                error_message: BashHandleError::SpawnFenced.to_string(),
             }
             .into_tool_output();
         }
     };
 
-    // REQ-BASH-005: cap check + handle id allocation under the same write
-    // lock so two concurrent runs can't both race past the cap.
-    let cap = registry.live_handle_cap();
     let ring_bytes_cap = registry.ring_bytes_cap();
-    let handle_id;
-    {
-        let mut handles = handles_arc.write().await;
-        if let Err(e) = handles.check_cap(cap).await {
-            return BashError::HandleCapReached(e).into_tool_output();
+    match spawn_child(
+        cmd,
+        label,
+        ctx,
+        spawn_context,
+        reservation.handle_id().clone(),
+        ring_bytes_cap,
+        spawn_mode,
+    ) {
+        Ok((handle, spawned)) => {
+            let inserted = match registry
+                .commit_spawn(&mut reservation, handle.clone())
+                .await
+            {
+                Ok(inserted) => inserted,
+                Err(error) => {
+                    return BashError::SpawnFailed {
+                        error_message: error.to_string(),
+                    }
+                    .into_tool_output();
+                }
+            };
+            // Spawn edge: a new bash handle exists for this scope. Emit a
+            // work-scope state-transition signal (REQ-WSUI-007). The
+            // detached waiter started below carries the sink so it can
+            // emit the terminal edge off-thread.
+            registry.emit_lifecycle(
+                &spawn_context.lifecycle_scope,
+                Some(handle.handle_id.clone()),
+                crate::bash::registry::BashLifecyclePhase::Spawned,
+                None,
+                None,
+            );
+            let progress_reporter = ctx
+                .bash_progress_sink()
+                .map(|sink| Arc::new(LiveBashProgressReporter::new(sink)));
+            let _progress_lease = progress_reporter
+                .as_ref()
+                .map(|reporter| LiveBashProgressLease(reporter.clone()));
+            let (child, sandbox_scratch_dir) = spawned.into_waiter_parts();
+            start_io_tasks(
+                &inserted,
+                spawn_context.lifecycle_scope.clone(),
+                child,
+                registry.lifecycle_sink(),
+                spawn_context.terminal_effect,
+                sandbox_scratch_dir,
+                progress_reporter.clone(),
+            );
+            race_run_response(inserted, cmd, wait_seconds, read_args, ctx).await
         }
-        handle_id = handles.allocate_handle_id();
-        // We deliberately do not insert the Handle yet — we need the pgid
-        // from the spawned child. We hold the write lock across the spawn
-        // so no other run can race the cap check, then insert below.
-        // Spawn is fast (a fork+exec) so this lock-hold is bounded.
-        match spawn_child(
-            cmd,
-            label,
-            ctx,
-            handle_id.clone(),
-            ring_bytes_cap,
-            spawn_mode,
-        ) {
-            Ok((handle, child, sandbox_scratch_dir)) => {
-                let inserted = handles.insert(handle.clone());
-                drop(handles);
-                // Spawn edge: a new bash handle exists for this scope. Emit a
-                // work-scope state-transition signal (REQ-WSUI-007). The
-                // detached waiter started below carries the sink so it can
-                // emit the terminal edge off-thread.
-                registry.emit_lifecycle(
-                    &ctx.work_scope,
-                    crate::bash::registry::BashLifecyclePhase::Spawned,
-                );
-                let progress_reporter = ctx
-                    .bash_progress_sink()
-                    .map(|sink| Arc::new(LiveBashProgressReporter::new(sink)));
-                let _progress_lease = progress_reporter
-                    .as_ref()
-                    .map(|reporter| LiveBashProgressLease(reporter.clone()));
-                start_io_tasks(
-                    &inserted,
-                    child,
-                    registry.lifecycle_sink(),
-                    sandbox_scratch_dir,
-                    progress_reporter.clone(),
-                );
-                race_run_response(inserted, cmd, wait_seconds, read_args, ctx).await
-            }
-            Err(e) => {
-                // Drop the allocated handle id by NOT inserting — next
-                // allocation will simply skip past it; that's harmless
-                // (handle ids are sequential and don't need to be dense).
-                drop(handles);
-                BashError::SpawnFailed { error_message: e }.into_tool_output()
-            }
+        Err(e) => {
+            registry.abort_spawn(reservation);
+            BashError::SpawnFailed { error_message: e }.into_tool_output()
+        }
+    }
+}
+
+struct SpawnedProcessGroup {
+    child: Option<tokio::process::Child>,
+    pgid: i32,
+    sandbox_scratch_dir: Option<std::path::PathBuf>,
+}
+
+impl SpawnedProcessGroup {
+    fn new(
+        child: tokio::process::Child,
+        pgid: i32,
+        sandbox_scratch_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            child: Some(child),
+            pgid,
+            sandbox_scratch_dir,
+        }
+    }
+
+    fn into_waiter_parts(mut self) -> (tokio::process::Child, Option<std::path::PathBuf>) {
+        let child = self
+            .child
+            .take()
+            .expect("spawned child already transferred");
+        (child, self.sandbox_scratch_dir.take())
+    }
+
+    #[cfg(test)]
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child
+            .as_mut()
+            .expect("spawned child already transferred")
+    }
+
+    #[cfg(test)]
+    fn pgid(&self) -> i32 {
+        self.pgid
+    }
+}
+
+impl Drop for SpawnedProcessGroup {
+    fn drop(&mut self) {
+        if self.child.is_none() {
+            return;
+        }
+        #[cfg(unix)]
+        unsafe {
+            // SAFETY: a negative pid targets the process group created by
+            // setpgid below. The direct child also has kill_on_drop enabled.
+            libc::kill(-self.pgid, libc::SIGKILL);
+        }
+        if let Some(dir) = self.sandbox_scratch_dir.take() {
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }
@@ -577,17 +710,11 @@ fn spawn_child(
     cmd: &str,
     label: Option<String>,
     ctx: &ToolContext,
+    spawn_context: &SpawnContext,
     handle_id: HandleId,
     ring_bytes_cap: usize,
     spawn_mode: BashSpawnMode,
-) -> Result<
-    (
-        Arc<Handle>,
-        tokio::process::Child,
-        Option<std::path::PathBuf>,
-    ),
-    String,
-> {
+) -> Result<(Arc<Handle>, SpawnedProcessGroup), String> {
     // Per bash.allium @guidance on HandleSpawned:
     //   "Spawn child via Command::new(\"bash\").args([\"-c\", cmd]) with
     //    pre_exec(setpgid(0,0))"
@@ -610,11 +737,14 @@ fn spawn_child(
     let mut command = match spawn_mode {
         BashSpawnMode::Direct => {
             let mut command = Command::new("bash");
-            command.arg("-c").arg(cmd).current_dir(ctx.working_dir());
+            command
+                .arg("-c")
+                .arg(cmd)
+                .current_dir(&spawn_context.working_dir);
             command
         }
-        BashSpawnMode::ExploreReadOnly => {
-            let sandbox_command = ExploreSandboxLauncher::command(cmd, ctx.working_dir())?;
+        BashSpawnMode::ExploreReadOnly | BashSpawnMode::SharedReadOnly => {
+            let sandbox_command = ExploreSandboxLauncher::command(cmd, &spawn_context.working_dir)?;
             sandbox_scratch_dir = Some(sandbox_command.scratch_dir);
             Command::from(sandbox_command.command)
         }
@@ -623,6 +753,8 @@ fn spawn_child(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    command.kill_on_drop(true);
 
     #[cfg(unix)]
     unsafe {
@@ -654,7 +786,7 @@ fn spawn_child(
     // pgid == pid because we made the child a process group leader.
     let pgid = i32::try_from(pid).unwrap_or(0);
 
-    let handle = Handle::new_live_for_actor(
+    let handle = Handle::new_live_for_actor_with_owner(
         ctx.work_scope.clone(),
         handle_id,
         ctx.resource_access.conversation_id().to_string(),
@@ -665,13 +797,26 @@ fn spawn_child(
         pid,
         ring_bytes_cap,
     );
-    Ok((handle, child, sandbox_scratch_dir))
+    Ok((
+        handle,
+        SpawnedProcessGroup::new(child, pgid, sandbox_scratch_dir),
+    ))
+}
+
+struct WaiterContext {
+    owner_scope: ResourceScopeKey,
+    lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
+    terminal_effect: BashTerminalEffect,
+    sandbox_scratch_dir: Option<std::path::PathBuf>,
+    progress_reporter: Option<Arc<LiveBashProgressReporter>>,
 }
 
 fn start_io_tasks(
     handle: &Arc<Handle>,
+    owner_scope: ResourceScopeKey,
     mut child: tokio::process::Child,
     lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
+    terminal_effect: BashTerminalEffect,
     sandbox_scratch_dir: Option<std::path::PathBuf>,
     progress_reporter: Option<Arc<LiveBashProgressReporter>>,
 ) {
@@ -719,9 +864,13 @@ fn start_io_tasks(
             child,
             stdout_join,
             stderr_join,
-            lifecycle_sink,
-            sandbox_scratch_dir,
-            progress_reporter,
+            WaiterContext {
+                owner_scope,
+                lifecycle_sink,
+                terminal_effect,
+                sandbox_scratch_dir,
+                progress_reporter,
+            },
         )
         .await;
     });
@@ -973,9 +1122,7 @@ async fn run_waiter(
     mut child: tokio::process::Child,
     stdout_join: Option<tokio::task::JoinHandle<()>>,
     stderr_join: Option<tokio::task::JoinHandle<()>>,
-    lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
-    sandbox_scratch_dir: Option<std::path::PathBuf>,
-    progress_reporter: Option<Arc<LiveBashProgressReporter>>,
+    context: WaiterContext,
 ) {
     let panic_guard = ExitWatchPanicGuard::new(handle.clone());
     let started_at = Instant::now();
@@ -1005,14 +1152,14 @@ async fn run_waiter(
         }
     };
     let _ = tokio::time::timeout(READER_DRAIN_TIMEOUT, drain).await;
-    if let Some(reporter) = &progress_reporter {
+    if let Some(reporter) = &context.progress_reporter {
         reporter.maybe_emit_handle(&handle, true).await;
         reporter.deactivate();
     }
 
     let elapsed = started_at.elapsed();
     if handle
-        .transition_to_terminal(cause, elapsed, finished_at, TOMBSTONE_TAIL_LINES)
+        .transition_to_terminal(cause.clone(), elapsed, finished_at, TOMBSTONE_TAIL_LINES)
         .await
     {
         handle.publish_exit(ExitState::Exited);
@@ -1020,20 +1167,25 @@ async fn run_waiter(
         // work-scope state-transition signal (REQ-WSUI-007). Guarded by the
         // `transition_to_terminal` return so a redundant late transition does
         // not double-emit. Best-effort: a closed sink is logged by the bridge.
-        if let Some(sink) = &lifecycle_sink {
+        if let Some(sink) = &context.lifecycle_sink {
             if let Err(e) = sink.send(crate::bash::registry::BashLifecycleEvent {
-                work_scope: handle.work_scope.clone(),
+                owner: context.owner_scope.clone(),
+                handle_id: Some(handle.handle_id.clone()),
                 phase: crate::bash::registry::BashLifecyclePhase::Terminal,
+                cause: Some(cause),
+                terminal_effect: Some(context.terminal_effect),
             }) {
                 tracing::debug!(
-                    work_scope = %handle.work_scope,
+                    owner = %context.owner_scope,
+                    handle_id = %handle.handle_id,
+                    terminal_effect = ?context.terminal_effect,
                     error = %e,
                     "dropping bash terminal lifecycle event — sink closed"
                 );
             }
         }
     }
-    if let Some(dir) = sandbox_scratch_dir {
+    if let Some(dir) = context.sandbox_scratch_dir {
         if let Err(e) = std::fs::remove_dir_all(&dir) {
             tracing::debug!(path = %dir.display(), error = %e, "failed to remove explore bash scratch directory");
         }
@@ -1256,7 +1408,24 @@ async fn run_kill(
             // state the inventory reflects (REQ-WSUI-007). Emit a non-
             // reconciling lifecycle phase now; the later true terminal
             // transition still emits from the waiter after final I/O drains.
-            ctx.bash_handle_registry().emit_lifecycle(&ctx.work_scope, crate::bash::registry::BashLifecyclePhase::KillPendingKernel);
+            if let Some(registered) = ctx
+                .bash_handle_registry()
+                .get_by_id(&handle.handle_id)
+                .await
+            {
+                ctx.bash_handle_registry().emit_lifecycle(
+                    &registered.owner,
+                    Some(handle.handle_id.clone()),
+                    crate::bash::registry::BashLifecyclePhase::KillPendingKernel,
+                    None,
+                    None,
+                );
+            } else {
+                tracing::debug!(
+                    handle_id = %handle.handle_id,
+                    "skipping kill-pending lifecycle event — handle owner unavailable"
+                );
+            }
             shape_handle_response(
                 &handle,
                 &ReadArgs::default(),
@@ -1289,24 +1458,18 @@ fn send_signal_to_group(_pgid: i32, _signal: KillSignal) {
 // ---------------------------------------------------------------------------
 
 async fn lookup_handle(ctx: &ToolContext, handle_id: &str) -> Result<Arc<Handle>, BashError> {
-    let handles_arc: Arc<RwLock<ResourceScopeKeyHandles>> =
-        ctx.bash_handles().await.map_err(|e| {
-            // The accessor is currently infallible (returns Ok), but if it
-            // ever fails we surface as handle_not_found-shaped. Use the
-            // BashHandleError debug for the message.
-            BashError::HandleNotFound {
-                handle_id: format!("{handle_id} (registry error: {e:?})"),
-            }
-        })?;
-    let handles = handles_arc.read().await;
-    let handle = handles
-        .get(&HandleId::new(handle_id.to_string()))
+    let registered = ctx
+        .bash_handle_registry()
+        .get_by_id(&HandleId::new(handle_id.to_string()))
+        .await
         .ok_or_else(|| BashError::HandleNotFound {
             handle_id: handle_id.to_string(),
         })?;
-    if !ctx
-        .resource_access
-        .can_control(&handle.creator_conversation_id, handle.authority)
+    let handle = registered.handle;
+    if handle.controller_scope != ctx.work_scope
+        || !ctx
+            .resource_access
+            .can_control(&handle.creator_conversation_id, handle.authority)
     {
         return Err(BashError::HandleNotFound {
             handle_id: handle_id.to_string(),
@@ -1477,6 +1640,24 @@ async fn shape_handle_response(
     ToolOutput::success(serialized).with_display(value)
 }
 
+fn durable_wake_scope(
+    ctx: &ToolContext,
+    handle: &Handle,
+) -> Result<Option<phoenix_workflow::wake_profile::WorkScopeIdentity>, String> {
+    match &ctx.work_scope {
+        ResourceScopeKey::Coordinator => {
+            tracing::debug!(
+                handle = %handle.handle_id,
+                "skipping durable wake registration for Coordinator bash handle"
+            );
+            Ok(None)
+        }
+        ResourceScopeKey::Work(_) | ResourceScopeKey::GlobalTerminal => {
+            work_scope_identity(&ctx.work_scope).map(Some)
+        }
+    }
+}
+
 async fn background_run_response(
     handle: &Arc<Handle>,
     elapsed: Duration,
@@ -1496,8 +1677,9 @@ async fn background_run_response(
         return response;
     };
 
-    let registration_scope = match work_scope_identity(&ctx.work_scope) {
-        Ok(scope) => scope,
+    let registration_scope = match durable_wake_scope(ctx, handle) {
+        Ok(Some(scope)) => scope,
+        Ok(None) => return response,
         Err(error) => return ToolOutput::error(error),
     };
     let resource = phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(
@@ -1914,10 +2096,18 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Mutex;
     use std::task::{Context, Poll};
-    use tokio::io::{AsyncRead, ReadBuf};
+    use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader, ReadBuf};
 
     fn scope(id: &str) -> ResourceScopeKey {
         ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse(id).unwrap())
+    }
+
+    fn spawn_context_for(ctx: &ToolContext) -> SpawnContext {
+        SpawnContext {
+            working_dir: ctx.working_dir().to_path_buf(),
+            lifecycle_scope: ctx.work_scope.clone(),
+            terminal_effect: BashTerminalEffect::InventoryAndBranchReconcile,
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -1950,6 +2140,54 @@ mod tests {
                 .expect("register_calls lock")
                 .clone()
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_unregistered_spawn_kills_the_process_group() {
+        let ctx = ctx_with_registrar(&scope("drop-process-group"), None);
+        let spawn_context = spawn_context_for(&ctx);
+        let (_, mut spawned) = spawn_child(
+            "(echo ready; exec sleep 30) & wait",
+            None,
+            &ctx,
+            &spawn_context,
+            HandleId::new("b-drop-process-group"),
+            RING_BUFFER_BYTES,
+            BashSpawnMode::Direct,
+        )
+        .expect("spawn process group");
+        let pgid = spawned.pgid();
+        let scratch_parent = tempfile::tempdir().expect("scratch parent");
+        let scratch = scratch_parent.path().join("spawn-scratch");
+        std::fs::create_dir(&scratch).expect("create scratch");
+        spawned.sandbox_scratch_dir = Some(scratch.clone());
+        let stdout = spawned.child_mut().stdout.take().expect("child stdout");
+        let mut ready = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            BufReader::new(stdout).read_line(&mut ready),
+        )
+        .await
+        .expect("descendant readiness timed out")
+        .expect("read descendant readiness");
+        assert_eq!(ready.trim(), "ready");
+
+        drop(spawned);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let result = unsafe { libc::kill(-pgid, 0) };
+                if result != 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("process group survived guard drop");
+        assert!(!scratch.exists(), "sandbox scratch survived guard drop");
     }
 
     #[async_trait::async_trait]
@@ -2007,8 +2245,11 @@ mod tests {
         if let Some(registrar) = registrar {
             ctx = ctx.with_wake_registrar(Some(registrar));
         }
-        if matches!(work_scope, ResourceScopeKey::GlobalTerminal) {
-            ctx.work_scope = ResourceScopeKey::GlobalTerminal;
+        if matches!(
+            work_scope,
+            ResourceScopeKey::Coordinator | ResourceScopeKey::GlobalTerminal
+        ) {
+            ctx.work_scope = work_scope.clone();
         }
         ctx
     }
@@ -2247,6 +2488,7 @@ mod tests {
             0,
             ReadArgs::default(),
             &ctx,
+            &spawn_context_for(&ctx),
             BashSpawnMode::Direct,
         )
         .await;
@@ -2273,6 +2515,7 @@ mod tests {
             0,
             ReadArgs::default(),
             &ctx,
+            &spawn_context_for(&ctx),
             BashSpawnMode::Direct,
         )
         .await;
@@ -2294,6 +2537,7 @@ mod tests {
             0,
             ReadArgs::default(),
             &ctx,
+            &spawn_context_for(&ctx),
             BashSpawnMode::Direct,
         )
         .await;
@@ -2315,12 +2559,62 @@ mod tests {
             5,
             ReadArgs::default(),
             &ctx,
+            &spawn_context_for(&ctx),
             BashSpawnMode::Direct,
         )
         .await;
         assert!(output.is_success(), "{}", output.output());
         let value: serde_json::Value = serde_json::from_str(output.output()).expect("json");
         assert_eq!(value["status"], "exited");
+        assert!(registrar.register_calls().is_empty());
+    }
+
+    #[test]
+    fn shared_read_only_handles_are_visible_across_scope_actors() {
+        assert_eq!(
+            BashSpawnMode::SharedReadOnly.authority(),
+            phoenix_core::work_scope::ResourceAuthority::Work
+        );
+        assert_eq!(
+            BashSpawnMode::ExploreReadOnly.authority(),
+            phoenix_core::work_scope::ResourceAuthority::Restricted
+        );
+        let successor = phoenix_core::work_scope::EffectiveResourceAccess::new(
+            "coordinator-successor",
+            BashSpawnMode::SharedReadOnly.authority(),
+        );
+        assert!(successor.can_control(
+            "coordinator-predecessor",
+            BashSpawnMode::SharedReadOnly.authority()
+        ));
+    }
+
+    #[tokio::test]
+    async fn coordinator_background_run_preserves_handle_without_durable_wake() {
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(1)]);
+        let ctx = ctx_with_registrar(&ResourceScopeKey::Coordinator, Some(registrar.clone()));
+        let output = run_run(
+            "sleep 10",
+            None,
+            0,
+            ReadArgs::default(),
+            &ctx,
+            &SpawnContext {
+                working_dir: ctx.working_dir().to_path_buf(),
+                lifecycle_scope: ResourceScopeKey::Work(
+                    phoenix_core::work_scope::WorkScopeId::parse("coordinator-target").unwrap(),
+                ),
+                terminal_effect: BashTerminalEffect::InventoryOnly,
+            },
+            BashSpawnMode::Direct,
+        )
+        .await;
+
+        assert!(output.is_success(), "{}", output.output());
+        let value: Value = serde_json::from_str(output.output()).expect("json");
+        assert_eq!(value["status"], "still_running");
+        assert!(value["handle"].as_str().is_some());
+        assert!(value["wake_registration"].is_null(), "got: {value}");
         assert!(registrar.register_calls().is_empty());
     }
 
@@ -2334,14 +2628,14 @@ mod tests {
             0,
             ReadArgs::default(),
             &ctx,
+            &spawn_context_for(&ctx),
             BashSpawnMode::Direct,
         )
         .await;
         assert!(!output.is_success());
-        assert_eq!(
-            output.output(),
-            "global terminal scope cannot own a durable wake"
-        );
+        assert!(output
+            .output()
+            .contains("bash processes require a WorkScope owner"));
         assert!(registrar.register_calls().is_empty());
     }
 
@@ -2354,6 +2648,7 @@ mod tests {
             0,
             ReadArgs::default(),
             &ctx,
+            &spawn_context_for(&ctx),
             BashSpawnMode::Direct,
         )
         .await;
@@ -2376,6 +2671,7 @@ mod tests {
             10,
             ReadArgs::default(),
             &ctx,
+            &spawn_context_for(&ctx),
             BashSpawnMode::Direct,
         )
         .await;
@@ -2396,6 +2692,7 @@ mod tests {
             0,
             ReadArgs::default(),
             &ctx,
+            &spawn_context_for(&ctx),
             BashSpawnMode::Direct,
         )
         .await;
@@ -2406,6 +2703,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn kill_pending_emits_non_reconciling_phase_before_true_terminal() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let socket_dir = tempfile::tempdir().expect("socket dir");
@@ -2439,6 +2737,7 @@ mod tests {
             0,
             ReadArgs::default(),
             &ctx,
+            &spawn_context_for(&ctx),
             BashSpawnMode::Direct,
         )
         .await;
@@ -2447,7 +2746,12 @@ mod tests {
 
         let spawned = rx.recv().await.expect("spawned event");
         assert_eq!(spawned.phase, BashLifecyclePhase::Spawned);
-        assert_eq!(spawned.work_scope, ctx.work_scope);
+        assert_eq!(spawned.owner, ctx.work_scope);
+        assert_eq!(
+            spawned.handle_id.as_ref().map(HandleId::as_str),
+            Some(handle_id.as_str())
+        );
+        assert_eq!(spawned.terminal_effect, None);
 
         // Wait for the trap-installed marker to appear in the ring. Deterministic
         // proof the trap is in place; no wall-clock assumption about bash startup.
@@ -2496,11 +2800,12 @@ mod tests {
 
         let kill_pending = rx.recv().await.expect("kill-pending event");
         assert_eq!(kill_pending.phase, BashLifecyclePhase::KillPendingKernel);
-        assert_eq!(kill_pending.work_scope, ctx.work_scope);
-        assert!(
-            !kill_pending.phase.schedules_reconciliation(),
-            "kill_pending must not trigger terminal reconciliation"
+        assert_eq!(kill_pending.owner, ctx.work_scope);
+        assert_eq!(
+            kill_pending.handle_id.as_ref().map(HandleId::as_str),
+            Some(handle_id.as_str())
         );
+        assert_eq!(kill_pending.terminal_effect, None);
 
         let kill_output = kill_task.await.expect("kill task");
         let kill_value: serde_json::Value =
@@ -2525,6 +2830,14 @@ mod tests {
         .await;
         let terminal = rx.recv().await.expect("terminal event");
         assert_eq!(terminal.phase, BashLifecyclePhase::Terminal);
-        assert!(terminal.phase.schedules_reconciliation());
+        assert_eq!(terminal.owner, ctx.work_scope);
+        assert_eq!(
+            terminal.handle_id.as_ref().map(HandleId::as_str),
+            Some(handle_id.as_str())
+        );
+        assert_eq!(
+            terminal.terminal_effect,
+            Some(BashTerminalEffect::InventoryAndBranchReconcile)
+        );
     }
 }

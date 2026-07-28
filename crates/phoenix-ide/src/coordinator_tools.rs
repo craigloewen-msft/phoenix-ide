@@ -5,19 +5,127 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::send_chat_service::{SendChatApplicationService, SendChatRequest, SendChatServiceError};
-use crate::tools::{Tool, ToolContext, ToolOutput};
+use crate::tools::{
+    ExploreToolPolicy, SandboxedBashTool, SharedSandboxedBashRequest, Tool, ToolContext,
+    ToolOutput, ValidatedBashSpawnTarget,
+};
+use phoenix_core::domain::bash_types::{BashInvocation, BashSpawnTarget};
 
 pub(crate) fn tools(
     service: GlobalReadService,
     send_chat: Arc<SendChatApplicationService>,
+    explore_policy: ExploreToolPolicy,
 ) -> Vec<Arc<dyn Tool>> {
-    vec![
+    let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(SearchConversations(service.clone())),
         Arc::new(ReadConversation(service.clone())),
         Arc::new(QueryDatabase(service.clone())),
         Arc::new(ResolveReference(service.clone())),
-        Arc::new(SendConversationMessage { service, send_chat }),
-    ]
+        Arc::new(SendConversationMessage {
+            service: service.clone(),
+            send_chat,
+        }),
+    ];
+    if explore_policy.has_sandboxed_bash() {
+        tools.push(Arc::new(ExplicitCwdSandboxedBash(service)));
+    }
+    tools
+}
+
+struct ExplicitCwdSandboxedBash(GlobalReadService);
+
+#[async_trait]
+impl Tool for ExplicitCwdSandboxedBash {
+    fn name(&self) -> &'static str {
+        "bash"
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "{}\n\nCoordinator usage: every op=run call must include work_scope_id copied from the authoritative active WorkScope row in Coordinator context. Phoenix resolves the canonical working directory from that persisted WorkScope, preferring worktree_path then cwd. There is no default repository or working directory. peek, wait, and kill use the handle and do not need work_scope_id.",
+            SandboxedBashTool.description()
+        )
+    }
+
+    fn description_for_language(
+        &self,
+        language: phoenix_core::llm_language::LlmLanguage,
+    ) -> String {
+        format!(
+            "{}\n\nCoordinator: every op=run needs work_scope_id from the same active WorkScope row in context. Phoenix resolves canonical cwd from persisted WorkScope data, preferring worktree_path then cwd. No default repo or cwd. peek, wait, kill use handle without work_scope_id.",
+            SandboxedBashTool.description_for_language(language)
+        )
+    }
+
+    fn input_schema(&self) -> Value {
+        let mut schema = SandboxedBashTool.input_schema();
+        schema["properties"]["work_scope_id"] = json!({
+            "type": "string",
+            "minLength": 1,
+            "description": "Authoritative active WorkScope id for op=run. Phoenix resolves the canonical cwd from the active persisted WorkScope, preferring worktree_path then cwd."
+        });
+        schema["if"] = json!({
+            "properties": { "op": { "const": "run" } },
+            "required": ["op"]
+        });
+        schema["then"] = json!({ "required": ["cmd", "work_scope_id"] });
+        schema["else"] = json!({
+            "required": ["handle"],
+            "not": {
+                "anyOf": [
+                    { "required": ["work_scope_id"] }
+                ]
+            }
+        });
+        schema
+    }
+
+    fn clearable(&self) -> bool {
+        true
+    }
+
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        let invocation = match BashInvocation::from_with_work_scope_target(input) {
+            Ok(invocation) => invocation,
+            Err(error) => return ToolOutput::error(error),
+        };
+        let context_input = invocation.to_context_tool_value();
+        let spawn_target = match &invocation {
+            BashInvocation::Run {
+                target: BashSpawnTarget::WorkScope(work_scope_id),
+                ..
+            } => {
+                let binding = match self
+                    .0
+                    .resolve_active_work_scope_bash_target(work_scope_id.as_str())
+                    .await
+                {
+                    Ok(path) => path,
+                    Err(error) => return ToolOutput::error(error),
+                };
+                Some(ValidatedBashSpawnTarget {
+                    working_dir: binding.path,
+                    lifecycle_scope: binding.work_scope_id,
+                })
+            }
+            BashInvocation::Run {
+                target: BashSpawnTarget::Context,
+                ..
+            }
+            | BashInvocation::Peek { .. }
+            | BashInvocation::Wait { .. }
+            | BashInvocation::Kill { .. } => None,
+        };
+        SandboxedBashTool
+            .run_shared_sandboxed(
+                SharedSandboxedBashRequest {
+                    input: context_input,
+                    spawn_target,
+                },
+                ctx,
+            )
+            .await
+    }
 }
 
 struct SearchConversations(GlobalReadService);
@@ -308,5 +416,93 @@ fn result(value: Result<String, String>) -> ToolOutput {
     match value {
         Ok(value) => ToolOutput::success(value),
         Err(error) => ToolOutput::error(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phoenix_db::retrieval::Fts5Retriever;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    struct NoLlm;
+
+    impl phoenix_core::llm_service::LlmSelector for NoLlm {
+        fn get(
+            &self,
+            _model_id: &str,
+        ) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
+            None
+        }
+
+        fn default_service(&self) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
+            None
+        }
+    }
+
+    async fn tool_and_context() -> (ExplicitCwdSandboxedBash, ToolContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("coordinator-bash.db");
+        let db = crate::db::Database::open(db_path.to_str().unwrap())
+            .await
+            .unwrap();
+        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+        let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
+        let tool = ExplicitCwdSandboxedBash(GlobalReadService::new(db, retriever));
+        let context = ToolContext::new_without_filesystem(
+            CancellationToken::new(),
+            "coordinator".to_string(),
+            Arc::new(crate::tools::BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+        );
+        (tool, context)
+    }
+
+    #[tokio::test]
+    async fn coordinator_bash_schema_requires_work_scope_id_for_run() {
+        let (tool, context) = tool_and_context().await;
+        let schema = tool.input_schema();
+        assert!(schema["properties"].get("cwd").is_none());
+        assert_eq!(schema["required"], json!(["op"]));
+        assert_eq!(schema["then"]["required"], json!(["cmd", "work_scope_id"]));
+        assert_eq!(schema["else"]["required"], json!(["handle"]));
+        assert_eq!(
+            schema["else"]["not"]["anyOf"],
+            json!([
+                { "required": ["work_scope_id"] }
+            ])
+        );
+        let alternate =
+            tool.description_for_language(phoenix_core::llm_language::LlmLanguage::Caveman);
+        assert!(alternate.contains("every op=run needs work_scope_id"));
+        assert!(alternate.contains("No default repo or cwd"));
+
+        let output = tool.run(json!({"op": "run", "cmd": "pwd"}), context).await;
+        assert!(!output.is_success());
+        assert!(output.output().contains("requires work_scope_id"));
+    }
+
+    #[tokio::test]
+    async fn coordinator_bash_rejects_missing_work_scope_before_sandbox_dispatch() {
+        let (tool, context) = tool_and_context().await;
+        let output = tool
+            .run(
+                json!({
+                    "op": "run",
+                    "cmd": "pwd",
+                    "work_scope_id": "missing-scope"
+                }),
+                context,
+            )
+            .await;
+
+        assert!(!output.is_success());
+        assert!(output
+            .output()
+            .contains("active persisted WorkScope with a live owner not found"));
     }
 }

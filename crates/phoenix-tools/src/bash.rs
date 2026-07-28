@@ -25,10 +25,12 @@ pub mod registry;
 pub mod ring;
 pub mod sandbox;
 
+pub use handle::FinalCause;
+pub use handle::HandleId;
 pub use reaper::{install_reaper, shutdown_kill_tree};
 pub use registry::{
     BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecyclePhase, BashLifecycleSink,
-    ResourceScopeKeyHandles,
+    BashTerminalEffect, ResourceScopeKeyHandles,
 };
 // `types` (BashOp, BashToolInput) moved to phoenix-core. Alias the module back
 // as `types` and re-export the items so existing paths resolve unchanged.
@@ -47,6 +49,28 @@ use serde_json::{json, Value};
 pub struct BashTool;
 
 pub struct SandboxedBashTool;
+
+#[derive(Debug, Clone)]
+pub struct ValidatedBashSpawnTarget {
+    pub working_dir: std::path::PathBuf,
+    pub lifecycle_scope: phoenix_core::work_scope::WorkScopeId,
+}
+
+#[derive(Debug, Clone)]
+pub struct SharedSandboxedBashRequest {
+    pub input: Value,
+    pub spawn_target: Option<ValidatedBashSpawnTarget>,
+}
+
+impl SandboxedBashTool {
+    pub async fn run_shared_sandboxed(
+        &self,
+        request: SharedSandboxedBashRequest,
+        ctx: ToolContext,
+    ) -> ToolOutput {
+        operations::dispatch_shared_sandboxed(request, ctx).await
+    }
+}
 
 #[async_trait]
 impl Tool for BashTool {
@@ -755,6 +779,91 @@ mod tests {
                 )
                 .await;
         }
+    }
+
+    #[tokio::test]
+    async fn shared_sandboxed_explicit_target_run_uses_resolved_cwd_and_owner_scope_without_mutating_context(
+    ) {
+        let registry = Arc::new(BashHandleRegistry::new());
+        let tool = SandboxedBashTool;
+        let original_dir = temp_dir();
+        let original = ToolContext::new(
+            CancellationToken::new(),
+            "conv-a".to_string(),
+            original_dir.clone(),
+            Arc::new(BrowserSessionManager::default()),
+            registry.clone(),
+            Arc::new(crate::NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            Arc::new(crate::TmuxRegistry::new()),
+            None,
+            phoenix_core::work_scope::WorkScopeId::parse("scope-a").unwrap(),
+        );
+        let explicit_scope = phoenix_core::work_scope::WorkScopeId::parse("scope-owned").unwrap();
+        let explicit_dir = tempfile::tempdir().unwrap();
+        let original =
+            original.with_resource_authority(phoenix_core::work_scope::ResourceAuthority::Work);
+
+        let running = tool
+            .run_shared_sandboxed(
+                SharedSandboxedBashRequest {
+                    input: json!({"op": "run", "cmd": "sleep 30", "wait_seconds": 0}),
+                    spawn_target: Some(ValidatedBashSpawnTarget {
+                        working_dir: explicit_dir.path().to_path_buf(),
+                        lifecycle_scope: explicit_scope.clone(),
+                    }),
+                },
+                original.clone(),
+            )
+            .await;
+        let handle = parse_response(&running)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let owner_ctx = ToolContext::new_with_resource_access(
+            CancellationToken::new(),
+            "conv-owner".to_string(),
+            original_dir.clone(),
+            Arc::new(BrowserSessionManager::default()),
+            registry.clone(),
+            Arc::new(crate::NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            Arc::new(crate::TmuxRegistry::new()),
+            None,
+            explicit_scope.clone(),
+            phoenix_core::work_scope::ResourceAuthority::Work,
+        );
+        let owner_attempt = tool
+            .run_shared_sandboxed(
+                SharedSandboxedBashRequest {
+                    input: json!({"op": "peek", "handle": handle.clone()}),
+                    spawn_target: None,
+                },
+                owner_ctx,
+            )
+            .await;
+        assert!(
+            !owner_attempt.is_success(),
+            "lifecycle ownership must not grant control authority"
+        );
+        assert!(registry
+            .owner_handles(&phoenix_core::work_scope::ResourceScopeKey::Work(
+                explicit_scope
+            ))
+            .await
+            .iter()
+            .any(|owned| owned.handle.handle_id.as_str() == handle));
+        let _ = tool
+            .run_shared_sandboxed(
+                SharedSandboxedBashRequest {
+                    input: json!({"op": "kill", "handle": handle, "signal": "KILL"}),
+                    spawn_target: None,
+                },
+                original.clone(),
+            )
+            .await;
+        assert_eq!(original.working_dir(), original_dir.as_path());
     }
 
     #[tokio::test]

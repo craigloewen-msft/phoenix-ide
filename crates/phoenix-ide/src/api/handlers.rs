@@ -283,10 +283,7 @@ pub fn create_router(state: AppState) -> Router {
         // delta, live resource sample). `:scope_key` is a
         // `ResourceScopeKey::stable_key()`; `:handle_id` names a bash handle in that
         // scope. See `specs/process-inspector/` REQ-PINSP-005.
-        .route(
-            "/api/work-scope/:scope_key/bash/:handle_id/inspect",
-            get(inspect_bash_handle),
-        )
+        .route("/api/bash/:handle_id/inspect", get(inspect_bash_handle))
         .route("/api/chains/:rootId", get(get_chain))
         .route("/api/chains/:rootId/qa", post(submit_chain_question))
         .route(
@@ -3165,39 +3162,52 @@ struct InspectQuery {
     since: Option<u64>,
 }
 
-/// `GET /api/work-scope/:scope_key/bash/:handle_id/inspect?since=K` — the
-/// per-handle drill-down snapshot (`specs/process-inspector/` REQ-PINSP-005).
+/// `GET /api/bash/:handle_id/inspect?since=K` — the per-handle drill-down
+/// snapshot (`specs/process-inspector/` REQ-PINSP-005).
 ///
-/// Resolves `:scope_key` into a `ResourceScopeKey` (400 on a malformed key, like the
-/// inventory handler), looks up `:handle_id` in that scope's bash table (404
-/// when absent), reads the output window for the optional `since` cursor via
-/// the existing ring/tombstone read helpers, and attaches a request-time
-/// process-group resource sample iff the handle is live.
+/// Resolves `:handle_id` through the global bash registry (404 when absent),
+/// authorizes either the owning controller metadata or a conversation that
+/// belongs to the handle's owning work scope, reads the output window for the
+/// optional `since` cursor via the existing ring/tombstone read helpers, and
+/// attaches a request-time process-group resource sample iff the handle is live.
 async fn inspect_bash_handle(
     State(state): State<AppState>,
-    Path((scope_key, handle_id)): Path<(String, String)>,
+    Path(handle_id): Path<String>,
     Query(query): Query<InspectQuery>,
 ) -> Result<Json<phoenix_core::domain::process_inspection::BashHandleInspection>, AppError> {
-    let work_scope = crate::work_scope::ResourceScopeKey::from_stable_key(&scope_key)
-        .ok_or_else(|| AppError::BadRequest(format!("malformed work-scope key: {scope_key}")))?;
-    let actor = work_scope_actor(&state, &work_scope, &query.conversation_id).await?;
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&query.conversation_id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    let authority = match conversation.conv_mode {
+        crate::db::ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
+        _ => crate::work_scope::ResourceAuthority::Work,
+    };
+    let actor = if authority == crate::work_scope::ResourceAuthority::Restricted
+        && conversation.runtime_role == crate::work_scope::RuntimeRole::User
+    {
+        crate::work_scope::EffectiveResourceAccess::shared_restricted(conversation.id.clone())
+    } else {
+        crate::work_scope::EffectiveResourceAccess::new(conversation.id.clone(), authority)
+    };
+    let actor_scope = conversation_resource_scope(&conversation);
 
     let mut assembly = phoenix_tools::process_inspection::assemble_inspection(
-        &work_scope,
         &handle_id,
+        Some(&actor_scope),
         query.since,
         Some(&actor),
+        Some(&conversation),
         state.runtime.bash_handles(),
     )
     .await
-    .ok_or_else(|| {
-        AppError::NotFound(format!(
-            "handle {handle_id} not found in work scope {scope_key}"
-        ))
-    })?;
+    .ok_or_else(|| AppError::NotFound(format!("handle {handle_id} not found or not visible")))?;
 
     if assembly.live_pgid.is_some() {
         let generation = state.resource_monitor.observe(&state).await;
+        let scope_key = assembly.owner.stable_key();
         let health = generation.handle_pids(&scope_key, &handle_id).map_or_else(
             || phoenix_core::domain::work_scope_inventory::ResourceHealth {
                 cpu_percent: None,
@@ -3259,7 +3269,15 @@ async fn get_system_prompt(
         phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
     };
     let system_prompt = if is_coordinator {
-        crate::system_prompt::build_coordinator_system_prompt(conversation.llm_language)
+        let coordinator_bash = if state.platform.has_sandbox() {
+            phoenix_core::domain::sm_state::ExploreBashCapability::Sandboxed
+        } else {
+            phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
+        };
+        crate::system_prompt::build_coordinator_system_prompt(
+            conversation.llm_language,
+            coordinator_bash,
+        )
     } else {
         let cwd = std::path::PathBuf::from(&conversation.cwd);
         let tasks_dir_name = taskmd_core::discover::discover_or_default(&cwd)
@@ -4407,6 +4425,26 @@ async fn refuse_if_chain_member(state: &AppState, id: &str, op: &str) -> Result<
     Err(AppError::Conflict(Box::new(response)))
 }
 
+pub(super) async fn refuse_if_coordinator(
+    state: &AppState,
+    id: &str,
+    op: &str,
+) -> Result<(), AppError> {
+    if state
+        .runtime
+        .db()
+        .is_coordinator_conversation(id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            format!("Cannot {op} the durable Coordinator conversation"),
+            "coordinator_lifecycle",
+        ))));
+    }
+    Ok(())
+}
+
 async fn archive_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -4426,6 +4464,7 @@ async fn archive_conversation(
 /// Resource cleanup failures (bash / tmux / worktree) log WARN and
 /// continue; only the final `archived = 1` write is fatal.
 pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
+    refuse_if_coordinator(state, id, "archive").await?;
     if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
         .has_owed_work_for_conversation(id)
         .await
@@ -4465,14 +4504,14 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
         ))));
     }
 
-    run_resource_cleanup_cascade(state, &conv).await?;
+    let cleanup = run_resource_cleanup_cascade(state, &conv).await?;
 
-    state
-        .runtime
-        .db()
-        .archive_conversation(id)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to set archived flag: {e}")))?;
+    if let Err(error) = state.runtime.db().archive_conversation(id).await {
+        reopen_bash_after_failed_lifecycle_mutation(state, &conv, &cleanup).await;
+        return Err(AppError::Internal(format!(
+            "Failed to set archived flag: {error}"
+        )));
+    }
 
     Ok(())
 }
@@ -4507,7 +4546,7 @@ async fn scope_still_owned_after_delete(
     if let Some(cont_id) = conv.continued_in_conv_id.as_deref() {
         match state.runtime.db().get_conversation(cont_id).await {
             Ok(continuation) => {
-                let cont_scope = conversation_work_scope(&continuation)?;
+                let cont_scope = conversation_resource_scope(&continuation);
                 if &cont_scope == work_scope {
                     return Ok(true);
                 }
@@ -4528,14 +4567,13 @@ async fn scope_still_owned_after_delete(
     // skip every resource + worktree teardown while the row is still
     // archived/deleted, orphaning those resources with no retry. Failing the
     // request instead lets the caller retry once the DB is healthy.
+    let Some(work_scope_id) = work_scope.work_scope_id() else {
+        return Ok(false);
+    };
     let conversations = state
         .runtime
         .db()
-        .list_conversations_for_work_scope(work_scope.work_scope_id().ok_or_else(|| {
-            AppError::Internal(format!(
-                "cleanup cascade has no durable scope: {work_scope}"
-            ))
-        })?)
+        .list_conversations_for_work_scope(work_scope_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(conversations.into_iter().any(|candidate| {
@@ -4579,6 +4617,36 @@ async fn cleanup_browser_with_retry(
     }
 }
 
+#[derive(Debug)]
+pub(super) struct ResourceCleanupReceipt {
+    work_scope: crate::work_scope::ResourceScopeKey,
+    bash_teardown_generation: Option<phoenix_tools::bash::registry::BashTeardownGeneration>,
+}
+
+pub(super) async fn reopen_bash_after_failed_lifecycle_mutation(
+    state: &AppState,
+    conversation: &crate::db::Conversation,
+    cleanup: &ResourceCleanupReceipt,
+) {
+    let Ok(persisted) = state.runtime.db().get_conversation(&conversation.id).await else {
+        return;
+    };
+    if !crate::runtime::conversation_owns_work_scope(&persisted) {
+        return;
+    }
+    let Some(generation) = cleanup.bash_teardown_generation else {
+        return;
+    };
+    if conversation_resource_scope(&persisted) != cleanup.work_scope {
+        return;
+    }
+    state
+        .runtime
+        .bash_handles()
+        .reopen_spawn_admission(&cleanup.work_scope, generation)
+        .await;
+}
+
 /// REQ-BED-032 steps 2-5 (bash + tmux + projects + browser cleanup),
 /// factored out so hard-delete, archive, abandon, and mark-merged share the
 /// exact same resource teardown. Authoritative failures (worktree-removal,
@@ -4610,9 +4678,9 @@ async fn cleanup_browser_with_retry(
 pub(super) async fn run_resource_cleanup_cascade(
     state: &AppState,
     conv: &crate::db::Conversation,
-) -> Result<(), AppError> {
+) -> Result<ResourceCleanupReceipt, AppError> {
     let id = conv.id.as_str();
-    let work_scope = conversation_work_scope(conv)?;
+    let work_scope = conversation_resource_scope(conv);
 
     // `inheritor_scope = Some(work_scope)` means "preserve"; `None` means
     // "tear down". Threaded to every scope-keyed cascade (bash, tmux,
@@ -4707,7 +4775,10 @@ pub(super) async fn run_resource_cleanup_cascade(
     // (REQ-BROWSER-WS-002, REQ-BROWSER-WS-003).
     cleanup_browser_with_retry(state, conv, &work_scope, inheritor_scope).await;
 
-    Ok(())
+    Ok(ResourceCleanupReceipt {
+        work_scope,
+        bash_teardown_generation: bash_report.teardown_generation,
+    })
 }
 
 /// REQ-BED-032: Hard-delete cascade orchestrator.
@@ -4754,6 +4825,7 @@ async fn delete_conversation(
 /// (see `Internal` variant) — bash / tmux / projects cleanup failures
 /// log WARN and continue per REQ-BED-032.
 pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
+    refuse_if_coordinator(state, id, "delete").await?;
     if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
         .has_owed_work_for_conversation(id)
         .await
@@ -4840,19 +4912,19 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
     // (returned as 500 so the user can retry). Shared with archive /
     // abandon / mark-merged so the resource teardown is byte-for-byte
     // identical.
-    run_resource_cleanup_cascade(state, &conv).await?;
+    let cleanup = run_resource_cleanup_cascade(state, &conv).await?;
 
     // Step 5: row deletion. SQLite ON DELETE CASCADE removes dependent
     // rows. This is the only step whose failure is fatal to the request
     // — partial cleanup above is non-fatal but a missing row deletion
     // means the user's "delete this conversation" never actually
     // happened.
-    state
-        .runtime
-        .db()
-        .delete_conversation(id)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to delete conversation row: {e}")))?;
+    if let Err(error) = state.runtime.db().delete_conversation(id).await {
+        reopen_bash_after_failed_lifecycle_mutation(state, &conv, &cleanup).await;
+        return Err(AppError::Internal(format!(
+            "Failed to delete conversation row: {error}"
+        )));
+    }
 
     // Scope retirement belongs to explicit scope cleanup, not to a terminal
     // transcript transition. The row deletion above removes this conversation's
@@ -10316,6 +10388,34 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
+    async fn coordinator_cannot_be_archived_or_hard_deleted() {
+        let state = make_test_state().await;
+        let coordinator = state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .expect("coordinator");
+
+        assert!(super::run_archive_cascade(&state, &coordinator.id)
+            .await
+            .is_err());
+        assert!(super::run_hard_delete_cascade(&state, &coordinator.id)
+            .await
+            .is_err());
+        let preserved = state
+            .db
+            .get_conversation(&coordinator.id)
+            .await
+            .expect("Coordinator history must remain durable");
+        assert!(!preserved.archived);
+        assert!(state
+            .db
+            .is_coordinator_conversation(&coordinator.id)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
     async fn coordinator_cached_pr_summary_is_absent() {
         let state = make_test_state().await;
         let coordinator = state
@@ -10372,7 +10472,6 @@ pub(crate) mod hard_delete_cascade_tests {
         let scope = create_inspector_actor(&state, actor_id, "Inventory live").await;
 
         // Insert a live handle directly into the ResourceScopeKey-keyed registry.
-        let table = state.runtime.bash_handles().get_or_create(&scope).await;
         let handle = Handle::new_live(
             scope.clone(),
             HandleId::new("b-1"),
@@ -10382,7 +10481,11 @@ pub(crate) mod hard_delete_cascade_tests {
             1234,
             RING_BUFFER_BYTES,
         );
-        table.write().await.insert(handle);
+        state
+            .runtime
+            .bash_handles()
+            .register_existing_handle(&scope, handle)
+            .await;
 
         let Json(inv) = super::get_work_scope_inventory(
             State(state),
@@ -10552,7 +10655,6 @@ pub(crate) mod hard_delete_cascade_tests {
         #[allow(clippy::cast_possible_wrap)]
         let pgid = pid as i32;
 
-        let table = state.runtime.bash_handles().get_or_create(&scope).await;
         let handle = Handle::new_live(
             scope.clone(),
             HandleId::new("b-1"),
@@ -10566,11 +10668,15 @@ pub(crate) mod hard_delete_cascade_tests {
         if let HandleState::Live(live) = handle.state().await.as_ref() {
             live.ring.lock().await.append(b"hello from inspector\n");
         }
-        table.write().await.insert(handle);
+        state
+            .runtime
+            .bash_handles()
+            .register_existing_handle(&scope, handle)
+            .await;
 
         let Json(inspection) = super::inspect_bash_handle(
             State(state),
-            Path((scope.stable_key(), "b-1".to_string())),
+            Path("b-1".to_string()),
             Query(super::InspectQuery {
                 conversation_id: actor_id.into(),
                 since: None,
@@ -10633,7 +10739,6 @@ pub(crate) mod hard_delete_cascade_tests {
         let actor_id = "conv-inspect-term";
         let scope = create_inspector_actor(&state, actor_id, "Inspect terminal").await;
 
-        let table = state.runtime.bash_handles().get_or_create(&scope).await;
         let handle = Handle::new_live(
             scope.clone(),
             HandleId::new("b-1"),
@@ -10655,11 +10760,15 @@ pub(crate) mod hard_delete_cascade_tests {
                 phoenix_tools::bash::handle::TOMBSTONE_TAIL_LINES,
             )
             .await;
-        table.write().await.insert(handle);
+        state
+            .runtime
+            .bash_handles()
+            .register_existing_handle(&scope, handle)
+            .await;
 
         let Json(inspection) = super::inspect_bash_handle(
             State(state),
-            Path((scope.stable_key(), "b-1".to_string())),
+            Path("b-1".to_string()),
             Query(super::InspectQuery {
                 conversation_id: actor_id.into(),
                 since: None,
@@ -10688,22 +10797,6 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
-    async fn inspect_rejects_malformed_scope_key() {
-        let state = make_test_state().await;
-        let err = super::inspect_bash_handle(
-            State(state),
-            Path(("bogus-no-namespace".to_string(), "b-1".to_string())),
-            Query(super::InspectQuery {
-                conversation_id: "conv-inspect".into(),
-                since: None,
-            }),
-        )
-        .await
-        .expect_err("malformed key must be rejected");
-        assert!(matches!(err, AppError::BadRequest(_)));
-    }
-
-    #[tokio::test]
     async fn inspect_unknown_handle_is_not_found() {
         let state = make_test_state().await;
         let scope = crate::scope("conv-inspect-missing");
@@ -10711,7 +10804,7 @@ pub(crate) mod hard_delete_cascade_tests {
         let _ = state.runtime.bash_handles().get_or_create(&scope).await;
         let err = super::inspect_bash_handle(
             State(state),
-            Path((scope.stable_key(), "b-404".to_string())),
+            Path("b-404".to_string()),
             Query(super::InspectQuery {
                 conversation_id: "conv-inspect".into(),
                 since: None,
@@ -11398,8 +11491,20 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("delete");
 
         assert!(
-            state.runtime.bash_handles().remove(&scope).await.is_none(),
-            "bash registry entry must be removed by cascade"
+            state
+                .runtime
+                .bash_handles()
+                .owner_handles(&scope)
+                .await
+                .is_empty(),
+            "delete cascade must leave no owned bash handles"
+        );
+        assert!(
+            matches!(
+                state.runtime.bash_handles().reserve_spawn(&scope).await,
+                Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
+            ),
+            "delete cascade must preserve the teardown fence"
         );
         assert!(state.db.get_conversation("c-2").await.is_err());
     }
@@ -11539,8 +11644,20 @@ pub(crate) mod hard_delete_cascade_tests {
 
         for (id, scope) in ids.into_iter().zip(scopes) {
             assert!(
-                state.runtime.bash_handles().remove(&scope).await.is_none(),
-                "bash registry leaked entry for {id}"
+                state
+                    .runtime
+                    .bash_handles()
+                    .owner_handles(&scope)
+                    .await
+                    .is_empty(),
+                "bash registry retained handles for {id}"
+            );
+            assert!(
+                matches!(
+                    state.runtime.bash_handles().reserve_spawn(&scope).await,
+                    Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
+                ),
+                "bash registry lost teardown fence for {id}"
             );
             assert!(state.db.get_conversation(id).await.is_err());
         }
@@ -11631,6 +11748,54 @@ pub(crate) mod hard_delete_cascade_tests {
                 "{id} must be gone after chain delete"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn chain_delete_preflights_coordinator_role_before_mutation() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["cc-a", "cc-b"]).await;
+        sqlx::query(
+            "UPDATE conversations SET runtime_role = 'coordinator', work_scope_id = NULL WHERE id = 'cc-b'",
+        )
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+
+        let err = crate::api::chains::delete_chain_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("cc-a".to_string()),
+        )
+        .await
+        .expect_err("Coordinator chain must be immutable");
+        match err {
+            AppError::Conflict(detail) => {
+                assert_eq!(detail.error_type, "coordinator_lifecycle");
+            }
+            other => panic!("expected 409, got {other:?}"),
+        }
+        assert!(state.db.get_conversation("cc-a").await.is_ok());
+        assert!(state.db.get_conversation("cc-b").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn chain_archive_preflights_coordinator_role_before_mutation() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["ca-a", "ca-b"]).await;
+        sqlx::query(
+            "UPDATE conversations SET runtime_role = 'coordinator', work_scope_id = NULL WHERE id = 'ca-b'",
+        )
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+
+        crate::api::chains::archive_chain_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("ca-a".to_string()),
+        )
+        .await
+        .expect_err("Coordinator chain must be immutable");
+        assert!(!state.db.get_conversation("ca-a").await.unwrap().archived);
+        assert!(!state.db.get_conversation("ca-b").await.unwrap().archived);
     }
 
     /// If any member of a chain is busy, `delete_chain_handler` refuses
@@ -11773,8 +11938,20 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(conv.archived, "archived flag must be set");
 
         assert!(
-            state.runtime.bash_handles().remove(&scope).await.is_none(),
-            "bash registry entry must be dropped by archive cascade"
+            state
+                .runtime
+                .bash_handles()
+                .owner_handles(&scope)
+                .await
+                .is_empty(),
+            "archive cascade must drain owned bash handles"
+        );
+        assert!(
+            matches!(
+                state.runtime.bash_handles().reserve_spawn(&scope).await,
+                Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
+            ),
+            "archive cascade must preserve the teardown admission fence"
         );
     }
 
@@ -11803,14 +11980,22 @@ pub(crate) mod hard_delete_cascade_tests {
                 .await
                 .unwrap_or_else(|_| panic!("{id} row preserved"));
             assert!(conv.archived, "{id} must be archived");
+            let scope = conversation_scope(&state, id).await;
             assert!(
                 state
                     .runtime
                     .bash_handles()
-                    .remove(&conversation_scope(&state, id).await)
+                    .owner_handles(&scope)
                     .await
-                    .is_none(),
-                "bash registry leaked entry for {id}"
+                    .is_empty(),
+                "bash registry retained handles for {id}"
+            );
+            assert!(
+                matches!(
+                    state.runtime.bash_handles().reserve_spawn(&scope).await,
+                    Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
+                ),
+                "bash registry lost teardown fence for {id}"
             );
         }
     }
@@ -12171,9 +12356,22 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("delete sub-agent");
 
         assert!(
-            state.runtime.bash_handles().remove(&scope).await.is_some(),
-            "parent's bash handle table must survive the sub-agent's deletion \
-             (scope still owned by the live parent)"
+            !state
+                .runtime
+                .bash_handles()
+                .owner_handles(&scope)
+                .await
+                .is_empty(),
+            "parent's bash handles must survive the sub-agent's deletion"
+        );
+        assert!(
+            state
+                .runtime
+                .bash_handles()
+                .reserve_spawn(&scope)
+                .await
+                .is_ok(),
+            "live parent must keep the shared scope open for new bash spawns"
         );
         assert!(
             state.db.get_conversation("sa-child").await.is_err(),
@@ -12217,8 +12415,20 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("delete");
 
         assert!(
-            state.runtime.bash_handles().remove(&scope).await.is_none(),
-            "scope must be torn down when its last live conversation is deleted"
+            state
+                .runtime
+                .bash_handles()
+                .owner_handles(&scope)
+                .await
+                .is_empty(),
+            "last-owner delete must drain the scope's bash handles"
+        );
+        assert!(
+            matches!(
+                state.runtime.bash_handles().reserve_spawn(&scope).await,
+                Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
+            ),
+            "last-owner delete must preserve the scope's teardown fence"
         );
     }
 

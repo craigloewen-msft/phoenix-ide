@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn tombstoned_bash_handle_omits_live_only_fields() {
         let inv = BashHandleInventory {
-            handle_id: "b-2".into(),
+            handle_id: "b-9".into(),
             label: None,
             cmd: "true".into(),
             state: BashHandleState::Tombstoned,

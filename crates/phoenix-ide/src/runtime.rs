@@ -33,8 +33,8 @@ use crate::tools::browser::session::{
     BrowserSessionAudience, BrowserSessionLifecycleEvent, BrowserSessionLifecycleKind,
 };
 use crate::tools::{
-    BashHandleRegistry, BashLifecycleEvent, BrowserSessionManager, ExploreToolPolicy,
-    TmuxLifecycleEvent, TmuxRegistry, ToolRegistry, WakeRegistrar,
+    BashHandleRegistry, BashLifecycleEvent, BashTerminalEffect, BrowserSessionManager,
+    ExploreToolPolicy, TmuxLifecycleEvent, TmuxRegistry, ToolRegistry, WakeRegistrar,
 };
 use phoenix_core::work_scope::ResourceScopeKey;
 
@@ -254,6 +254,13 @@ pub struct RuntimeManager {
 struct WorkScopeReconciliationRequest {
     work_scope: ResourceScopeKey,
     terminal_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BashLifecycleBridgeAction {
+    Ignore,
+    Broadcast,
+    Reconcile,
 }
 
 /// Handle to interact with a running conversation
@@ -1414,6 +1421,14 @@ impl RuntimeManager {
             .await
         {
             Ok(phoenix_core::work_scope::WorkScopeRetirementOutcome::Retired) => {
+                let report = phoenix_tools::bash::registry::teardown_bash_owner(
+                    &self.bash_handles,
+                    work_scope,
+                )
+                .await;
+                for (pgid, error) in report.kill_failures {
+                    tracing::warn!(work_scope = %scope_id, pgid, %error, "bash process-group cleanup after work-scope retirement failed");
+                }
                 tracing::debug!(work_scope = %scope_id, "retired unowned work scope after browser teardown");
             }
             Ok(_) => {}
@@ -1623,6 +1638,18 @@ impl RuntimeManager {
     /// REQ-PROJ-025 guarantees at most
     /// one non-terminal conversation per scope, so this lands on the one live
     /// member.
+    fn bash_lifecycle_bridge_action(event: &BashLifecycleEvent) -> BashLifecycleBridgeAction {
+        match (&event.owner, event.terminal_effect) {
+            (ResourceScopeKey::Work(_), Some(BashTerminalEffect::InventoryAndBranchReconcile)) => {
+                BashLifecycleBridgeAction::Reconcile
+            }
+            (ResourceScopeKey::Work(_), _) => BashLifecycleBridgeAction::Broadcast,
+            (ResourceScopeKey::Coordinator | ResourceScopeKey::GlobalTerminal, _) => {
+                BashLifecycleBridgeAction::Ignore
+            }
+        }
+    }
+
     pub async fn start_work_scope_bridge(self: &Arc<Self>) {
         let bash_rx = self.bash_lifecycle_rx.write().await.take();
         let tmux_rx = self.tmux_lifecycle_rx.write().await.take();
@@ -1648,32 +1675,44 @@ impl RuntimeManager {
                     else => break,
                 };
                 match event {
-                    BridgeEvent::Bash(event) if event.phase.schedules_reconciliation() => {
-                        manager.broadcast_work_scope_update(&event.work_scope).await;
-                        let generation = manager
-                            .db()
-                            .active_work_scope_pr_selection(
-                                event
-                                    .work_scope
-                                    .work_scope_id()
-                                    .expect("bash events have work scope identity"),
-                            )
-                            .await
-                            .ok()
-                            .flatten()
-                            .map_or(0, |state| state.inference_generation);
-                        manager
-                            .reconcile_work_scope_after_bash_terminal(
-                                WorkScopeReconciliationRequest {
-                                    work_scope: event.work_scope,
-                                    terminal_generation: generation,
-                                },
-                            )
-                            .await;
-                    }
-                    BridgeEvent::Bash(event) => {
-                        manager.broadcast_work_scope_update(&event.work_scope).await;
-                    }
+                    BridgeEvent::Bash(event) => match Self::bash_lifecycle_bridge_action(&event) {
+                        BashLifecycleBridgeAction::Ignore => {
+                            tracing::debug!(
+                                owner = %event.owner,
+                                phase = ?event.phase,
+                                handle_id = event
+                                    .handle_id
+                                    .as_ref()
+                                    .map(phoenix_tools::bash::HandleId::as_str),
+                                terminal_effect = ?event.terminal_effect,
+                                "skipping work-scope reconciliation for non-Work bash lifecycle"
+                            );
+                        }
+                        BashLifecycleBridgeAction::Broadcast => {
+                            manager.broadcast_work_scope_update(&event.owner).await;
+                        }
+                        BashLifecycleBridgeAction::Reconcile => {
+                            manager.broadcast_work_scope_update(&event.owner).await;
+                            let ResourceScopeKey::Work(work_scope_id) = &event.owner else {
+                                unreachable!("bridge action requires Work scope");
+                            };
+                            let generation = manager
+                                .db()
+                                .active_work_scope_pr_selection(work_scope_id)
+                                .await
+                                .ok()
+                                .flatten()
+                                .map_or(0, |state| state.inference_generation);
+                            manager
+                                .reconcile_work_scope_after_bash_terminal(
+                                    WorkScopeReconciliationRequest {
+                                        work_scope: event.owner,
+                                        terminal_generation: generation,
+                                    },
+                                )
+                                .await;
+                        }
+                    },
                     BridgeEvent::Tmux(work_scope) | BridgeEvent::Browser(work_scope) => {
                         manager.broadcast_work_scope_update(&work_scope).await;
                     }
@@ -2792,7 +2831,11 @@ impl RuntimeManager {
                         self.clone(),
                     ));
                 ToolRegistryExecutor::builtin_only(
-                    ToolRegistry::coordinator(crate::coordinator_tools::tools(service, send_chat)),
+                    ToolRegistry::coordinator(crate::coordinator_tools::tools(
+                        service,
+                        send_chat,
+                        ExploreToolPolicy::from_platform(&self.platform),
+                    )),
                     agent_catalog.clone(),
                 )
             } else {
@@ -3540,6 +3583,72 @@ pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
 }
 
 #[cfg(test)]
+mod bash_lifecycle_bridge_tests {
+    use super::{BashLifecycleBridgeAction, RuntimeManager};
+    use crate::tools::{BashLifecycleEvent, BashLifecyclePhase, BashTerminalEffect};
+    use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+    use phoenix_tools::bash::HandleId;
+
+    #[test]
+    fn coordinator_lifecycle_is_not_sent_to_work_scope_reconciliation() {
+        for phase in [
+            BashLifecyclePhase::Spawned,
+            BashLifecyclePhase::KillPendingKernel,
+            BashLifecyclePhase::Terminal,
+        ] {
+            assert_eq!(
+                RuntimeManager::bash_lifecycle_bridge_action(&BashLifecycleEvent {
+                    owner: ResourceScopeKey::Coordinator,
+                    handle_id: None,
+                    phase,
+                    cause: None,
+                    terminal_effect: None,
+                }),
+                BashLifecycleBridgeAction::Ignore
+            );
+        }
+    }
+
+    #[test]
+    fn work_lifecycle_retains_broadcast_and_reconciliation() {
+        let scope = ResourceScopeKey::Work(WorkScopeId::parse("scope").unwrap());
+        assert_eq!(
+            RuntimeManager::bash_lifecycle_bridge_action(&BashLifecycleEvent {
+                owner: scope.clone(),
+                handle_id: Some(HandleId::new("b-1")),
+                phase: BashLifecyclePhase::Spawned,
+                cause: None,
+                terminal_effect: None,
+            }),
+            BashLifecycleBridgeAction::Broadcast
+        );
+        assert_eq!(
+            RuntimeManager::bash_lifecycle_bridge_action(&BashLifecycleEvent {
+                owner: scope.clone(),
+                handle_id: Some(HandleId::new("b-1")),
+                phase: BashLifecyclePhase::Terminal,
+                terminal_effect: Some(BashTerminalEffect::InventoryAndBranchReconcile),
+                cause: Some(phoenix_tools::bash::FinalCause::Exited { exit_code: Some(0) }),
+            }),
+            BashLifecycleBridgeAction::Reconcile
+        );
+        assert_eq!(
+            RuntimeManager::bash_lifecycle_bridge_action(&BashLifecycleEvent {
+                owner: scope.clone(),
+                handle_id: Some(HandleId::new("b-1")),
+                phase: BashLifecyclePhase::Terminal,
+                terminal_effect: Some(BashTerminalEffect::InventoryOnly),
+                cause: Some(phoenix_tools::bash::FinalCause::Killed {
+                    exit_code: Some(137),
+                    signal_number: Some(9),
+                }),
+            }),
+            BashLifecycleBridgeAction::Broadcast
+        );
+    }
+}
+
+#[cfg(test)]
 mod sub_agent_registry_resume_tests {
     //! Regression coverage for the resume-path tool-registry selection
     //! (`runtime.rs` ~1267, subagents.allium `SubAgentRegistryOnResume`).
@@ -4281,6 +4390,37 @@ mod scope_liveness_tests {
             Arc::new(McpClientManager::new()),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn browser_retirement_fences_late_bash_spawn_admission() {
+        let mgr = test_manager().await;
+        let scope_id = phoenix_core::work_scope::WorkScopeId::parse("retired-browser-scope")
+            .expect("scope id");
+        sqlx::query(
+            "INSERT INTO work_scopes
+             (id, authority_kind, lifecycle, environment_kind, cwd, created_at, updated_at)
+             VALUES (?1, 'work', 'active', 'unowned_cwd', '/tmp', datetime('now'), datetime('now'))",
+        )
+        .bind(scope_id.as_str())
+        .execute(mgr.db().pool())
+        .await
+        .expect("insert active scope");
+        let scope = ResourceScopeKey::Work(scope_id.clone());
+
+        mgr.retire_scope_after_browser_teardown(&scope).await;
+
+        let lifecycle: String =
+            sqlx::query_scalar("SELECT lifecycle FROM work_scopes WHERE id = ?1")
+                .bind(scope_id.as_str())
+                .fetch_one(mgr.db().pool())
+                .await
+                .expect("read lifecycle");
+        assert_eq!(lifecycle, "retired");
+        assert!(matches!(
+            mgr.bash_handles().reserve_spawn(&scope).await,
+            Err(phoenix_tools::bash::registry::BashHandleError::SpawnFenced)
+        ));
     }
 
     /// Register a lingering runtime handle for `conv_id` without spawning a

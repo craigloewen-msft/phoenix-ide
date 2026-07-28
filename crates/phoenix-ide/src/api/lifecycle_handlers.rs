@@ -1,7 +1,9 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 //! Conversation lifecycle HTTP handlers: task approval, abandon, mark-merged.
 
-use super::handlers::{run_resource_cleanup_cascade, AppError};
+use super::handlers::{
+    reopen_bash_after_failed_lifecycle_mutation, run_resource_cleanup_cascade, AppError,
+};
 use super::types::{
     ConflictErrorResponse, ForkDismissResponse, ForkPromoteResponse, ForkProposalListResponse,
     ForkProposalSummary, ForkSpawnResponse, RequestChangesRequest, SuccessResponse,
@@ -617,7 +619,7 @@ pub(crate) async fn abandon_task(
     // too. Work mode task files live on the deleted branch and go with it.
     // Only fatal error is a continuation-row lookup failure (returned as
     // 500 so the user can retry).
-    run_resource_cleanup_cascade(&state, &conv).await?;
+    let cleanup = run_resource_cleanup_cascade(&state, &conv).await?;
 
     // 3. Broadcast diff snapshot (persisted above, before state transition).
     // Reuses the handle obtained during seq pre-allocation at step 2b.
@@ -645,7 +647,7 @@ pub(crate) async fn abandon_task(
         mode = mode_label,
         "Abandon complete"
     );
-    state
+    if let Err(error) = state
         .runtime
         .send_event(
             &id,
@@ -655,7 +657,10 @@ pub(crate) async fn abandon_task(
             },
         )
         .await
-        .map_err(AppError::BadRequest)?;
+    {
+        reopen_bash_after_failed_lifecycle_mutation(&state, &conv, &cleanup).await;
+        return Err(AppError::BadRequest(error));
+    }
 
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -737,7 +742,7 @@ pub(crate) async fn mark_merged(
     // delete (Work mode only), browser kill. Shared with hard-delete and
     // archive. Only fatal error is a continuation-row lookup failure
     // (returned as 500 so the user can retry).
-    run_resource_cleanup_cascade(&state, &conv).await?;
+    let cleanup = run_resource_cleanup_cascade(&state, &conv).await?;
 
     // 3. Route through state machine -> Terminal
     let mode_label = if is_work_mode { "Work" } else { "Branch" };
@@ -755,7 +760,7 @@ pub(crate) async fn mark_merged(
         "Mark-merged complete"
     );
 
-    state
+    if let Err(error) = state
         .runtime
         .send_event(
             &id,
@@ -765,7 +770,10 @@ pub(crate) async fn mark_merged(
             },
         )
         .await
-        .map_err(AppError::BadRequest)?;
+    {
+        reopen_bash_after_failed_lifecycle_mutation(&state, &conv, &cleanup).await;
+        return Err(AppError::BadRequest(error));
+    }
 
     Ok(Json(SuccessResponse { success: true }))
 }

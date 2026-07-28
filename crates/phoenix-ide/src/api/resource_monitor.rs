@@ -332,7 +332,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            generation.visible_handle_pids("conversation:c1", &["b-1".into()]),
+            generation.visible_handle_pids("conversation:c1", &["b-1".into()],),
             BTreeSet::from([10, 11])
         );
         assert_eq!(generation.all_bash_pids(), BTreeSet::from([10, 11, 12]));
