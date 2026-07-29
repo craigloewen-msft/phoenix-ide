@@ -2574,6 +2574,8 @@ where
             }
         };
 
+        self.classify_active_direct_turn_outcome_terminal(&result.new_state);
+
         // Apply transition result and process any generated events
         let mut events_to_process = self.apply_transition_result(result).await?;
 
@@ -3948,6 +3950,17 @@ where
         if matches!(event, Event::UserCancel { .. }) {
             self.direct_turn_cancellation_initiated = true;
         }
+        self.classify_active_direct_turn_state_terminal(new_state);
+    }
+
+    fn classify_active_direct_turn_outcome_terminal(&mut self, new_state: &ConvState) {
+        self.classify_active_direct_turn_state_terminal(new_state);
+    }
+
+    fn classify_active_direct_turn_state_terminal(&mut self, new_state: &ConvState) {
+        if self.active_direct_turn.is_none() {
+            return;
+        }
         if matches!(new_state, ConvState::Idle) {
             if self.direct_turn_cancellation_initiated {
                 self.pending_direct_turn_terminal = Some(Box::new(
@@ -3960,18 +3973,19 @@ where
             }
             return;
         }
-        if matches!(
-            new_state,
-            ConvState::Error { .. } | ConvState::ContextExhausted { .. }
-        ) {
-            let reason = match event {
-                Event::LlmError { message, .. } | Event::CredentialHelperFailed { message } => {
-                    message.clone()
-                }
-                _ => format!("conversation entered terminal error state after {event:?}"),
-            };
+        if let ConvState::Error { message, .. } = new_state {
             self.pending_direct_turn_terminal = Some(Box::new(
-                crate::runtime::traits::ActiveDirectTurnTerminal::Failed { reason },
+                crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                    reason: message.clone(),
+                },
+            ));
+            return;
+        }
+        if let ConvState::ContextExhausted { summary } = new_state {
+            self.pending_direct_turn_terminal = Some(Box::new(
+                crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                    reason: summary.clone(),
+                },
             ));
             return;
         }
@@ -8491,6 +8505,7 @@ mod authoritative_user_message_effect_tests {
     use crate::db::{Message, MessageContent, MessageType};
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::runtime::traits::AuthoritativeUserMessageMaterialization;
+    use crate::state_machine::state::AssistantMessage;
     use crate::tools::BrowserSessionManager;
     use phoenix_core::domain::sm_event::{DirectTurnAttemptAuthority, PreparedDirectTurnPayload};
     use phoenix_db::workflow::DirectTurnMaterializationEligibility;
@@ -8709,6 +8724,126 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
+    async fn active_direct_turn_completes_after_final_llm_outcome() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let active = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(11),
+            generation: 0,
+        };
+        rt = rt.with_active_direct_turn(Some(active.clone()));
+        rt.state = ConvState::LlmRequesting { attempt: 1 };
+
+        rt.process_outcome(EffectOutcome::Llm(LlmOutcome::Response {
+            content: vec![ContentBlock::text("done")],
+            tool_calls: Vec::new(),
+            end_turn: true,
+            usage: phoenix_llm::Usage::default(),
+            request_id: "response".to_string(),
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            storage.recorded_terminate_active_direct_turn_calls(),
+            vec![(
+                active,
+                crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
+            )]
+        );
+        assert_eq!(rt.active_direct_turn, None);
+    }
+
+    #[tokio::test]
+    async fn active_direct_turn_tool_abort_outcome_preserves_user_cancellation() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let active = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(12),
+            generation: 0,
+        };
+        rt = rt.with_active_direct_turn(Some(active.clone()));
+        let tool_use_id = "cancelled-tool";
+        rt.state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                tool_use_id,
+                ToolInput::from(crate::tools::BashToolInput::run("echo hi")),
+            ),
+            remaining_tools: Vec::new(),
+            completed_results: Vec::new(),
+            pending_sub_agents: Vec::new(),
+            assistant_message: AssistantMessage::new(
+                "assistant".to_string(),
+                vec![ContentBlock::ToolUse {
+                    id: tool_use_id.to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({}),
+                }],
+                None,
+                None,
+            ),
+        };
+
+        rt.process_event(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .unwrap();
+        rt.process_outcome(EffectOutcome::Tool(ToolExecOutcome::Aborted {
+            tool_use_id: tool_use_id.to_string(),
+            reason: crate::state_machine::outcome::AbortReason::CancellationRequested,
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            storage.recorded_terminate_active_direct_turn_calls(),
+            vec![(
+                active,
+                crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled,
+            )]
+        );
+        assert_eq!(rt.active_direct_turn, None);
+    }
+
+    #[tokio::test]
+    async fn active_direct_turn_failure_outcome_preserves_reducer_reason() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let active = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(13),
+            generation: 0,
+        };
+        rt = rt.with_active_direct_turn(Some(active.clone()));
+        rt.state = ConvState::LlmRequesting { attempt: 1 };
+        let reason = "provider rejected the prepared request";
+
+        rt.process_outcome(EffectOutcome::Llm(LlmOutcome::RequestRejected {
+            message: reason.to_string(),
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            storage.recorded_terminate_active_direct_turn_calls(),
+            vec![(
+                active,
+                crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                    reason: reason.to_string(),
+                },
+            )]
+        );
+        assert_eq!(rt.active_direct_turn, None);
+    }
+
+    #[tokio::test]
     async fn active_direct_turn_terminal_classification_releases_exactly_once() {
         for (event, new_state, expected) in [
             (
@@ -8747,6 +8882,17 @@ mod authoritative_user_message_effect_tests {
                 },
                 crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
                     reason: "provider failed".to_string(),
+                },
+            ),
+            (
+                Event::ContinuationFailed {
+                    error: "continuation failed".to_string(),
+                },
+                ConvState::ContextExhausted {
+                    summary: "preserved continuation summary".to_string(),
+                },
+                crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                    reason: "preserved continuation summary".to_string(),
                 },
             ),
         ] {
