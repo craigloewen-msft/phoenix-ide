@@ -53,6 +53,10 @@ import asyncio
 import contextlib
 import json
 import os
+try:
+    import resource
+except ImportError:  # Windows: profiling unavailable; normal E2E remains usable.
+    resource = None
 import shutil
 import socket
 import subprocess
@@ -60,6 +64,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -76,6 +81,11 @@ STARTUP_ATTEMPTS = 3
 # 60s covers a CPU-starved start without masking a real startup hang.
 STARTUP_TIMEOUT_SECONDS = 60.0
 SCENARIO_TIMEOUT_SECONDS = 45.0
+PROFILE_ENV = "PHOENIX_CHECK_PROFILE_DIR"
+SCHEMA_VERSION = 1
+PROVENANCE = "windowed_process"
+
+
 
 # 1x1 transparent PNG, base64-encoded.
 TINY_PNG_B64 = (
@@ -102,6 +112,198 @@ def _build_binary() -> None:
     if res.returncode != 0:
         sys.exit(res.returncode)
     print(f"[e2e] build done in {time.monotonic() - t0:.1f}s", flush=True)
+
+
+def _profile_dir_from_env() -> Path | None:
+    configured = os.environ.get(PROFILE_ENV, "").strip()
+    if not configured:
+        return None
+    return Path(configured)
+
+
+def _append_jsonl(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as output:
+        json.dump(value, output, sort_keys=True)
+        output.write("\n")
+
+
+def _harness_cpu_times() -> tuple[float | None, float | None, float]:
+    if resource is not None:
+        own = resource.getrusage(resource.RUSAGE_SELF)
+        return own.ru_utime, own.ru_stime, own.ru_utime + own.ru_stime
+    process = os.times()
+    user = process.user + process.children_user
+    system = process.system + process.children_system
+    return user, system, user + system
+
+
+def _harness_with_waited_children_cpu_times() -> tuple[float | None, float | None, float]:
+    own = _harness_cpu_times()
+    if resource is None:
+        return own
+    children = resource.getrusage(resource.RUSAGE_CHILDREN)
+    user = own[0] + children.ru_utime
+    system = own[1] + children.ru_stime
+    return user, system, user + system
+
+
+def _linux_proc_cpu_times(stat: str, hz: float) -> tuple[float, float, float] | None:
+    rparen = stat.rfind(")")
+    if rparen < 0:
+        return None
+    fields = stat[rparen + 2 :].split()
+    try:
+        user = (int(fields[11]) + int(fields[13])) / hz
+        system = (int(fields[12]) + int(fields[14])) / hz
+    except (IndexError, ValueError, ZeroDivisionError):
+        return None
+    return user, system, user + system
+
+
+def _darwin_rusage_cpu_times(info) -> tuple[float, float, float]:
+    nanoseconds_per_second = 1_000_000_000
+    user = (info.ri_user_time + info.ri_child_user_time) / nanoseconds_per_second
+    system = (info.ri_system_time + info.ri_child_system_time) / nanoseconds_per_second
+    return user, system, user + system
+
+
+def _darwin_process_cpu_times(pid: int) -> tuple[float, float, float] | None:
+    import ctypes
+
+    class RusageInfoV2(ctypes.Structure):
+        _fields_ = [
+            ("ri_uuid", ctypes.c_uint8 * 16),
+            ("ri_user_time", ctypes.c_uint64),
+            ("ri_system_time", ctypes.c_uint64),
+            ("ri_pkg_idle_wkups", ctypes.c_uint64),
+            ("ri_interrupt_wkups", ctypes.c_uint64),
+            ("ri_pageins", ctypes.c_uint64),
+            ("ri_wired_size", ctypes.c_uint64),
+            ("ri_resident_size", ctypes.c_uint64),
+            ("ri_phys_footprint", ctypes.c_uint64),
+            ("ri_proc_start_abstime", ctypes.c_uint64),
+            ("ri_proc_exit_abstime", ctypes.c_uint64),
+            ("ri_child_user_time", ctypes.c_uint64),
+            ("ri_child_system_time", ctypes.c_uint64),
+            ("ri_child_pkg_idle_wkups", ctypes.c_uint64),
+            ("ri_child_interrupt_wkups", ctypes.c_uint64),
+            ("ri_child_pageins", ctypes.c_uint64),
+            ("ri_child_elapsed_abstime", ctypes.c_uint64),
+            ("ri_diskio_bytesread", ctypes.c_uint64),
+            ("ri_diskio_byteswritten", ctypes.c_uint64),
+        ]
+
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    proc_pid_rusage = libproc.proc_pid_rusage
+    proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    proc_pid_rusage.restype = ctypes.c_int
+    info = RusageInfoV2()
+    if proc_pid_rusage(pid, 2, ctypes.byref(info)) != 0:
+        return None
+    return _darwin_rusage_cpu_times(info)
+
+
+def _process_cpu_times(
+    pid: int,
+) -> tuple[float | None, float | None, float] | None:
+    if pid == os.getpid():
+        if resource is not None:
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            return usage.ru_utime, usage.ru_stime, usage.ru_utime + usage.ru_stime
+        process = os.times()
+        return process.user, process.system, process.user + process.system
+    if sys.platform == "linux":
+        try:
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as stat_file:
+                stat = stat_file.read()
+        except FileNotFoundError:
+            return None
+        hz = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+        return _linux_proc_cpu_times(stat, hz)
+    if sys.platform == "darwin":
+        return _darwin_process_cpu_times(pid)
+    return None
+
+
+def _profile_writer(profile_dir: Path | None):
+    if profile_dir is None:
+        return None
+    return profile_dir / "e2e-scenario-cpu.jsonl"
+
+
+def _cpu_window_record(
+    *,
+    identity: str,
+    started_wall_ns: int,
+    started_monotonic_ns: int,
+    finished_monotonic_ns: int,
+    start_cpu: tuple[float | None, float | None, float] | None,
+    finish_cpu: tuple[float | None, float | None, float] | None,
+    extra: dict | None = None,
+) -> dict:
+    available = start_cpu is not None and finish_cpu is not None
+    components_available = (
+        available
+        and start_cpu[0] is not None and finish_cpu[0] is not None
+        and start_cpu[1] is not None and finish_cpu[1] is not None
+    )
+    user_cpu_ms = (
+        max(0.0, (finish_cpu[0] - start_cpu[0]) * 1000.0)
+        if components_available else None
+    )
+    system_cpu_ms = (
+        max(0.0, (finish_cpu[1] - start_cpu[1]) * 1000.0)
+        if components_available else None
+    )
+    total_cpu_ms = (
+        max(0.0, (finish_cpu[2] - start_cpu[2]) * 1000.0) if available else None
+    )
+    record = {
+        "schema_version": SCHEMA_VERSION,
+        "provenance": (
+            PROVENANCE if components_available
+            else "windowed_process_total_only" if available
+            else "unavailable"
+        ),
+        "identity": identity,
+        "started_unix_ns": started_wall_ns,
+        "wall_ms": (finished_monotonic_ns - started_monotonic_ns) / 1_000_000.0,
+        "user_cpu_ms": user_cpu_ms,
+        "system_cpu_ms": system_cpu_ms,
+        "total_cpu_ms": total_cpu_ms,
+    }
+    if extra:
+        record.update(extra)
+    return record
+
+
+def _write_cpu_window(
+    profile_dir: Path | None,
+    *,
+    identity: str,
+    started_wall_ns: int,
+    started_monotonic_ns: int,
+    finished_monotonic_ns: int,
+    start_cpu: tuple[float | None, float | None, float] | None,
+    finish_cpu: tuple[float | None, float | None, float] | None,
+    extra: dict | None = None,
+) -> None:
+    destination = _profile_writer(profile_dir)
+    if destination is None:
+        return
+    _append_jsonl(
+        destination,
+        _cpu_window_record(
+            identity=identity,
+            started_wall_ns=started_wall_ns,
+            started_monotonic_ns=started_monotonic_ns,
+            finished_monotonic_ns=finished_monotonic_ns,
+            start_cpu=start_cpu,
+            finish_cpu=finish_cpu,
+            extra=extra,
+        ),
+    )
 
 
 class _StartupFailure(RuntimeError):
@@ -221,22 +423,109 @@ def _server_env(tmpdir: Path, parent_env: dict[str, str] | None = None) -> dict[
 def _server():
     tmpdir = Path(tempfile.mkdtemp(prefix="phoenix-e2e-"))
     env = _server_env(tmpdir)
+    profile_dir = _profile_dir_from_env()
+    startup_started_wall_ns = time.time_ns()
+    startup_started_monotonic_ns = time.monotonic_ns()
+    startup_started_cpu = _harness_cpu_times() if profile_dir is not None else None
 
     try:
         proc, base_url, log_path, log_file = _start_server_with_retries(env, tmpdir)
     except Exception:
+        startup_finished_monotonic_ns = time.monotonic_ns()
+        _write_cpu_window(
+            profile_dir,
+            identity="e2e:startup:harness",
+            started_wall_ns=startup_started_wall_ns,
+            started_monotonic_ns=startup_started_monotonic_ns,
+            finished_monotonic_ns=startup_finished_monotonic_ns,
+            start_cpu=startup_started_cpu,
+            finish_cpu=_harness_cpu_times() if profile_dir is not None else None,
+            extra={
+                "kind": "e2e_startup", "process_role": "harness",
+                "status": "failed",
+            },
+        )
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise
 
+    startup_finished_monotonic_ns = time.monotonic_ns()
+    startup_finished_cpu = _harness_cpu_times() if profile_dir is not None else None
+    _write_cpu_window(
+        profile_dir,
+        identity="e2e:startup:harness",
+        started_wall_ns=startup_started_wall_ns,
+        started_monotonic_ns=startup_started_monotonic_ns,
+        finished_monotonic_ns=startup_finished_monotonic_ns,
+        start_cpu=startup_started_cpu,
+        finish_cpu=startup_finished_cpu,
+        extra={"kind": "e2e_startup", "process_role": "harness"},
+    )
+    if profile_dir is not None:
+        startup_server_cpu = _process_cpu_times(proc.pid)
+        if startup_server_cpu is not None:
+            startup_server_zero = (
+                0.0 if startup_server_cpu[0] is not None else None,
+                0.0 if startup_server_cpu[1] is not None else None,
+                0.0,
+            )
+            _write_cpu_window(
+                profile_dir,
+                identity="e2e:startup:server",
+                started_wall_ns=startup_started_wall_ns,
+                started_monotonic_ns=startup_started_monotonic_ns,
+                finished_monotonic_ns=startup_finished_monotonic_ns,
+                start_cpu=startup_server_zero,
+                finish_cpu=startup_server_cpu,
+                extra={"kind": "e2e_startup", "process_role": "server"},
+            )
+
     try:
-        yield base_url, log_path
+        yield base_url, log_path, proc.pid, profile_dir
     finally:
+        teardown_started_wall_ns = time.time_ns()
+        teardown_started_monotonic_ns = time.monotonic_ns()
+        teardown_harness_cpu = (
+            _harness_cpu_times() if profile_dir is not None else None
+        )
+        teardown_server_cpu = (
+            _process_cpu_times(proc.pid) if profile_dir is not None else None
+        )
         proc.terminate()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5)
+        teardown_finished_monotonic_ns = time.monotonic_ns()
+        teardown_finished_harness_cpu = (
+            _harness_cpu_times() if profile_dir is not None else None
+        )
+        _write_cpu_window(
+            profile_dir,
+            identity="e2e:teardown:harness",
+            started_wall_ns=teardown_started_wall_ns,
+            started_monotonic_ns=teardown_started_monotonic_ns,
+            finished_monotonic_ns=teardown_finished_monotonic_ns,
+            start_cpu=teardown_harness_cpu,
+            finish_cpu=teardown_finished_harness_cpu,
+            extra={"kind": "e2e_teardown", "process_role": "harness"},
+        )
+        # The exited server can no longer be sampled. Its last cumulative sample
+        # is still emitted explicitly, with honest incomplete provenance.
+        if profile_dir is not None and teardown_server_cpu is not None:
+            _write_cpu_window(
+                profile_dir,
+                identity="e2e:teardown:server",
+                started_wall_ns=teardown_started_wall_ns,
+                started_monotonic_ns=teardown_started_monotonic_ns,
+                finished_monotonic_ns=teardown_finished_monotonic_ns,
+                start_cpu=teardown_server_cpu,
+                finish_cpu=None,
+                extra={
+                    "kind": "e2e_teardown", "process_role": "server",
+                    "measurement_note": "server exited before final cumulative sample",
+                },
+            )
         log_file.close()
         # Clean up the per-run tempdir (DB + logs). Without this, repeated
         # local / CI runs leak /tmp/phoenix-e2e-* directories.
@@ -996,6 +1285,106 @@ class HarnessIsolationTests(unittest.TestCase):
             _terminal_event("state_change", "not-json")
 
 
+class CpuProfilingTests(unittest.TestCase):
+    def test_linux_process_cpu_includes_waited_children(self):
+        # fields after comm begin at proc field 3; indexes 11..14 are
+        # utime, stime, cutime, and cstime respectively.
+        fields = ["S", *(["0"] * 10), "100", "25", "40", "10"]
+        sample = _linux_proc_cpu_times(f"42 (phoenix worker) {' '.join(fields)}", 100)
+
+        self.assertEqual((1.4, 0.35, 1.75), sample)
+
+    def test_linux_process_cpu_rejects_malformed_stat(self):
+        self.assertIsNone(_linux_proc_cpu_times("42 malformed", 100))
+        self.assertIsNone(_linux_proc_cpu_times("42 (short) S 1", 100))
+
+    def test_darwin_process_cpu_includes_waited_children(self):
+        info = type("Rusage", (), {
+            "ri_user_time": 1_000_000_000,
+            "ri_system_time": 250_000_000,
+            "ri_child_user_time": 400_000_000,
+            "ri_child_system_time": 100_000_000,
+        })()
+
+        self.assertEqual((1.4, 0.35, 1.75), _darwin_rusage_cpu_times(info))
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS proc_pid_rusage only")
+    def test_darwin_process_cpu_samples_live_process(self):
+        sample = _darwin_process_cpu_times(os.getpid())
+
+        self.assertIsNotNone(sample)
+        self.assertGreater(sample[2], 0)
+
+    def test_cpu_window_record_has_required_fields(self):
+        started_monotonic_ns = 1_000_000
+        finished_monotonic_ns = 3_500_000
+        record = _cpu_window_record(
+            identity="e2e:scenario:demo:harness",
+            started_wall_ns=123,
+            started_monotonic_ns=started_monotonic_ns,
+            finished_monotonic_ns=finished_monotonic_ns,
+            start_cpu=(1.0, 2.0, 3.0),
+            finish_cpu=(1.25, 2.5, 3.75),
+            extra={"kind": "e2e_scenario", "process_role": "harness"},
+        )
+
+        self.assertEqual(1, record["schema_version"])
+        self.assertEqual("windowed_process", record["provenance"])
+        self.assertEqual("e2e:scenario:demo:harness", record["identity"])
+        self.assertEqual(2.5, record["wall_ms"])
+        self.assertEqual(250.0, record["user_cpu_ms"])
+        self.assertEqual(500.0, record["system_cpu_ms"])
+        self.assertEqual(750.0, record["total_cpu_ms"])
+        self.assertEqual("harness", record["process_role"])
+
+    def test_total_only_cpu_window_does_not_fabricate_components(self):
+        record = _cpu_window_record(
+            identity="e2e:server",
+            started_wall_ns=123,
+            started_monotonic_ns=1_000_000,
+            finished_monotonic_ns=2_000_000,
+            start_cpu=(None, None, 1.0),
+            finish_cpu=(None, None, 1.5),
+        )
+
+        self.assertEqual("windowed_process_total_only", record["provenance"])
+        self.assertIsNone(record["user_cpu_ms"])
+        self.assertIsNone(record["system_cpu_ms"])
+        self.assertEqual(500.0, record["total_cpu_ms"])
+
+    @unittest.skipIf(resource is None, "resource module unavailable")
+    def test_harness_cpu_excludes_waited_children(self):
+        own = type("Rusage", (), {"ru_utime": 1.0, "ru_stime": 0.25})()
+        children = type("Rusage", (), {"ru_utime": 4.0, "ru_stime": 2.0})()
+
+        with mock.patch.object(resource, "getrusage", side_effect=[own, own, children]):
+            harness = _harness_cpu_times()
+            combined = _harness_with_waited_children_cpu_times()
+
+        self.assertEqual((1.0, 0.25, 1.25), harness)
+        self.assertEqual((5.0, 2.25, 7.25), combined)
+
+    def test_write_cpu_window_appends_jsonl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile_dir = Path(directory)
+            _write_cpu_window(
+                profile_dir,
+                identity="e2e:startup:harness",
+                started_wall_ns=100,
+                started_monotonic_ns=0,
+                finished_monotonic_ns=2_000_000,
+                start_cpu=(0.0, 0.0, 0.0),
+                finish_cpu=(0.1, 0.2, 0.3),
+                extra={"kind": "e2e_startup", "process_role": "harness"},
+            )
+            lines = (profile_dir / "e2e-scenario-cpu.jsonl").read_text().splitlines()
+
+        self.assertEqual(1, len(lines))
+        record = json.loads(lines[0])
+        self.assertEqual("e2e:startup:harness", record["identity"])
+        self.assertEqual(300.0, record["total_cpu_ms"])
+
+
 class StartupRetryTests(unittest.TestCase):
     def test_addr_in_use_detection_accepts_rust_and_os_messages(self):
         self.assertTrue(_is_addr_in_use('Error: Os { code: 48, kind: AddrInUse }'))
@@ -1042,7 +1431,7 @@ class StartupRetryTests(unittest.TestCase):
 def _run_self_tests() -> int:
     suite = unittest.TestSuite(
         unittest.defaultTestLoader.loadTestsFromTestCase(case)
-        for case in (HarnessIsolationTests, StartupRetryTests)
+        for case in (HarnessIsolationTests, CpuProfilingTests, StartupRetryTests)
     )
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
@@ -1054,21 +1443,59 @@ def main() -> int:
     _build_binary()
     failures: list[tuple[str, str]] = []
     log_text = ""
-    with _server() as (base_url, log_path):
+    with _server() as (base_url, log_path, server_pid, profile_dir):
         print(f"[e2e] server up at {base_url}", flush=True)
         for name, fn in SCENARIOS:
-            t0 = time.monotonic()
+            started_wall_ns = time.time_ns()
+            started_monotonic_ns = time.monotonic_ns()
+            started_harness_cpu = (
+                _harness_cpu_times() if profile_dir is not None else None
+            )
+            started_server_cpu = (
+                _process_cpu_times(server_pid) if profile_dir is not None else None
+            )
+            scenario_status = "failed"
             try:
                 fn(base_url)
-                dt = time.monotonic() - t0
+                scenario_status = "passed"
+                dt = (time.monotonic_ns() - started_monotonic_ns) / 1_000_000_000.0
                 print(f"  ✓ {name:<22s} {dt:6.2f}s", flush=True)
             except Exception as e:
-                dt = time.monotonic() - t0
+                dt = (time.monotonic_ns() - started_monotonic_ns) / 1_000_000_000.0
                 detail = f"{type(e).__name__}: {e}"
                 print(f"  ✗ {name:<22s} {dt:6.2f}s  {detail}", flush=True)
                 failures.append((name, detail))
                 print("[e2e] stopping after first failure to preserve root-cause signal", flush=True)
                 break
+            finally:
+                finished_monotonic_ns = time.monotonic_ns()
+                finished_harness_cpu = (
+                    _harness_cpu_times() if profile_dir is not None else None
+                )
+                finished_server_cpu = (
+                    _process_cpu_times(server_pid) if profile_dir is not None else None
+                )
+                _write_cpu_window(
+                    profile_dir,
+                    identity=f"e2e:scenario:{name}:harness",
+                    started_wall_ns=started_wall_ns,
+                    started_monotonic_ns=started_monotonic_ns,
+                    finished_monotonic_ns=finished_monotonic_ns,
+                    start_cpu=started_harness_cpu,
+                    finish_cpu=finished_harness_cpu,
+                    extra={"kind": "e2e_scenario", "process_role": "harness", "scenario": name, "status": scenario_status},
+                )
+                _write_cpu_window(
+                    profile_dir,
+                    identity=f"e2e:scenario:{name}:server",
+                    started_wall_ns=started_wall_ns,
+                    started_monotonic_ns=started_monotonic_ns,
+                    finished_monotonic_ns=finished_monotonic_ns,
+                    start_cpu=started_server_cpu,
+                    finish_cpu=finished_server_cpu,
+                    extra={"kind": "e2e_scenario", "process_role": "server", "scenario": name, "status": scenario_status},
+                )
+            
         # Read log inside the context — the tempdir may be cleaned up after.
         if log_path.exists():
             log_text = log_path.read_text()

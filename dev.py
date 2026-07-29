@@ -8,6 +8,7 @@
 """Development tasks for phoenix-ide."""
 
 import argparse
+import contextvars
 import contextlib
 import dataclasses
 import datetime
@@ -17,8 +18,10 @@ import hashlib
 import ipaddress
 import json
 import os
+import platform
 import plistlib
 import re
+import resource
 import shutil
 import signal
 import socket
@@ -51,6 +54,8 @@ _DEFAULT_DEV_TRACE_ENDPOINT = (
 )
 _DEV_TRACING = None
 _DEV_TRACE_AVAILABLE = None
+_DEV_CURRENT_SPAN = contextvars.ContextVar("phoenix_dev_current_span", default=None)
+_CHECK_PROFILE = None
 _DEV_TRACE_PACKAGES = (
     "opentelemetry-sdk>=1.39,<2",
     "opentelemetry-exporter-otlp-proto-http>=1.39,<2",
@@ -80,21 +85,382 @@ class _DevTracing:
         self.command_span = None
         self.command_started_at = None
 
-    def start_span(self, name: str, attributes: dict | None = None):
-        context = None
-        if self.command_span is not None:
-            context = self.trace_api.set_span_in_context(self.command_span)
-        return self.tracer.start_span(name, context=context, attributes=attributes)
+    def start_span(
+        self, name: str, attributes: dict | None = None, parent=None,
+        start_time: int | None = None,
+    ):
+        parent = parent or _DEV_CURRENT_SPAN.get() or self.command_span
+        context = self.trace_api.set_span_in_context(parent) if parent is not None else None
+        return self.tracer.start_span(
+            name, context=context, attributes=attributes, start_time=start_time,
+        )
 
-    def finish_span(self, span, attributes: dict, failed: bool = False) -> None:
+    def finish_span(
+        self, span, attributes: dict, failed: bool = False,
+        end_time: int | None = None,
+    ) -> None:
         for name, value in attributes.items():
             span.set_attribute(name, value)
         code = self.status_api.StatusCode.ERROR if failed else self.status_api.StatusCode.OK
         span.set_status(self.status_api.Status(code))
-        span.end()
+        span.end(end_time=end_time)
 
     def shutdown(self) -> None:
         self.provider.shutdown()
+
+
+@dataclasses.dataclass
+class CheckWorkProfile:
+    run_id: str
+    artifact_dir: Path
+    started_self: resource.struct_rusage
+    started_children: resource.struct_rusage
+    started_thread_ns: int
+    started_wall_ns: int
+    started_monotonic_ns: int
+    initial_git_sha: str
+    initial_git_dirty: bool
+    finalized_cpu: dict | None = None
+    finalized_wall_ns: int | None = None
+    finalized_monotonic_ns: int | None = None
+    metadata: dict = dataclasses.field(default_factory=dict)
+    artifacts_finalized: bool = False
+
+    @classmethod
+    def start(cls, artifact_dir: Path | None = None):
+        import uuid
+        run_id = uuid.uuid4().hex
+        artifact_dir = artifact_dir or ROOT / "target" / "check-profile" / run_id
+        artifact_dir = artifact_dir.resolve()
+        initial_git_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT,
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        initial_git_dirty = bool(subprocess.run(
+            ["git", "status", "--porcelain"], cwd=ROOT,
+            capture_output=True, text=True, check=False,
+        ).stdout.strip())
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        claim_path = artifact_dir / ".phoenix-profile-claim"
+        try:
+            claim_fd = os.open(claim_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as error:
+            raise ValueError(f"profile artifact directory is already claimed: {artifact_dir}") from error
+        try:
+            if any(entry != claim_path for entry in artifact_dir.iterdir()):
+                raise ValueError(f"profile artifact directory must be empty: {artifact_dir}")
+            os.write(claim_fd, f"pid={os.getpid()}\n".encode())
+        except Exception:
+            os.close(claim_fd)
+            claim_path.unlink(missing_ok=True)
+            raise
+        os.close(claim_fd)
+        return cls(
+            run_id=run_id,
+            artifact_dir=artifact_dir,
+            started_self=resource.getrusage(resource.RUSAGE_SELF),
+            started_children=resource.getrusage(resource.RUSAGE_CHILDREN),
+            started_thread_ns=time.thread_time_ns(),
+            started_wall_ns=time.time_ns(),
+            started_monotonic_ns=time.monotonic_ns(),
+            initial_git_sha=initial_git_sha,
+            initial_git_dirty=initial_git_dirty,
+        )
+
+    def finalize_cpu(self) -> dict:
+        if self.finalized_cpu is None:
+            self.finalized_wall_ns = time.time_ns()
+            self.finalized_monotonic_ns = time.monotonic_ns()
+            self_usage = resource.getrusage(resource.RUSAGE_SELF)
+            child_usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+            self_cpu = _rusage_delta_attributes(
+                self.started_self, self_usage, "exact_process"
+            )
+            child_cpu = _rusage_delta_attributes(
+                self.started_children, child_usage, "exact_waited_children"
+            )
+            self.finalized_cpu = _cpu_attributes(
+                self_cpu["cpu.user_ms"] + child_cpu["cpu.user_ms"],
+                self_cpu["cpu.system_ms"] + child_cpu["cpu.system_ms"],
+                "exact_process_plus_waited_children",
+                **{"cpu.tree_closure": "command_reaped_descendants_unverified"},
+            )
+        return self.finalized_cpu
+
+    def measurement_path(self, lane: str, step: str) -> Path:
+        safe = re.sub(r"[^a-zA-Z0-9_.-]+", "-", f"{lane}-{step}").strip("-")
+        return self.artifact_dir / "processes" / f"{safe}.json"
+
+
+def _profile_returncode(error: BaseException | None) -> int:
+    if error is None:
+        return 0
+    if isinstance(error, subprocess.CalledProcessError):
+        return error.returncode
+    if isinstance(error, SystemExit):
+        return error.code if isinstance(error.code, int) else 0 if error.code is None else 1
+    return 1
+
+
+def _profile_failed(error: BaseException | None) -> bool:
+    return _profile_returncode(error) != 0
+
+
+def _finalize_check_profile(error: BaseException | None) -> None:
+    profile = _CHECK_PROFILE
+    if profile is None or profile.artifacts_finalized:
+        return
+    profile.artifacts_finalized = True
+    returncode = _profile_returncode(error)
+    failed = returncode != 0
+    try:
+        command_cpu = profile.finalize_cpu()
+        assert profile.finalized_wall_ns is not None
+        assert profile.finalized_monotonic_ns is not None
+        wall_ms = (
+            profile.finalized_monotonic_ns - profile.started_monotonic_ns
+        ) / 1_000_000.0
+        if _DEV_TRACING is not None and _DEV_TRACING.command_span is not None:
+            _finish_dev_span(
+                _DEV_TRACING.command_span,
+                {
+                    "dev.elapsed_seconds": wall_ms / 1000.0,
+                    "dev.success": not failed,
+                    **command_cpu,
+                },
+                failed=failed,
+                end_time=profile.finalized_wall_ns,
+            )
+            _DEV_TRACING.command_span = None
+        (profile.artifact_dir / "command.json").write_text(json.dumps({
+            "schema_version": 1,
+            "identity": "command:dev.py check",
+            "kind": "command",
+            "provenance": "exact_process_plus_waited_children",
+            "user_cpu_ms": command_cpu["cpu.user_ms"],
+            "system_cpu_ms": command_cpu["cpu.system_ms"],
+            "total_cpu_ms": command_cpu["cpu.total_ms"],
+            "started_unix_ns": profile.started_wall_ns,
+            "wall_ms": wall_ms,
+            "tree_closure": "command_reaped_descendants_unverified",
+            "status": "failed" if failed else "passed",
+            "returncode": returncode,
+            "metadata": {
+                "git_sha": profile.initial_git_sha,
+                "git_dirty": profile.initial_git_dirty,
+                "host_platform": sys.platform,
+                "host_machine": platform.machine(),
+                "python_version": platform.python_version(),
+                "profile_artifact_dir": str(profile.artifact_dir),
+                **profile.metadata,
+            },
+        }, sort_keys=True) + "\n")
+        report = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "check_profile_report.py"),
+             str(profile.artifact_dir), "--run-id", profile.run_id],
+            capture_output=True, text=True, check=False,
+        )
+        if report.returncode == 0:
+            print(f"  i  CPU work profile: {_display_path(profile.artifact_dir / 'summary.md')}")
+        else:
+            print(f"  i  CPU work report failed: {report.stderr.strip()}")
+    except Exception as finalize_error:
+        print(f"  ⚠ CPU work profile finalization failed: {finalize_error}", file=sys.stderr)
+
+
+def _cpu_attributes(user_ms: float, system_ms: float, provenance: str, **extra) -> dict:
+    return {
+        "cpu.user_ms": max(0.0, user_ms),
+        "cpu.system_ms": max(0.0, system_ms),
+        "cpu.total_ms": max(0.0, user_ms + system_ms),
+        "cpu.provenance": provenance,
+        **extra,
+    }
+
+
+def _rusage_delta_attributes(before, after, provenance: str) -> dict:
+    return _cpu_attributes(
+        (after.ru_utime - before.ru_utime) * 1000.0,
+        (after.ru_stime - before.ru_stime) * 1000.0,
+        provenance,
+    )
+
+
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _read_cpu_measurement(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text())
+        attributes = _cpu_attributes(
+            float(value["user_cpu_ms"]),
+            float(value["system_cpu_ms"]),
+            str(value["provenance"]),
+            **{
+                "cpu.tree_closure": str(value["tree_closure"]),
+                "cpu.measurement_path": _display_path(path),
+            },
+        )
+        reader_cpu_ms = float(value.get("reader_thread_cpu_ms", 0.0))
+        attributes["cpu.reader_thread_ms"] = reader_cpu_ms
+        attributes["cpu.total_ms"] = float(value.get(
+            "total_cpu_ms", attributes["cpu.total_ms"] + reader_cpu_ms
+        ))
+        return attributes
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _write_unavailable_measurement(
+    path: Path, *, identity: str, duration_ms: float, returncode: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "identity": identity,
+        "provenance": "unavailable",
+        "started_unix_ns": time.time_ns() - int(duration_ms * 1_000_000),
+        "wall_ms": duration_ms,
+        "user_cpu_ms": None,
+        "system_cpu_ms": None,
+        "total_cpu_ms": None,
+        "tree_closure": "measurement_process_terminated",
+        "returncode": returncode,
+    }, sort_keys=True) + "\n")
+
+
+def _profile_record_attributes(record: dict, source: Path) -> dict | None:
+    try:
+        provenance = str(record["provenance"])
+        user_value = record.get("user_cpu_ms")
+        system_value = record.get("system_cpu_ms")
+        total_value = record.get("total_cpu_ms")
+        if user_value is None and "cpu_user_us" in record:
+            user_value = record["cpu_user_us"] / 1000.0
+        if system_value is None and "cpu_system_us" in record:
+            system_value = record["cpu_system_us"] / 1000.0
+        identity = str(
+            record.get("identity")
+            or record.get("full_name")
+            or (
+                f'{record["file"]}::{record["full_test_name"]}'
+                if record.get("file") and record.get("full_test_name") else None
+            )
+            or record.get("full_test_name")
+            or record["test_name"]
+        )
+        if user_value is not None and system_value is not None:
+            attributes = _cpu_attributes(float(user_value), float(system_value), provenance)
+        elif total_value is not None:
+            attributes = {
+                "cpu.total_ms": float(total_value),
+                "cpu.provenance": provenance,
+            }
+        else:
+            attributes = {"cpu.provenance": "unavailable"}
+        started_unix_ns = int(record["started_unix_ns"])
+        wall_ms = float(record.get("wall_ms", record.get("wall_time_ms", 0.0)))
+        source_label = _display_path(source)
+        attributes.update({
+            "check.test.identity": identity,
+            "check.profile_record": source_label,
+            "check.wall_ms": wall_ms,
+            "check.test.started_unix_ns": started_unix_ns,
+            "check.test.ended_unix_ns": started_unix_ns + int(wall_ms * 1_000_000),
+        })
+        for source_key, attribute in (
+            ("kind", "check.test.kind"),
+            ("status", "check.test.status"),
+            ("file", "check.test.file"),
+            ("scenario", "check.test.scenario"),
+            ("process_role", "process.role"),
+            ("returncode", "process.exit_code"),
+            ("tree_closure", "cpu.tree_closure"),
+            ("attempt", "check.test.attempt"),
+            ("pid", "process.pid"),
+            ("worker_id", "check.test.worker_id"),
+            ("test_id", "check.test.runner_id"),
+            ("binary_id", "check.test.binary_id"),
+            ("concurrent", "check.test.concurrent"),
+        ):
+            value = record.get(source_key)
+            if value is not None:
+                attributes[attribute] = value
+        command = record.get("command")
+        if command:
+            attributes["process.command"] = json.dumps(command, separators=(",", ":"))
+        return attributes
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _emit_profile_record_spans(profile_dir: Path, parent, patterns: tuple[str, ...]) -> int:
+    emitted = 0
+    for pattern in patterns:
+        for path in sorted(profile_dir.glob(pattern)):
+            try:
+                if path.suffix == ".jsonl":
+                    records = []
+                    for line_number, line in enumerate(path.read_text().splitlines(), 1):
+                        if not line.strip():
+                            continue
+                        try:
+                            records.append(json.loads(line))
+                        except (ValueError, TypeError) as error:
+                            error_span = _begin_dev_span(
+                                "dev.check.profile_error", {
+                                    "check.profile_record": str(path),
+                                    "check.profile_line": line_number,
+                                    "error.message": str(error),
+                                }, parent=parent,
+                            )
+                            _finish_dev_span(error_span, {}, failed=True)
+                else:
+                    records = [json.loads(path.read_text())]
+            except (OSError, ValueError, TypeError):
+                continue
+            for record in records:
+                attributes = _profile_record_attributes(record, path)
+                if attributes is None:
+                    continue
+                started_unix_ns = attributes["check.test.started_unix_ns"]
+                ended_unix_ns = attributes["check.test.ended_unix_ns"]
+                span = _begin_dev_span("dev.check.test", {
+                    "check.test.identity": attributes["check.test.identity"],
+                }, parent=parent, start_time=started_unix_ns)
+                _finish_dev_span(
+                    span, attributes,
+                    failed=record.get("status") in {
+                        "fail", "failed", "error", "unexpected_success",
+                    }
+                    or int(record.get("returncode", 0)) != 0,
+                    end_time=ended_unix_ns,
+                )
+                emitted += 1
+    return emitted
+
+
+def _write_nextest_profile_config(profile: CheckWorkProfile) -> Path:
+    config = profile.artifact_dir / "nextest-profile.toml"
+    wrapper = ROOT / "scripts" / "check_profile_command.py"
+    output_dir = profile.artifact_dir / "rust-tests"
+    command = json.dumps([
+        sys.executable, str(wrapper), "--output-dir", str(output_dir), "--",
+    ])
+    config.write_text(
+        'nextest-version = "0.9.98"\n'
+        'experimental = ["wrapper-scripts"]\n\n'
+        '[scripts.wrapper.phoenix-cpu]\n'
+        f'command = {command}\n\n'
+        '[[profile.phoenix-cpu.scripts]]\n'
+        'filter = "all()"\n'
+        'run-wrapper = "phoenix-cpu"\n'
+    )
+    return config
 
 
 def _dev_trace_endpoint(environ: dict[str, str] | None = None) -> str | None:
@@ -181,6 +547,8 @@ def _init_dev_tracing(environ: dict[str, str] | None = None):
             exporter,
             schedule_delay_millis=60_000,
             export_timeout_millis=1_000,
+            max_queue_size=16_384,
+            max_export_batch_size=16_384,
         ))
         return _DevTracing(provider, provider.get_tracer("phoenix-dev"), trace, status)
     except Exception as error:
@@ -190,12 +558,26 @@ def _init_dev_tracing(environ: dict[str, str] | None = None):
 
 def _start_dev_command_tracing(command: str) -> None:
     global _DEV_TRACING
-    _DEV_TRACING = _init_dev_tracing()
+    if _DEV_TRACING is None:
+        _DEV_TRACING = _init_dev_tracing()
     if _DEV_TRACING is None:
         return
-    _DEV_TRACING.command_started_at = time.monotonic()
+    _DEV_TRACING.command_started_at = (
+        _CHECK_PROFILE.started_monotonic_ns / 1_000_000_000.0
+        if _CHECK_PROFILE is not None else time.monotonic()
+    )
+    attributes = {"dev.command": command}
+    if _CHECK_PROFILE is not None:
+        attributes.update({
+            "check.profile_work": True,
+            "check.profile_run_id": _CHECK_PROFILE.run_id,
+            "check.profile_artifact_dir": _display_path(_CHECK_PROFILE.artifact_dir),
+        })
     _DEV_TRACING.command_span = _DEV_TRACING.tracer.start_span(
-        "dev.command", attributes={"dev.command": command}
+        "dev.command", attributes=attributes,
+        start_time=(
+            _CHECK_PROFILE.started_wall_ns if _CHECK_PROFILE is not None else None
+        ),
     )
 
 
@@ -211,27 +593,55 @@ def _shutdown_dev_tracing(error: BaseException | None) -> None:
             failed = error.code not in (None, 0)
         if tracing.command_span is not None:
             elapsed = max(0.0, time.monotonic() - tracing.command_started_at)
-            tracing.finish_span(tracing.command_span, {
+            attributes = {
                 "dev.elapsed_seconds": elapsed,
                 "dev.success": not failed,
-            }, failed=failed)
+            }
+            if _CHECK_PROFILE is not None:
+                attributes.update(_CHECK_PROFILE.finalize_cpu())
+            tracing.finish_span(tracing.command_span, attributes, failed=failed)
             tracing.command_span = None
         tracing.shutdown()
     except Exception as shutdown_error:
         print(f"  ⚠ dev trace export failed: {shutdown_error}", file=sys.stderr)
 
 
-def _begin_dev_span(name: str, attributes: dict | None = None):
+def _begin_dev_span(
+    name: str, attributes: dict | None = None, parent=None,
+    start_time: int | None = None,
+):
     if _DEV_TRACING is None:
         return _NOOP_SPAN
-    return _DEV_TRACING.start_span(name, attributes)
+    attributes = dict(attributes or {})
+    if _CHECK_PROFILE is not None:
+        attributes.setdefault("check.profile_run_id", _CHECK_PROFILE.run_id)
+    parent = parent or _DEV_CURRENT_SPAN.get()
+    return _DEV_TRACING.start_span(
+        name, attributes, parent=parent, start_time=start_time,
+    )
 
 
-def _finish_dev_span(span, attributes: dict, failed: bool = False) -> None:
+class _DevSpanScope:
+    def __init__(self, span):
+        self.span = span
+        self.token = None
+
+    def __enter__(self):
+        self.token = _DEV_CURRENT_SPAN.set(self.span)
+        return self.span
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        assert self.token is not None
+        _DEV_CURRENT_SPAN.reset(self.token)
+
+
+def _finish_dev_span(
+    span, attributes: dict, failed: bool = False, end_time: int | None = None,
+) -> None:
     if span is _NOOP_SPAN or _DEV_TRACING is None:
         return
     try:
-        _DEV_TRACING.finish_span(span, attributes, failed)
+        _DEV_TRACING.finish_span(span, attributes, failed, end_time=end_time)
     except Exception as error:
         print(f"  ⚠ dev span recording failed: {error}", file=sys.stderr)
 
@@ -3458,6 +3868,12 @@ def _categorize_changed_paths(paths) -> set:
             cats.add("SPECS")
         if p == "scripts/check_rust_test_timing.py":
             cats.update({"ASTGREP", "SPECS"})
+        if p in {
+            "scripts/check_profile_command.py",
+            "scripts/check_profile_report.py",
+            "scripts/python_unittest_profile.py",
+        }:
+            cats.add("SPECS")
         if p.startswith("ast-grep-rules/"):
             cats.add("ASTGREP")
         if p.startswith("tests/e2e/") or p == "phoenix-client.py":
@@ -4229,13 +4645,20 @@ def _finish_check_step_span(
     timed_out: bool,
     lock_wait: float,
     returncode: int,
+    cpu_attributes: dict | None = None,
+    end_time: int | None = None,
 ) -> None:
-    _finish_dev_span(span, {
+    attributes = {
         "check.elapsed_seconds": elapsed,
         "check.timed_out": timed_out,
         "cargo.lock_wait_seconds": lock_wait,
         "process.exit_code": returncode,
-    }, failed=returncode != 0)
+    }
+    if cpu_attributes:
+        attributes.update(cpu_attributes)
+    elif _CHECK_PROFILE is not None:
+        attributes.update({"cpu.provenance": "unavailable"})
+    _finish_dev_span(span, attributes, failed=returncode != 0, end_time=end_time)
 
 
 def cmd_check(
@@ -4243,6 +4666,7 @@ def cmd_check(
     lanes: str | None = None,
     pretty: bool = False,
     compiler_cache: str | None = None,
+    profile_work: bool = False,
 ):
     """Run lint, format check, tests, and task validation in parallel.
 
@@ -4251,7 +4675,15 @@ def cmd_check(
     gate=False. `pretty` renders a live lane table instead of line-per-event
     output.
     """
-    results = []  # (name, returncode, elapsed, output)
+    failed_lanes: set[str] = set()
+
+    class _CheckResults(list):
+        def append(self, result):
+            super().append(result)
+            if result[1] != 0:
+                failed_lanes.add(threading.current_thread().name)
+
+    results = _CheckResults()  # (name, returncode, elapsed, output)
     results_lock = threading.Lock()
     t_start = time.monotonic()
 
@@ -4267,6 +4699,8 @@ def cmd_check(
     # working cargo toolchain to be present. --all / PHOENIX_CHECK_ALL=1
     # (handled in _gate_lanes) forces every lane.
     active, skipped = _resolve_check_lanes(gate=gate, lanes=lanes)
+    if _CHECK_PROFILE is not None:
+        _CHECK_PROFILE.metadata["active_lanes"] = sorted(active)
     if lanes is not None and not active:
         print("  i  no requested lane is active for this change set")
 
@@ -4353,27 +4787,47 @@ def cmd_check(
             "check.step": name,
         })
 
+        measurement_path = None
+        launched_cmd = cmd
+        if profile_work and _CHECK_PROFILE is not None:
+            measurement_path = _CHECK_PROFILE.measurement_path(lane, name)
+            measurement_path.parent.mkdir(parents=True, exist_ok=True)
+            launched_cmd = [
+                sys.executable, str(ROOT / "scripts" / "check_profile_command.py"),
+                "--output", str(measurement_path),
+                "--identity", f"step:{lane}:{name}", "--", *cmd,
+            ]
+            env["PHOENIX_CHECK_PROFILE_DIR"] = str(_CHECK_PROFILE.artifact_dir)
+            env["PHOENIX_CHECK_PROFILE_LANE"] = lane
+            env["PHOENIX_CHECK_PROFILE_STEP"] = name
+
         proc = subprocess.Popen(
-            cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            launched_cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, env=env, start_new_session=True, bufsize=1,
         )
 
+        reader_cpu_ms = 0.0
+
         def reader():
-            nonlocal truncated
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                now = time.monotonic()
-                if len(buf) == buf.maxlen:
-                    truncated = True
-                # Strip terminal control sequences before buffering. The env
-                # above disables color for tools that honour it, but rustfmt's
-                # --check diff colours via the `term` crate keyed on $TERM and
-                # ignores both NO_COLOR and CARGO_TERM_COLOR; this is the
-                # tool-agnostic backstop so the reprinted buffer stays clean.
-                clean = _CONTROL_SEQ_RE.sub("", line).rstrip("\n")
-                lock_timer.observe_line(clean, now)
-                buf.append(clean)
-            proc.stdout.close()
+            nonlocal truncated, reader_cpu_ms
+            started_reader_ns = time.thread_time_ns()
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    now = time.monotonic()
+                    if len(buf) == buf.maxlen:
+                        truncated = True
+                    # Strip terminal control sequences before buffering. The env
+                    # above disables color for tools that honour it, but rustfmt's
+                    # --check diff colours via the `term` crate keyed on $TERM and
+                    # ignores both NO_COLOR and CARGO_TERM_COLOR; this is the
+                    # tool-agnostic backstop so the reprinted buffer stays clean.
+                    clean = _CONTROL_SEQ_RE.sub("", line).rstrip("\n")
+                    lock_timer.observe_line(clean, now)
+                    buf.append(clean)
+                proc.stdout.close()
+            finally:
+                reader_cpu_ms = (time.thread_time_ns() - started_reader_ns) / 1_000_000.0
 
         rt = threading.Thread(target=reader, daemon=True)
         rt.start()
@@ -4398,6 +4852,7 @@ def cmd_check(
         # Reader exits when stdout closes (proc termination drops the pipe).
         rt.join(timeout=5)
         finished_at = time.monotonic()
+        finished_wall_ns = time.time_ns()
         elapsed = finished_at - t0
         lock_wait = lock_timer.finish(finished_at)
         if lock_wait >= 1.0:
@@ -4419,13 +4874,42 @@ def cmd_check(
         with results_lock:
             results.append((name, rc, elapsed, output))
         reporter.step_done(lane, name, rc, elapsed)
+        if measurement_path is not None and not measurement_path.exists():
+            _write_unavailable_measurement(
+                measurement_path,
+                identity=f"step:{lane}:{name}",
+                duration_ms=elapsed * 1000.0,
+                returncode=rc,
+            )
+        if measurement_path is not None and measurement_path.exists():
+            try:
+                measurement = json.loads(measurement_path.read_text())
+                measurement["reader_thread_cpu_ms"] = reader_cpu_ms
+                measurement["total_cpu_ms"] = float(measurement["total_cpu_ms"]) + reader_cpu_ms
+                measurement_path.write_text(json.dumps(measurement, sort_keys=True) + "\n")
+            except (OSError, ValueError, TypeError):
+                pass
+        cpu_attributes = (
+            _read_cpu_measurement(measurement_path)
+            if measurement_path is not None else None
+        )
         _finish_check_step_span(
             span,
             elapsed=elapsed,
             timed_out=timed_out,
             lock_wait=lock_wait,
             returncode=rc,
+            cpu_attributes=cpu_attributes,
+            end_time=finished_wall_ns,
         )
+        if profile_work and _CHECK_PROFILE is not None:
+            patterns = {
+                "cargo test": ("rust-tests/*.json",),
+                "vitest": ("vitest-cpu-*.jsonl",),
+                "dev.py unit tests": ("python-test-cpu.jsonl",),
+                "e2e": ("e2e-scenario-cpu.jsonl",),
+            }.get(name, ())
+            _emit_profile_record_spans(_CHECK_PROFILE.artifact_dir, span, patterns)
         return rc
 
     def lane_rust():
@@ -4581,6 +5065,8 @@ def cmd_check(
             'fi'
         )])
 
+    skipped_lane_reasons: dict[str, str] = {}
+
     def check_ast_grep():
         """Run every structural lint rule in a single ast-grep pass.
 
@@ -4595,6 +5081,7 @@ def cmd_check(
         if not shutil.which("ast-grep"):
             with results_lock:
                 results.append(("ast-grep", 0, 0.0, ""))
+            skipped_lane_reasons["ast-grep"] = "not installed"
             reporter.step_skipped("ast-grep", "ast-grep", "not installed")
             return
         rules_dir = ROOT / "ast-grep-rules"
@@ -4630,6 +5117,7 @@ def cmd_check(
         if not shutil.which("allium"):
             with results_lock:
                 results.append(("allium specs", 0, 0.0, ""))
+            skipped_lane_reasons["allium"] = "install via 'cargo install allium-cli'"
             reporter.step_skipped("allium", "allium specs",
                                   "install via 'cargo install allium-cli'")
             return
@@ -4637,26 +5125,64 @@ def cmd_check(
         if not spec_files:
             with results_lock:
                 results.append(("allium specs", 0, 0.0, ""))
+            skipped_lane_reasons["allium"] = "no .allium files"
             reporter.step_skipped("allium", "allium specs", "no .allium files")
             return
         t0 = time.monotonic()
         reporter.step_start("allium", "allium specs")
+        span = _begin_dev_span("dev.check.step", {
+            "check.lane": "allium", "check.step": "allium specs",
+        })
+        command = ["allium", "analyse", *[str(p) for p in spec_files]]
+        measurement_path = None
+        if profile_work and _CHECK_PROFILE is not None:
+            measurement_path = _CHECK_PROFILE.measurement_path("allium", "allium specs")
+            measurement_path.parent.mkdir(parents=True, exist_ok=True)
+            command = [
+                sys.executable, str(ROOT / "scripts" / "check_profile_command.py"),
+                "--output", str(measurement_path),
+                "--identity", "step:allium:allium specs", "--", *command,
+            ]
         try:
-            proc = subprocess.run(
-                ["allium", "analyse", *[str(p) for p in spec_files]],
-                capture_output=True, text=True, timeout=60,
+            proc = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, start_new_session=True,
             )
+            try:
+                stdout, stderr = proc.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                stdout, stderr = proc.communicate()
+                raise subprocess.TimeoutExpired(command, 60, stdout, stderr)
         except subprocess.TimeoutExpired:
             elapsed = time.monotonic() - t0
             with results_lock:
                 results.append(("allium specs", 1, elapsed, "allium analyse timed out after 60s"))
             reporter.step_done("allium", "allium specs", 1, elapsed)
+            if measurement_path is not None and not measurement_path.exists():
+                _write_unavailable_measurement(
+                    measurement_path,
+                    identity="step:allium:allium specs",
+                    duration_ms=elapsed * 1000.0,
+                    returncode=1,
+                )
+            _finish_check_step_span(
+                span, elapsed=elapsed, timed_out=True, lock_wait=0.0,
+                returncode=1,
+                cpu_attributes=(
+                    _read_cpu_measurement(measurement_path)
+                    if measurement_path is not None else None
+                ),
+            )
             return
         # Parse the concatenated JSON-doc stream that allium-cli emits
         # (one {...} per file passed). Use raw_decode to walk the stream
         # without depending on whitespace conventions.
         decoder = json.JSONDecoder()
-        text = proc.stdout
+        text = stdout
         idx = 0
         failures = []
         all_findings = []          # (spec_file, trigger) tuples
@@ -4748,8 +5274,8 @@ def cmd_check(
                 lines.append("allium analyse gate failure:")
                 for p in gate_problems:
                     lines.append(f"  {p}")
-                if proc.stderr.strip():
-                    lines.append(f"stderr (first 500 chars):\n{proc.stderr[:500]}")
+                if stderr.strip():
+                    lines.append(f"stderr (first 500 chars):\n{stderr[:500]}")
                 if text.strip() and not failures and not new_findings:
                     lines.append(f"stdout (first 500 chars):\n{text[:500]}")
                 if failures or new_findings:
@@ -4793,6 +5319,24 @@ def cmd_check(
             with results_lock:
                 results.append(("allium specs", 0, elapsed, ""))
             reporter.step_done("allium", "allium specs", 0, elapsed)
+        semantic_rc = 1 if gate_problems or failures or new_findings else 0
+        if measurement_path is not None and measurement_path.exists():
+            try:
+                measurement = json.loads(measurement_path.read_text())
+                measurement["raw_returncode"] = measurement.get("returncode")
+                measurement["returncode"] = semantic_rc
+                measurement["status"] = "passed" if semantic_rc == 0 else "failed"
+                measurement_path.write_text(json.dumps(measurement, sort_keys=True) + "\n")
+            except (OSError, ValueError, TypeError):
+                pass
+        _finish_check_step_span(
+            span, elapsed=elapsed, timed_out=False, lock_wait=0.0,
+            returncode=semantic_rc,
+            cpu_attributes=(
+                _read_cpu_measurement(measurement_path)
+                if measurement_path is not None else None
+            ),
+        )
 
     def check_spec_anchors():
         """REQ-* anchor cross-validator. Fails on orphan code anchors —
@@ -4853,6 +5397,34 @@ def cmd_check(
         ADR-chain structure, but treats existing specs/*/design.md files
         as legacy inventory rather than current-shape failures."""
         t0 = time.monotonic()
+        started_wall_ns = time.time_ns()
+        started_thread_ns = time.thread_time_ns()
+        span = _begin_dev_span("dev.check.step", {
+            "check.lane": "spec-shape", "check.step": "spec shape",
+        })
+
+        def finish_profile(rc: int) -> None:
+            thread_cpu_ms = (time.thread_time_ns() - started_thread_ns) / 1_000_000.0
+            attributes = {
+                "orchestration.cpu.total_ms": thread_cpu_ms,
+                "orchestration.cpu.provenance": "exact_thread",
+            }
+            if profile_work and _CHECK_PROFILE is not None:
+                (_CHECK_PROFILE.artifact_dir / "processes").mkdir(exist_ok=True)
+                path = _CHECK_PROFILE.artifact_dir / "processes" / "spec-shape-spec shape.json"
+                path.write_text(json.dumps({
+                    "schema_version": 1,
+                    "identity": "step:spec-shape:spec shape",
+                    "kind": "step",
+                    "provenance": "exact_thread",
+                    "started_unix_ns": started_wall_ns,
+                    "wall_ms": (time.monotonic() - t0) * 1000.0,
+                    "total_cpu_ms": thread_cpu_ms,
+                    "status": "failed" if rc else "passed",
+                    "returncode": rc,
+                }, sort_keys=True) + "\n")
+            _finish_dev_span(span, attributes, failed=rc != 0)
+
         reporter.step_start("spec-shape", "spec shape")
         try:
             result = _validate_spears_v2_shape(ROOT / "specs")
@@ -4861,6 +5433,7 @@ def cmd_check(
             with results_lock:
                 results.append(("spec shape", 1, elapsed, f"scan failed: {e}"))
             reporter.step_done("spec-shape", "spec shape", 1, elapsed)
+            finish_profile(1)
             return
 
         elapsed = time.monotonic() - t0
@@ -4869,6 +5442,7 @@ def cmd_check(
             with results_lock:
                 results.append(("spec shape", 1, elapsed, out))
             reporter.step_done("spec-shape", "spec shape", 1, elapsed)
+            finish_profile(1)
         else:
             detail = ""
             if result.legacy_design_docs:
@@ -4876,7 +5450,16 @@ def cmd_check(
             with results_lock:
                 results.append(("spec shape", 0, elapsed, detail))
             reporter.step_done("spec-shape", "spec shape", 0, elapsed)
-            run_step("dev.py unit tests", [sys.executable, "-m", "unittest", "discover", "tests/devpy"])
+            finish_profile(0)
+            unittest_cmd = [sys.executable, "-m", "unittest", "discover", "tests/devpy"]
+            if profile_work and _CHECK_PROFILE is not None:
+                unittest_cmd = [
+                    sys.executable,
+                    str(ROOT / "scripts" / "python_unittest_profile.py"),
+                    "discover",
+                    "tests/devpy",
+                ]
+            run_step("dev.py unit tests", unittest_cmd)
 
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.
     # Skipped when no UI lane runs, so a non-UI change never needs pnpm.
@@ -4885,8 +5468,23 @@ def cmd_check(
 
     # Share compiler outputs across worktrees and independent target dirs.
     # The selected wrapper is inherited by every cargo subprocess below.
+    selected_compiler_cache = None
     if cargo_active:
-        _configure_compiler_cache(compiler_cache)
+        selected_compiler_cache = _configure_compiler_cache(compiler_cache)
+    if _CHECK_PROFILE is not None:
+        _CHECK_PROFILE.metadata["compiler_cache"] = selected_compiler_cache
+    if _CHECK_PROFILE is not None and _DEV_TRACING is not None:
+        profile_metadata = {
+            "check.profile.git_sha": _CHECK_PROFILE.initial_git_sha,
+            "check.profile.git_dirty": _CHECK_PROFILE.initial_git_dirty,
+            "check.profile.host_platform": sys.platform,
+            "check.profile.host_machine": platform.machine(),
+            "check.profile.python_version": platform.python_version(),
+            "check.profile.active_lanes": sorted(active),
+            "check.profile.compiler_cache": selected_compiler_cache or "none",
+        }
+        for key, value in profile_metadata.items():
+            _DEV_TRACING.command_span.set_attribute(key, value)
 
     # Environment classification and Git subprocess safety only matter when a
     # cargo lane runs.
@@ -4933,7 +5531,17 @@ def cmd_check(
             ).returncode == 0
         except (subprocess.TimeoutExpired, OSError):
             has_nextest = False
-            reporter.info("cargo nextest probe stalled/failed — using plain `cargo test`")
+        if not has_nextest:
+            reporter.info("cargo nextest unavailable — using plain `cargo test`")
+            if _CHECK_PROFILE is not None:
+                _CHECK_PROFILE.metadata["rust_per_test_attribution"] = "unavailable_without_nextest"
+            if profile_work:
+                reporter.info(
+                    "Rust per-test CPU attribution unavailable without cargo-nextest; "
+                    "the Rust step remains measured as a whole"
+                )
+        elif _CHECK_PROFILE is not None:
+            _CHECK_PROFILE.metadata["rust_per_test_attribution"] = "available"
         # nextest defaults to available_parallelism (= num_cpus). On low-RAM
         # boxes, num_cpus parallel test threads can swap and stall sensitive
         # tests (e.g. browser tests where Chrome's CDP WebSocket handshake
@@ -4993,7 +5601,13 @@ def cmd_check(
             compile_p, codegen_p = [], []
         if has_nextest:
             compile_cmd = ["cargo", "nextest", "run", *compile_p, "--no-run"]
-            test_cmd = ["cargo", "nextest", "run", *_pflags(),
+            nextest_profile_args = []
+            if profile_work and _CHECK_PROFILE is not None:
+                nextest_config = _write_nextest_profile_config(_CHECK_PROFILE)
+                nextest_profile_args = [
+                    "--config-file", str(nextest_config), "--profile", "phoenix-cpu",
+                ]
+            test_cmd = ["cargo", "nextest", *nextest_profile_args, "run", *_pflags(),
                         "-E", "not test(/export_bindings/)",
                         "--test-threads", str(test_threads)]
             codegen_cmd = ["cargo", "nextest", "run", *codegen_p,
@@ -5060,13 +5674,63 @@ def cmd_check(
     reporter.banner("\nRunning checks in parallel...\n")
 
     def _lane(fn):
-        """Wrap a lane body with reporter lifecycle events."""
+        """Wrap a lane body with reporter lifecycle and trace events."""
         def wrapped():
             lane = threading.current_thread().name
             reporter.lane_start(lane)
+            in_process_steps = {
+                "task": "task validation",
+                "spec-anchors": "spec anchors",
+            }
+            step_name = in_process_steps.get(lane)
+            span = _begin_dev_span(
+                "dev.check.step" if step_name else "dev.check.lane",
+                {"check.lane": lane, **({"check.step": step_name} if step_name else {})},
+            )
+            started_thread_ns = time.thread_time_ns()
+            started_wall_ns = time.time_ns()
+            started_monotonic_ns = time.monotonic_ns()
+            failed = False
             try:
-                fn()
+                with _DevSpanScope(span):
+                    fn()
+            except BaseException:
+                failed = True
+                raise
             finally:
+                with results_lock:
+                    failed = failed or lane in failed_lanes
+                skip_reason = skipped_lane_reasons.get(lane)
+                attributes = {}
+                if profile_work:
+                    thread_cpu_ms = (time.thread_time_ns() - started_thread_ns) / 1_000_000.0
+                    attributes = {
+                        "orchestration.cpu.total_ms": thread_cpu_ms,
+                        "orchestration.cpu.provenance": "exact_thread",
+                        "check.status": (
+                            "skipped" if skip_reason else "failed" if failed else "passed"
+                        ),
+                        **({"check.skip_reason": skip_reason} if skip_reason else {}),
+                    }
+                    record_dir = "processes" if step_name else "lanes"
+                    record_name = f"{lane}-{step_name}.json" if step_name else f"{lane}.json"
+                    lane_record = _CHECK_PROFILE.artifact_dir / record_dir / record_name
+                    lane_record.parent.mkdir(parents=True, exist_ok=True)
+                    lane_record.write_text(json.dumps({
+                        "schema_version": 1,
+                        "identity": f"step:{lane}:{step_name}" if step_name else f"lane:{lane}:in_process_orchestration",
+                        "kind": "step" if step_name else "lane_orchestration",
+                        "provenance": "exact_thread",
+                        "started_unix_ns": started_wall_ns,
+                        "wall_ms": (time.monotonic_ns() - started_monotonic_ns) / 1_000_000.0,
+                        "total_cpu_ms": thread_cpu_ms,
+                        "status": (
+                            "skipped" if skip_reason else "failed" if failed else "passed"
+                        ),
+                        "returncode": None if skip_reason else 1 if failed else 0,
+                        **({"skip_reason": skip_reason} if skip_reason else {}),
+                    }, sort_keys=True) + "\n")
+                _finish_dev_span(span, attributes, failed=failed)
                 reporter.lane_done(lane)
         return wrapped
 
@@ -5126,9 +5790,27 @@ def cmd_check(
             ))
             print(f"  ✗ {label:<18s} ({LANE_JOIN_TIMEOUT}s)")
 
-    total_elapsed = time.monotonic() - t_start
+    profile_messages = []
+    if profile_work and _CHECK_PROFILE is not None and sys.platform == "darwin":
+        profile_messages.append(
+            "sampled stacks for a new correlated run: choose an empty DIR, then run "
+            "`xctrace record --template 'Time Profiler' --output DIR/full-check.trace "
+            f"--no-prompt --launch -- {ROOT / 'dev.py'} check --all --profile-work "
+            "--profile-work-dir DIR`"
+        )
+
     failures = [(n, out) for n, rc, _, out in results if rc != 0]
 
+    if profile_work and _CHECK_PROFILE is not None:
+        _CHECK_PROFILE.metadata.update({
+            "active_lanes": sorted(active),
+            "compiler_cache": selected_compiler_cache,
+            "rust_test_threads": test_threads if "rust" in active else None,
+        })
+    for message in profile_messages:
+        print(f"  i  {message}")
+
+    total_elapsed = time.monotonic() - t_start
     if failures:
         print()
         for name, output in failures:
@@ -8905,6 +9587,14 @@ def main():
         "--compiler-cache", choices=_COMPILER_CACHE_BACKENDS, default=None,
         help="Rust compiler cache (default: PHOENIX_COMPILER_CACHE or auto)",
     )
+    check_parser.add_argument(
+        "--profile-work", action="store_true", default=False,
+        help="Record hierarchical CPU work in the dev trace and target/check-profile/",
+    )
+    check_parser.add_argument(
+        "--profile-work-dir", type=Path, default=None,
+        help="Use this empty artifact directory for a correlated profiling run",
+    )
 
     check_plan_parser = sub.add_parser(
         "check-plan",
@@ -9077,8 +9767,27 @@ def main():
     if pretty:
         _bootstrap_rich()
 
+    global _CHECK_PROFILE
+    if args.command == "check" and getattr(args, "profile_work_dir", None):
+        args.profile_work = True
     _bootstrap_dev_tracing()
+    if args.command == "check" and getattr(args, "profile_work", False):
+        # Provider imports/initialization are outside the measured check interval.
+        _init_dev_tracing()
+        try:
+            # CPU, wall, and trace intervals intentionally begin after the
+            # optional tracing dependency bootstrap has completed.
+            _CHECK_PROFILE = CheckWorkProfile.start(getattr(args, "profile_work_dir", None))
+        except ValueError as error:
+            print(f"error: {error}", file=sys.stderr)
+            sys.exit(2)
     _start_dev_command_tracing(args.command)
+    if _CHECK_PROFILE is not None and _DEV_TRACING is None:
+        print(
+            "  ⚠ CPU artifacts will be recorded, but dev tracing is unavailable; "
+            "TraceQL queries will not find this run",
+            file=sys.stderr,
+        )
 
     if args.command == "up":
         cmd_up(
@@ -9101,6 +9810,7 @@ def main():
             lanes=args.lanes,
             pretty=pretty,
             compiler_cache=args.compiler_cache,
+            profile_work=args.profile_work,
         )
     elif args.command == "check-plan":
         cmd_check_plan(gate=not args.check_all, lanes=args.lanes, fmt=args.format)
@@ -9219,6 +9929,7 @@ if __name__ == "__main__":
         failure = error
         raise
     finally:
+        _finalize_check_profile(failure)
         _shutdown_dev_tracing(failure)
     if failed_command_exit is not None:
         sys.exit(failed_command_exit)
