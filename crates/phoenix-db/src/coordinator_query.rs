@@ -24,14 +24,51 @@ pub enum CoordinatorQueryError {
     MultipleStatements,
     #[error("query exceeded its execution budget")]
     BudgetExceeded,
-    #[error("database open failed")]
-    OpenFailed,
-    #[error("statement preparation failed")]
-    PrepareFailed,
-    #[error("query execution failed")]
-    ExecutionFailed,
+    #[error("SQLite {0}")]
+    Sqlite(CoordinatorSqliteDiagnostic),
     #[error("query worker failed")]
     WorkerFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinatorSqliteDiagnostic {
+    pub phase: CoordinatorSqlitePhase,
+    pub primary_code: c_int,
+    pub extended_code: c_int,
+    pub symbolic_code: &'static str,
+    pub message: String,
+    pub error_offset: Option<c_int>,
+}
+
+impl std::fmt::Display for CoordinatorSqliteDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} failed: {} ({}; primary_code={}; extended_code={}",
+            self.phase, self.message, self.symbolic_code, self.primary_code, self.extended_code
+        )?;
+        if let Some(offset) = self.error_offset {
+            write!(formatter, "; error_offset={offset}")?;
+        }
+        formatter.write_str(")")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinatorSqlitePhase {
+    Open,
+    Prepare,
+    Execute,
+}
+
+impl std::fmt::Display for CoordinatorSqlitePhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Open => "open",
+            Self::Prepare => "prepare",
+            Self::Execute => "execute",
+        })
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -82,10 +119,11 @@ pub fn execute_coordinator_query(
     let open_flags = ffi::SQLITE_OPEN_READONLY | ffi::SQLITE_OPEN_NOMUTEX;
     let rc = unsafe { ffi::sqlite3_open_v2(path.as_ptr(), &raw mut db, open_flags, ptr::null()) };
     if rc != ffi::SQLITE_OK {
+        let diagnostic = sqlite_diagnostic(db, rc, CoordinatorSqlitePhase::Open);
         if !db.is_null() {
             unsafe { ffi::sqlite3_close(db) };
         }
-        return Err(CoordinatorQueryError::OpenFailed);
+        return Err(CoordinatorQueryError::Sqlite(diagnostic));
     }
     let mut connection = ConnectionGuard(db);
     let mut authorizer = Box::new(AuthorizerState { denied: None });
@@ -116,7 +154,12 @@ pub fn execute_coordinator_query(
         )
     };
     if rc != ffi::SQLITE_OK {
-        return Err(classify_error(&authorizer, rc, QueryPhase::Prepare));
+        return Err(classify_error(
+            &authorizer,
+            connection.0,
+            rc,
+            CoordinatorSqlitePhase::Prepare,
+        ));
     }
     let statement = StatementGuard(statement);
     if statement.0.is_null() || tail_has_statement(tail) {
@@ -160,7 +203,14 @@ pub fn execute_coordinator_query(
             }
             ffi::SQLITE_DONE => break,
             ffi::SQLITE_INTERRUPT => return Err(CoordinatorQueryError::BudgetExceeded),
-            _ => return Err(classify_error(&authorizer, rc, QueryPhase::Execute)),
+            _ => {
+                return Err(classify_error(
+                    &authorizer,
+                    connection.0,
+                    rc,
+                    CoordinatorSqlitePhase::Execute,
+                ));
+            }
         }
     }
     unsafe {
@@ -299,16 +349,11 @@ fn tail_has_statement(mut tail: *const c_char) -> bool {
     false
 }
 
-#[derive(Clone, Copy)]
-enum QueryPhase {
-    Prepare,
-    Execute,
-}
-
 fn classify_error(
     authorizer: &AuthorizerState,
+    db: *mut ffi::sqlite3,
     rc: c_int,
-    phase: QueryPhase,
+    phase: CoordinatorSqlitePhase,
 ) -> CoordinatorQueryError {
     if rc == ffi::SQLITE_AUTH || authorizer.denied.is_some() {
         CoordinatorQueryError::Denied(
@@ -320,10 +365,158 @@ fn classify_error(
     } else if rc == ffi::SQLITE_INTERRUPT {
         CoordinatorQueryError::BudgetExceeded
     } else {
-        match phase {
-            QueryPhase::Prepare => CoordinatorQueryError::PrepareFailed,
-            QueryPhase::Execute => CoordinatorQueryError::ExecutionFailed,
-        }
+        CoordinatorQueryError::Sqlite(sqlite_diagnostic(db, rc, phase))
+    }
+}
+
+fn sqlite_diagnostic(
+    db: *mut ffi::sqlite3,
+    rc: c_int,
+    phase: CoordinatorSqlitePhase,
+) -> CoordinatorSqliteDiagnostic {
+    let extended_code = if db.is_null() {
+        rc
+    } else {
+        unsafe { ffi::sqlite3_extended_errcode(db) }
+    };
+    let primary_code = extended_code & 0xff;
+    let message = if db.is_null() {
+        unsafe { c_string(ffi::sqlite3_errstr(rc)) }
+    } else {
+        unsafe { c_string(ffi::sqlite3_errmsg(db)) }
+    };
+    let error_offset = if db.is_null() {
+        None
+    } else {
+        let offset = unsafe { ffi::sqlite3_error_offset(db) };
+        (offset >= 0).then_some(offset)
+    };
+    CoordinatorSqliteDiagnostic {
+        phase,
+        primary_code,
+        extended_code,
+        symbolic_code: sqlite_symbolic_code(extended_code),
+        message,
+        error_offset,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn sqlite_symbolic_code(code: c_int) -> &'static str {
+    match code {
+        ffi::SQLITE_ERROR_MISSING_COLLSEQ => "SQLITE_ERROR_MISSING_COLLSEQ",
+        ffi::SQLITE_ERROR_RETRY => "SQLITE_ERROR_RETRY",
+        ffi::SQLITE_ERROR_SNAPSHOT => "SQLITE_ERROR_SNAPSHOT",
+        ffi::SQLITE_ERROR_RESERVESIZE => "SQLITE_ERROR_RESERVESIZE",
+        ffi::SQLITE_ERROR_KEY => "SQLITE_ERROR_KEY",
+        ffi::SQLITE_ERROR_UNABLE => "SQLITE_ERROR_UNABLE",
+        ffi::SQLITE_BUSY_RECOVERY => "SQLITE_BUSY_RECOVERY",
+        ffi::SQLITE_BUSY_SNAPSHOT => "SQLITE_BUSY_SNAPSHOT",
+        ffi::SQLITE_BUSY_TIMEOUT => "SQLITE_BUSY_TIMEOUT",
+        ffi::SQLITE_LOCKED_SHAREDCACHE => "SQLITE_LOCKED_SHAREDCACHE",
+        ffi::SQLITE_LOCKED_VTAB => "SQLITE_LOCKED_VTAB",
+        ffi::SQLITE_READONLY_RECOVERY => "SQLITE_READONLY_RECOVERY",
+        ffi::SQLITE_READONLY_CANTLOCK => "SQLITE_READONLY_CANTLOCK",
+        ffi::SQLITE_READONLY_ROLLBACK => "SQLITE_READONLY_ROLLBACK",
+        ffi::SQLITE_READONLY_DBMOVED => "SQLITE_READONLY_DBMOVED",
+        ffi::SQLITE_READONLY_CANTINIT => "SQLITE_READONLY_CANTINIT",
+        ffi::SQLITE_READONLY_DIRECTORY => "SQLITE_READONLY_DIRECTORY",
+        ffi::SQLITE_ABORT_ROLLBACK => "SQLITE_ABORT_ROLLBACK",
+        ffi::SQLITE_IOERR_READ => "SQLITE_IOERR_READ",
+        ffi::SQLITE_IOERR_SHORT_READ => "SQLITE_IOERR_SHORT_READ",
+        ffi::SQLITE_IOERR_WRITE => "SQLITE_IOERR_WRITE",
+        ffi::SQLITE_IOERR_FSYNC => "SQLITE_IOERR_FSYNC",
+        ffi::SQLITE_IOERR_DIR_FSYNC => "SQLITE_IOERR_DIR_FSYNC",
+        ffi::SQLITE_IOERR_TRUNCATE => "SQLITE_IOERR_TRUNCATE",
+        ffi::SQLITE_IOERR_FSTAT => "SQLITE_IOERR_FSTAT",
+        ffi::SQLITE_IOERR_UNLOCK => "SQLITE_IOERR_UNLOCK",
+        ffi::SQLITE_IOERR_RDLOCK => "SQLITE_IOERR_RDLOCK",
+        ffi::SQLITE_IOERR_DELETE => "SQLITE_IOERR_DELETE",
+        ffi::SQLITE_IOERR_BLOCKED => "SQLITE_IOERR_BLOCKED",
+        ffi::SQLITE_IOERR_NOMEM => "SQLITE_IOERR_NOMEM",
+        ffi::SQLITE_IOERR_ACCESS => "SQLITE_IOERR_ACCESS",
+        ffi::SQLITE_IOERR_CHECKRESERVEDLOCK => "SQLITE_IOERR_CHECKRESERVEDLOCK",
+        ffi::SQLITE_IOERR_LOCK => "SQLITE_IOERR_LOCK",
+        ffi::SQLITE_IOERR_CLOSE => "SQLITE_IOERR_CLOSE",
+        ffi::SQLITE_IOERR_DIR_CLOSE => "SQLITE_IOERR_DIR_CLOSE",
+        ffi::SQLITE_IOERR_SHMOPEN => "SQLITE_IOERR_SHMOPEN",
+        ffi::SQLITE_IOERR_SHMSIZE => "SQLITE_IOERR_SHMSIZE",
+        ffi::SQLITE_IOERR_SHMLOCK => "SQLITE_IOERR_SHMLOCK",
+        ffi::SQLITE_IOERR_SHMMAP => "SQLITE_IOERR_SHMMAP",
+        ffi::SQLITE_IOERR_SEEK => "SQLITE_IOERR_SEEK",
+        ffi::SQLITE_IOERR_DELETE_NOENT => "SQLITE_IOERR_DELETE_NOENT",
+        ffi::SQLITE_IOERR_MMAP => "SQLITE_IOERR_MMAP",
+        ffi::SQLITE_IOERR_GETTEMPPATH => "SQLITE_IOERR_GETTEMPPATH",
+        ffi::SQLITE_IOERR_CONVPATH => "SQLITE_IOERR_CONVPATH",
+        ffi::SQLITE_IOERR_VNODE => "SQLITE_IOERR_VNODE",
+        ffi::SQLITE_IOERR_AUTH => "SQLITE_IOERR_AUTH",
+        ffi::SQLITE_IOERR_BEGIN_ATOMIC => "SQLITE_IOERR_BEGIN_ATOMIC",
+        ffi::SQLITE_IOERR_COMMIT_ATOMIC => "SQLITE_IOERR_COMMIT_ATOMIC",
+        ffi::SQLITE_IOERR_ROLLBACK_ATOMIC => "SQLITE_IOERR_ROLLBACK_ATOMIC",
+        ffi::SQLITE_IOERR_DATA => "SQLITE_IOERR_DATA",
+        ffi::SQLITE_IOERR_CORRUPTFS => "SQLITE_IOERR_CORRUPTFS",
+        ffi::SQLITE_IOERR_IN_PAGE => "SQLITE_IOERR_IN_PAGE",
+        ffi::SQLITE_IOERR_BADKEY => "SQLITE_IOERR_BADKEY",
+        ffi::SQLITE_IOERR_CODEC => "SQLITE_IOERR_CODEC",
+        ffi::SQLITE_CANTOPEN_NOTEMPDIR => "SQLITE_CANTOPEN_NOTEMPDIR",
+        ffi::SQLITE_CANTOPEN_ISDIR => "SQLITE_CANTOPEN_ISDIR",
+        ffi::SQLITE_CANTOPEN_FULLPATH => "SQLITE_CANTOPEN_FULLPATH",
+        ffi::SQLITE_CANTOPEN_CONVPATH => "SQLITE_CANTOPEN_CONVPATH",
+        ffi::SQLITE_CANTOPEN_DIRTYWAL => "SQLITE_CANTOPEN_DIRTYWAL",
+        ffi::SQLITE_CANTOPEN_SYMLINK => "SQLITE_CANTOPEN_SYMLINK",
+        ffi::SQLITE_CORRUPT_VTAB => "SQLITE_CORRUPT_VTAB",
+        ffi::SQLITE_CORRUPT_SEQUENCE => "SQLITE_CORRUPT_SEQUENCE",
+        ffi::SQLITE_CORRUPT_INDEX => "SQLITE_CORRUPT_INDEX",
+        ffi::SQLITE_CONSTRAINT_CHECK => "SQLITE_CONSTRAINT_CHECK",
+        ffi::SQLITE_CONSTRAINT_COMMITHOOK => "SQLITE_CONSTRAINT_COMMITHOOK",
+        ffi::SQLITE_CONSTRAINT_FOREIGNKEY => "SQLITE_CONSTRAINT_FOREIGNKEY",
+        ffi::SQLITE_CONSTRAINT_FUNCTION => "SQLITE_CONSTRAINT_FUNCTION",
+        ffi::SQLITE_CONSTRAINT_NOTNULL => "SQLITE_CONSTRAINT_NOTNULL",
+        ffi::SQLITE_CONSTRAINT_PRIMARYKEY => "SQLITE_CONSTRAINT_PRIMARYKEY",
+        ffi::SQLITE_CONSTRAINT_TRIGGER => "SQLITE_CONSTRAINT_TRIGGER",
+        ffi::SQLITE_CONSTRAINT_UNIQUE => "SQLITE_CONSTRAINT_UNIQUE",
+        ffi::SQLITE_CONSTRAINT_VTAB => "SQLITE_CONSTRAINT_VTAB",
+        ffi::SQLITE_CONSTRAINT_ROWID => "SQLITE_CONSTRAINT_ROWID",
+        ffi::SQLITE_CONSTRAINT_PINNED => "SQLITE_CONSTRAINT_PINNED",
+        ffi::SQLITE_CONSTRAINT_DATATYPE => "SQLITE_CONSTRAINT_DATATYPE",
+        ffi::SQLITE_NOTICE_RECOVER_WAL => "SQLITE_NOTICE_RECOVER_WAL",
+        ffi::SQLITE_NOTICE_RECOVER_ROLLBACK => "SQLITE_NOTICE_RECOVER_ROLLBACK",
+        ffi::SQLITE_NOTICE_RBU => "SQLITE_NOTICE_RBU",
+        ffi::SQLITE_WARNING_AUTOINDEX => "SQLITE_WARNING_AUTOINDEX",
+        ffi::SQLITE_AUTH_USER => "SQLITE_AUTH_USER",
+        _ => match code & 0xff {
+            ffi::SQLITE_ERROR => "SQLITE_ERROR",
+            ffi::SQLITE_INTERNAL => "SQLITE_INTERNAL",
+            ffi::SQLITE_PERM => "SQLITE_PERM",
+            ffi::SQLITE_ABORT => "SQLITE_ABORT",
+            ffi::SQLITE_BUSY => "SQLITE_BUSY",
+            ffi::SQLITE_LOCKED => "SQLITE_LOCKED",
+            ffi::SQLITE_NOMEM => "SQLITE_NOMEM",
+            ffi::SQLITE_READONLY => "SQLITE_READONLY",
+            ffi::SQLITE_INTERRUPT => "SQLITE_INTERRUPT",
+            ffi::SQLITE_IOERR => "SQLITE_IOERR",
+            ffi::SQLITE_CORRUPT => "SQLITE_CORRUPT",
+            ffi::SQLITE_NOTFOUND => "SQLITE_NOTFOUND",
+            ffi::SQLITE_FULL => "SQLITE_FULL",
+            ffi::SQLITE_CANTOPEN => "SQLITE_CANTOPEN",
+            ffi::SQLITE_PROTOCOL => "SQLITE_PROTOCOL",
+            ffi::SQLITE_EMPTY => "SQLITE_EMPTY",
+            ffi::SQLITE_SCHEMA => "SQLITE_SCHEMA",
+            ffi::SQLITE_TOOBIG => "SQLITE_TOOBIG",
+            ffi::SQLITE_CONSTRAINT => "SQLITE_CONSTRAINT",
+            ffi::SQLITE_MISMATCH => "SQLITE_MISMATCH",
+            ffi::SQLITE_MISUSE => "SQLITE_MISUSE",
+            ffi::SQLITE_NOLFS => "SQLITE_NOLFS",
+            ffi::SQLITE_AUTH => "SQLITE_AUTH",
+            ffi::SQLITE_FORMAT => "SQLITE_FORMAT",
+            ffi::SQLITE_RANGE => "SQLITE_RANGE",
+            ffi::SQLITE_NOTADB => "SQLITE_NOTADB",
+            ffi::SQLITE_NOTICE => "SQLITE_NOTICE",
+            ffi::SQLITE_WARNING => "SQLITE_WARNING",
+            ffi::SQLITE_ROW => "SQLITE_ROW",
+            ffi::SQLITE_DONE => "SQLITE_DONE",
+            _ => "SQLITE_UNKNOWN",
+        },
     }
 }
 
@@ -475,6 +668,112 @@ mod tests {
     }
 
     #[test]
+    fn reports_actionable_prepare_diagnostics() {
+        let (_dir, path) = fixture();
+        for (sql, expected_message, expected_offset) in [
+            (
+                "SELECT missing_column FROM conversations",
+                "no such column: missing_column",
+                Some(7),
+            ),
+            (
+                "SELECT * FROM missing_table",
+                "no such table: missing_table",
+                None,
+            ),
+            ("SELEC 1", "near \"SELEC\": syntax error", Some(0)),
+        ] {
+            let error = execute_coordinator_query(path.to_str().unwrap(), sql).unwrap_err();
+            let CoordinatorQueryError::Sqlite(diagnostic) = error else {
+                panic!("expected SQLite diagnostic for {sql}: {error}");
+            };
+            assert_eq!(diagnostic.phase, CoordinatorSqlitePhase::Prepare);
+            assert_eq!(diagnostic.primary_code, ffi::SQLITE_ERROR);
+            assert_eq!(diagnostic.extended_code, ffi::SQLITE_ERROR);
+            assert_eq!(diagnostic.symbolic_code, "SQLITE_ERROR");
+            assert_eq!(diagnostic.message, expected_message);
+            assert_eq!(diagnostic.error_offset, expected_offset);
+            let rendered = diagnostic.to_string();
+            assert!(rendered.contains(expected_message), "{rendered}");
+            assert!(rendered.contains("primary_code=1"), "{rendered}");
+            assert!(rendered.contains("extended_code=1"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn reports_busy_snapshot_with_extended_code() {
+        let diagnostic = sqlite_diagnostic(
+            ptr::null_mut(),
+            ffi::SQLITE_BUSY_SNAPSHOT,
+            CoordinatorSqlitePhase::Execute,
+        );
+        assert_eq!(diagnostic.primary_code, ffi::SQLITE_BUSY);
+        assert_eq!(diagnostic.extended_code, ffi::SQLITE_BUSY_SNAPSHOT);
+        assert_eq!(diagnostic.symbolic_code, "SQLITE_BUSY_SNAPSHOT");
+        assert_eq!(diagnostic.message, "database is locked");
+        assert_eq!(diagnostic.error_offset, None);
+        assert!(diagnostic.to_string().contains("extended_code=517"));
+    }
+
+    #[test]
+    fn preserves_non_locking_extended_symbolic_codes() {
+        for (code, expected) in [
+            (ffi::SQLITE_IOERR_READ, "SQLITE_IOERR_READ"),
+            (ffi::SQLITE_CANTOPEN_ISDIR, "SQLITE_CANTOPEN_ISDIR"),
+            (ffi::SQLITE_CORRUPT_VTAB, "SQLITE_CORRUPT_VTAB"),
+            (
+                ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+                "SQLITE_CONSTRAINT_FOREIGNKEY",
+            ),
+            (
+                ffi::SQLITE_ERROR_MISSING_COLLSEQ,
+                "SQLITE_ERROR_MISSING_COLLSEQ",
+            ),
+        ] {
+            assert_eq!(sqlite_symbolic_code(code), expected);
+        }
+    }
+
+    #[test]
+    fn preserves_error_offset_for_execute_phase_diagnostics() {
+        let (_dir, path) = fixture();
+        let db = rusqlite_for_test(&path);
+        let sql = CString::new("SELEC 1").unwrap();
+        let mut statement = ptr::null_mut();
+        let rc = unsafe {
+            ffi::sqlite3_prepare_v2(db.0, sql.as_ptr(), -1, &raw mut statement, ptr::null_mut())
+        };
+        assert_ne!(rc, ffi::SQLITE_OK);
+
+        let diagnostic = sqlite_diagnostic(db.0, rc, CoordinatorSqlitePhase::Execute);
+
+        assert_eq!(diagnostic.error_offset, Some(0));
+        if !statement.is_null() {
+            unsafe { ffi::sqlite3_finalize(statement) };
+        }
+    }
+
+    #[test]
+    fn reports_real_database_lock_diagnostic() {
+        let (_dir, path) = fixture();
+        let writer = rusqlite_for_test(&path);
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let error = execute_coordinator_query(path.to_str().unwrap(), "SELECT 1").unwrap_err();
+
+        writer.execute_batch("ROLLBACK").unwrap();
+        let CoordinatorQueryError::Sqlite(diagnostic) = error else {
+            panic!("expected SQLite lock diagnostic: {error}");
+        };
+        assert_eq!(diagnostic.primary_code, ffi::SQLITE_BUSY);
+        assert!(matches!(
+            diagnostic.symbolic_code,
+            "SQLITE_BUSY" | "SQLITE_BUSY_RECOVERY" | "SQLITE_BUSY_SNAPSHOT" | "SQLITE_BUSY_TIMEOUT"
+        ));
+        assert!(diagnostic.message.contains("locked"), "{diagnostic}");
+    }
+
+    #[test]
     fn denies_writes_attach_pragmas_and_multiple_statements() {
         let (_dir, path) = fixture();
         for sql in [
@@ -518,7 +817,7 @@ mod tests {
             assert!(
                 matches!(
                     execute_coordinator_query(path.to_str().unwrap(), sql),
-                    Err(CoordinatorQueryError::Denied(_) | CoordinatorQueryError::PrepareFailed)
+                    Err(CoordinatorQueryError::Denied(_) | CoordinatorQueryError::Sqlite(_))
                 ),
                 "{sql}"
             );
