@@ -474,7 +474,7 @@ async def _send_chat_and_stream_async(
     conv_id: str,
     text: str,
     timeout: float,
-) -> None:
+) -> int:
     stream_url = f"{base_url}/api/conversations/{conv_id}/stream"
     chat_url = f"{base_url}/api/conversations/{conv_id}/chat"
     transport_timeout = httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=5.0)
@@ -504,8 +504,8 @@ async def _send_chat_and_stream_async(
                     snapshot = await client.get(f"{base_url}/api/conversations/{conv_id}")
                     snapshot.raise_for_status()
                     messages = snapshot.json().get("messages", [])
-                    if len(messages) >= baseline_count + 2 and messages[-1].get("message_type") == "agent":
-                        return
+                    if len(messages) >= baseline_count + 2:
+                        return baseline_count + 2
             raise RuntimeError("SSE stream closed before the continuation completed")
 
 
@@ -514,14 +514,46 @@ def _send_chat_and_stream(
     conv_id: str,
     text: str,
     timeout: float,
-) -> None:
+) -> int:
     try:
-        asyncio.run(_send_chat_and_stream_async(base_url, conv_id, text, timeout))
+        return asyncio.run(_send_chat_and_stream_async(base_url, conv_id, text, timeout))
     except (TimeoutError, httpx.TimeoutException) as error:
         diagnostic = _timeout_diagnostic(base_url, conv_id)
         raise TimeoutError(
             f"continuation SSE did not reach terminal in {timeout:g}s ({diagnostic})"
         ) from error
+
+
+def _assert_next_chat_is_accepted(base_url: str, conv_id: str) -> None:
+    baseline_count = len(_get_conv(base_url, conv_id).get("messages") or [])
+    message_id = str(uuid.uuid4())
+    response = httpx.post(
+        f"{base_url}/api/conversations/{conv_id}/chat",
+        json={
+            "text": "[[scenario:plain_text]] ownership release probe",
+            "images": [],
+            "message_id": message_id,
+        },
+        timeout=10.0,
+    )
+    assert response.status_code == 200, (
+        "completed direct turn did not release the next acceptance: "
+        f"status={response.status_code}, body={response.text[:500]!r}"
+    )
+
+    accepted = response.json()
+    assert accepted.get("steering") is not True, (
+        "ownership probe was queued as steering instead of accepted as a direct turn: "
+        f"body={accepted!r}"
+    )
+
+    _poll_to_idle_with_messages(
+        base_url,
+        conv_id,
+        lambda messages: len(messages) >= baseline_count + 2,
+        "accepted ownership probe response",
+        timeout=SCENARIO_TIMEOUT_SECONDS,
+    )
 
 
 def _poll_to_idle_with_messages(
@@ -674,11 +706,18 @@ def scenario_continuation(base_url: str) -> None:
         "first-turn response",
         timeout=SCENARIO_TIMEOUT_SECONDS,
     )
-    _send_chat_and_stream(
+    second_turn_message_count = _send_chat_and_stream(
         base_url,
         conv["id"],
         "[[scenario:markdown]] two",
         SCENARIO_TIMEOUT_SECONDS,
+    )
+    _poll_to_idle_with_messages(
+        base_url,
+        conv["id"],
+        lambda messages: len(messages) >= second_turn_message_count,
+        "second-turn idle completion",
+        timeout=SCENARIO_TIMEOUT_SECONDS,
     )
     final = _get_conv(base_url, conv["id"])
     users = _user_messages(final["messages"])
@@ -686,6 +725,7 @@ def scenario_continuation(base_url: str) -> None:
     text = _agent_text(final["messages"])
     assert "analyzed the situation" in text, "first turn's assistant text missing"
     assert "## Analysis" in text, "second turn's assistant text missing"
+    _assert_next_chat_is_accepted(base_url, conv["id"])
 
 
 def scenario_mid_stream_cancel(base_url: str) -> None:
