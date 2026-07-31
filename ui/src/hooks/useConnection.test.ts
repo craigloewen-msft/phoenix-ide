@@ -13,6 +13,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
+import { StrictMode } from 'react';
 import { useConnection } from './useConnection';
 import type { SSEAction } from '../conversation/atom';
 import { ConversationStore } from '../conversation/ConversationStore';
@@ -69,11 +70,14 @@ class FakeEventSource {
 // ---------------------------------------------------------------------------
 
 let originalEventSource: typeof EventSource | undefined;
+let originalFetch: typeof fetch | undefined;
 
 beforeEach(() => {
   originalEventSource = (globalThis as { EventSource?: typeof EventSource }).EventSource;
+  originalFetch = globalThis.fetch;
   (globalThis as { EventSource: unknown }).EventSource =
     FakeEventSource as unknown as typeof EventSource;
+  globalThis.fetch = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
   FakeEventSource.instances.length = 0;
 });
 
@@ -81,6 +85,7 @@ afterEach(() => {
   if (originalEventSource) {
     (globalThis as { EventSource: typeof EventSource }).EventSource = originalEventSource;
   }
+  if (originalFetch) globalThis.fetch = originalFetch;
 });
 
 // Minimal valid `init` payload — must satisfy SseInitDataSchema or
@@ -123,7 +128,9 @@ describe('useConnection epoch stamping (task 08683)', () => {
     renderHook(() => useConnection({ conversationId: 'conv-A', dispatch }));
 
     expect(FakeEventSource.instances).toHaveLength(1);
-    expect(FakeEventSource.instances[0]!.url).toBe('/api/conversations/conv-A/stream');
+    expect(FakeEventSource.instances[0]!.url).toMatch(
+      /^\/api\/conversations\/conv-A\/stream\?open_id=[0-9a-f-]{36}$/,
+    );
   });
 
   it('uses after_event_sequence when the atom already has a replay cursor', () => {
@@ -136,8 +143,8 @@ describe('useConnection epoch stamping (task 08683)', () => {
     }));
 
     expect(FakeEventSource.instances).toHaveLength(1);
-    expect(FakeEventSource.instances[0]!.url).toBe(
-      '/api/conversations/conv-A/stream?after_event_sequence=42',
+    expect(FakeEventSource.instances[0]!.url).toMatch(
+      /^\/api\/conversations\/conv-A\/stream\?after_event_sequence=42&open_id=[0-9a-f-]{36}$/,
     );
   });
 
@@ -173,8 +180,8 @@ describe('useConnection epoch stamping (task 08683)', () => {
     }));
 
     expect(FakeEventSource.instances).toHaveLength(1);
-    expect(FakeEventSource.instances[0]!.url).toBe(
-      '/api/conversations/conv-A/stream?init_mode=messages_after_floor&after_message_floor=77&transcript_generation=3',
+    expect(FakeEventSource.instances[0]!.url).toMatch(
+      /^\/api\/conversations\/conv-A\/stream\?init_mode=messages_after_floor&after_message_floor=77&transcript_generation=3&open_id=[0-9a-f-]{36}$/,
     );
   });
 
@@ -189,9 +196,129 @@ describe('useConnection epoch stamping (task 08683)', () => {
     }));
 
     expect(FakeEventSource.instances).toHaveLength(1);
-    expect(FakeEventSource.instances[0]!.url).toBe(
-      '/api/conversations/conv-A/stream?after_event_sequence=42',
+    expect(FakeEventSource.instances[0]!.url).toMatch(
+      /^\/api\/conversations\/conv-A\/stream\?after_event_sequence=42&open_id=[0-9a-f-]{36}$/,
     );
+  });
+
+  it('reports one connected measurement correlated to the stream open ID', () => {
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+
+    renderHook(() => useConnection({ conversationId: 'conv-A', dispatch }));
+    const stream = FakeEventSource.instances[0]!;
+    const openId = new URL(stream.url, 'http://localhost').searchParams.get('open_id');
+
+    act(() => {
+      stream.emit('init', makeInitPayload('conv-A', 'slug-A'));
+      stream.emit('init', makeInitPayload('conv-A', 'slug-A'));
+    });
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(
+      (vi.mocked(fetch).mock.calls[0]![1] as RequestInit).body as string,
+    ) as { open_id: string; outcome: string };
+    expect(body).toMatchObject({ open_id: openId, outcome: 'connected' });
+  });
+
+  it('reports an unfinished open as canceled when the conversation changes', () => {
+    vi.useFakeTimers();
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+    const { rerender } = renderHook(
+      ({ convId }) => useConnection({ conversationId: convId, dispatch }),
+      { initialProps: { convId: 'conv-A' as string | undefined } },
+    );
+    const firstOpenId = new URL(
+      FakeEventSource.instances[0]!.url,
+      'http://localhost',
+    ).searchParams.get('open_id');
+
+    rerender({ convId: 'conv-B' });
+    act(() => {
+      vi.advanceTimersByTime(0);
+    });
+
+    const reports = vi.mocked(fetch).mock.calls.map((call) =>
+      JSON.parse((call[1] as RequestInit).body as string) as {
+        open_id: string;
+        outcome: string;
+      },
+    );
+    expect(reports).toContainEqual({
+      open_id: firstOpenId,
+      outcome: 'canceled',
+      native_open_ms: null,
+      init_received_ms: null,
+      handler_ms: null,
+      total_ms: expect.any(Number),
+      retry_attempt: 0,
+      visible: expect.any(Boolean),
+      effective_type: null,
+    });
+  });
+
+  afterEach(() => vi.useRealTimers());
+
+  it('does not report StrictMode effect replay as a canceled open', () => {
+    vi.useFakeTimers();
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+
+    renderHook(() => useConnection({ conversationId: 'conv-A', dispatch }), {
+      wrapper: StrictMode,
+    });
+    act(() => {
+      vi.advanceTimersByTime(0);
+    });
+
+    expect(fetch).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it('reports the active unfinished open synchronously on pagehide', () => {
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+    renderHook(() => useConnection({ conversationId: 'conv-A', dispatch }));
+
+    act(() => window.dispatchEvent(new Event('pagehide')));
+
+    const body = JSON.parse(
+      (vi.mocked(fetch).mock.calls[0]![1] as RequestInit).body as string,
+    ) as { outcome: string };
+    expect(body.outcome).toBe('canceled');
+  });
+
+  it('flushes pending and active opens together on pagehide', () => {
+    vi.useFakeTimers();
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+    const { rerender } = renderHook(
+      ({ convId }) => useConnection({ conversationId: convId, dispatch }),
+      { initialProps: { convId: 'conv-A' as string | undefined } },
+    );
+    rerender({ convId: 'conv-B' });
+
+    act(() => window.dispatchEvent(new Event('pagehide')));
+
+    const outcomes = vi.mocked(fetch).mock.calls.map((call) =>
+      (JSON.parse((call[1] as RequestInit).body as string) as { outcome: string }).outcome,
+    );
+    expect(outcomes).toEqual(['canceled', 'canceled']);
+  });
+
+  it('flushes every rapid conversation-switch cancellation on pagehide', () => {
+    vi.useFakeTimers();
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+    const { rerender } = renderHook(
+      ({ convId }) => useConnection({ conversationId: convId, dispatch }),
+      { initialProps: { convId: 'conv-A' as string | undefined } },
+    );
+    rerender({ convId: 'conv-B' });
+    rerender({ convId: 'conv-C' });
+
+    act(() => window.dispatchEvent(new Event('pagehide')));
+
+    expect(fetch).toHaveBeenCalledTimes(3);
+    const outcomes = vi.mocked(fetch).mock.calls.map((call) =>
+      (JSON.parse((call[1] as RequestInit).body as string) as { outcome: string }).outcome,
+    );
+    expect(outcomes).toEqual(['canceled', 'canceled', 'canceled']);
   });
 
   it('stamps every wire-derived dispatch with the connection epoch', () => {

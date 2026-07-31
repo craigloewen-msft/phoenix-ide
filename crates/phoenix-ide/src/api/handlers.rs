@@ -166,6 +166,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         // SSE streaming (REQ-API-005)
         .route("/api/conversations/:id/stream", get(stream_conversation))
+        .route(
+            "/api/telemetry/conversation-open",
+            post(report_conversation_open),
+        )
         // Terminal WebSocket (REQ-TERM-001 through REQ-TERM-014)
         .route("/api/conversations/:id/terminal", get(terminal_ws_handler))
         // Global terminal WebSocket — singleton scope, unbound to any
@@ -2259,6 +2263,245 @@ struct StreamConversationQuery {
     init_mode: Option<StreamInitMode>,
     after_message_floor: Option<i64>,
     transcript_generation: Option<i64>,
+    open_id: Option<uuid::Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "outcome", rename_all = "lowercase")]
+enum ConversationOpenPhases {
+    Connected {
+        native_open_ms: Option<f64>,
+        init_received_ms: f64,
+        handler_ms: f64,
+    },
+    Error {
+        native_open_ms: Option<f64>,
+        init_received_ms: Option<f64>,
+        #[expect(
+            dead_code,
+            reason = "presence enforces JSON null during deserialization"
+        )]
+        handler_ms: MustBeNull,
+    },
+    Canceled {
+        native_open_ms: Option<f64>,
+        init_received_ms: Option<f64>,
+        #[expect(
+            dead_code,
+            reason = "presence enforces JSON null during deserialization"
+        )]
+        handler_ms: MustBeNull,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct MustBeNull;
+
+impl ConversationOpenPhases {
+    fn values(&self) -> (&'static str, Option<f64>, Option<f64>, Option<f64>) {
+        match self {
+            Self::Connected {
+                native_open_ms,
+                init_received_ms,
+                handler_ms,
+            } => (
+                "connected",
+                *native_open_ms,
+                Some(*init_received_ms),
+                Some(*handler_ms),
+            ),
+            Self::Error {
+                native_open_ms,
+                init_received_ms,
+                handler_ms: _,
+            } => ("error", *native_open_ms, *init_received_ms, None),
+            Self::Canceled {
+                native_open_ms,
+                init_received_ms,
+                handler_ms: _,
+            } => ("canceled", *native_open_ms, *init_received_ms, None),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+enum NetworkEffectiveType {
+    #[serde(rename = "slow-2g")]
+    Slow2g,
+    #[serde(rename = "2g")]
+    TwoG,
+    #[serde(rename = "3g")]
+    ThreeG,
+    #[serde(rename = "4g")]
+    FourG,
+}
+
+impl NetworkEffectiveType {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Slow2g => "slow-2g",
+            Self::TwoG => "2g",
+            Self::ThreeG => "3g",
+            Self::FourG => "4g",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ConversationOpenTelemetry {
+    open_id: uuid::Uuid,
+    #[serde(flatten)]
+    phases: ConversationOpenPhases,
+    total_ms: f64,
+    retry_attempt: u32,
+    visible: bool,
+    effective_type: Option<NetworkEffectiveType>,
+}
+
+impl ConversationOpenTelemetry {
+    fn has_valid_bounds(&self) -> bool {
+        const MAX_DURATION_MS: f64 = 300_000.0;
+        const MAX_RETRY_ATTEMPT: u32 = 10_000;
+        let valid_duration =
+            |value: f64| value.is_finite() && (0.0..=MAX_DURATION_MS).contains(&value);
+        let (_, native_open_ms, init_received_ms, handler_ms) = self.phases.values();
+        let phase_order_valid = match &self.phases {
+            ConversationOpenPhases::Connected {
+                init_received_ms,
+                handler_ms,
+                ..
+            } => {
+                *init_received_ms <= self.total_ms
+                    && native_open_ms.is_none_or(|value| value <= *init_received_ms)
+                    && (*init_received_ms + *handler_ms - self.total_ms).abs() <= 0.2
+            }
+            ConversationOpenPhases::Error {
+                init_received_ms, ..
+            }
+            | ConversationOpenPhases::Canceled {
+                init_received_ms, ..
+            } => init_received_ms.is_none_or(|init| {
+                init <= self.total_ms && native_open_ms.is_none_or(|native| native <= init)
+            }),
+        };
+        native_open_ms.is_none_or(|value| valid_duration(value) && value <= self.total_ms)
+            && init_received_ms.is_none_or(valid_duration)
+            && handler_ms.is_none_or(valid_duration)
+            && valid_duration(self.total_ms)
+            && self.retry_attempt <= MAX_RETRY_ATTEMPT
+            && phase_order_valid
+    }
+}
+
+#[cfg(test)]
+mod conversation_open_telemetry_tests {
+    use super::ConversationOpenTelemetry;
+
+    #[test]
+    fn rejects_unknown_network_effective_types() {
+        let report = r#"{
+            "open_id":"550e8400-e29b-41d4-a716-446655440000",
+            "outcome":"connected",
+            "native_open_ms":1.0,
+            "init_received_ms":2.0,
+            "handler_ms":1.0,
+            "total_ms":3.0,
+            "retry_attempt":0,
+            "visible":true,
+            "effective_type":"content-bearing-value"
+        }"#;
+        assert!(serde_json::from_str::<ConversationOpenTelemetry>(report).is_err());
+    }
+
+    #[test]
+    fn connected_requires_completed_phase_timings() {
+        let report = serde_json::json!({
+            "open_id": "550e8400-e29b-41d4-a716-446655440000",
+            "outcome": "connected",
+            "native_open_ms": 1.0,
+            "init_received_ms": null,
+            "handler_ms": null,
+            "total_ms": 3.0,
+            "retry_attempt": 0,
+            "visible": true,
+            "effective_type": "4g"
+        });
+        assert!(serde_json::from_value::<ConversationOpenTelemetry>(report).is_err());
+    }
+
+    #[test]
+    fn rejects_contradictory_phase_timings() {
+        let base = serde_json::json!({
+            "open_id": "550e8400-e29b-41d4-a716-446655440000",
+            "outcome": "connected",
+            "native_open_ms": 1.0,
+            "init_received_ms": 2.0,
+            "handler_ms": 1.0,
+            "total_ms": 3.0,
+            "retry_attempt": 0,
+            "visible": true,
+            "effective_type": "4g"
+        });
+        let mut impossible_total = base.clone();
+        impossible_total["total_ms"] = serde_json::json!(1.0);
+        assert!(
+            !serde_json::from_value::<ConversationOpenTelemetry>(impossible_total)
+                .unwrap()
+                .has_valid_bounds()
+        );
+
+        let mut error_with_handler = base;
+        error_with_handler["outcome"] = serde_json::json!("error");
+        assert!(serde_json::from_value::<ConversationOpenTelemetry>(error_with_handler).is_err());
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_numbers() {
+        let valid = serde_json::json!({
+            "open_id": "550e8400-e29b-41d4-a716-446655440000",
+            "outcome": "connected",
+            "native_open_ms": 1.0,
+            "init_received_ms": 2.0,
+            "handler_ms": 1.0,
+            "total_ms": 3.0,
+            "retry_attempt": 0,
+            "visible": true,
+            "effective_type": "4g"
+        });
+        for (field, value) in [
+            ("total_ms", serde_json::json!(-1)),
+            ("total_ms", serde_json::json!(300_001)),
+            ("retry_attempt", serde_json::json!(10_001)),
+        ] {
+            let mut report = valid.clone();
+            report[field] = value;
+            assert!(!serde_json::from_value::<ConversationOpenTelemetry>(report)
+                .unwrap()
+                .has_valid_bounds());
+        }
+    }
+}
+
+async fn report_conversation_open(Json(report): Json<ConversationOpenTelemetry>) -> StatusCode {
+    if !report.has_valid_bounds() {
+        return StatusCode::BAD_REQUEST;
+    }
+    let (outcome, native_open_ms, init_received_ms, handler_ms) = report.phases.values();
+    let span = tracing::info_span!(
+        target: "phoenix_ide::otel",
+        "browser.conversation_open",
+        "open.id" = %report.open_id,
+        "browser.outcome" = outcome,
+        "browser.native_open_ms" = native_open_ms,
+        "browser.init_received_ms" = init_received_ms,
+        "browser.handler_ms" = handler_ms,
+        "browser.total_ms" = report.total_ms,
+        "browser.retry_attempt" = report.retry_attempt,
+        "browser.visible" = report.visible,
+        "network.effective_type" = report.effective_type.as_ref().map(NetworkEffectiveType::as_str),
+    );
+    drop(span.enter());
+    StatusCode::NO_CONTENT
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3417,6 +3660,9 @@ async fn stream_conversation(
     Query(query): Query<StreamConversationQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let init_trace = SseInitTrace::new();
+    if let Some(open_id) = query.open_id {
+        init_trace.record_open_id(open_id);
+    }
     let conversation_for_runtime = state
         .runtime
         .db()
@@ -9683,6 +9929,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 init_mode: None,
                 after_message_floor: None,
                 transcript_generation: None,
+                open_id: None,
             },
         );
 
@@ -9720,6 +9967,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: None,
                     after_message_floor: None,
                     transcript_generation: Some(1),
+                    open_id: None,
                 },
                 10,
                 1,
@@ -9735,6 +9983,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: None,
                     after_message_floor: None,
                     transcript_generation: None,
+                    open_id: None,
                 },
                 10,
                 1,
@@ -9751,6 +10000,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: None,
                     after_message_floor: None,
                     transcript_generation: Some(2),
+                    open_id: None,
                 },
                 10,
                 3,
@@ -9767,6 +10017,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: None,
                     after_message_floor: None,
                     transcript_generation: None,
+                    open_id: None,
                 },
                 10,
                 1,
@@ -9782,6 +10033,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: None,
                     after_message_floor: None,
                     transcript_generation: None,
+                    open_id: None,
                 },
                 10,
                 1,
@@ -9954,6 +10206,7 @@ pub(crate) mod hard_delete_cascade_tests {
             init_mode: None,
             after_message_floor: None,
             transcript_generation: Some(1),
+            open_id: None,
         };
 
         bump_generation_after_next_stable_read_value("stream-none-race");
@@ -10013,6 +10266,7 @@ pub(crate) mod hard_delete_cascade_tests {
             init_mode: Some(StreamInitMode::MessagesAfterFloor),
             after_message_floor: Some(2),
             transcript_generation: Some(1),
+            open_id: None,
         };
 
         bump_generation_after_next_stable_read_value("stream-floor-race");
@@ -10082,6 +10336,7 @@ pub(crate) mod hard_delete_cascade_tests {
             init_mode: Some(StreamInitMode::MessagesAfterFloor),
             after_message_floor: Some(99),
             transcript_generation: Some(1),
+            open_id: None,
         };
 
         let stable = stable_transcript_read(
@@ -10197,6 +10452,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 init_mode: Some(StreamInitMode::MessagesAfterFloor),
                 after_message_floor: Some(1),
                 transcript_generation: Some(1),
+                open_id: None,
             },
             true,
             1,
@@ -10230,6 +10486,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: Some(StreamInitMode::MessagesAfterFloor),
                     after_message_floor: Some(50),
                     transcript_generation: Some(3),
+                    open_id: None,
                 },
                 75,
                 3,
@@ -10245,6 +10502,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: Some(StreamInitMode::MessagesAfterFloor),
                     after_message_floor: Some(50),
                     transcript_generation: Some(2),
+                    open_id: None,
                 },
                 75,
                 3,
@@ -10260,6 +10518,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: Some(StreamInitMode::MessagesAfterFloor),
                     after_message_floor: Some(76),
                     transcript_generation: Some(3),
+                    open_id: None,
                 },
                 75,
                 3,
@@ -10275,6 +10534,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: Some(StreamInitMode::MessagesAfterFloor),
                     after_message_floor: None,
                     transcript_generation: Some(3),
+                    open_id: None,
                 },
                 75,
                 3,

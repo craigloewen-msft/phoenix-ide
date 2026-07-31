@@ -3,6 +3,7 @@ import * as v from 'valibot';
 import type { SseInitData } from '../api';
 import type { SSEAction, InitPayload } from '../conversation/atom';
 import { parseConversationState } from '../utils';
+import { generateUUID } from '../utils/uuid';
 import { notifyConversationStateChange } from '../notifications';
 import {
   SseInitDataSchema,
@@ -133,6 +134,11 @@ function epochStampedDispatch(
 }
 
 export type { ConnectionState } from './connectionMachine';
+import {
+  ConversationOpenMeasurement,
+  reportConversationOpen,
+  type ConversationOpenTelemetryPayload,
+} from './conversationOpenTelemetry';
 
 export interface ConnectionInfo {
   state: ConnectionState;
@@ -156,7 +162,7 @@ interface UseConnectionOptions {
   getInitialRequestMode?: () => InitialSseRequestMode;
 }
 
-function buildStreamUrl(conversationId: string, lastAppliedEventSeq: number, initialRequestMode?: InitialSseRequestMode): string {
+function buildStreamUrl(conversationId: string, lastAppliedEventSeq: number, initialRequestMode?: InitialSseRequestMode, openId?: string): string {
   const params = new URLSearchParams();
   if (lastAppliedEventSeq > 0) {
     params.set('after_event_sequence', String(lastAppliedEventSeq));
@@ -165,6 +171,7 @@ function buildStreamUrl(conversationId: string, lastAppliedEventSeq: number, ini
     params.set('after_message_floor', String(initialRequestMode.afterMessageFloor));
     params.set('transcript_generation', String(initialRequestMode.transcriptGeneration));
   }
+  if (openId) params.set('open_id', openId);
   const query = params.toString();
   return query.length > 0
     ? `/api/conversations/${conversationId}/stream?${query}`
@@ -215,6 +222,13 @@ export function useConnection({
 
   // Refs for values that shouldn't trigger effect re-runs
   const eventSourceRef = useRef<EventSource | null>(null);
+  const openMeasurementRef = useRef<ConversationOpenMeasurement | null>(null);
+  const openAttemptRef = useRef<{ conversationId: string; attempt: number } | null>(null);
+  const pendingCancellationsRef = useRef<Array<{
+    conversationId: string;
+    timeout: number;
+    telemetry: ConversationOpenTelemetryPayload;
+  }>>([]);
   const retryTimeoutRef = useRef<number | null>(null);
   const countdownIntervalRef = useRef<number | null>(null);
   const reconnectedTimeoutRef = useRef<number | null>(null);
@@ -272,6 +286,35 @@ export function useConnection({
     dispatchMachineRef.current = dispatchMachine;
   }, [dispatchMachine]);
 
+  const reportCanceledOpen = useCallback((conversationId: string) => {
+    const telemetry = openMeasurementRef.current?.canceled();
+    openMeasurementRef.current = null;
+    if (!telemetry) return;
+    const timeout = window.setTimeout(() => {
+      pendingCancellationsRef.current = pendingCancellationsRef.current.filter(
+        (pending) => pending.timeout !== timeout,
+      );
+      reportConversationOpen(telemetry);
+    }, 0);
+    pendingCancellationsRef.current.push({ conversationId, timeout, telemetry });
+  }, []);
+
+  useEffect(() => {
+    const flushPendingCancellation = () => {
+      const pending = pendingCancellationsRef.current;
+      pendingCancellationsRef.current = [];
+      for (const cancellation of pending) {
+        clearTimeout(cancellation.timeout);
+        reportConversationOpen(cancellation.telemetry);
+      }
+      const telemetry = openMeasurementRef.current?.canceled();
+      openMeasurementRef.current = null;
+      if (telemetry) reportConversationOpen(telemetry);
+    };
+    window.addEventListener('pagehide', flushPendingCancellation);
+    return () => window.removeEventListener('pagehide', flushPendingCancellation);
+  }, []);
+
   const executeEffects = useCallback((effects: ConnectionEffect[]) => {
     for (const effect of effects) {
       switch (effect.type) {
@@ -279,7 +322,16 @@ export function useConnection({
           const convId = conversationIdRef.current;
           if (!convId) break;
 
+          const replayIndex = pendingCancellationsRef.current.findLastIndex(
+            (pending) => pending.conversationId === convId,
+          );
+          if (replayIndex >= 0) {
+            const [replayed] = pendingCancellationsRef.current.splice(replayIndex, 1);
+            if (replayed) clearTimeout(replayed.timeout);
+            openAttemptRef.current = null;
+          }
           if (eventSourceRef.current) {
+            reportCanceledOpen(convId);
             eventSourceRef.current.close();
             eventSourceRef.current = null;
           }
@@ -293,16 +345,30 @@ export function useConnection({
           const initialRequestMode = lastAppliedEventSeq > 0
             ? undefined
             : getInitialRequestModeRef.current?.();
-          const url = buildStreamUrl(convId, lastAppliedEventSeq, initialRequestMode);
+          const openId = generateUUID();
+          const previousAttempt = openAttemptRef.current;
+          const openAttempt = previousAttempt?.conversationId === convId
+            ? Math.min(previousAttempt.attempt + 1, 10_000)
+            : 0;
+          openAttemptRef.current = { conversationId: convId, attempt: openAttempt };
+          const measurement = new ConversationOpenMeasurement(openId, openAttempt);
+          const url = buildStreamUrl(convId, lastAppliedEventSeq, initialRequestMode, openId);
           const es = new EventSource(url);
+          es.addEventListener('open', () => measurement.nativeOpen());
           eventSourceRef.current = es;
+          openMeasurementRef.current = measurement;
           const isCurrentOwner = () =>
             conversationIdRef.current === convId &&
             machineStateRef.current.epoch === epoch &&
             eventSourceRef.current === es;
-          const on = (type: string, handler: (e: Event) => void) => {
+          const on = (
+            type: string,
+            handler: (e: Event) => void,
+            beforeObserved?: () => void,
+          ) => {
             es.addEventListener(type, (e) => {
               if (!isCurrentOwner()) return;
+              beforeObserved?.();
               // REQ-WPV-004: bump the heartbeat-watchdog clock before
               // delegating to per-event processing, on EVERY named
               // event (native EventSource has no wildcard so this
@@ -326,7 +392,11 @@ export function useConnection({
 
           on('init', (e) => {
             const res = parseEvent(SseInitDataSchema, e, 'init', stampedDispatch);
-            if (!res.ok) return;
+            if (!res.ok) {
+              const telemetry = measurement.error();
+              if (telemetry) reportConversationOpen(telemetry);
+              return;
+            }
 
             dispatchMachineRef.current({ type: 'SSE_OPEN' });
             const payload = transformInitData(res.data);
@@ -336,7 +406,9 @@ export function useConnection({
               type: 'sse_init',
               payload,
             });
-          });
+            const telemetry = measurement.connected();
+            if (telemetry) reportConversationOpen(telemetry);
+          }, () => measurement.initReceived());
 
           on('message', (e) => {
             const res = parseEvent(SseMessageDataSchema, e, 'message', stampedDispatch);
@@ -636,6 +708,8 @@ export function useConnection({
             }
             // Native connection drop — log for diagnosing spinner-forever scenarios.
             // This is the path that triggers SSE reconnect logic.
+            const telemetry = measurement.error();
+            if (telemetry) reportConversationOpen(telemetry);
             if (import.meta.env.DEV) {
               console.warn('[sse] native connection error (no data); scheduling reconnect', {
                 convId,
@@ -651,6 +725,13 @@ export function useConnection({
 
         case 'CLOSE_SSE': {
           if (eventSourceRef.current) {
+            if (effect.deferForReplay) {
+              reportCanceledOpen(conversationIdRef.current ?? '');
+            } else {
+              const telemetry = openMeasurementRef.current?.canceled();
+              openMeasurementRef.current = null;
+              if (telemetry) reportConversationOpen(telemetry);
+            }
             eventSourceRef.current.close();
             eventSourceRef.current = null;
           }
@@ -744,7 +825,7 @@ export function useConnection({
         }
       }
     }
-  }, []);
+  }, [reportCanceledOpen]);
 
   const executeEffectsRef = useRef(executeEffects);
   useEffect(() => {
@@ -787,7 +868,7 @@ export function useConnection({
     }
 
     return () => {
-      dispatchMachineRef.current({ type: 'DISCONNECT' });
+      dispatchMachineRef.current({ type: 'DISCONNECT', deferCloseForReplay: true });
     };
   }, [conversationId]);
 
