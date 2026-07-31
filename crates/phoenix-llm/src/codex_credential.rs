@@ -1,6 +1,6 @@
 //! `ChatGPT` `OAuth` credential source bridged from the local `Codex` CLI.
 //!
-//! Reads `~/.codex/auth.json` (written by `codex login` against a `ChatGPT`
+//! Reads `~/.phoenix-ide/codex-auth.json` (written by `codex login` against a `ChatGPT`
 //! Plus/Pro/Team/Enterprise account), returns the access token for use with
 //! the `ChatGPT`-backend Responses API at `https://chatgpt.com/backend-api/codex`,
 //! and refreshes the token via the `OpenAI` `OAuth` endpoint when it nears expiry.
@@ -26,6 +26,7 @@ const REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const REFRESH_SKEW_SECS: i64 = 30;
 pub const CODEX_BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+pub const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
 /// Context-window cap enforced by the ChatGPT-backend codex bridge,
 /// regardless of the model's platform-API ceiling. Sourced from
@@ -38,7 +39,7 @@ pub const CODEX_BRIDGE_CONTEXT_WINDOW: usize = 272_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodexAuthError {
-    #[error("codex auth file not found at {0:?} — run `codex login` first")]
+    #[error("codex auth file not found at {0:?} — sign in with Codex from Phoenix first")]
     NotFound(PathBuf),
     #[error("expected auth_mode 'chatgpt' in {path:?}, got {found:?} — this provider only supports ChatGPT OAuth tokens")]
     WrongAuthMode {
@@ -47,9 +48,11 @@ pub enum CodexAuthError {
     },
     #[error("no access_token in {0:?}")]
     NoAccessToken(PathBuf),
-    #[error("no refresh_token in {0:?} — run `codex login` again")]
+    #[error("no refresh_token in {0:?} — sign in with Codex from Phoenix again")]
     NoRefreshToken(PathBuf),
-    #[error("refresh token rejected ({reason}) — run `codex login` to re-authenticate")]
+    #[error(
+        "refresh token rejected ({reason}) — sign in with Codex from Phoenix to re-authenticate"
+    )]
     RefreshTokenInvalid { reason: String },
     #[error("token refresh failed: {0}")]
     RefreshFailed(String),
@@ -107,41 +110,12 @@ struct RefreshError {
     error: Option<String>,
 }
 
-/// Whether the user has opted into piggybacking on the Codex CLI's own
-/// `auth.json` via `OPENAI_USE_CODEX_AUTH`. A behaviour flag, not a path, so it
-/// is read directly here rather than resolved through
-/// [`PhoenixRuntimeEnvironment`].
-fn piggyback_enabled() -> bool {
-    std::env::var("OPENAI_USE_CODEX_AUTH")
-        .ok()
-        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
-}
-
-/// Decide which file to load credentials from at startup.
-///
-/// Priority:
-/// 1. **Phoenix's own** `~/.phoenix-ide/codex-auth.json` — written by the
-///    in-app `/codex/login` flow. Independent session, "I logged into
-///    Phoenix" model.
-/// 2. **Codex CLI's** `~/.codex/auth.json` — only consulted when the user
-///    opts in via `OPENAI_USE_CODEX_AUTH=1`. Piggyback mode for users who
-///    already use the Codex CLI and want a single shared session.
-///
-/// Returns `None` when neither is available; the registry treats that as
-/// "no `ChatGPT` bridge today".
+/// Return Phoenix's native Codex credential path when it exists.
 #[must_use]
 pub fn resolve_active_auth_path(env: &PhoenixRuntimeEnvironment) -> Option<PathBuf> {
-    let phoenix_path = env.codex_auth_path();
-    if phoenix_path.exists() {
-        return Some(phoenix_path);
-    }
-    if piggyback_enabled() {
-        let codex_path = env.codex_cli_auth_path();
-        if codex_path.exists() {
-            return Some(codex_path);
-        }
-    }
-    None
+    env.codex_auth_path()
+        .exists()
+        .then(|| env.codex_auth_path())
 }
 
 /// Read `auth.json` and validate it's a ChatGPT-mode file.
@@ -325,6 +299,7 @@ struct InnerState {
     /// the "JWT exp still in the future" shortcut and rotate via the refresh
     /// token, so a server-side revocation actually replaces the token.
     force_refresh: bool,
+    revoked: bool,
 }
 
 /// Return the file mtime, or `None` if it can't be read (the caller treats
@@ -334,17 +309,17 @@ fn file_mtime(path: &PathBuf) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
-/// `CredentialSource` impl for `ChatGPT` `OAuth` tokens borrowed from the `Codex` CLI.
+/// Credential source for Phoenix's native `ChatGPT` OAuth session.
 pub struct CodexCredential {
     auth_path: PathBuf,
     inner: Mutex<InnerState>,
     /// `account_id` mirrored from the most recent file read. Updated by
     /// `fetch()` so per-request callers (`account_id()`) see the current
-    /// account after a `codex login` mid-session.
+    /// account after a native Codex login mid-session.
     account_id: StdMutex<Option<String>>,
     /// Most recent fetch failure message, surfaced via the `CredentialSource`
     /// `last_error_hint()` trait method so the UI shows actionable recovery
-    /// guidance ("run `codex login`") instead of the generic auth-failure
+    /// guidance ("sign in with Codex from Phoenix") instead of the generic auth-failure
     /// message.
     last_error: StdMutex<Option<String>>,
 }
@@ -423,8 +398,13 @@ impl CodexCredential {
     /// `force_refresh` is only cleared after a successful refresh, so a
     /// transient refresh failure (network blip) does not silently demote the
     /// next call back to "JWT looks fine, return cached token."
-    async fn fetch(&self) -> Result<String, CodexAuthError> {
+    async fn fetch(&self) -> Result<(String, Option<String>), CodexAuthError> {
         let mut state = self.inner.lock().await;
+        if state.revoked {
+            return Err(CodexAuthError::RefreshFailed(
+                "credential signed out".to_string(),
+            ));
+        }
         let forced = state.force_refresh;
         let current_mtime = file_mtime(&self.auth_path);
 
@@ -437,7 +417,7 @@ impl CodexCredential {
                 if c.file_mtime == current_mtime {
                     if let Some(exp) = c.exp {
                         if now_unix() < exp - REFRESH_SKEW_SECS {
-                            return Ok(c.access_token.clone());
+                            return Ok((c.access_token.clone(), self.account_id()));
                         }
                     }
                 }
@@ -473,7 +453,7 @@ impl CodexCredential {
                         exp: Some(exp_unix),
                         file_mtime: post_read_mtime,
                     });
-                    return Ok(token);
+                    return Ok((token, tokens.account_id.clone()));
                 }
             }
         }
@@ -502,7 +482,36 @@ impl CodexCredential {
         });
         // Successful refresh — clear the force_refresh flag set by invalidate().
         state.force_refresh = false;
-        Ok(new_token)
+        let account_id = auth
+            .tokens
+            .as_ref()
+            .and_then(|tokens| tokens.account_id.clone());
+        Ok((new_token, account_id))
+    }
+
+    pub async fn revoke(&self) {
+        let mut state = self.inner.lock().await;
+        state.revoked = true;
+        state.cached = None;
+    }
+
+    pub async fn get_with_account_id(&self) -> Option<(String, Option<String>)> {
+        match self.fetch().await {
+            Ok(snapshot) => {
+                if let Ok(mut guard) = self.last_error.lock() {
+                    *guard = None;
+                }
+                Some(snapshot)
+            }
+            Err(error) => {
+                let hint = error_hint(&error);
+                tracing::warn!(%error, "codex_credential: get() failed");
+                if let Ok(mut guard) = self.last_error.lock() {
+                    *guard = Some(hint);
+                }
+                None
+            }
+        }
     }
 }
 
@@ -530,28 +539,28 @@ fn apply_refresh_response(auth: &mut AuthFile, response: RefreshResponse) {
 fn error_hint(err: &CodexAuthError) -> String {
     match err {
         CodexAuthError::NotFound(_) => {
-            "ChatGPT credentials not found at ~/.codex/auth.json — run `codex login`".to_string()
+            "ChatGPT credentials not found at ~/.phoenix-ide/codex-auth.json — sign in with Codex from Phoenix".to_string()
         }
         CodexAuthError::WrongAuthMode { .. } => {
-            "~/.codex/auth.json is in API-key mode, not ChatGPT — run `codex login` to switch"
+            "~/.phoenix-ide/codex-auth.json is in API-key mode, not ChatGPT — sign in with Codex from Phoenix to switch"
                 .to_string()
         }
         CodexAuthError::NoAccessToken(_) | CodexAuthError::NoRefreshToken(_) => {
-            "Codex credentials are missing fields — run `codex login` to refresh".to_string()
+            "Codex credentials are missing fields — sign in with Codex from Phoenix to refresh".to_string()
         }
         CodexAuthError::RefreshTokenInvalid { reason } => {
             format!(
-                "ChatGPT refresh token rejected ({reason}) — run `codex login` to re-authenticate"
+                "ChatGPT refresh token rejected ({reason}) — sign in with Codex from Phoenix to re-authenticate"
             )
         }
         CodexAuthError::RefreshFailed(msg) => {
             format!("ChatGPT token refresh failed: {msg}")
         }
         CodexAuthError::Io { err, .. } => {
-            format!("Could not read ~/.codex/auth.json: {err}")
+            format!("Could not read ~/.phoenix-ide/codex-auth.json: {err}")
         }
         CodexAuthError::ParseAuthFile { err, .. } => {
-            format!("~/.codex/auth.json is malformed: {err}")
+            format!("~/.phoenix-ide/codex-auth.json is malformed: {err}")
         }
     }
 }
@@ -559,22 +568,7 @@ fn error_hint(err: &CodexAuthError) -> String {
 #[async_trait::async_trait]
 impl CredentialSource for CodexCredential {
     async fn get(&self) -> Option<String> {
-        match self.fetch().await {
-            Ok(token) => {
-                if let Ok(mut guard) = self.last_error.lock() {
-                    *guard = None;
-                }
-                Some(token)
-            }
-            Err(e) => {
-                let hint = error_hint(&e);
-                tracing::warn!(error = %e, "codex_credential: get() failed");
-                if let Ok(mut guard) = self.last_error.lock() {
-                    *guard = Some(hint);
-                }
-                None
-            }
-        }
+        self.get_with_account_id().await.map(|(token, _)| token)
     }
 
     async fn invalidate(&self) -> bool {
@@ -813,80 +807,17 @@ mod tests {
         assert!(auth.last_refresh.is_some());
     }
 
-    /// Process-wide mutex for tests that mutate env vars. `set_var` /
-    /// `remove_var` are unsafe because concurrent env access is UB; cargo's
-    /// per-binary thread pool runs tests in parallel by default. Any test in
-    /// this binary that touches env vars must take this lock.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// RAII restore of `OPENAI_USE_CODEX_AUTH` on drop — the one behaviour flag
-    /// `resolve_active_auth_path` still reads from the process environment (the
-    /// paths now come from a `with_root` [`PhoenixRuntimeEnvironment`]). Holding
-    /// `_lock` blocks other env-mutating tests; restoring on drop survives a
-    /// panic mid-test.
-    struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        use_codex: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        fn capture() -> Self {
-            // If a previous test panicked while holding the lock, the mutex is
-            // poisoned but the env state is restorable; recover and continue.
-            let lock = ENV_MUTEX
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Self {
-                _lock: lock,
-                use_codex: std::env::var_os("OPENAI_USE_CODEX_AUTH"),
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: we hold ENV_MUTEX, so no other test in this binary is
-            // touching this var right now.
-            unsafe {
-                match self.use_codex.take() {
-                    Some(v) => std::env::set_var("OPENAI_USE_CODEX_AUTH", v),
-                    None => std::env::remove_var("OPENAI_USE_CODEX_AUTH"),
-                }
-            }
-        }
-    }
-
     #[test]
-    fn resolve_active_auth_path_priority_phoenix_then_piggyback() {
-        let _guard = EnvGuard::capture();
+    fn resolve_active_auth_path_uses_only_phoenix_native_auth() {
         let dir = tempfile::tempdir().unwrap();
         let env = PhoenixRuntimeEnvironment::with_root(dir.path());
-
-        // SAFETY: ENV_MUTEX is held by `_guard` for this test's lifetime.
-        unsafe {
-            std::env::remove_var("OPENAI_USE_CODEX_AUTH");
-        }
-
-        // (1) Nothing exists, no env-var → None.
         assert!(resolve_active_auth_path(&env).is_none());
 
-        // (2) Codex CLI file exists but env-var not set → still None
-        // (independent-mode is the default, piggyback is opt-in).
         let codex_dir = dir.path().join(".codex");
         std::fs::create_dir_all(&codex_dir).unwrap();
         std::fs::write(codex_dir.join("auth.json"), b"{}").unwrap();
         assert!(resolve_active_auth_path(&env).is_none());
 
-        // (3) Same plus env-var → Codex CLI file picked.
-        unsafe {
-            std::env::set_var("OPENAI_USE_CODEX_AUTH", "1");
-        }
-        assert_eq!(
-            resolve_active_auth_path(&env).as_deref(),
-            Some(codex_dir.join("auth.json").as_path())
-        );
-
-        // (4) Phoenix's own file appears → it wins regardless of the env-var.
         let phoenix_dir = dir.path().join(".phoenix-ide");
         std::fs::create_dir_all(&phoenix_dir).unwrap();
         std::fs::write(phoenix_dir.join("codex-auth.json"), b"{}").unwrap();
@@ -894,6 +825,5 @@ mod tests {
             resolve_active_auth_path(&env).as_deref(),
             Some(phoenix_dir.join("codex-auth.json").as_path())
         );
-        // _guard's Drop restores OPENAI_USE_CODEX_AUTH.
     }
 }

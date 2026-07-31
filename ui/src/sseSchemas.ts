@@ -388,11 +388,32 @@ const RateLimitWindowSchema = v.looseObject({
   resets_at: v.nullable(v.number()),
 }) satisfies v.GenericSchema<unknown, WireRateLimitWindow>;
 
+const QuotaLimitFamilySchema = v.looseObject({
+  limit_name: v.string(),
+  primary: v.nullable(RateLimitWindowSchema),
+  secondary: v.nullable(RateLimitWindowSchema),
+});
+
 const CreditsSnapshotSchema = v.looseObject({
   has_credits: v.boolean(),
   unlimited: v.boolean(),
   balance: v.nullable(v.string()),
 }) satisfies v.GenericSchema<unknown, WireCreditsSnapshot>;
+
+const SpendControlLimitSnapshotSchema = v.looseObject({
+  limit: v.string(),
+  used: v.string(),
+  remaining_percent: v.number(),
+  resets_at: v.number(),
+});
+
+const RateLimitReachedTypeSchema = v.picklist([
+  'rate_limit_reached',
+  'workspace_owner_credits_depleted',
+  'workspace_member_credits_depleted',
+  'workspace_owner_usage_limit_reached',
+  'workspace_member_usage_limit_reached',
+]);
 
 /** Structured quota state — every field is nullable per the Rust spec
  *  (`crates/phoenix-ide/src/llm/rate_limit.rs`). The SSE-event path
@@ -406,8 +427,11 @@ const QuotaDetailsSchema = v.looseObject({
   limit_name: v.nullable(v.string()),
   primary: v.nullable(RateLimitWindowSchema),
   secondary: v.nullable(RateLimitWindowSchema),
+  additional_limits: v.array(QuotaLimitFamilySchema),
   credits: v.nullable(CreditsSnapshotSchema),
+  individual_limit: v.nullable(SpendControlLimitSnapshotSchema),
   promo_message: v.nullable(v.string()),
+  rate_limit_reached_type: v.nullable(RateLimitReachedTypeSchema),
 }) satisfies v.GenericSchema<unknown, WireQuotaDetails>;
 
 /** `rate_limit_snapshot`: mid-stream quota update from the codex backend

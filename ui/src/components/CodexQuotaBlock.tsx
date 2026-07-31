@@ -1,10 +1,11 @@
 import type { QuotaDetails, RateLimitWindow } from '../sseSchemas';
 
-// Window-minutes → human label. Codex uses 60 (hourly), 1440 (daily),
-// 10080 (weekly); fall back to "Window" for anything unrecognized so a
+// Window-minutes → human label. Codex uses 60 (hourly), 300 (five-hour),
+// 1440 (daily), and 10080 (weekly); fall back to "Window" for anything unrecognized so a
 // future limit type doesn't render an empty cell.
 function windowLabel(windowMinutes: number | null): string {
   if (windowMinutes === 60) return 'Hourly';
+  if (windowMinutes === 300) return '5-hour';
   if (windowMinutes === 1440) return 'Daily';
   if (windowMinutes === 10080) return 'Weekly';
   return 'Window';
@@ -49,6 +50,48 @@ function QuotaRow({ label, window }: { label: string; window: RateLimitWindow })
   );
 }
 
+function creditsAreDepleted(type: QuotaDetails['rate_limit_reached_type']): boolean {
+  return (
+    type === 'workspace_owner_credits_depleted' ||
+    type === 'workspace_member_credits_depleted'
+  );
+}
+
+function SpendControlRow({ limit }: { limit: NonNullable<QuotaDetails['individual_limit']> }) {
+  return (
+    <div className="settings-codex-quota__credits">
+      Individual limit: {limit.used} / {limit.limit} · {limit.remaining_percent}% remaining
+      {formatReset(limit.resets_at) ? ` · ${formatReset(limit.resets_at)}` : null}
+    </div>
+  );
+}
+
+function exhaustionMessage(type: QuotaDetails['rate_limit_reached_type']): string | null {
+  switch (type) {
+    case 'rate_limit_reached':
+      return 'Usage limit reached';
+    case 'workspace_owner_usage_limit_reached':
+      return 'Workspace usage limit reached';
+    case 'workspace_member_usage_limit_reached':
+      return 'Member usage limit reached';
+    default:
+      return null;
+  }
+}
+
+function CreditsRow({ credits }: { credits: NonNullable<QuotaDetails['credits']> }) {
+  if (credits.unlimited) {
+    return <div className="settings-codex-quota__credits">Credits: Unlimited</div>;
+  }
+  if (!credits.has_credits) return null;
+  const balance = credits.balance?.trim();
+  return (
+    <div className="settings-codex-quota__credits">
+      Credits: {balance || 'Available'}
+    </div>
+  );
+}
+
 /// Renders the structured codex quota snapshot — per-window usage bars,
 /// credits state. Returns `null` when the snapshot has no displayable
 /// data so callers can render unconditionally.
@@ -57,7 +100,10 @@ function QuotaRow({ label, window }: { label: string; window: RateLimitWindow })
 /// the conversation hits a terminal `usage_limit_reached` state).
 export function CodexQuotaBlock({ quota }: { quota: QuotaDetails }) {
   const credits = quota.credits;
-  if (!quota.primary && !quota.secondary && !credits) return null;
+  const creditsDepleted = creditsAreDepleted(quota.rate_limit_reached_type);
+  const reachedMessage = exhaustionMessage(quota.rate_limit_reached_type);
+  const hasCreditsRow = creditsDepleted || (credits && (credits.unlimited || credits.has_credits));
+  if (!quota.primary && !quota.secondary && quota.additional_limits.length === 0 && !hasCreditsRow && !quota.individual_limit && !reachedMessage) return null;
   return (
     <div className="settings-codex-quota">
       {quota.primary && (
@@ -66,14 +112,23 @@ export function CodexQuotaBlock({ quota }: { quota: QuotaDetails }) {
       {quota.secondary && (
         <QuotaRow label={windowLabel(quota.secondary.window_minutes)} window={quota.secondary} />
       )}
-      {credits && credits.has_credits && credits.balance && (
-        <div className="settings-codex-quota__credits">
-          Credits: {credits.balance}{credits.unlimited ? ' (unlimited)' : ''}
+      {quota.additional_limits.map((family) => (
+        <div key={family.limit_name}>
+          {family.primary ? (
+            <QuotaRow label={`${family.limit_name} · ${windowLabel(family.primary.window_minutes)}`} window={family.primary} />
+          ) : null}
+          {family.secondary ? (
+            <QuotaRow label={`${family.limit_name} · ${windowLabel(family.secondary.window_minutes)}`} window={family.secondary} />
+          ) : null}
         </div>
-      )}
-      {credits && !credits.has_credits && (
+      ))}
+      {quota.individual_limit ? <SpendControlRow limit={quota.individual_limit} /> : null}
+      {reachedMessage ? <div className="settings-codex-quota__credits">{reachedMessage}</div> : null}
+      {creditsDepleted ? (
         <div className="settings-codex-quota__credits">No credits remaining</div>
-      )}
+      ) : credits ? (
+        <CreditsRow credits={credits} />
+      ) : null}
     </div>
   );
 }

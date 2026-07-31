@@ -2,7 +2,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from
 import { useNavigate } from 'react-router-dom';
 import { api, type CodexLoginPreflight, type LlmLanguageSetting, type NotificationSettings } from '../api';
 import { refreshModels } from '../modelsPoller';
-import { clearCodexQuota, useCodexQuota } from '../codexQuota';
+import { clearCodexQuota, setCodexQuota, useCodexQuota } from '../codexQuota';
 import { CodexQuotaBlock } from './CodexQuotaBlock';
 import {
   getBrowserNotificationPermission,
@@ -161,13 +161,24 @@ export function SettingsDropdown({
           <h2 id={titleId} className="settings-dropdown-title">Settings</h2>
           <ThemeSection theme={theme} onToggle={onToggleTheme} />
           <DensitySection />
-          {codexPreflight?.already_signed_in && (
+          {codexPreflight?.already_signed_in ? (
             <CodexSection
               preflight={codexPreflight}
               onPreflightInvalidated={onPreflightInvalidated}
               onCloseMenu={() => setOpen(false)}
             />
-          )}
+          ) : codexPreflight ? (
+            <section className="settings-section">
+              <div className="settings-section-label">LLM Provider</div>
+              <button
+                type="button"
+                className="settings-inline-btn"
+                onClick={() => { setOpen(false); navigate('/codex/login'); }}
+              >
+                Sign in with Codex
+              </button>
+            </section>
+          ) : null}
           <NotificationsSection />
           <LlmLanguageSection onCloseMenu={() => setOpen(false)} />
           <section className="settings-section">
@@ -274,7 +285,22 @@ function CodexSection({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const mountedRef = useRef(true);
+  const quotaRequestGenerationRef = useRef(0);
   const quota = useCodexQuota();
+  useEffect(() => {
+    const generation = ++quotaRequestGenerationRef.current;
+    clearCodexQuota();
+    api.codexQuota()
+      .then((next) => {
+        if (quotaRequestGenerationRef.current === generation && next) {
+          setCodexQuota(next);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      quotaRequestGenerationRef.current = Math.max(quotaRequestGenerationRef.current, generation + 1);
+    };
+  }, [preflight.account_id]);
   useEffect(() => {
     mountedRef.current = true;
     return () => { mountedRef.current = false; };
@@ -285,6 +311,7 @@ function CodexSection({
   const handleSignOut = useCallback(async () => {
     if (busy) return;
     setBusy(true);
+    quotaRequestGenerationRef.current++;
     setError(null);
     try {
       await api.codexSignout();

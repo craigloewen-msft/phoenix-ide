@@ -3838,8 +3838,11 @@ mod tests {
             limit_name: None,
             primary: None,
             secondary: None,
+            additional_limits: Vec::new(),
             credits: None,
+            individual_limit: None,
             promo_message: None,
+            rate_limit_reached_type: None,
         };
         let event = llm_outcome_to_event(
             LlmOutcome::UsageLimitReached {

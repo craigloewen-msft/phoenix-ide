@@ -9,10 +9,9 @@
 //! The 429 JSON body additionally provides `resets_at` (no header
 //! equivalent) and historically also `plan_type` (now also in a header).
 //!
-//! Phoenix uses the HTTP/SSE transport against this backend. The WebSocket
-//! variant of the same endpoint emits a richer mid-stream `codex.rate_limits`
-//! frame (consumed by codex CLI) — the HTTP path never sees that frame, so
-//! the response headers are the single source of truth here.
+//! Phoenix obtains the authoritative account snapshot from Codex's authenticated
+//! usage endpoint. HTTP response headers and WebSocket `codex.rate_limits`
+//! events provide partial per-turn updates that are normalized into the same shape.
 //!
 //! These types intentionally mirror the codex CLI's `RateLimitSnapshot` shape
 //! (`codex-rs/protocol/src/protocol.rs`) without depending on the
@@ -22,7 +21,10 @@
 //! `CreditsSnapshot`) live in `phoenix_core::domain::quota_details` and are
 //! re-exported here; the `reqwest`-dependent header-parsing functions stay.
 
-pub use phoenix_core::domain::quota_details::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
+pub use phoenix_core::domain::quota_details::{
+    CreditsSnapshot, QuotaDetails, QuotaLimitFamily, RateLimitReachedType, RateLimitWindow,
+    SpendControlLimitSnapshot,
+};
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
 
@@ -59,6 +61,146 @@ struct CodexRateLimitEvent {
     credits: Option<CodexRateLimitEventCredits>,
     metered_limit_name: Option<String>,
     limit_name: Option<String>,
+    rate_limit_reached_type: Option<CodexUsageReachedType>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexUsageWindow {
+    used_percent: f64,
+    limit_window_seconds: i64,
+    reset_at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexUsageRateLimit {
+    primary_window: Option<CodexUsageWindow>,
+    secondary_window: Option<CodexUsageWindow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexUsageReachedType {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexUsageIndividualLimit {
+    limit: String,
+    used: String,
+    remaining_percent: i64,
+    reset_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexUsageSpendControl {
+    individual_limit: Option<CodexUsageIndividualLimit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexUsageAdditionalRateLimit {
+    limit_name: String,
+    rate_limit: CodexUsageRateLimit,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexUsagePayload {
+    plan_type: Option<String>,
+    rate_limit: Option<CodexUsageRateLimit>,
+    credits: Option<CodexRateLimitEventCredits>,
+    rate_limit_reached_type: Option<CodexUsageReachedType>,
+    spend_control: Option<CodexUsageSpendControl>,
+    #[serde(default)]
+    additional_rate_limits: Vec<CodexUsageAdditionalRateLimit>,
+}
+
+pub fn normalize_credit_depletion(
+    credits: &Option<CreditsSnapshot>,
+    reached_type: Option<RateLimitReachedType>,
+) -> Option<RateLimitReachedType> {
+    match (credits, reached_type) {
+        (
+            Some(CreditsSnapshot {
+                unlimited: true, ..
+            }),
+            Some(
+                RateLimitReachedType::WorkspaceOwnerCreditsDepleted
+                | RateLimitReachedType::WorkspaceMemberCreditsDepleted,
+            ),
+        ) => {
+            tracing::warn!("ignoring contradictory Codex credit depletion for unlimited credits");
+            None
+        }
+        (_, reached_type) => reached_type,
+    }
+}
+
+/// Normalize the account-wide payload returned by Codex's authenticated usage endpoint.
+#[must_use]
+pub fn quota_from_codex_usage_payload(value: &serde_json::Value) -> Option<QuotaDetails> {
+    let payload: CodexUsagePayload = serde_json::from_value(value.clone()).ok()?;
+    let map_window = |window: CodexUsageWindow| RateLimitWindow {
+        used_percent: window.used_percent,
+        window_minutes: Some(window.limit_window_seconds / 60),
+        resets_at: window.reset_at,
+    };
+    let (primary, secondary) = payload.rate_limit.map_or((None, None), |rate_limit| {
+        (
+            rate_limit.primary_window.map(map_window),
+            rate_limit.secondary_window.map(map_window),
+        )
+    });
+    let additional_limits = payload
+        .additional_rate_limits
+        .into_iter()
+        .map(|family| QuotaLimitFamily {
+            limit_name: family.limit_name,
+            primary: family.rate_limit.primary_window.map(map_window),
+            secondary: family.rate_limit.secondary_window.map(map_window),
+        })
+        .collect::<Vec<_>>();
+    let credits = payload.credits.map(|credits| CreditsSnapshot {
+        has_credits: credits.has_credits,
+        unlimited: credits.unlimited,
+        balance: credits.balance,
+    });
+    let individual_limit = payload
+        .spend_control
+        .and_then(|control| control.individual_limit)
+        .map(|limit| {
+            Box::new(SpendControlLimitSnapshot {
+                limit: limit.limit,
+                used: limit.used,
+                remaining_percent: limit.remaining_percent,
+                resets_at: limit.reset_at,
+            })
+        });
+    let rate_limit_reached_type = payload
+        .rate_limit_reached_type
+        .and_then(|reached| parse_rate_limit_reached_type_value(&reached.kind));
+    let rate_limit_reached_type = normalize_credit_depletion(&credits, rate_limit_reached_type);
+    if primary.is_none()
+        && secondary.is_none()
+        && credits.is_none()
+        && individual_limit.is_none()
+        && additional_limits.is_empty()
+        && rate_limit_reached_type.is_none()
+        && payload.plan_type.is_none()
+    {
+        return None;
+    }
+    Some(QuotaDetails {
+        plan_type: payload.plan_type,
+        resets_at: None,
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary,
+        secondary,
+        credits,
+        individual_limit,
+        additional_limits,
+        promo_message: None,
+        rate_limit_reached_type,
+    })
 }
 
 /// Normalize the complete `codex.rate_limits` WebSocket event. Its plan,
@@ -100,9 +242,13 @@ pub fn quota_from_codex_rate_limit_event(value: &serde_json::Value) -> Option<Qu
         .or(event.limit_name)
         .or_else(|| details.as_ref()?.metered_limit_name.clone())
         .or_else(|| details.as_ref()?.limit_name.clone())
-        .unwrap_or_else(|| "codex".to_string())
-        .to_ascii_lowercase()
-        .replace('_', "-");
+        .map_or_else(|| "codex".to_string(), |value| canonical_limit_id(&value));
+    let rate_limit_reached_type = normalize_credit_depletion(
+        &credits,
+        event
+            .rate_limit_reached_type
+            .and_then(|reached| parse_rate_limit_reached_type_value(&reached.kind)),
+    );
     Some(QuotaDetails {
         plan_type,
         resets_at: None,
@@ -110,14 +256,18 @@ pub fn quota_from_codex_rate_limit_event(value: &serde_json::Value) -> Option<Qu
         limit_name: None,
         primary,
         secondary,
+        additional_limits: Vec::new(),
         credits,
+        individual_limit: None,
         promo_message: None,
+        rate_limit_reached_type,
     })
 }
 
 const ACTIVE_LIMIT_HEADER: &str = "x-codex-active-limit";
 const PROMO_MESSAGE_HEADER: &str = "x-codex-promo-message";
 const PLAN_TYPE_HEADER: &str = "x-codex-plan-type";
+const RATE_LIMIT_REACHED_TYPE_HEADER: &str = "x-codex-rate-limit-reached-type";
 
 /// Build a complete `QuotaDetails` snapshot from a successful codex-bridge
 /// response's headers. Returns `None` only when the response carries no
@@ -158,8 +308,11 @@ pub fn quota_from_codex_response_headers(headers: &HeaderMap) -> Option<QuotaDet
         limit_name,
         primary,
         secondary,
+        additional_limits: Vec::new(),
         credits,
+        individual_limit: None,
         promo_message,
+        rate_limit_reached_type: None,
     })
 }
 
@@ -202,11 +355,15 @@ pub fn parse_rate_limit_for_limit(
     (primary, secondary, limit_name)
 }
 
+fn canonical_limit_id(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace('_', "-")
+}
+
 pub fn parse_active_limit(headers: &HeaderMap) -> Option<String> {
     parse_header_str(headers, ACTIVE_LIMIT_HEADER)
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .map(str::to_string)
+        .map(canonical_limit_id)
 }
 
 pub fn parse_promo_message(headers: &HeaderMap) -> Option<String> {
@@ -214,6 +371,36 @@ pub fn parse_promo_message(headers: &HeaderMap) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn parse_rate_limit_reached_type_value(value: &str) -> Option<RateLimitReachedType> {
+    match value.trim() {
+        "rate_limit_reached" => Some(RateLimitReachedType::RateLimitReached),
+        "workspace_owner_credits_depleted" => {
+            Some(RateLimitReachedType::WorkspaceOwnerCreditsDepleted)
+        }
+        "workspace_member_credits_depleted" => {
+            Some(RateLimitReachedType::WorkspaceMemberCreditsDepleted)
+        }
+        "workspace_owner_usage_limit_reached" => {
+            Some(RateLimitReachedType::WorkspaceOwnerUsageLimitReached)
+        }
+        "workspace_member_usage_limit_reached" => {
+            Some(RateLimitReachedType::WorkspaceMemberUsageLimitReached)
+        }
+        unknown => {
+            tracing::debug!(
+                variant = unknown,
+                "unsupported Codex rate-limit-reached type"
+            );
+            None
+        }
+    }
+}
+
+#[must_use]
+pub fn parse_rate_limit_reached_type(headers: &HeaderMap) -> Option<RateLimitReachedType> {
+    parse_rate_limit_reached_type_value(parse_header_str(headers, RATE_LIMIT_REACHED_TYPE_HEADER)?)
 }
 
 pub fn parse_credits_snapshot(headers: &HeaderMap) -> Option<CreditsSnapshot> {
@@ -282,6 +469,158 @@ mod tests {
     use reqwest::header::HeaderValue;
 
     #[test]
+    fn parses_current_and_weekly_windows_from_upstream_usage_payload() {
+        #![allow(clippy::float_cmp)]
+        let payload = serde_json::json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 3,
+                    "limit_window_seconds": 18_000,
+                    "reset_at": 1_800_000_000
+                },
+                "secondary_window": {
+                    "used_percent": 4,
+                    "limit_window_seconds": 604_800,
+                    "reset_at": 1_800_500_000
+                }
+            },
+            "credits": { "has_credits": false, "unlimited": false, "balance": null },
+            "rate_limit_reached_type": null
+        });
+
+        let quota = quota_from_codex_usage_payload(&payload).expect("usage payload");
+        assert_eq!(quota.primary.as_ref().unwrap().used_percent, 3.0);
+        assert_eq!(quota.primary.as_ref().unwrap().window_minutes, Some(300));
+        assert_eq!(quota.secondary.as_ref().unwrap().used_percent, 4.0);
+        assert_eq!(
+            quota.secondary.as_ref().unwrap().window_minutes,
+            Some(10_080)
+        );
+        assert!(!quota.credits.as_ref().unwrap().has_credits);
+    }
+
+    #[test]
+    fn preserves_additional_rate_limit_families() {
+        let payload = serde_json::json!({
+            "additional_rate_limits": [{
+                "limit_name": "review",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 12,
+                        "limit_window_seconds": 18_000,
+                        "reset_at": 1_800_000_000
+                    },
+                    "secondary_window": null
+                }
+            }]
+        });
+
+        let quota = quota_from_codex_usage_payload(&payload).expect("additional quota family");
+        assert_eq!(quota.additional_limits.len(), 1);
+        assert_eq!(quota.additional_limits[0].limit_name, "review");
+        assert_eq!(
+            quota.additional_limits[0]
+                .primary
+                .as_ref()
+                .unwrap()
+                .window_minutes,
+            Some(300)
+        );
+    }
+
+    #[test]
+    fn websocket_event_preserves_explicit_depletion_reason() {
+        let event = serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": null,
+            "credits": null,
+            "rate_limit_reached_type": {
+                "type": "workspace_owner_credits_depleted"
+            }
+        });
+        let quota = quota_from_codex_rate_limit_event(&event).expect("websocket quota");
+        assert_eq!(
+            quota.rate_limit_reached_type,
+            Some(RateLimitReachedType::WorkspaceOwnerCreditsDepleted)
+        );
+    }
+
+    #[test]
+    fn websocket_event_rejects_depletion_for_unlimited_credits() {
+        let event = serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": null,
+            "credits": { "has_credits": true, "unlimited": true, "balance": null },
+            "rate_limit_reached_type": {
+                "type": "workspace_owner_credits_depleted"
+            }
+        });
+        let quota = quota_from_codex_rate_limit_event(&event).expect("websocket quota");
+        assert!(quota.rate_limit_reached_type.is_none());
+    }
+
+    #[test]
+    fn preserves_spend_control_without_standard_rate_windows() {
+        let payload = serde_json::json!({
+            "spend_control": {
+                "individual_limit": {
+                    "limit": "100.00",
+                    "used": "25.00",
+                    "remaining_percent": 75,
+                    "reset_at": 1_800_000_000
+                }
+            }
+        });
+
+        let quota = quota_from_codex_usage_payload(&payload).expect("spend-control payload");
+        let limit = quota.individual_limit.expect("individual limit");
+        assert_eq!(limit.limit, "100.00");
+        assert_eq!(limit.used, "25.00");
+        assert_eq!(limit.remaining_percent, 75);
+        assert_eq!(limit.resets_at, 1_800_000_000);
+    }
+
+    #[test]
+    fn preserves_credit_only_usage_payload() {
+        let payload = serde_json::json!({
+            "plan_type": null,
+            "rate_limit": null,
+            "credits": { "has_credits": false, "unlimited": false, "balance": null },
+            "rate_limit_reached_type": {
+                "type": "workspace_member_credits_depleted"
+            }
+        });
+
+        let quota = quota_from_codex_usage_payload(&payload).expect("credit-only usage payload");
+        assert!(quota.primary.is_none());
+        assert!(quota.secondary.is_none());
+        assert!(!quota.credits.as_ref().unwrap().unlimited);
+        assert_eq!(
+            quota.rate_limit_reached_type,
+            Some(RateLimitReachedType::WorkspaceMemberCreditsDepleted)
+        );
+    }
+
+    #[test]
+    fn rejects_credit_depletion_that_contradicts_unlimited_credits() {
+        let payload = serde_json::json!({
+            "credits": { "has_credits": true, "unlimited": true, "balance": null },
+            "rate_limit_reached_type": {
+                "type": "workspace_member_credits_depleted"
+            }
+        });
+        let quota = quota_from_codex_usage_payload(&payload).expect("credits payload");
+        assert!(quota.rate_limit_reached_type.is_none());
+        assert!(quota.credits.unwrap().unlimited);
+    }
+
+    #[test]
+    fn rejects_usage_payload_without_quota_data() {
+        assert!(quota_from_codex_usage_payload(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
     // Parsed percentages are exact, representable values from the fixture header.
     #[allow(clippy::float_cmp)]
     fn parses_default_codex_primary_window() {
@@ -306,6 +645,53 @@ mod tests {
         assert_eq!(primary.resets_at, Some(1_704_069_000));
         assert!(secondary.is_none());
         assert!(name.is_none());
+    }
+
+    #[test]
+    fn parses_explicit_rate_limit_reached_types() {
+        for (raw, expected) in [
+            (
+                "workspace_owner_credits_depleted",
+                RateLimitReachedType::WorkspaceOwnerCreditsDepleted,
+            ),
+            (
+                "workspace_member_credits_depleted",
+                RateLimitReachedType::WorkspaceMemberCreditsDepleted,
+            ),
+            (
+                "workspace_owner_usage_limit_reached",
+                RateLimitReachedType::WorkspaceOwnerUsageLimitReached,
+            ),
+            (
+                "workspace_member_usage_limit_reached",
+                RateLimitReachedType::WorkspaceMemberUsageLimitReached,
+            ),
+            ("rate_limit_reached", RateLimitReachedType::RateLimitReached),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                RATE_LIMIT_REACHED_TYPE_HEADER,
+                HeaderValue::from_str(raw).expect("header value"),
+            );
+            assert_eq!(parse_rate_limit_reached_type(&headers), Some(expected));
+        }
+    }
+
+    #[test]
+    fn ignores_unknown_rate_limit_reached_type() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RATE_LIMIT_REACHED_TYPE_HEADER,
+            HeaderValue::from_static("future_limit_type"),
+        );
+        assert_eq!(parse_rate_limit_reached_type(&headers), None);
+    }
+
+    #[test]
+    fn canonicalizes_active_limit_family() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACTIVE_LIMIT_HEADER, HeaderValue::from_static("CODEX_OTHER"));
+        assert_eq!(parse_active_limit(&headers).as_deref(), Some("codex-other"));
     }
 
     #[test]

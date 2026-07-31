@@ -124,6 +124,26 @@ fn render_usage_limit_message(quota: &QuotaDetails) -> String {
         }
     }
 
+    if matches!(
+        quota.rate_limit_reached_type,
+        Some(crate::rate_limit::RateLimitReachedType::WorkspaceOwnerCreditsDepleted)
+    ) {
+        return format!(
+            "Your workspace has run out of Codex credits. Visit https://chatgpt.com/codex/settings/usage to purchase more credits{}",
+            retry_suffix_after_or(quota.resets_at.as_ref())
+        );
+    }
+
+    if matches!(
+        quota.rate_limit_reached_type,
+        Some(crate::rate_limit::RateLimitReachedType::WorkspaceOwnerUsageLimitReached)
+    ) {
+        return format!(
+            "Your workspace usage limit has been reached. Visit https://chatgpt.com/codex/settings/usage to manage the limit{}",
+            retry_suffix_after_or(quota.resets_at.as_ref())
+        );
+    }
+
     // 2. Backend-provided promo message wins over plan-specific defaults.
     if let Some(promo) = quota.promo_message.as_deref() {
         return format!(
@@ -241,8 +261,11 @@ mod tests {
             limit_name: None,
             primary: None,
             secondary: None,
+            additional_limits: Vec::new(),
             credits: None,
+            individual_limit: None,
             promo_message: None,
+            rate_limit_reached_type: None,
         }
     }
 
@@ -319,6 +342,16 @@ mod tests {
             let msg = render_usage_limit_message(&quota(Some("plus"), Some(resets)));
             assert_eq!(msg, format!("{PLUS_MSG} or try again at {time}."));
         });
+    }
+
+    #[test]
+    fn workspace_owner_credit_depletion_uses_purchase_guidance() {
+        let mut details = quota(Some("team"), None);
+        details.rate_limit_reached_type =
+            Some(crate::rate_limit::RateLimitReachedType::WorkspaceOwnerCreditsDepleted);
+        let message = render_usage_limit_message(&details);
+        assert!(message.contains("purchase more credits"));
+        assert!(!message.contains("request to your admin"));
     }
 
     #[test]

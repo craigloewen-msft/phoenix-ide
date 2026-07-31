@@ -29,7 +29,7 @@ pub trait CredentialSource: Send + Sync + std::fmt::Debug {
     async fn invalidate(&self) -> bool;
     /// Optional source-specific hint to surface on auth failures, used by
     /// `LlmAuth::resolve()` to enrich the generic "credential unavailable"
-    /// message with actionable recovery guidance (e.g. "run `codex login`").
+    /// message with actionable recovery guidance (e.g. "sign in with Codex from Phoenix").
     /// Returns `None` to fall back to the generic message. Default-impl `None`
     /// keeps existing implementations unchanged.
     async fn last_error_hint(&self) -> Option<String> {
@@ -99,7 +99,7 @@ impl LlmAuth {
             });
         }
         let recovering = self.source.is_recovering().await;
-        // Prefer the source's own hint (e.g. "run `codex login`") over the
+        // Prefer the source's own hint (e.g. "sign in with Codex from Phoenix") over the
         // generic message; fall back to the recovery / generic text.
         let message = if let Some(hint) = self.source.last_error_hint().await {
             hint
@@ -173,21 +173,17 @@ pub struct LlmConfig {
     /// These are additive only; duplicate IDs are ignored when merged with
     /// built-ins.
     pub external_models: Vec<super::ModelSpec>,
-    /// User has signalled intent to use the `ChatGPT` bridge. True when
-    /// Phoenix's own login file (`~/.phoenix-ide/codex-auth.json`) exists at
-    /// startup OR when `OPENAI_USE_CODEX_AUTH=1` is set (piggyback mode).
+    /// User has signed into the native `ChatGPT` bridge.
     /// When true, `OpenAI` models route through the bridge; when true but
     /// `codex_credential` is `None` (load failed), `OpenAI` models are
     /// unavailable rather than silently falling back to `OPENAI_API_KEY`.
     pub use_codex_auth: bool,
     /// When populated, `OpenAI` models are routed through the
     /// `ChatGPT` backend (`https://chatgpt.com/backend-api/codex`) using
-    /// `OAuth` tokens borrowed from the local `Codex` CLI's `~/.codex/auth.json`.
+    /// Phoenix's native OAuth credential.
     /// `Anthropic` and `Mock` providers are unaffected.
     pub codex_credential: Option<Arc<CodexCredential>>,
-    /// Filesystem path the loaded `codex_credential` was constructed from
-    /// (Phoenix's own auth file or Codex CLI's, depending on which won the
-    /// startup-time priority dance — see `codex_credential::resolve_active_auth_path`).
+    /// Filesystem path of Phoenix's native Codex credential.
     /// `None` whenever `codex_credential` is `None`. Surfaced so the login
     /// preflight can answer "do you need to restart after signing in?": if
     /// the loaded path equals the path the in-app login writes to, the mtime
@@ -336,10 +332,7 @@ impl LlmConfig {
             })
             .unwrap_or_default();
 
-        // Resolve which file (if any) holds ChatGPT credentials at startup.
-        // Phoenix's own ~/.phoenix-ide/codex-auth.json wins; OPENAI_USE_CODEX_AUTH=1
-        // opts into reading Codex CLI's ~/.codex/auth.json instead. See
-        // [`codex_credential::resolve_active_auth_path`].
+        // Resolve Phoenix's native ChatGPT credential at startup.
         let active_auth_path = codex_credential::resolve_active_auth_path(&runtime_env);
         let (codex_credential, codex_credential_path) = match active_auth_path.as_ref() {
             Some(path) => match CodexCredential::load(path.clone()) {
@@ -359,15 +352,7 @@ impl LlmConfig {
             },
             None => (None, None),
         };
-        // `use_codex_auth` is the bridge-intent flag (see field docs). True
-        // whenever the user has done something that signals "I want OpenAI
-        // models routed through ChatGPT" — either logging in via Phoenix or
-        // setting the piggyback env-var. The credential's actual presence is
-        // checked separately at call sites.
-        let use_codex_auth = active_auth_path.is_some()
-            || std::env::var("OPENAI_USE_CODEX_AUTH")
-                .ok()
-                .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
+        let use_codex_auth = active_auth_path.is_some();
 
         Self {
             anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
@@ -490,7 +475,7 @@ fn derive_models_url(base_url: &str) -> Option<String> {
 pub struct ModelRegistry {
     services: std::sync::RwLock<HashMap<String, Arc<dyn LlmService>>>,
     specs: std::sync::RwLock<HashMap<String, super::ModelSpec>>,
-    default_model: String,
+    default_model: std::sync::RwLock<String>,
     /// Whether the Codex/ChatGPT credential was loaded into the registry at
     /// process startup. **Frozen** at construction time and **not updated**
     /// when [`Self::reload_codex_credential`] runs — this is "was the bridge
@@ -504,6 +489,7 @@ pub struct ModelRegistry {
     /// when no credential is active. Updated by `reload_codex_credential`
     /// in lockstep with the `OpenAI` bridge services.
     current_codex_loaded_path: std::sync::RwLock<Option<std::path::PathBuf>>,
+    current_codex_credential: std::sync::RwLock<Option<Arc<CodexCredential>>>,
     /// Config template kept for rebuilding bridge services on reload. The
     /// `codex_credential` / `codex_credential_path` fields are ignored on
     /// reload — we always re-resolve those from the filesystem.
@@ -518,9 +504,10 @@ impl ModelRegistry {
         Self {
             services: std::sync::RwLock::new(HashMap::new()),
             specs: std::sync::RwLock::new(HashMap::new()),
-            default_model: "test-model".to_string(),
+            default_model: std::sync::RwLock::new("test-model".to_string()),
             codex_bridge_loaded_at_startup: false,
             current_codex_loaded_path: std::sync::RwLock::new(None),
+            current_codex_credential: std::sync::RwLock::new(None),
             config: Arc::new(LlmConfig::default()),
         }
     }
@@ -543,9 +530,10 @@ impl ModelRegistry {
         Self {
             services: std::sync::RwLock::new(services),
             specs: std::sync::RwLock::new(specs),
-            default_model,
+            default_model: std::sync::RwLock::new(default_model),
             codex_bridge_loaded_at_startup: config.codex_credential.is_some(),
             current_codex_loaded_path: std::sync::RwLock::new(config.codex_credential_path.clone()),
+            current_codex_credential: std::sync::RwLock::new(config.codex_credential.clone()),
             config: Arc::new(config.clone()),
         }
     }
@@ -651,9 +639,10 @@ impl ModelRegistry {
         Self {
             services: std::sync::RwLock::new(services),
             specs: std::sync::RwLock::new(specs),
-            default_model,
+            default_model: std::sync::RwLock::new(default_model),
             codex_bridge_loaded_at_startup: config.codex_credential.is_some(),
             current_codex_loaded_path: std::sync::RwLock::new(config.codex_credential_path.clone()),
+            current_codex_credential: std::sync::RwLock::new(config.codex_credential.clone()),
             config: Arc::new(config.clone()),
         }
     }
@@ -770,7 +759,6 @@ impl ModelRegistry {
         // ChatGPT bridge: when the user has signalled intent to use the
         // bridge — either by logging in via Phoenix's `/codex/login` flow
         // (which writes ~/.phoenix-ide/codex-auth.json) or by setting
-        // OPENAI_USE_CODEX_AUTH=1 to piggyback Codex CLI's file — OpenAI
         // models route through the ChatGPT backend. If intent was signalled
         // but the credential failed to load, OpenAI models are unavailable
         // rather than silently falling through to OPENAI_API_KEY (which
@@ -859,12 +847,14 @@ impl ModelRegistry {
 
     /// Get the default model
     pub fn default(&self) -> Option<Arc<dyn LlmService>> {
-        self.get(&self.default_model)
+        self.get(&self.default_model_id())
     }
 
     /// Get the default model ID
-    pub fn default_model_id(&self) -> &str {
-        &self.default_model
+    pub fn default_model_id(&self) -> String {
+        self.default_model
+            .read()
+            .map_or_else(|_| "gpt-5.6-sol".to_string(), |model| model.clone())
     }
 
     /// Get the context window size for a model (REQ-BED-022)
@@ -970,9 +960,10 @@ impl ModelRegistry {
         Self {
             services: std::sync::RwLock::new(services),
             specs: std::sync::RwLock::new(HashMap::new()),
-            default_model: "claude-sonnet-5".to_string(),
+            default_model: std::sync::RwLock::new("claude-sonnet-5".to_string()),
             codex_bridge_loaded_at_startup: false,
             current_codex_loaded_path: std::sync::RwLock::new(None),
+            current_codex_credential: std::sync::RwLock::new(None),
             config: Arc::new(LlmConfig::default()),
         }
     }
@@ -998,7 +989,7 @@ impl ModelRegistry {
                 return Some(((*id).to_string(), service));
             }
         }
-        self.default().map(|s| (self.default_model.clone(), s))
+        self.default().map(|s| (self.default_model_id(), s))
     }
 
     /// Get a cheap/fast model for auxiliary tasks like title generation.
@@ -1050,6 +1041,13 @@ impl ModelRegistry {
                 || parent_model_id.to_string(),
                 std::string::ToString::to_string,
             )
+    }
+
+    pub fn current_codex_credential(&self) -> Option<Arc<CodexCredential>> {
+        self.current_codex_credential
+            .read()
+            .ok()
+            .and_then(|credential| credential.clone())
     }
 
     /// Re-resolve the active Codex/ChatGPT credential and rebuild the `OpenAI`
@@ -1160,6 +1158,10 @@ impl ModelRegistry {
                 .current_codex_loaded_path
                 .write()
                 .expect("loaded-path lock poisoned");
+            let mut current_credential = self
+                .current_codex_credential
+                .write()
+                .expect("codex credential lock poisoned");
 
             // Remove existing OpenAI entries before inserting the new ones,
             // so deregister-on-logout (cred=None) and switch-account both
@@ -1184,6 +1186,12 @@ impl ModelRegistry {
 
             let prev = current_path.clone();
             current_path.clone_from(&new_path);
+            *current_credential = cred_with_account
+                .as_ref()
+                .map(|(credential, _)| Arc::clone(credential));
+            if let Ok(mut default_model) = self.default_model.write() {
+                *default_model = Self::pick_default_model(&services, &self.config);
+            }
             prev
         };
 
@@ -1828,6 +1836,7 @@ mod tests {
             "no OpenAI bridge before reload"
         );
         assert_eq!(registry.current_codex_loaded_path(), None);
+        assert!(registry.current_codex_credential().is_none());
 
         // Drop a fresh auth file, simulate the login handler's reload call.
         let dir = tempfile::tempdir().unwrap();
@@ -1843,6 +1852,14 @@ mod tests {
         assert_eq!(outcome.current_path.as_deref(), Some(auth_path.as_path()));
         assert!(outcome.credential_loaded);
 
+        assert_eq!(
+            registry
+                .current_codex_credential()
+                .unwrap()
+                .account_id()
+                .as_deref(),
+            Some("acc-1")
+        );
         assert!(
             registry.get("gpt-5.5").is_some(),
             "reload must register the OpenAI bridge"
@@ -1863,7 +1880,7 @@ mod tests {
     #[test]
     fn reload_swaps_active_auth_path_for_account_switch() {
         let dir1 = tempfile::tempdir().unwrap();
-        let path1 = dir1.path().join("piggyback.json");
+        let path1 = dir1.path().join("account-one.json");
         std::fs::write(
             &path1,
             br#"{"auth_mode":"chatgpt","tokens":{"access_token":"a","refresh_token":"r","account_id":"acc-old"}}"#,
@@ -1898,6 +1915,45 @@ mod tests {
             Some(path2.as_path())
         );
         assert!(registry.get("gpt-5.5").is_some());
+        assert_eq!(
+            registry
+                .current_codex_credential()
+                .unwrap()
+                .account_id()
+                .as_deref(),
+            Some("acc-new")
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_replaces_a_revoked_credential_from_the_existing_auth_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.json");
+        let access_token = "e30.eyJleHAiOjQxMDI0NDQ4MDB9.";
+        std::fs::write(
+            &auth_path,
+            format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{access_token}","refresh_token":"r","account_id":"acc-1"}}}}"#
+            ),
+        )
+        .unwrap();
+        let initial = crate::CodexCredential::load(auth_path.clone()).unwrap().0;
+        let config = LlmConfig {
+            use_codex_auth: true,
+            codex_credential: Some(Arc::clone(&initial)),
+            codex_credential_path: Some(auth_path.clone()),
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        initial.revoke().await;
+        assert!(initial.get().await.is_none());
+
+        let outcome = registry.reload_codex_credential_with(Some(auth_path));
+        assert!(outcome.credential_loaded);
+        let restored = registry.current_codex_credential().unwrap();
+        assert!(!Arc::ptr_eq(&initial, &restored));
+        assert_eq!(restored.get().await.as_deref(), Some(access_token));
     }
 
     /// Reload to None (e.g. file deleted) deregisters the `OpenAI` bridge.
@@ -1916,6 +1972,7 @@ mod tests {
 
         let outcome = registry.reload_codex_credential_with(None);
         assert!(!outcome.credential_loaded);
+        assert!(registry.current_codex_credential().is_none());
         assert!(
             registry.get("gpt-5.5").is_none(),
             "OpenAI bridge must be removed when reload resolves to None"
@@ -1991,7 +2048,7 @@ mod tests {
         // gpt-5.5 isn't registered (no OpenAI auth), so default must fall
         // back to a model that actually exists.
         assert_ne!(registry.default_model_id(), "gpt-5.5");
-        assert!(registry.get(registry.default_model_id()).is_some());
+        assert!(registry.get(&registry.default_model_id()).is_some());
     }
 
     #[test]

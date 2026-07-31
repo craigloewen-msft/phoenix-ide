@@ -52,7 +52,9 @@ mod registry;
 mod service;
 pub(crate) mod sse;
 
-pub use codex_credential::{CodexCredential, CODEX_BACKEND_URL, CODEX_BRIDGE_CONTEXT_WINDOW};
+pub use codex_credential::{
+    CodexCredential, CODEX_BACKEND_URL, CODEX_BRIDGE_CONTEXT_WINDOW, CODEX_USAGE_URL,
+};
 pub use credential_helper::{CredentialHelper, CredentialStatus};
 pub use discovery::{discover_models, DiscoveredModels, DiscoveryConfig};
 pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
@@ -94,7 +96,7 @@ pub enum TokenChunk {
     /// `codex.rate_limits` SSE event. Emitted on every turn (not only
     /// pre-429), so the UI can show usage trends before the user hits the
     /// terminal `UsageLimitReached` state.
-    RateLimitSnapshot(QuotaDetails),
+    RateLimitSnapshot(Box<QuotaDetails>),
 }
 
 /// Provider request-shape limits that apply to continuation summaries.

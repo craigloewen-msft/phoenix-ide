@@ -14,16 +14,13 @@
 //!   requests a device code from `OpenAI` and returns the verification URL
 //!   plus the user-visible code. A background task polls and finalises.
 //!
-//! Both flows write **Phoenix's own** `~/.phoenix-ide/codex-auth.json` on
-//! success — never Codex CLI's `~/.codex/auth.json`, even if the user happens
-//! to be in piggyback mode. Two distinct sources, two distinct lifecycles.
+//! Both flows write Phoenix's native `~/.phoenix-ide/codex-auth.json`.
 //!
 //! Status is read via `GET /api/codex/login/{kind}/{id}/status`. The Codex
 //! credential ([`phoenix_llm::codex_credential::CodexCredential`]) mtime-watches
 //! its file, so an *already-loaded* credential picks up new tokens on next use.
-//! On a first-time login (no credential constructed at startup), or when
-//! switching accounts from a piggyback-loaded credential to a Phoenix-own
-//! one, the `settle_*` handlers call
+//! On a first-time login (no credential constructed at startup), the
+//! `settle_*` handlers call
 //! [`phoenix_llm::ModelRegistry::reload_codex_credential`] *before* publishing
 //! the success status. That hot-reload swaps the `OpenAI` bridge services in
 //! atomically, so the next `OpenAI` request after login uses the new credential
@@ -129,6 +126,8 @@ struct PkceSession {
     /// against this; a late callback after cancel must NOT proceed to
     /// `finalize_login` and write `~/.phoenix-ide/codex-auth.json`.
     cancel: CancellationToken,
+    settled: tokio::sync::Notify,
+    is_settled: std::sync::atomic::AtomicBool,
 }
 
 struct DeviceSession {
@@ -140,12 +139,15 @@ struct DeviceSession {
     /// completes the verification page anyway — does NOT end up with
     /// silently-written credentials.
     cancel: CancellationToken,
+    settled: tokio::sync::Notify,
+    is_settled: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
 pub struct CodexLoginManager {
     pkce: Mutex<HashMap<String, Arc<PkceSession>>>,
     device: Mutex<HashMap<String, Arc<DeviceSession>>>,
+    lifecycle: Mutex<()>,
 }
 
 impl CodexLoginManager {
@@ -194,10 +196,52 @@ async fn drain_active_pkce(mgr: &CodexLoginManager) -> usize {
         sessions.drain().map(|(_, v)| v).collect()
     };
     let n = stale.len();
-    for s in stale {
-        s.cancel.cancel();
+    for session in &stale {
+        session.cancel.cancel();
+    }
+    for session in stale {
+        while !session
+            .is_settled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let notified = session.settled.notified();
+            if session
+                .is_settled
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+            notified.await;
+        }
     }
     n
+}
+
+async fn drain_active_device_sessions(mgr: &CodexLoginManager) -> usize {
+    let stale: Vec<Arc<DeviceSession>> = {
+        let mut sessions = mgr.device.lock().await;
+        sessions.drain().map(|(_, session)| session).collect()
+    };
+    let count = stale.len();
+    for session in &stale {
+        session.cancel.cancel();
+    }
+    for session in stale {
+        while !session
+            .is_settled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let notified = session.settled.notified();
+            if session
+                .is_settled
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+            notified.await;
+        }
+    }
+    count
 }
 
 /// Bind the loopback callback server, retrying briefly on `PortInUse` when
@@ -257,6 +301,7 @@ async fn bind_loopback_with_retry(
 pub async fn pkce_start(
     State(state): State<AppState>,
 ) -> Result<Json<PkceStartResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let _lifecycle = state.codex_login.lifecycle.lock().await;
     let mgr = state.codex_login.clone();
     let session = build_pkce_session();
     let session_id = new_session_id();
@@ -270,6 +315,8 @@ pub async fn pkce_start(
             status: LoginStatus::default(),
         }),
         cancel: cancel.clone(),
+        settled: tokio::sync::Notify::new(),
+        is_settled: std::sync::atomic::AtomicBool::new(false),
     });
 
     // Cancel any prior in-flight PKCE session before binding. Without this,
@@ -283,7 +330,7 @@ pub async fn pkce_start(
 
     {
         let mut sessions = mgr.pkce.lock().await;
-        sessions.insert(session_id.clone(), pkce_session);
+        sessions.insert(session_id.clone(), pkce_session.clone());
     }
 
     // Spawn the background driver. Sequence: race loopback callback against
@@ -301,6 +348,7 @@ pub async fn pkce_start(
         // Codex CLI's). Resolve it here where the runtime environment is in
         // scope, then hand the destination to the background driver.
         let login_target = state.runtime_env.codex_auth_path();
+        let session_for_task = pkce_session.clone();
         tokio::spawn(async move {
             let outcome = drive_pkce(
                 cancel_for_task,
@@ -319,6 +367,10 @@ pub async fn pkce_start(
                 outcome,
             )
             .await;
+            session_for_task
+                .is_settled
+                .store(true, std::sync::atomic::Ordering::Release);
+            session_for_task.settled.notify_waiters();
         });
     }
 
@@ -655,6 +707,7 @@ pub struct DeviceStartResponse {
 pub async fn device_start(
     State(state): State<AppState>,
 ) -> Result<Json<DeviceStartResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let _lifecycle = state.codex_login.lifecycle.lock().await;
     let mgr = state.codex_login.clone();
     let device = request_device_code().await.map_err(|e| match e {
         LoginError::DeviceCodeNotEnabled => (
@@ -688,6 +741,8 @@ pub async fn device_start(
                 user_code: device.user_code.clone(),
                 status: Mutex::new(LoginStatus::default()),
                 cancel: cancel.clone(),
+                settled: tokio::sync::Notify::new(),
+                is_settled: std::sync::atomic::AtomicBool::new(false),
             }),
         );
     }
@@ -697,6 +752,13 @@ pub async fn device_start(
         let registry_for_task = state.llm_registry.clone();
         let session_id_for_task = session_id.clone();
         let login_target = state.runtime_env.codex_auth_path();
+        let session_for_task = {
+            let sessions = mgr.device.lock().await;
+            sessions
+                .get(&session_id)
+                .cloned()
+                .expect("device session inserted")
+        };
         tokio::spawn(async move {
             let outcome = drive_device_code(cancel, device, login_target).await;
             settle_device(
@@ -706,6 +768,10 @@ pub async fn device_start(
                 outcome,
             )
             .await;
+            session_for_task
+                .is_settled
+                .store(true, std::sync::atomic::Ordering::Release);
+            session_for_task.settled.notify_waiters();
         });
     }
 
@@ -823,34 +889,15 @@ pub async fn device_cancel(
 pub struct LoginPreflight {
     /// Path the in-app login will write to (Phoenix's own auth file).
     pub auth_path: String,
-    /// Path Phoenix will piggyback off when `OPENAI_USE_CODEX_AUTH=1` is set
-    /// and Phoenix's own file is absent. Surfaced for diagnostic clarity.
-    pub piggyback_path: String,
     /// Whether Phoenix's own auth file exists and parses as a valid
     /// chatgpt-mode token.
     pub already_signed_in: bool,
-    /// Whether a Codex credential was constructed at startup (any path).
-    /// Informational only — the UI should drive restart messaging from
-    /// `restart_required_after_login` instead, since piggyback-loaded
-    /// credentials still require restart when the user signs in via Phoenix.
+    /// Whether a native Codex credential was constructed at startup.
     pub bridge_loaded_at_startup: bool,
     /// Whether the user must restart Phoenix before an in-app login takes
-    /// effect. True when:
-    ///  - no credential was loaded at startup (registry has nothing to
-    ///    refresh), OR
-    ///  - a credential was loaded but from a different path than the in-app
-    ///    login writes to (e.g. piggyback mode loaded `~/.codex/auth.json`,
-    ///    but the new login writes `~/.phoenix-ide/codex-auth.json` — the
-    ///    in-memory credential keeps watching the old path).
-    ///
-    /// False only when the loaded credential's path matches the destination
-    /// of the in-app login, i.e. its `mtime` watch will pick up new tokens
-    /// without a restart.
+    /// effect. Native login completion normally hot-reloads the credential,
+    /// so this is false after a successful sign-in.
     pub restart_required_after_login: bool,
-    /// Whether `OPENAI_USE_CODEX_AUTH=1` is set in the current environment.
-    /// Informational; the env-var only governs piggyback mode, not whether
-    /// in-app login works.
-    pub piggyback_env_set: bool,
     /// `account_id` from the loaded `ChatGPT` credential, when one is loaded.
     /// Surfaced so the UI can display account identity in the sidebar account
     /// chip / sign-out menu without making a second request. `None` when no
@@ -863,16 +910,75 @@ pub struct LoginPreflight {
     pub account_email: Option<String>,
 }
 
+async fn fetch_codex_quota(
+    credential: &codex_credential::CodexCredential,
+) -> Option<(Option<String>, phoenix_llm::QuotaDetails)> {
+    use phoenix_llm::CredentialSource;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let mut attempts = 0;
+    let (response, account_id) = loop {
+        let (token, account_id) = credential.get_with_account_id().await?;
+        let mut request = client
+            .get(phoenix_llm::CODEX_USAGE_URL)
+            .bearer_auth(token)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::USER_AGENT, "phoenix-ide");
+        if let Some(account_id) = account_id.as_ref() {
+            request = request.header("chatgpt-account-id", account_id);
+        }
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::debug!(%error, "failed to fetch Codex quota");
+                return None;
+            }
+        };
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempts == 0 {
+            attempts += 1;
+            credential.invalidate().await;
+            continue;
+        }
+        break (response, account_id);
+    };
+    if !response.status().is_success() {
+        tracing::debug!(status = %response.status(), "Codex quota endpoint rejected request");
+        return None;
+    }
+    let payload = match response.json::<serde_json::Value>().await {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::debug!(%error, "failed to decode Codex quota");
+            return None;
+        }
+    };
+    phoenix_llm::rate_limit::quota_from_codex_usage_payload(&payload)
+        .map(|quota| (account_id, quota))
+}
+
+pub async fn codex_quota(State(state): State<AppState>) -> Json<Option<phoenix_llm::QuotaDetails>> {
+    let quota = match state.llm_registry.current_codex_credential() {
+        Some(credential) => fetch_codex_quota(credential.as_ref())
+            .await
+            .map(|(_, quota)| quota),
+        None => None,
+    };
+    Json(quota)
+}
+
 pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflight> {
     let auth_path = state.runtime_env.codex_auth_path();
-    let piggyback_path = state.runtime_env.codex_cli_auth_path();
-    let (already_signed_in, account_id) =
-        match codex_credential::CodexCredential::load(auth_path.clone()) {
-            Ok((_cred, account_id)) => (true, account_id),
-            Err(_) => (false, None),
-        };
-    let account_email = if already_signed_in {
-        codex_credential::CodexCredential::read_id_token(&auth_path)
+    let active_path = state.llm_registry.current_codex_loaded_path();
+    let already_signed_in = state.llm_registry.current_codex_credential().is_some();
+    let account_id = state
+        .llm_registry
+        .current_codex_credential()
+        .and_then(|credential| credential.account_id());
+    let account_email = if let Some(active_path) = active_path.as_ref() {
+        codex_credential::CodexCredential::read_id_token(active_path)
             .as_deref()
             .and_then(phoenix_llm::codex_login::extract_email)
     } else {
@@ -886,16 +992,11 @@ pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflig
     // after a successful sign-in, current_codex_loaded_path == auth_path.
     let restart_required_after_login =
         state.llm_registry.current_codex_loaded_path().as_deref() != Some(auth_path.as_path());
-    let piggyback_env_set = std::env::var("OPENAI_USE_CODEX_AUTH")
-        .ok()
-        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
     Json(LoginPreflight {
         auth_path: auth_path.display().to_string(),
-        piggyback_path: piggyback_path.display().to_string(),
         already_signed_in,
         bridge_loaded_at_startup,
         restart_required_after_login,
-        piggyback_env_set,
         account_id,
         account_email,
     })
@@ -904,16 +1005,28 @@ pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflig
 /// Sign out of the in-app `ChatGPT` login: delete `~/.phoenix-ide/codex-auth.json`
 /// and hot-reload the registry to deregister `OpenAI`/Codex bridge models.
 ///
-/// Idempotent — missing file is treated as success. Piggyback mode (loaded from
-/// `~/.codex/auth.json` via `OPENAI_USE_CODEX_AUTH=1`) is left alone: this
-/// endpoint only manages Phoenix's own auth file.
+/// Idempotent — missing file is treated as success.
 pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let _lifecycle = state.codex_login.lifecycle.lock().await;
     let auth_path = state.runtime_env.codex_auth_path();
+    // Sweep half-open sign-in flows so an in-progress PKCE driver can't race
+    // against the registry reload below and re-install a credential the user
+    // just asked us to delete.
+    let drained = drain_active_pkce(&state.codex_login).await;
+    let drained_device = drain_active_device_sessions(&state.codex_login).await;
+    if let Some(credential) = state.llm_registry.current_codex_credential() {
+        credential.revoke().await;
+    }
     let removed = match std::fs::remove_file(&auth_path) {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => {
+            let registry = state.llm_registry.clone();
+            let restored = tokio::task::spawn_blocking(move || registry.reload_codex_credential())
+                .await
+                .ok();
             tracing::warn!(error = %e, path = %auth_path.display(),
+                credential_restored = restored.as_ref().is_some_and(|o| o.credential_loaded),
                 "codex_login: signout failed to remove auth file");
             return Json(serde_json::json!({
                 "ok": false,
@@ -921,10 +1034,6 @@ pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
             }));
         }
     };
-    // Sweep half-open sign-in flows so an in-progress PKCE driver can't race
-    // against the registry reload below and re-install a credential the user
-    // just asked us to delete.
-    let drained = drain_active_pkce(&state.codex_login).await;
     let registry = state.llm_registry.clone();
     let outcome = tokio::task::spawn_blocking(move || registry.reload_codex_credential())
         .await
@@ -932,6 +1041,7 @@ pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
     tracing::info!(
         removed,
         drained_pkce_sessions = drained,
+        drained_device_sessions = drained_device,
         bridge_path = ?outcome.as_ref().and_then(|o| o.current_path.as_ref()),
         "codex_login: signed out"
     );

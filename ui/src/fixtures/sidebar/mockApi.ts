@@ -6,6 +6,7 @@ import type { SidebarFixtureData } from './types';
 export function installSidebarFixtureApi(data: SidebarFixtureData) {
   const original = {
     codexLoginPreflight: api.codexLoginPreflight,
+    codexQuota: api.codexQuota,
     deploymentInfo: api.deploymentInfo,
     getLocalServices: api.getLocalServices,
     getProjects: api.getProjects,
@@ -14,14 +15,13 @@ export function installSidebarFixtureApi(data: SidebarFixtureData) {
 
   api.codexLoginPreflight = async (): Promise<CodexLoginPreflight> => ({
     auth_path: '/tmp/sidebar-fixture/auth.json',
-    piggyback_path: '/tmp/sidebar-fixture/piggyback.json',
     already_signed_in: false,
     bridge_loaded_at_startup: false,
     restart_required_after_login: false,
-    piggyback_env_set: false,
     account_id: null,
     account_email: null,
   });
+  api.codexQuota = async () => null;
   api.deploymentInfo = async (): Promise<DeploymentInfo> => ({ local_access: true } as unknown as DeploymentInfo);
   api.getLocalServices = async () => ({ services: [] });
   api.getProjects = async () => data.projects;
@@ -34,6 +34,7 @@ export function installSidebarFixtureApi(data: SidebarFixtureData) {
 
   return () => {
     api.codexLoginPreflight = original.codexLoginPreflight;
+    api.codexQuota = original.codexQuota;
     api.deploymentInfo = original.deploymentInfo;
     api.getLocalServices = original.getLocalServices;
     api.getProjects = original.getProjects;

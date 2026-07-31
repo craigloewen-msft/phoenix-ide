@@ -10,6 +10,7 @@ import type { ApproveReleaseUpdateResponse } from './generated/ApproveReleaseUpd
 import type { FileViewerKind } from './generated/FileViewerKind';
 import type { UsageOverview } from './generated/UsageOverview';
 import type { ConversationUsageDetail } from './generated/ConversationUsageDetail';
+import type { QuotaDetails } from './generated/QuotaDetails';
 // Phoenix API Client
 
 export class ApiResponseError extends Error {
@@ -1042,14 +1043,10 @@ export interface ConversationUsage {
 
 export interface CodexLoginPreflight {
   auth_path: string;
-  piggyback_path: string;
   already_signed_in: boolean;
   bridge_loaded_at_startup: boolean;
-  /// True when an in-app login won't take effect until Phoenix restarts —
-  /// either because no credential was loaded at startup or because the
-  /// loaded credential is pinned to a different file (the piggyback case).
+  /// True when an in-app login has not yet hot-reloaded the native credential.
   restart_required_after_login: boolean;
-  piggyback_env_set: boolean;
   account_id: string | null;
   account_email: string | null;
 }
@@ -1418,6 +1415,12 @@ export const api = {
   async codexLoginPreflight(): Promise<CodexLoginPreflight> {
     const resp = await fetch('/api/codex/login/preflight');
     if (!resp.ok) throw new Error('Failed to check codex login preflight');
+    return resp.json();
+  },
+
+  async codexQuota(): Promise<QuotaDetails | null> {
+    const resp = await fetch('/api/codex/quota');
+    if (!resp.ok) throw new Error('Failed to load Codex quota');
     return resp.json();
   },
 

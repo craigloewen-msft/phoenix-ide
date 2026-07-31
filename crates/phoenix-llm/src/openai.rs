@@ -3,8 +3,8 @@
 use super::headers::apply_source_header;
 use super::models::ModelSpec;
 use super::rate_limit::{
-    parse_active_limit, parse_credits_snapshot, parse_promo_message, parse_rate_limit_for_limit,
-    QuotaDetails,
+    normalize_credit_depletion, parse_active_limit, parse_credits_snapshot, parse_promo_message,
+    parse_rate_limit_for_limit, parse_rate_limit_reached_type, QuotaDetails,
 };
 use super::stream_telemetry::{GenerationKind, StreamTelemetryRecorder};
 use super::types::{ContentBlock, LlmRequest, LlmResponse, MessageRole, Usage};
@@ -165,8 +165,11 @@ fn classify_responses_error(code: &str, message: &str) -> LlmError {
             limit_name: None,
             primary: None,
             secondary: None,
+            additional_limits: Vec::new(),
             credits: None,
+            individual_limit: None,
             promo_message: None,
+            rate_limit_reached_type: None,
         });
     }
     if lower == "usage_not_included" {
@@ -1055,7 +1058,7 @@ async fn complete_codex_websocket(
             if event_type == "codex.rate_limits" {
                 if let Some(snapshot) = parse_codex_rate_limits(&value) {
                     let _ = chunk_tx
-                        .send(super::TokenChunk::RateLimitSnapshot(snapshot))
+                        .send(super::TokenChunk::RateLimitSnapshot(Box::new(snapshot)))
                         .await;
                 }
                 continue;
@@ -1312,7 +1315,7 @@ pub async fn complete_streaming(
             super::rate_limit::quota_from_codex_response_headers(response.headers())
         {
             let _ = chunk_tx
-                .send(super::TokenChunk::RateLimitSnapshot(snapshot))
+                .send(super::TokenChunk::RateLimitSnapshot(Box::new(snapshot)))
                 .await;
         }
     }
@@ -1804,6 +1807,10 @@ fn parse_codex_error(status: u16, headers: &HeaderMap, body: &str) -> Option<Llm
                         .error
                         .resets_at
                         .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0));
+                    let rate_limit_reached_type = normalize_credit_depletion(
+                        &credits,
+                        parse_rate_limit_reached_type(headers),
+                    );
                     Some(LlmError::usage_limit_reached(QuotaDetails {
                         plan_type: envelope.error.plan_type,
                         resets_at,
@@ -1812,7 +1819,10 @@ fn parse_codex_error(status: u16, headers: &HeaderMap, body: &str) -> Option<Llm
                         primary,
                         secondary,
                         credits,
+                        additional_limits: Vec::new(),
                         promo_message,
+                        individual_limit: None,
+                        rate_limit_reached_type,
                     }))
                 }
                 Some("usage_not_included") => Some(LlmError::auth(
@@ -3285,6 +3295,21 @@ mod tests {
         }
 
         #[test]
+        fn usage_limit_reached_threads_explicit_credits_depletion_type() {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-codex-rate-limit-reached-type",
+                HeaderValue::from_static("workspace_member_credits_depleted"),
+            );
+            let body = r#"{"error":{"type":"usage_limit_reached","plan_type":"team"}}"#;
+            let err = parse_codex_error(429, &headers, body).expect("parsed");
+            assert_eq!(
+                err.quota.as_ref().unwrap().rate_limit_reached_type,
+                Some(crate::rate_limit::RateLimitReachedType::WorkspaceMemberCreditsDepleted)
+            );
+        }
+
+        #[test]
         fn usage_limit_reached_extracts_limit_name_from_active_family() {
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -3298,7 +3323,7 @@ mod tests {
             let body = r#"{"error":{"type":"usage_limit_reached","plan_type":"pro"}}"#;
             let err = parse_codex_error(429, &headers, body).expect("parsed");
             let quota = err.quota.as_ref().expect("quota");
-            assert_eq!(quota.limit_id.as_deref(), Some("codex_other"));
+            assert_eq!(quota.limit_id.as_deref(), Some("codex-other"));
             assert_eq!(quota.limit_name.as_deref(), Some("gpt-5.2-codex-sonic"));
             // The non-codex limit_name branch wins over the plan wording.
             assert!(

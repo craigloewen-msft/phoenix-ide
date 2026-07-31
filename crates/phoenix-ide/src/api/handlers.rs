@@ -458,6 +458,7 @@ pub fn create_router(state: AppState) -> Router {
             "/api/codex/login/preflight",
             get(super::codex_login::login_preflight),
         )
+        .route("/api/codex/quota", get(super::codex_login::codex_quota))
         .route(
             "/api/codex/login/pkce/start",
             post(super::codex_login::pkce_start),
@@ -927,7 +928,7 @@ async fn ensure_coordinator(
         .map_err(|e| AppError::Internal(e.to_string()))?;
     let conversation = state
         .db
-        .get_or_create_coordinator(Some(state.llm_registry.default_model_id()), llm_language)
+        .get_or_create_coordinator(Some(&state.llm_registry.default_model_id()), llm_language)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Json(ConversationResponse {
@@ -1863,7 +1864,7 @@ async fn create_conversation_with_id(
     let conv_mode = crate::db::ConvMode::Direct;
     let effective_cwd = req.cwd.clone();
     let desired_base_branch = req.base_branch.as_deref();
-    let registry_default_model = state.llm_registry.default_model_id().to_string();
+    let registry_default_model = state.llm_registry.default_model_id();
     let shell_model = req
         .model
         .clone()
@@ -6706,7 +6707,7 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
 
     Json(ModelsResponse {
         models,
-        default: state.llm_registry.default_model_id().to_string(),
+        default: state.llm_registry.default_model_id(),
         llm_configured,
         credential_status,
     })
