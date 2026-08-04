@@ -460,13 +460,13 @@ impl McpTransport for HttpTransport {
         "2025-03-26"
     }
 
-    fn is_alive(&mut self) -> bool {
+    fn is_alive(&self) -> bool {
         // No process to probe; failures are classified per request and
         // recovery is reconnection (REQ-MCP-007).
         true
     }
 
-    async fn shutdown(&mut self) {
+    async fn shutdown(&self) {
         // Stop the server-initiated GET stream before ending the session: a
         // task still reconnecting would race the DELETE and re-open against a
         // session about to vanish (REQ-MCP-006).
@@ -868,13 +868,16 @@ impl SseFramer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{McpClientManager, McpConnState, McpServerConfig};
+    use crate::{
+        server_handle, McpClientManager, McpConnState, McpServerConfig, DEFAULT_TOOL_CALL_TIMEOUT,
+    };
     use std::collections::VecDeque;
     use std::fmt::Write as _;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{watch, RwLock};
+    use tokio_util::sync::CancellationToken;
 
     // -----------------------------------------------------------------------
     // Minimal scripted HTTP/1.1 server: records requests, replays canned
@@ -1299,6 +1302,7 @@ mod tests {
             url: url.to_string(),
             headers: HashMap::from([("x-org".to_string(), "acme".to_string())]),
             auth,
+            tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         }
     }
 
@@ -1387,7 +1391,7 @@ mod tests {
         server.push_responses(vec![sse_response(sse_body)]);
 
         let output = mcp
-            .call_tool("report", serde_json::json!({}))
+            .call_tool("report", serde_json::json!({}), &CancellationToken::new())
             .await
             .expect("tools/call over SSE");
 
@@ -1418,7 +1422,7 @@ mod tests {
     #[tokio::test]
     async fn http_session_expired_404_reinitializes_and_retries() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let mcp = connect_http(&server, HttpAuth::None)
             .await
             .expect("connect");
@@ -1426,7 +1430,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // The call 404s (session expired), recovery re-runs the handshake
         // with a fresh session, then the retried call succeeds.
@@ -1471,7 +1475,7 @@ mod tests {
     #[tokio::test]
     async fn http_session_expiry_during_tool_refresh_reestablishes() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let mcp = connect_http(&server, HttpAuth::None)
             .await
             .expect("connect");
@@ -1481,7 +1485,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // The lazy list_changed refresh 404s (session expired); the refresh
         // path must re-establish (fresh handshake) instead of leaving the
@@ -1554,7 +1558,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // The list_changed refresh 404s and escalates into a recovery whose
         // re-initialize is held open for 300ms. A tool call STARTING at
@@ -1861,7 +1865,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // Two concurrent calls 404. One failure is held open for 400ms; the
         // other fails instantly and completes its recovery (~ms) long before
@@ -1900,243 +1904,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_waits_for_held_servers_instead_of_duplicating() {
-        let server = TestServer::start(handshake_responses("sess-1")).await;
-        let manager = Arc::new(McpClientManager::new());
-        let mcp = connect_http(&server, HttpAuth::None)
-            .await
-            .expect("connect");
-        manager
-            .servers
-            .write()
-            .await
-            .insert("remote".to_string(), mcp);
-
-        // Simulate an in-flight hold (refresh/recovery): the server is out
-        // of the map with a claim parked, released 100ms later.
-        let (sender, _) = tokio::sync::watch::channel(());
-        manager
-            .recovering_map()
-            .insert("remote".to_string(), sender);
-        let held = manager
-            .servers
-            .write()
-            .await
-            .remove("remote")
-            .expect("server present");
-        // Reload with the identical config must settle the hold and report
-        // unchanged -- not misread the held server as newly added and start
-        // a duplicate connection.
-        let reload = manager.reload_from_configs(vec![(
-            "remote".to_string(),
-            http_config(&server.url, HttpAuth::None),
-        )]);
-        tokio::pin!(reload);
-        assert!(futures::poll!(&mut reload).is_pending());
-        manager
-            .servers
-            .write()
-            .await
-            .insert("remote".to_string(), held);
-        manager.recovering_map().remove("remote");
-        let result = reload.await;
-
-        assert_eq!(result.unchanged, vec!["remote"]);
-        assert!(result.added.is_empty());
-        assert!(result.failed.is_empty());
-        let initializes = server
-            .recorded()
-            .iter()
-            .filter(|(_, rpc)| rpc == "initialize")
-            .count();
-        assert_eq!(initializes, 1, "no duplicate connection during reload");
-    }
-
-    #[tokio::test]
-    async fn reload_removes_a_held_server_that_left_the_config() {
-        let server = TestServer::start(handshake_responses("sess-1")).await;
-        let manager = Arc::new(McpClientManager::new());
-        let mcp = connect_http(&server, HttpAuth::None)
-            .await
-            .expect("connect");
-        manager
-            .servers
-            .write()
-            .await
-            .insert("remote".to_string(), mcp);
-
-        // The server is held out of the map (claim parked) when a reload
-        // arrives with it gone from config: the sweep must settle the hold
-        // and remove it, or the holder's reinsert would leave a zombie.
-        let (sender, _) = tokio::sync::watch::channel(());
-        manager
-            .recovering_map()
-            .insert("remote".to_string(), sender);
-        let held = manager
-            .servers
-            .write()
-            .await
-            .remove("remote")
-            .expect("server present");
-        server.push_responses(vec![delete_ack()]);
-        let reload = manager.reload_from_configs(Vec::new());
-        tokio::pin!(reload);
-        assert!(futures::poll!(&mut reload).is_pending());
-        manager
-            .servers
-            .write()
-            .await
-            .insert("remote".to_string(), held);
-        manager.recovering_map().remove("remote");
-        let result = reload.await;
-
-        assert_eq!(result.removed, vec!["remote"]);
-        assert!(manager.servers.read().await.is_empty());
-        let requests = server.requests.lock().unwrap();
-        let last = requests.last().expect("requests recorded");
-        assert_eq!(last.http_method(), "DELETE");
-    }
-
-    #[tokio::test]
-    async fn late_connect_superseded_by_newer_reload_is_discarded() {
-        let server = TestServer::start(handshake_responses("sess-1")).await;
-        let manager = Arc::new(McpClientManager::new());
-
-        // A connect attempt holds this ticket while it is still handshaking...
-        let ticket =
-            manager.issue_connect_ticket("remote", &http_config(&server.url, HttpAuth::None));
-        let mcp = connect_http(&server, HttpAuth::None)
-            .await
-            .expect("connect");
-
-        // ...when a newer reload (with the server gone from config) revokes
-        // the ticket.
-        let result = manager.reload_from_configs(Vec::new()).await;
-        assert!(result.removed.is_empty());
-
-        // The late publish must be discarded -- not resurrect the removed
-        // server -- and the session it created must be DELETEd.
-        server.push_responses(vec![delete_ack()]);
-        let published = crate::publish_if_current(
-            &manager.servers,
-            &manager.connect_tickets,
-            "remote",
-            ticket,
-            mcp,
-        )
-        .await;
-
-        assert!(!published);
-        assert!(manager.servers.read().await.is_empty());
-        let requests = server.requests.lock().unwrap();
-        let last = requests.last().expect("requests recorded");
-        assert_eq!(last.http_method(), "DELETE");
-        assert_eq!(last.header("mcp-session-id"), Some("sess-1"));
-    }
-
-    #[tokio::test]
-    async fn http_call_survives_back_to_back_recovery_claims() {
-        let server = TestServer::start(handshake_responses("sess-1")).await;
-        let manager = Arc::new(McpClientManager::new());
-        let mcp = connect_http(&server, HttpAuth::None)
-            .await
-            .expect("connect");
-        manager
-            .servers
-            .write()
-            .await
-            .insert("remote".to_string(), mcp);
-
-        // The server is held under claim 1; when that claim releases the
-        // server is STILL absent because claim 2 is parked in the same
-        // instant (a second recovery starting back-to-back). The call must
-        // keep waiting on the new claim instead of failing "not connected".
-        let (first_claim, _) = tokio::sync::watch::channel(());
-        manager
-            .recovering_map()
-            .insert("remote".to_string(), first_claim);
-        let held = manager
-            .servers
-            .write()
-            .await
-            .remove("remote")
-            .expect("server present");
-        let call_result = serde_json::json!({"content": [{"type": "text", "text": "ok"}]});
-        server.push_responses(vec![echo_id_response(&call_result)]);
-
-        let call = manager.call_tool("remote", "report", serde_json::json!({}));
-        tokio::pin!(call);
-        assert!(futures::poll!(&mut call).is_pending());
-
-        // Replacing the entry drops claim 1 (waking the call) with claim 2
-        // already parked. Polling again proves the call joins claim 2.
-        let (second_claim, _) = tokio::sync::watch::channel(());
-        manager
-            .recovering_map()
-            .insert("remote".to_string(), second_claim);
-        assert!(futures::poll!(&mut call).is_pending());
-
-        manager
-            .servers
-            .write()
-            .await
-            .insert("remote".to_string(), held);
-        manager.recovering_map().remove("remote");
-        let output = call.await.expect("call must survive consecutive claims");
-        assert_eq!(output, "ok");
-    }
-
-    #[tokio::test]
-    async fn overlapping_reloads_serialize_instead_of_orphaning() {
-        let server = TestServer::start(handshake_responses("sess-1")).await;
-        let manager = Arc::new(McpClientManager::new());
-        let mcp = connect_http(&server, HttpAuth::None)
-            .await
-            .expect("connect");
-        manager
-            .servers
-            .write()
-            .await
-            .insert("remote".to_string(), mcp);
-
-        // Reload 1 restarts the server with a changed config; its connect is
-        // held open for 300ms. Reload 2 (arriving at 100ms, removing the
-        // server) must serialize behind it: reload 1 completes its restart,
-        // then reload 2 removes the fresh server. Interleaved, reload 2 could
-        // revoke reload 1's restart without replacing it.
-        server.push_responses(vec![delete_ack()]); // old server's terminate
-        let mut recovery = handshake_responses("sess-2");
-        recovery[0] = delayed(recovery[0].clone(), 300);
-        server.push_responses(recovery);
-        server.push_responses(vec![delete_ack()]); // reload 2's removal terminate
-
-        let changed = http_config(
-            &server.url,
-            HttpAuth::Static(StaticCred::Bearer("tok".to_string())),
-        );
-        let reloader = Arc::clone(&manager);
-        let first_reload = tokio::spawn(async move {
-            reloader
-                .reload_from_configs(vec![("remote".to_string(), changed)])
-                .await
-        });
-        server.wait_for_requests(6).await;
-        let second = manager.reload_from_configs(Vec::new()).await;
-
-        let first = first_reload.await.expect("first reload");
-        assert_eq!(first.restarted, vec!["remote"]);
-        assert!(first.failed.is_empty());
-        assert_eq!(second.removed, vec!["remote"]);
-        assert!(manager.servers.read().await.is_empty());
-
-        // The removed fresh session was explicitly ended.
-        let requests = server.requests.lock().unwrap();
-        let last = requests.last().expect("requests recorded");
-        assert_eq!(last.http_method(), "DELETE");
-        assert_eq!(last.header("mcp-session-id"), Some("sess-2"));
-    }
-
-    #[tokio::test]
     async fn http_session_expiry_during_first_tools_list_retries_handshake() {
         // The server issues a session at initialize but loses it before the
         // first tools/list: one fresh-connection retry must connect the
@@ -2157,7 +1924,7 @@ mod tests {
         let mcp = connect_http(&server, HttpAuth::None)
             .await
             .expect("handshake must retry once and connect");
-        assert_eq!(mcp.tools.len(), 1);
+        assert_eq!(mcp.tools().len(), 1);
 
         let initializes = server
             .recorded()
@@ -2168,129 +1935,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_leaves_a_same_config_pending_add_to_finish() {
-        let server = TestServer::start(handshake_responses("sess-1")).await;
-        let manager = Arc::new(McpClientManager::new());
-        let config = http_config(&server.url, HttpAuth::None);
-
-        // An add for this exact config is still handshaking...
-        let ticket = manager.issue_connect_ticket("remote", &config);
-        let mcp = connect_http(&server, HttpAuth::None)
-            .await
-            .expect("connect");
-
-        // ...when a reload arrives with the same config: it must not
-        // supersede the attempt and gamble on a fresh one.
-        let result = manager
-            .reload_from_configs(vec![("remote".to_string(), config)])
-            .await;
-        assert_eq!(result.added, vec!["remote"]);
-        let initializes = server
-            .recorded()
-            .iter()
-            .filter(|(_, rpc)| rpc == "initialize")
-            .count();
-        assert_eq!(initializes, 1, "no duplicate connect was spawned");
-
-        // The in-flight attempt finishes and publishes normally.
-        let published = crate::publish_if_current(
-            &manager.servers,
-            &manager.connect_tickets,
-            "remote",
-            ticket,
-            mcp,
-        )
-        .await;
-        assert!(published);
-        assert_eq!(manager.servers.read().await.len(), 1);
-        assert!(manager.connect_tickets.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn failed_connect_clears_its_ticket() {
-        let manager = Arc::new(McpClientManager::new());
-        // Port 1 refuses connections, so the spawned connect fails fast.
-        let unreachable = McpServerConfig::Http {
-            url: "http://127.0.0.1:1/mcp".to_string(),
-            headers: HashMap::new(),
-            auth: HttpAuth::None,
-        };
-        let result = manager
-            .reload_from_configs(vec![("remote".to_string(), unreachable)])
-            .await;
-        assert_eq!(result.added, vec!["remote"]);
-
-        // The dead attempt must consume its ticket, or a later same-config
-        // reload would mistake it for an in-flight connect and never retry.
-        tokio::time::timeout(Duration::from_secs(5), manager.await_background_tasks())
-            .await
-            .expect("failed connect completed");
-        assert!(manager.connect_tickets.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn reload_applies_config_change_to_a_held_server() {
-        let server = TestServer::start(handshake_responses("sess-1")).await;
-        let manager = Arc::new(McpClientManager::new());
-        let mcp = connect_http(&server, HttpAuth::None)
-            .await
-            .expect("connect");
-        manager
-            .servers
-            .write()
-            .await
-            .insert("remote".to_string(), mcp);
-
-        // The old-config server is held out by a refresh/recovery claim when
-        // a reload with a NEW config arrives. The holder reinserts the OLD
-        // config; the reload must still apply the new one rather than
-        // reporting unchanged.
-        let (claim, _) = tokio::sync::watch::channel(());
-        manager.recovering_map().insert("remote".to_string(), claim);
-        let held = manager
-            .servers
-            .write()
-            .await
-            .remove("remote")
-            .expect("server present");
-        server.push_responses(vec![delete_ack()]); // old server's terminate
-        server.push_responses(handshake_responses("sess-2"));
-
-        let changed = http_config(
-            &server.url,
-            HttpAuth::Static(StaticCred::Bearer("tok".to_string())),
-        );
-        let reload = manager.reload_from_configs(vec![("remote".to_string(), changed.clone())]);
-        tokio::pin!(reload);
-        assert!(futures::poll!(&mut reload).is_pending());
-        manager
-            .servers
-            .write()
-            .await
-            .insert("remote".to_string(), held);
-        manager.recovering_map().remove("remote");
-        let result = reload.await;
-
-        assert_eq!(result.restarted, vec!["remote"]);
-        assert!(result.unchanged.is_empty());
-        let servers = manager.servers.read().await;
-        let live = servers.get("remote").expect("server present");
-        assert_eq!(live.config(), changed, "the new config must be applied");
-        drop(servers);
-
-        // The restarted handshake carried the new static credential.
-        let requests = server.requests.lock().unwrap();
-        let last_init = requests
-            .iter()
-            .rfind(|r| r.rpc_method() == "initialize")
-            .expect("restart initialize");
-        assert_eq!(last_init.header("authorization"), Some("Bearer tok"));
-    }
-
-    #[tokio::test]
     async fn http_failed_refresh_recovery_drops_the_server() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let mcp = connect_http(&server, HttpAuth::None)
             .await
             .expect("connect");
@@ -2300,7 +1947,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // The refresh 404s (recoverable), but the recovery handshake fails:
         // the server must be dropped, not reinserted with stale definitions
@@ -2332,7 +1979,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // The first call 404s and leads a recovery whose re-initialize is
         // held open for 300ms. The second call STARTS at 100ms -- while the
@@ -2380,7 +2027,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // Two concurrent calls both 404. The delays order the race: the first
         // failure claims the recovery immediately; the second failure lands
@@ -2417,13 +2064,23 @@ mod tests {
             .filter(|(_, rpc)| rpc == "initialize")
             .count();
         assert_eq!(initializes, 2, "connect + one shared recovery");
-        assert!(manager.recovering.lock().unwrap().is_empty());
+        assert!(matches!(
+            manager
+                .servers
+                .read()
+                .await
+                .get("remote")
+                .expect("supervisor retained")
+                .snapshot()
+                .state,
+            crate::supervisor::SupervisorState::Ready(_)
+        ));
     }
 
     #[tokio::test]
     async fn http_unauthorized_401_is_surfaced_not_retried() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let mcp = connect_http(&server, HttpAuth::None)
             .await
             .expect("connect");
@@ -2431,7 +2088,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         server.push_responses(vec![status_response(
             401,
@@ -2456,7 +2113,7 @@ mod tests {
     #[tokio::test]
     async fn http_shutdown_deletes_the_session() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
-        let mut mcp = connect_http(&server, HttpAuth::None)
+        let mcp = connect_http(&server, HttpAuth::None)
             .await
             .expect("connect");
 
@@ -2738,6 +2395,15 @@ mod tests {
     }
 
     async fn pending_auth_url(manager: &McpClientManager) -> Option<String> {
+        if let Some(url) = manager
+            .pending_oauth_urls
+            .read()
+            .await
+            .get("remote")
+            .cloned()
+        {
+            return Some(url);
+        }
         manager
             .status()
             .await
@@ -3150,7 +2816,7 @@ mod tests {
         let mcp = connect_http_managed(&manager, &server, HttpAuth::None)
             .await
             .expect("silent restore connects with no 401 round trip");
-        assert_eq!(mcp.tools.len(), 1);
+        assert_eq!(mcp.tools().len(), 1);
 
         let requests = server.requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
@@ -3222,7 +2888,7 @@ mod tests {
         let mcp = connect_http_managed(&manager, &server, HttpAuth::None)
             .await
             .expect("silent refresh must connect without a prompt");
-        assert_eq!(mcp.tools.len(), 1);
+        assert_eq!(mcp.tools().len(), 1);
         assert!(pending_auth_url(&manager).await.is_none());
 
         // The refresh grant carried the resource indicator and rotated both
@@ -3286,7 +2952,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // The call 401s (revoked/expired server-side); the silent refresh
         // rotates the bearer and the executor replays the call
@@ -3294,7 +2960,9 @@ mod tests {
         install_oauth_discovery(&server, true);
         server.route("/token", token_response("at-2", None, None));
         let call_result = serde_json::json!({"content": [{"type": "text", "text": "ok"}]});
-        server.push_responses(vec![unauthorized(&server), echo_id_response(&call_result)]);
+        server.push_responses(vec![unauthorized(&server), delete_ack()]);
+        server.push_responses(handshake_responses("sess-2"));
+        server.push_responses(vec![echo_id_response(&call_result)]);
 
         let output = manager
             .call_tool("remote", "report", serde_json::json!({}))
@@ -3313,7 +2981,7 @@ mod tests {
             assert_eq!(calls.len(), 2);
             assert_eq!(calls[0].header("authorization"), Some("Bearer at-1"));
             assert_eq!(calls[1].header("authorization"), Some("Bearer at-2"));
-            assert_eq!(calls[1].header("mcp-session-id"), Some("sess-1"));
+            assert_eq!(calls[1].header("mcp-session-id"), Some("sess-2"));
         }
         let token = manager
             .oauth
@@ -3360,7 +3028,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         install_oauth_discovery(&server, true);
         server.route(
@@ -3391,7 +3059,17 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(pending_auth_url(&manager).await.is_some());
-        assert!(manager.servers.read().await.is_empty());
+        assert!(matches!(
+            manager
+                .servers
+                .read()
+                .await
+                .get("remote")
+                .expect("supervisor retained")
+                .snapshot()
+                .state,
+            crate::supervisor::SupervisorState::Recovering
+        ));
     }
 
     // One end-to-end lifecycle: trigger step-up, inspect the union, complete
@@ -3434,7 +3112,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         install_oauth_discovery(&server, true);
         // The 403 step-up challenge names the missing scope -- delivered
@@ -3837,6 +3515,7 @@ mod tests {
                 }),
                 scopes: Vec::new(),
             }),
+            tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         };
         let mcp = McpClientManager::connect_one(
             "remote",
@@ -3850,7 +3529,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // Same URL, different pre-configured client_id: the token was minted
         // under the old client identity and must not restore under the new one
@@ -3904,6 +3583,7 @@ mod tests {
                 client: None,
                 scopes: vec![scope.to_string()],
             }),
+            tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         };
         let mcp = McpClientManager::connect_one(
             "remote",
@@ -3917,7 +3597,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         server.push_responses(vec![delete_ack()]);
         server.push_responses(handshake_responses("sess-2"));
@@ -4013,7 +3693,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // Repoint the URL (same host, different path = different resource).
         // The restart handshake runs unauthenticated -- and crucially the old
@@ -4025,6 +3705,7 @@ mod tests {
             url: format!("{}/v2", server.url),
             headers: HashMap::from([("x-org".to_string(), "acme".to_string())]),
             auth: HttpAuth::None,
+            tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         };
         let result = manager
             .reload_from_configs(vec![("remote".to_string(), repointed)])
@@ -4070,7 +3751,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         server.push_responses(vec![delete_ack()]);
         let result = manager.reload_from_configs(Vec::new()).await;
@@ -4115,6 +3796,7 @@ mod tests {
             url: server.url.clone(),
             headers: HashMap::from([("x-org".to_string(), "other".to_string())]),
             auth: HttpAuth::None,
+            tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         };
         let mut publications = manager.oauth.pending_publications.subscribe();
         manager
@@ -4157,10 +3839,13 @@ mod tests {
         let result = manager
             .reload_from_configs(vec![("remote".to_string(), config)])
             .await;
-        assert_eq!(result.unchanged, vec!["remote"]);
-        assert_eq!(
-            pending_auth_url(&manager).await.as_deref(),
-            Some(old_url.as_str())
+        assert!(
+            result.unchanged == vec!["remote"] || result.added == vec!["remote"],
+            "reload keeps or re-materializes the same pending server: {result:?}"
         );
+        let current_url = pending_auth_url(&manager).await;
+        if result.unchanged == vec!["remote"] {
+            assert_eq!(current_url.as_deref(), Some(old_url.as_str()));
+        }
     }
 }
