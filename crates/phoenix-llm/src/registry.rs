@@ -552,7 +552,6 @@ impl ModelRegistry {
             "gpt-5.6-luna",
             "gpt-5.6-terra",
             "gpt-5.5",
-            "gpt-5.3-codex",
             "gpt-5.4",
             "gpt-5.4-mini",
             "mock",
@@ -873,6 +872,71 @@ impl ModelRegistry {
         }
     }
 
+    #[must_use]
+    pub fn effort_capabilities(&self, model_id: &str) -> Option<super::EffortCapabilities> {
+        let specs = self.specs.read().ok()?;
+        let services = self.services.read().ok()?;
+        let (spec, service) = specs.get(model_id).zip(services.get(model_id))?;
+        Some(spec.effort_capabilities_for(service.as_ref()))
+    }
+
+    #[must_use]
+    pub fn supports_effort(
+        &self,
+        model_id: &str,
+        effort: phoenix_core::domain::llm_types::ModelEffort,
+    ) -> bool {
+        self.effort_capabilities(model_id)
+            .is_some_and(|capabilities| capabilities.supports(effort))
+    }
+
+    #[must_use]
+    pub fn effective_effort(
+        &self,
+        model_id: &str,
+        explicit: Option<phoenix_core::domain::llm_types::ModelEffort>,
+    ) -> phoenix_core::domain::llm_types::EffectiveEffort {
+        use phoenix_core::domain::llm_types::EffectiveEffort;
+
+        if let Some(level) = explicit {
+            return EffectiveEffort::explicit(level);
+        }
+        match self.effort_capabilities(model_id) {
+            Some(super::EffortCapabilities::Unsupported) => EffectiveEffort::unsupported(),
+            Some(super::EffortCapabilities::Supported(capabilities)) => {
+                match capabilities.native_default() {
+                    super::NativeDefault::Known(level) => EffectiveEffort::native_known(level),
+                    super::NativeDefault::Unknown => EffectiveEffort::native_unknown(),
+                }
+            }
+            Some(super::EffortCapabilities::Unknown) | None => EffectiveEffort::native_unknown(),
+        }
+    }
+
+    /// Resolve a persisted model id to an exact registered route, or to the
+    /// retired built-in replacement when no exact route exists.
+    pub fn resolve_model_id(&self, model_id: &str) -> String {
+        if self.get(model_id).is_some() {
+            model_id.to_string()
+        } else if model_id == "gpt-5.3-codex" {
+            "gpt-5.4".to_string()
+        } else {
+            model_id.to_string()
+        }
+    }
+
+    /// Return an operator-declared output ceiling for a registered route.
+    ///
+    /// # Panics
+    /// Panics if the internal specs lock is poisoned.
+    pub fn output_token_limit(&self, model_id: &str) -> Option<u32> {
+        self.specs
+            .read()
+            .expect("specs lock poisoned")
+            .get(model_id)
+            .and_then(super::ModelSpec::output_token_limit)
+    }
+
     /// List all available model IDs
     ///
     /// # Panics
@@ -900,6 +964,7 @@ impl ModelRegistry {
                     description: spec.description.clone(),
                     context_window: spec.context_window_for(service.as_ref()),
                     recommended: spec.recommended,
+                    effort_capabilities: spec.effort_capabilities_for(service.as_ref()),
                 });
             }
         }
@@ -994,18 +1059,19 @@ impl ModelRegistry {
 
     /// Get a cheap/fast model for auxiliary tasks like title generation.
     /// Prefers: claude-haiku-4-5 > gpt-5.4-mini > any available model
-    pub fn get_cheap_model(&self) -> Option<Arc<dyn LlmService>> {
-        // Priority order for cheap models
+    pub fn get_cheap_model_with_id(&self) -> Option<(String, Arc<dyn LlmService>)> {
         const CHEAP_MODELS: &[&str] = &["claude-haiku-4-5", "gpt-5.4-mini"];
-
         for model_id in CHEAP_MODELS {
             if let Some(service) = self.get(model_id) {
-                return Some(service);
+                return Some(((*model_id).to_string(), service));
             }
         }
-
-        // Fall back to default model if no cheap model available
         self.default()
+            .map(|service| (self.default_model_id(), service))
+    }
+
+    pub fn get_cheap_model(&self) -> Option<Arc<dyn LlmService>> {
+        self.get_cheap_model_with_id().map(|(_, service)| service)
     }
 
     /// Get the cheapest available model ID from the same provider family as `parent_model_id`.
@@ -1242,9 +1308,34 @@ impl phoenix_core::llm_service::LlmSelector for ModelRegistry {
         })
     }
 
+    fn default_selection(&self) -> Option<phoenix_core::llm_service::CompletionSelection> {
+        let model_id = self.default_model_id();
+        ModelRegistry::get(self, &model_id).map(|service| {
+            phoenix_core::llm_service::CompletionSelection {
+                model_id: model_id.clone(),
+                service: Arc::new(AsCompletion(service))
+                    as Arc<dyn phoenix_core::llm_service::CompletionService>,
+                effective_effort: self.effective_effort(&model_id, None),
+                max_output_tokens: self.output_token_limit(&model_id),
+            }
+        })
+    }
+
     fn get_cheap_model(&self) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
         ModelRegistry::get_cheap_model(self).map(|svc| {
             Arc::new(AsCompletion(svc)) as Arc<dyn phoenix_core::llm_service::CompletionService>
+        })
+    }
+
+    fn get_cheap_selection(&self) -> Option<phoenix_core::llm_service::CompletionSelection> {
+        self.get_cheap_model_with_id().map(|(model_id, service)| {
+            phoenix_core::llm_service::CompletionSelection {
+                model_id: model_id.clone(),
+                service: Arc::new(AsCompletion(service))
+                    as Arc<dyn phoenix_core::llm_service::CompletionService>,
+                effective_effort: self.effective_effort(&model_id, None),
+                max_output_tokens: self.output_token_limit(&model_id),
+            }
         })
     }
 }

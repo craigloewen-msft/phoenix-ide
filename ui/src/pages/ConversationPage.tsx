@@ -486,7 +486,7 @@ function ConversationPageContent({
   const [files, setFiles] = useState<FileAttachment[]>([]);
 
   // Shared models/credential poller — one request loop app-wide.
-  const { models: availableModels, credentialStatus } = useModels();
+  const { models: availableModels, credentialStatus, defaultModel } = useModels();
 
   // Task approval overlay
   const [showTaskApproval, setShowTaskApproval] = useState(false);
@@ -1625,13 +1625,13 @@ function ConversationPageContent({
     }
   }, [conversationId, isArchived, dispatch]);
 
-  const handleUpgradeModel = useCallback(async (newModelId: string) => {
+  const handleUpgradeModel = useCallback(async (newModelId: string, effort?: import('../api').ModelEffort | null) => {
     if (!conversationId || isArchived || !canChangeModelInState(atom.phase)) return;
 
     try {
-      await api.upgradeModel(conversationId, newModelId);
+      await api.upgradeModel(conversationId, newModelId, effort);
       showInfo(`Switched to ${newModelId}`);
-      dispatch({ type: 'local_conversation_update', updates: { model: newModelId }, expectedConversationId: conversationId });
+      dispatch({ type: 'local_conversation_update', updates: { model: newModelId, effort: effort ?? null }, expectedConversationId: conversationId });
     } catch (err) {
       console.error('Failed to upgrade model:', err);
     }
@@ -1658,11 +1658,16 @@ function ConversationPageContent({
       // Stash the seed draft BEFORE navigation so it's visible to the new
       // page on first render (useDraft reads localStorage synchronously in
       // its initializer).
+      const conversationModelIsAvailable = conversation.model !== null
+        && availableModels.some(model => model.id === conversation.model);
+      const seedModel = conversationModelIsAvailable ? conversation.model : defaultModel;
+      if (!seedModel) throw new Error('No model is available');
       const newConv = await createConversationWithStore(
         homeDir,
         '', // empty — server accepts empty text when seed_parent_id is set
         messageId,
-        conversation.model ?? undefined,
+        seedModel,
+        null,
         [],
         'direct',
         null,
@@ -1674,7 +1679,7 @@ function ConversationPageContent({
       );
       navigate(routeForConversation(newConv));
     },
-    [conversation, navigate, createConversationWithStore],
+    [conversation, availableModels, defaultModel, navigate, createConversationWithStore],
   );
 
   const handleApproveTask = async (handoff: 'continue_in_current_conversation' | 'start_fresh_work_conversation') => {

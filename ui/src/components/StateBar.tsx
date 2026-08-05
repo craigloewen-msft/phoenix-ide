@@ -16,6 +16,8 @@ import {
   canChangeModelInState,
   type Conversation,
   type ConversationState,
+  type EffortCapabilities,
+  type ModelEffort,
   type ModelInfo,
   type PrStatusResponse,
 } from "../api";
@@ -85,8 +87,8 @@ interface StateBarProps {
   /** Continuation trigger, structurally bound to the idle phase. Absent or
    *  `{ phase: 'unavailable' }` means the trigger is unavailable. */
   continuation?: ContinuationState;
-  /** Callback invoked when the user selects a different model for this conversation */
-  onUpgradeModel?: (newModelId: string) => void;
+  /** Callback invoked when the user selects a different model or effort for this conversation */
+  onUpgradeModel?: (newModelId: string, effort?: ModelEffort | null) => void;
   /** `Date.now()` timestamp when the current tool_executing phase began.
    *  Used to render a live elapsed-time counter ("running bash ... 4s").
    *  `null` or `undefined` when not in tool_executing.
@@ -171,6 +173,37 @@ function abbreviateModel(model: string): string {
   return inner;
 }
 
+const EFFORT_LABELS: Record<ModelEffort, string> = {
+  none: 'None',
+  minimal: 'Minimal',
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'X-High',
+  max: 'Max',
+};
+
+function effortLabel(effort: ModelEffort): string {
+  return EFFORT_LABELS[effort];
+}
+
+function effortTriggerLabel(effort: ModelEffort | null | undefined, capabilities: EffortCapabilities | undefined): string {
+  if (!effort) {
+    if (capabilities?.support === 'supported') {
+      const nativeDefault = capabilities.native_default;
+      if (nativeDefault && typeof nativeDefault === 'object' && 'known' in nativeDefault) {
+        return `Effort: default (${effortLabel(nativeDefault.known)})`;
+      }
+    }
+    return 'Effort: default';
+  }
+  return `Effort: ${effortLabel(effort)}`;
+}
+
+function effortCompatible(capabilities: EffortCapabilities | undefined, effort: ModelEffort | null | undefined): boolean {
+  if (!effort) return true;
+  return capabilities?.support === 'supported' && capabilities.levels.includes(effort);
+}
 
 function StateBarPrBadge({ pr }: { pr: PrStatusResponse }) {
   if (!pr.url) return null;
@@ -894,6 +927,12 @@ export function StateBar({
   // and we have models and a callback. Error-state switch lets the user
   // recover from overload/quota by picking another model, then retrying.
   const currentModel = conversation?.model ?? "";
+  const currentModelInfo = availableModels?.find((model) => model.id === currentModel);
+  const currentEffortCapabilities = currentModelInfo?.effort_capabilities;
+  const persistedEffort = conversation?.effort ?? null;
+  const effortIsStale = persistedEffort !== null
+    && !effortCompatible(currentEffortCapabilities, persistedEffort);
+  const currentEffort = persistedEffort;
   const canPickModel = !!(
     onUpgradeModel &&
     availableModels &&
@@ -923,7 +962,18 @@ export function StateBar({
     setPickerOpen(false);
     if (!onUpgradeModel) return;
     if (modelId === currentModel) return;
-    onUpgradeModel(modelId);
+    const targetCapabilities = availableModels?.find((model) => model.id === modelId)?.effort_capabilities;
+    const compatibleEffort = effortCompatible(targetCapabilities, persistedEffort)
+      ? persistedEffort
+      : null;
+    onUpgradeModel(modelId, compatibleEffort);
+  };
+
+  const handleSelectEffort = (effort: ModelEffort | null) => {
+    setPickerOpen(false);
+    if (!onUpgradeModel || !currentModel) return;
+    if (persistedEffort === effort) return;
+    onUpgradeModel(currentModel, effort);
   };
 
   const baseBranch = identity?.branch.base ?? null;
@@ -1001,6 +1051,9 @@ export function StateBar({
           {variant === "mobile"
             ? (conversation?.model ?? "default")
             : modelAbbrev}
+          {(currentEffortCapabilities?.support !== 'unsupported' || effortIsStale) && (
+            <span className="conv-model-effort"> · {currentEffort ? `${effortLabel(currentEffort)}${effortIsStale ? ' (unsupported)' : ''}` : effortTriggerLabel(null, currentEffortCapabilities).replace('Effort: ', '')}</span>
+          )}
           <span className="conv-model-caret" aria-hidden="true">
             &#9662;
           </span>
@@ -1013,6 +1066,9 @@ export function StateBar({
           {variant === "mobile"
             ? (conversation?.model ?? "default")
             : modelAbbrev}
+          {(currentEffortCapabilities?.support !== 'unsupported' || effortIsStale) && (
+            <span className="conv-model-effort"> · {currentEffort ? `${effortLabel(currentEffort)}${effortIsStale ? ' (unsupported)' : ''}` : effortTriggerLabel(null, currentEffortCapabilities).replace('Effort: ', '')}</span>
+          )}
         </span>
       )}
       {pickerOpen && canPickModel && (
@@ -1044,6 +1100,48 @@ export function StateBar({
               );
             })}
           </div>
+          {(currentEffortCapabilities?.support === 'supported' || effortIsStale) && (
+            <div className="model-picker-list" role="listbox" aria-label="Select effort">
+              <button
+                type="button"
+                role="option"
+                aria-selected={currentEffort === null}
+                className={
+                  'model-picker-item' +
+                  (currentEffort === null ? ' model-picker-item--selected' : '')
+                }
+                onClick={() => handleSelectEffort(null)}
+                title={effortTriggerLabel(null, currentEffortCapabilities)}
+              >
+                <span className="model-picker-item-check" aria-hidden="true">
+                  {currentEffort === null ? <CheckIcon /> : null}
+                </span>
+                <span className="model-picker-item-id">{effortTriggerLabel(null, currentEffortCapabilities)}</span>
+              </button>
+              {currentEffortCapabilities?.support === 'supported' && currentEffortCapabilities.levels.map((level) => {
+                const selected = currentEffort === level;
+                return (
+                  <button
+                    key={level}
+                    type="button"
+                    role="option"
+                    aria-selected={selected}
+                    className={
+                      'model-picker-item' +
+                      (selected ? ' model-picker-item--selected' : '')
+                    }
+                    onClick={() => handleSelectEffort(level)}
+                    title={`Effort: ${effortLabel(level)}`}
+                  >
+                    <span className="model-picker-item-check" aria-hidden="true">
+                      {selected ? <CheckIcon /> : null}
+                    </span>
+                    <span className="model-picker-item-id">{effortLabel(level)}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
           <label className="model-picker-show-all-toggle">
             <input
               type="checkbox"

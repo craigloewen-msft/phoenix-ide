@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import type { TaskEntry } from '../api';
 import { useConversationSnapshot, useCreateConversationWithStore } from '../conversation';
 import { generateUUID } from '../utils/uuid';
+import { useModels } from '../hooks/useModels';
 import './TaskViewer.css';
 
 interface TaskViewerProps {
@@ -32,6 +33,7 @@ const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c
 export function TaskViewer({ task, tasksDir, activeSlug, readOnly = false, onBack }: TaskViewerProps) {
   const navigate = useNavigate();
   const createConversationWithStore = useCreateConversationWithStore();
+  const { models, defaultModel } = useModels();
   // Read the parent conversation live from the store rather than receiving a
   // snapshot threaded through props — the store is the single source of truth
   // (task 08684) so cwd/model/id never go stale here.
@@ -102,11 +104,16 @@ export function TaskViewer({ task, tasksDir, activeSlug, readOnly = false, onBac
       } catch {
         // ignore — non-fatal
       }
+      const parentModelIsAvailable = parentConversation.model !== null
+        && models.some(model => model.id === parentConversation.model);
+      const seedModel = parentModelIsAvailable ? parentConversation.model : defaultModel;
+      if (!seedModel) throw new Error('No model is available');
       const newConv = await createConversationWithStore(
         parentConversation.cwd,
         '', // empty — server accepts empty text when seed_parent_id is set
         messageId,
-        parentConversation.model ?? undefined,
+        seedModel,
+        null,
         [],
         'auto',
         null,

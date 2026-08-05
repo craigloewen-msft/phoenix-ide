@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { api, ExpansionError, MAX_FILE_ATTACHMENT_SIZE, MAX_FILE_ATTACHMENTS, MAX_TOTAL_FILE_ATTACHMENT_SIZE } from '../api';
 import { subscribeModels } from '../modelsPoller';
-import type { GitBranchEntry, ImageData, ModelsResponse, Project, TaskEntry } from '../api';
+import type { GitBranchEntry, ImageData, ModelEffort, ModelsResponse, Project, TaskEntry } from '../api';
 import type { DirStatus } from '../components/SettingsFields';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
 import { isWebSpeechSupported } from '../components/VoiceInput/VoiceRecorder';
@@ -12,6 +12,31 @@ const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
 const NEW_CONVERSATION_DRAFT_KEY = 'phoenix-new-conversation-draft';
 const MAX_PROJECT_SUGGESTIONS = 5;
+
+function effortSupportedByModel(models: ModelsResponse | null, modelId: string | null, effort: ModelEffort | null): boolean {
+  if (!effort) return true;
+  const capabilities = models?.models.find((model) => model.id === modelId)?.effort_capabilities;
+  return capabilities?.support === 'supported' && capabilities.levels.includes(effort);
+}
+
+export function reconcileSubscribedModelSelection(
+  modelsData: ModelsResponse,
+  previousModel: string | null,
+  previousEffort: ModelEffort | null,
+): { selectedModel: string | null; selectedEffort: ModelEffort | null } {
+  const selectedModel = modelsData.models.length === 0
+    ? null
+    : previousModel && modelsData.models.some((model) => model.id === previousModel)
+      ? previousModel
+      : modelsData.default;
+  return {
+    selectedModel,
+    selectedEffort: effortSupportedByModel(modelsData, selectedModel, previousEffort)
+      ? previousEffort
+      : null,
+  };
+}
+
 
 function readNewConversationDraft(): string {
   try {
@@ -153,6 +178,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [isGitDir, setIsGitDir] = useState<boolean | null>(null);
   const [models, setModels] = useState<ModelsResponse | null>(null);
   const [selectedModel, setSelectedModel] = useState<string | null>(() => localStorage.getItem(LAST_MODEL_KEY));
+  const [selectedEffort, setSelectedEffort] = useState<ModelEffort | null>(null);
   const [showAllModels, setShowAllModels] = useState(false);
   const [draft, setDraft] = useState(readNewConversationDraft);
   const [images, setImages] = useState<ImageData[]>([]);
@@ -188,8 +214,25 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const metadataRequestSeqRef = useRef(0);
   const taskAvailabilityRequestSeqRef = useRef(0);
   const taskListRequestSeqRef = useRef(0);
+  const selectedModelRef = useRef(selectedModel);
+  const selectedEffortRef = useRef(selectedEffort);
+  const selectModel = useCallback((model: string | null) => {
+    selectedModelRef.current = model;
+    setSelectedModel(model);
+  }, []);
+  const selectEffort = useCallback((effort: ModelEffort | null) => {
+    selectedEffortRef.current = effort;
+    setSelectedEffort(effort);
+  }, []);
 
   const workflow = effectiveWorkflow(workflowOverride, isGitDir, defaultBranch ?? currentBranch, branchUnavailable);
+
+  useEffect(() => {
+    selectedModelRef.current = selectedModel;
+  }, [selectedModel]);
+  useEffect(() => {
+    selectedEffortRef.current = selectedEffort;
+  }, [selectedEffort]);
 
   // Subscribe to the shared models poller so credential transitions
   // (Codex sign-in/sign-out, gateway flips) reach this page without a
@@ -197,18 +240,13 @@ export function useCreateConversation(navigate: (path: string) => void) {
   useEffect(() => {
     const unsub = subscribeModels(modelsData => {
       setModels(modelsData);
-      // Honor saved preference only if it's still a registered model. Without
-      // this, a stale localStorage entry (e.g. a model that was the only
-      // option at a previous deploy and has since been superseded) silently
-      // sticks and the user submits against an unintended model. After a
-      // sign-out the registered set may drop to empty — null out the
-      // selection so the UI doesn't pin a now-invalid id.
-      setSelectedModel(prev => {
-        if (modelsData.models.length === 0) return null;
-        return prev && modelsData.models.some(m => m.id === prev)
-          ? prev
-          : modelsData.default;
-      });
+      const next = reconcileSubscribedModelSelection(
+        modelsData,
+        selectedModelRef.current,
+        selectedEffortRef.current,
+      );
+      selectModel(next.selectedModel);
+      selectEffort(next.selectedEffort);
     });
     api.getEnv().then(env => {
       setHomeDir(env.home_dir);
@@ -220,11 +258,16 @@ export function useCreateConversation(navigate: (path: string) => void) {
       .then((projects) => setProjectDirs(suggestedProjectDirs(projects)))
       .catch((error) => console.warn('Failed to load project suggestions:', error));
     return () => { unsub(); };
-  }, []);
+  }, [selectEffort, selectModel]);
 
   // Save preferences
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
   useEffect(() => { if (selectedModel) localStorage.setItem(LAST_MODEL_KEY, selectedModel); }, [selectedModel]);
+  useEffect(() => {
+    if (!effortSupportedByModel(models, selectedModel, selectedEffort)) {
+      selectEffort(null);
+    }
+  }, [models, selectedEffort, selectedModel, selectEffort]);
   useEffect(() => { writeNewConversationDraft(draft); }, [draft]);
 
   // A new directory drops any prior workflow choice; the active workflow then
@@ -507,6 +550,11 @@ export function useCreateConversation(navigate: (path: string) => void) {
         setCreating(false);
         return;
       }
+      if (!selectedModel) {
+        setError('Pick a model before creating the conversation.');
+        setCreating(false);
+        return;
+      }
       const submitText = selectedTask
         ? buildTaskStartPrompt(trimmedCwd, selectedTask, trimmed)
         : trimmed;
@@ -514,7 +562,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
         trimmedCwd,
         submitText,
         messageId,
-        selectedModel || undefined,
+        selectedModel,
+        selectedEffort,
         images,
         submission.mode,
         submission.baseBranch,
@@ -555,7 +604,9 @@ export function useCreateConversation(navigate: (path: string) => void) {
     setIsGitDir,
     models,
     selectedModel,
-    setSelectedModel,
+    setSelectedModel: selectModel,
+    selectedEffort,
+    setSelectedEffort: selectEffort,
     showAllModels,
     setShowAllModels,
     draft,

@@ -144,6 +144,10 @@ struct ReviewWarning {
 #[derive(Debug, Serialize)]
 struct ReviewSummary {
     target: ReviewTargetSummary,
+    #[serde(skip)]
+    model: String,
+    #[serde(skip)]
+    effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
     files_changed: usize,
     files_reviewed: usize,
     insertions: u64,
@@ -287,7 +291,8 @@ impl Tool for CommissionReviewTool {
                 ToolOutput::success(pretty_json(&out))
                     .with_display(display)
                     .with_llm_usage(ToolLlmUsage {
-                        model: "commission_review".to_string(),
+                        model: out.summary.model.clone(),
+                        effective_effort: out.summary.effective_effort,
                         usage: out.summary.usage,
                     })
             }
@@ -402,21 +407,28 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         .into_output(started.elapsed().as_millis()));
     }
 
-    let service = ctx.llm_selector().default_service().ok_or_else(|| {
+    let selection = ctx.llm_selector().default_selection().ok_or_else(|| {
         "commission_review cannot run: no Phoenix LLM model is configured".to_string()
     })?;
+    let stamp_selection = |mut output: ReviewOutput| {
+        output.summary.model.clone_from(&selection.model_id);
+        output.summary.effective_effort = selection.effective_effort;
+        output
+    };
     let chunks = review_chunks(&collection.body);
     let mut findings = Vec::new();
     let mut reviewer_summaries = Vec::new();
     let mut warnings = Vec::new();
     let mut input_tokens = 0;
     let mut output_tokens = 0;
+    let mut reasoning_tokens = None;
+    let mut all_reasoning_tokens_reported = true;
     let mut cache_creation_tokens = 0;
     let mut cache_read_tokens = 0;
 
     for (index, chunk) in chunks.iter().enumerate() {
         if ctx.cancel.is_cancelled() {
-            return Ok(interrupted_review_output(
+            return Ok(stamp_selection(interrupted_review_output(
                 started,
                 target.summary.clone(),
                 &collection,
@@ -427,13 +439,14 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                     usage: phoenix_core::domain::llm_types::Usage {
                         input_tokens,
                         output_tokens,
+                        reasoning_tokens,
                         cache_creation_tokens,
                         cache_read_tokens,
                     },
                     reason: "commission_review cancelled during LLM review".to_string(),
                     interruption: ReviewInterruption::Cancelled,
                 },
-            ));
+            )));
         }
         let attempt_capture = phoenix_core::domain::llm_types::LlmAttemptCapture::new();
         let request = LlmRequest {
@@ -450,7 +463,12 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                 ))],
             }],
             tools: vec![],
-            max_tokens: Some(4096),
+            max_tokens: Some(
+                selection
+                    .max_output_tokens
+                    .map_or(4096, |limit| limit.min(4096)),
+            ),
+            effective_effort: selection.effective_effort,
             telemetry: Some(phoenix_core::domain::llm_types::LlmRequestTelemetry {
                 conversation_id: ctx.conversation_id.clone(),
                 root_conversation_id: ctx.root_conversation_id.clone(),
@@ -468,7 +486,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
             () = ctx.cancel.cancelled() => {
                 let _ = attempt_capture.finalize_cancelled();
                 ctx.record_llm_attempt(&attempt_capture);
-                return Ok(interrupted_review_output(
+                return Ok(stamp_selection(interrupted_review_output(
                     started,
                     target.summary.clone(),
                     &collection,
@@ -479,20 +497,21 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                         usage: phoenix_core::domain::llm_types::Usage {
                             input_tokens,
                             output_tokens,
+                            reasoning_tokens,
                             cache_creation_tokens,
                             cache_read_tokens,
                         },
                         reason: "commission_review cancelled during LLM review".to_string(),
                         interruption: ReviewInterruption::Cancelled,
                     },
-                ));
+                )));
             }
-            response = service.complete(&request) => {
+            response = selection.service.complete(&request) => {
                 ctx.record_llm_attempt(&attempt_capture);
                 match response {
                     Ok(response) => response,
                     Err(e) => {
-                        return Ok(interrupted_review_output(
+                        return Ok(stamp_selection(interrupted_review_output(
                         started,
                         target.summary.clone(),
                         &collection,
@@ -503,19 +522,34 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                             usage: phoenix_core::domain::llm_types::Usage {
                                 input_tokens,
                                 output_tokens,
+                                reasoning_tokens,
                                 cache_creation_tokens,
                                 cache_read_tokens,
                             },
                             reason: format!("commission_review LLM review failed: {e}"),
                             interruption: classify_llm_error(&e),
                         },
-                        ));
+                        )));
                     }
                 }
             },
         };
         input_tokens += response.usage.input_tokens;
         output_tokens += response.usage.output_tokens;
+        match response.usage.reasoning_tokens {
+            Some(chunk_reasoning_tokens) if all_reasoning_tokens_reported => {
+                reasoning_tokens = Some(
+                    reasoning_tokens
+                        .unwrap_or(0u64)
+                        .saturating_add(chunk_reasoning_tokens),
+                );
+            }
+            None => {
+                all_reasoning_tokens_reported = false;
+                reasoning_tokens = None;
+            }
+            Some(_) => {}
+        }
         cache_creation_tokens += response.usage.cache_creation_tokens;
         cache_read_tokens += response.usage.cache_read_tokens;
         let (mut chunk_findings, chunk_summary, chunk_warnings) = parse_findings(&response.text());
@@ -530,19 +564,22 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
     }
 
     normalize_findings(&mut findings, &mut warnings);
-    Ok(ReviewRun::Completed {
-        target: target.summary,
-        coverage: ReviewCoverage::from_collection(collection),
-        parsed: ParsedReviewOutput::from_parts(findings, &reviewer_summaries),
-        warnings,
-        usage: phoenix_core::domain::llm_types::Usage {
-            input_tokens,
-            output_tokens,
-            cache_creation_tokens,
-            cache_read_tokens,
-        },
-    }
-    .into_output(started.elapsed().as_millis()))
+    Ok(stamp_selection(
+        ReviewRun::Completed {
+            target: target.summary,
+            coverage: ReviewCoverage::from_collection(collection),
+            parsed: ParsedReviewOutput::from_parts(findings, &reviewer_summaries),
+            warnings,
+            usage: phoenix_core::domain::llm_types::Usage {
+                input_tokens,
+                output_tokens,
+                reasoning_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
+            },
+        }
+        .into_output(started.elapsed().as_millis()),
+    ))
 }
 
 #[derive(Debug)]
@@ -837,6 +874,8 @@ fn review_summary(
 ) -> ReviewSummary {
     ReviewSummary {
         target,
+        model: "commission_review".to_string(),
+        effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
         files_changed: coverage.files_changed,
         files_reviewed: coverage.files_reviewed,
         insertions: coverage.insertions,
@@ -2358,6 +2397,9 @@ mod tests {
             warnings_summary: Vec::new(),
             retry_recommendation: RetryRecommendation::DoNotRetry,
             summary: ReviewSummary {
+                model: "commission_review".to_string(),
+                effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(
+                ),
                 target: ReviewTargetSummary {
                     kind: ReviewTargetKind::CommittedBranchDiff,
                     repo_root: "/r".to_string(),
@@ -2993,6 +3035,9 @@ mod tests {
             },
             retry_recommendation: RetryRecommendation::DoNotRetry,
             summary: ReviewSummary {
+                model: "commission_review".to_string(),
+                effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(
+                ),
                 target: sample_target(),
                 files_changed: 1,
                 files_reviewed: 1,
@@ -3071,6 +3116,9 @@ mod tests {
             },
             retry_recommendation: RetryRecommendation::Retry,
             summary: ReviewSummary {
+                model: "commission_review".to_string(),
+                effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(
+                ),
                 target: sample_target(),
                 files_changed: 1,
                 files_reviewed: 1,
@@ -3122,6 +3170,9 @@ mod tests {
             },
             retry_recommendation: RetryRecommendation::DoNotRetry,
             summary: ReviewSummary {
+                model: "commission_review".to_string(),
+                effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(
+                ),
                 target: sample_target(),
                 files_changed: 1,
                 files_reviewed: 1,
@@ -3131,6 +3182,7 @@ mod tests {
                 usage: phoenix_core::domain::llm_types::Usage {
                     input_tokens: 10,
                     output_tokens: 20,
+                    reasoning_tokens: None,
                     cache_creation_tokens: 30,
                     cache_read_tokens: 40,
                 },

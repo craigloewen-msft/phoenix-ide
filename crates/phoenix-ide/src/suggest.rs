@@ -31,6 +31,8 @@ const MAX_SUGGEST_TOKENS: u32 = 400;
 pub async fn suggest_commands(
     query: &str,
     llm: Arc<dyn LlmService>,
+    effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
+    max_output_tokens: Option<u32>,
 ) -> Result<Vec<String>, String> {
     let request = LlmRequest {
         system: vec![SystemContent::cached(SUGGEST_SYSTEM)],
@@ -39,7 +41,10 @@ pub async fn suggest_commands(
             content: vec![ContentBlock::text(query)],
         }],
         tools: vec![],
-        max_tokens: Some(MAX_SUGGEST_TOKENS),
+        max_tokens: Some(
+            max_output_tokens.map_or(MAX_SUGGEST_TOKENS, |limit| limit.min(MAX_SUGGEST_TOKENS)),
+        ),
+        effective_effort,
         telemetry: None,
         // Shared by every suggestion call so SUGGEST_SYSTEM caches.
         cache_key: PromptCacheKey::stable("command-suggester"),

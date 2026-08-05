@@ -366,6 +366,9 @@ pub struct ConversationCreationIntent {
     pub cwd: String,
     #[serde(default)]
     pub model: Option<String>,
+    // owned: pre-feature creation jobs had no effort; None correctly follows the model default.
+    #[serde(default)]
+    pub effort: Option<crate::domain::llm_types::ModelEffort>,
     pub text: String,
     // owned: pre-feature rows had no accepted expansion status; false correctly re-expands.
     #[serde(default)]
@@ -434,6 +437,10 @@ pub struct Conversation {
     pub updated_at: DateTime<Utc>,
     pub archived: bool,
     pub model: Option<String>,
+    /// Explicit per-conversation effort override. `None` follows the selected
+    /// model route's native default.
+    #[serde(default)]
+    pub effort: Option<crate::domain::llm_types::ModelEffort>,
     /// Project this conversation belongs to (None for legacy pre-project conversations)
     #[serde(default)]
     pub project_id: Option<String>,
@@ -1618,6 +1625,9 @@ pub struct UsageTurnRow {
     pub first_byte_at: Option<String>,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub reasoning_tokens: Option<i64>,
+    pub effort_source: crate::domain::llm_types::EffortSource,
+    pub effort_level: Option<crate::domain::llm_types::ModelEffort>,
     pub cache_creation_tokens: i64,
     pub cache_read_tokens: i64,
 }
@@ -1935,6 +1945,7 @@ mod conversation_serde_tests {
             transcript_generation: 1,
             model: None,
             project_id: None,
+            effort: None,
             conv_mode: ConvMode::Explore {
                 worktree_path: None,
                 next_taskmd_id_hint: None,

@@ -79,11 +79,31 @@ export type { BashRingWindow } from './generated/BashRingWindow';
 export type { BashRingLine } from './generated/BashRingLine';
 import type { BashHandleInspection as BashHandleInspectionType } from './generated/BashHandleInspection';
 
+export type { ModelEffort } from './generated/ModelEffort';
+import type { ModelEffort } from './generated/ModelEffort';
+import type { EffortSource } from './generated/EffortSource';
+import type { UsageData } from './generated/UsageData';
+export type { UsageData } from './generated/UsageData';
+
+export type NativeDefaultCapability =
+  | { known: ModelEffort }
+  | 'unknown';
+
+export type EffortCapabilities =
+  | { support: 'unsupported' }
+  | { support: 'unknown' }
+  | {
+    support: 'supported';
+    levels: ModelEffort[];
+    native_default?: NativeDefaultCapability;
+  };
+
 export interface Conversation {
   id: string;
   slug: string;
   title?: string | null;
   model: string;
+  effort?: ModelEffort | null;
   cwd: string;
   created_at: string;
   updated_at: string;
@@ -591,7 +611,7 @@ export interface Message {
   type?: string; // legacy
   content: MessageContent;
   display_data?: ImageData | Record<string, unknown> | null; // For tool results with images (e.g., screenshots)
-  usage_data?: UsageData;
+  usage_data?: UsageData | null;
   created_at: string;
 }
 
@@ -690,19 +710,13 @@ export const MAX_FILE_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 export const MAX_TOTAL_FILE_ATTACHMENT_SIZE = 25 * 1024 * 1024;
 export const MAX_FILE_ATTACHMENTS = 10;
 
-export interface UsageData {
-  input_tokens: number;
-  output_tokens: number;
-  cache_creation_input_tokens?: number;
-  cache_read_input_tokens?: number;
-}
-
 export interface ModelInfo {
   id: string;
   provider: string;
   description: string;
   context_window: number;
   recommended: boolean;
+  effort_capabilities?: EffortCapabilities;
 }
 
 export type CredentialStatus = 'not_configured' | 'valid' | 'required' | 'running' | 'failed';
@@ -1142,6 +1156,7 @@ export interface AnalyticsFidelity {
 export interface AnalyticsTokenTotals {
   input_tokens: number;
   output_tokens: number;
+  reasoning_tokens: number | null;
   cache_creation_tokens: number;
   cache_read_tokens: number;
 }
@@ -1151,6 +1166,8 @@ export interface AnalyticsUsageTurn {
   conversation_id: string;
   root_conversation_id: string;
   model: string;
+  effort_source: EffortSource;
+  effort_level: ModelEffort | null;
   created_at: string;
   first_byte_at: string | null;
   first_byte_latency_ms: number | null;
@@ -1497,7 +1514,8 @@ export const api = {
     cwd: string,
     text: string,
     messageId: string,
-    model?: string,
+    model: string,
+    effort?: ModelEffort | null,
     images: ImageData[] = [],
     mode?: 'direct' | 'managed' | 'branch' | 'auto',
     baseBranch?: string | null,
@@ -1507,7 +1525,7 @@ export const api = {
     checkoutRef?: string | null,
     conversationId?: string,
   ): Promise<Conversation> {
-    const body: Record<string, unknown> = { cwd, model, text, message_id: messageId, images, mode };
+    const body: Record<string, unknown> = { cwd, model, effort, text, message_id: messageId, images, mode };
     if (conversationId) {
       body['conversation_id'] = conversationId;
     }
@@ -2280,11 +2298,11 @@ export const api = {
     return resp.json();
   },
 
-  async upgradeModel(conversationId: string, model: string): Promise<void> {
+  async upgradeModel(conversationId: string, model: string, effort?: ModelEffort | null): Promise<void> {
     const resp = await fetch(`/api/conversations/${conversationId}/upgrade-model`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model }),
+      body: JSON.stringify({ model, effort }),
     });
     if (!resp.ok) {
       const err = await resp.json();

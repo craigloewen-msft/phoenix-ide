@@ -7,7 +7,7 @@ use super::rate_limit::{
     parse_rate_limit_for_limit, parse_rate_limit_reached_type, QuotaDetails,
 };
 use super::stream_telemetry::{GenerationKind, StreamTelemetryRecorder};
-use super::types::{ContentBlock, LlmRequest, LlmResponse, MessageRole, Usage};
+use super::types::{ContentBlock, LlmRequest, LlmResponse, MessageRole, ModelEffort, Usage};
 use super::LlmError;
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
@@ -210,6 +210,7 @@ fn classify_responses_error(code: &str, message: &str) -> LlmError {
 struct ResponsesStreamAccumulator {
     input_tokens: u32,
     output_tokens: u32,
+    reasoning_tokens: Option<u32>,
     /// Cached-read subset of `input_tokens`.
     cached_tokens: u32,
     /// Cache-write subset of `input_tokens` on GPT-5.6-era models.
@@ -232,6 +233,7 @@ impl ResponsesStreamAccumulator {
         Self {
             input_tokens: 0,
             output_tokens: 0,
+            reasoning_tokens: None,
             cached_tokens: 0,
             cache_write_tokens: 0,
             output_items: Vec::new(),
@@ -425,6 +427,10 @@ impl ResponsesStreamAccumulator {
                             .unwrap_or(0),
                     )
                     .unwrap_or(0);
+                    self.reasoning_tokens = usage
+                        .pointer("/output_tokens_details/reasoning_tokens")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| u32::try_from(value).ok());
                     self.cached_tokens = u32::try_from(
                         usage
                             .pointer("/input_tokens_details/cached_tokens")
@@ -526,6 +532,11 @@ impl ResponsesStreamAccumulator {
                     cached_tokens: self.cached_tokens,
                     cache_write_tokens: self.cache_write_tokens,
                 },
+                output_tokens_details: self.reasoning_tokens.map(|reasoning_tokens| {
+                    ResponsesApiOutputTokensDetails {
+                        reasoning_tokens: Some(reasoning_tokens),
+                    }
+                }),
             },
         })?;
         telemetry.attach_success(&mut response);
@@ -1566,7 +1577,11 @@ fn translate_to_responses_request(
         max_output_tokens: if use_codex_backend {
             None
         } else {
-            request.max_tokens
+            Some(
+                request
+                    .raised_output_token_ceiling()
+                    .unwrap_or_else(|| default_output_headroom(request.effective_effort.level())),
+            )
         },
         stream: None,
         store: if use_codex_backend { Some(false) } else { None },
@@ -1575,6 +1590,10 @@ fn translate_to_responses_request(
             mode: PromptCacheMode::Implicit,
             ttl: PromptCacheTtl::ThirtyMinutes,
         }),
+        reasoning: request
+            .effective_effort
+            .explicit_level()
+            .map(platform_reasoning),
         // Match the explicit defaults Codex CLI and Pi send. `tool_choice`
         // mirrors the server-side default but stabilises the wire shape so
         // non-default strategies become a smaller change later. Omitted when
@@ -1598,6 +1617,25 @@ fn translate_to_responses_request(
         parallel_tool_calls: if has_tools { Some(true) } else { None },
         include: Vec::new(),
         tags: None,
+    }
+}
+
+fn default_output_headroom(effort: Option<ModelEffort>) -> u32 {
+    if effort.is_some_and(ModelEffort::needs_extended_output_headroom) {
+        64_000
+    } else {
+        16_384
+    }
+}
+
+fn platform_reasoning(effort: ModelEffort) -> ResponsesApiReasoning {
+    ResponsesApiReasoning { effort }
+}
+
+fn codex_lite_reasoning(effort: Option<ModelEffort>) -> CodexResponsesLiteReasoning {
+    CodexResponsesLiteReasoning {
+        context: CodexReasoningContext::AllTurns,
+        effort,
     }
 }
 
@@ -1746,10 +1784,15 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmRes
         // preserves the provider-reported context total.
         let cached = u64::from(resp.usage.input_tokens_details.cached_tokens);
         let written = u64::from(resp.usage.input_tokens_details.cache_write_tokens);
+        let reasoning = resp
+            .usage
+            .output_tokens_details
+            .and_then(|details| details.reasoning_tokens.map(u64::from));
         Usage {
             input_tokens: u64::from(resp.usage.input_tokens)
                 .saturating_sub(cached.saturating_add(written)),
             output_tokens: u64::from(resp.usage.output_tokens),
+            reasoning_tokens: reasoning,
             cache_creation_tokens: written,
             cache_read_tokens: cached,
         }
@@ -1919,6 +1962,8 @@ enum CodexResponsesLiteToolChoice {
 #[derive(Debug, Serialize)]
 struct CodexResponsesLiteReasoning {
     context: CodexReasoningContext,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<ModelEffort>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1956,9 +2001,7 @@ impl CodexResponsesLiteRequest {
                 .expect("LlmRequest always supplies a prompt cache key"),
             parallel_tool_calls: false,
             tool_choice: CodexResponsesLiteToolChoice::Auto,
-            reasoning: CodexResponsesLiteReasoning {
-                context: CodexReasoningContext::AllTurns,
-            },
+            reasoning: codex_lite_reasoning(request.reasoning.as_ref().map(|r| r.effort)),
             stream: request.stream,
             tags: request.tags,
         }
@@ -1991,6 +2034,8 @@ pub(crate) struct ResponsesApiRequest {
     /// the ChatGPT/Codex bridge, which reject the new platform fields.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) prompt_cache_options: Option<PromptCacheOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning: Option<ResponsesApiReasoning>,
     /// Tool selection strategy. `"auto"` is the server-side default; sent
     /// explicitly to stabilise the wire shape and to make non-default
     /// strategies a smaller change later. Omitted when no tools are sent.
@@ -2012,6 +2057,11 @@ pub(crate) struct ResponsesApiRequest {
     /// from the wire when empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tags: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ResponsesApiReasoning {
+    effort: ModelEffort,
 }
 
 #[derive(Debug, Serialize)]
@@ -2237,6 +2287,11 @@ pub(crate) struct ResponsesApiInputTokensDetails {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct ResponsesApiOutputTokensDetails {
+    pub(crate) reasoning_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct ResponsesApiUsage {
     pub(crate) input_tokens: u32,
     pub(crate) output_tokens: u32,
@@ -2246,6 +2301,8 @@ pub(crate) struct ResponsesApiUsage {
     /// indistinguishable from "we forgot to parse it".
     #[serde(default)]
     pub(crate) input_tokens_details: ResponsesApiInputTokensDetails,
+    #[serde(default)]
+    pub(crate) output_tokens_details: Option<ResponsesApiOutputTokensDetails>,
 }
 
 #[cfg(test)]
@@ -2424,9 +2481,11 @@ mod tests {
             backend: ModelBackend::OpenAIResponses,
             description: String::new(),
             context_window: 100_000,
+            max_output_tokens: None,
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
+            effort_capabilities: crate::EffortCapabilities::unknown(),
         }
     }
 
@@ -2442,6 +2501,7 @@ mod tests {
                 .collect(),
             tools: vec![],
             max_tokens: None,
+            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             telemetry: None,
             cache_key: PromptCacheKey::stable("integration"),
         }
@@ -3027,9 +3087,114 @@ mod tests {
             messages: vec![],
             tools: vec![],
             max_tokens: None,
+            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             telemetry: None,
             cache_key: PromptCacheKey::stable("test"),
         }
+    }
+
+    #[test]
+    fn explicit_effort_serializes_on_platform_and_native_default_omits_reasoning() {
+        let mut request = empty_request();
+        request.max_tokens = Some(16_384);
+
+        let native = serde_json::to_value(translate_to_responses_request(
+            "gpt-5.6-sol",
+            &request,
+            false,
+        ))
+        .unwrap();
+        assert!(native.get("reasoning").is_none());
+        assert_eq!(native["max_output_tokens"], 16_384);
+
+        request.effective_effort =
+            phoenix_core::domain::llm_types::EffectiveEffort::native_known(ModelEffort::Medium);
+        let native_known = serde_json::to_value(translate_to_responses_request(
+            "gpt-5.6-sol",
+            &request,
+            false,
+        ))
+        .unwrap();
+        assert!(native_known.get("reasoning").is_none());
+
+        request.effective_effort =
+            phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::Max);
+        let explicit = serde_json::to_value(translate_to_responses_request(
+            "gpt-5.6-sol",
+            &request,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(explicit["reasoning"]["effort"], "max");
+        assert_eq!(explicit["max_output_tokens"], 16_384);
+    }
+
+    #[test]
+    fn codex_lite_composes_effort_with_reasoning_context() {
+        let mut request = empty_request();
+        request.effective_effort =
+            phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::High);
+        let translated = translate_to_backend_request("gpt-5.6-sol", &request, true);
+        let json = serde_json::to_value(translated).unwrap();
+
+        assert_eq!(json["reasoning"]["context"], "all_turns");
+        assert_eq!(json["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn present_output_details_may_omit_reasoning_tokens() {
+        let response: ResponsesApiResponse = serde_json::from_value(serde_json::json!({
+            "status": "completed",
+            "output": [],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "output_tokens_details": {}
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            response
+                .usage
+                .output_tokens_details
+                .unwrap()
+                .reasoning_tokens,
+            None
+        );
+    }
+
+    #[test]
+    fn reasoning_tokens_are_preserved_as_output_subset() {
+        let response: ResponsesApiResponse = serde_json::from_value(serde_json::json!({
+            "status": "completed",
+            "output": [{"type":"message","content":[{"type":"output_text","text":"ok"}]}],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 25,
+                "output_tokens_details": {"reasoning_tokens": 20}
+            }
+        }))
+        .unwrap();
+
+        let normalized = normalize_responses_api_response(response).unwrap();
+        assert_eq!(normalized.usage.output_tokens, 25);
+        assert_eq!(normalized.usage.reasoning_tokens, Some(20));
+    }
+
+    #[test]
+    fn missing_reasoning_tokens_stays_absent() {
+        let response: ResponsesApiResponse = serde_json::from_value(serde_json::json!({
+            "status": "completed",
+            "output": [{"type":"message","content":[{"type":"output_text","text":"ok"}]}],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 25
+            }
+        }))
+        .unwrap();
+
+        let normalized = normalize_responses_api_response(response).unwrap();
+        assert_eq!(normalized.usage.reasoning_tokens, None);
     }
 
     #[tokio::test]
@@ -3695,6 +3860,32 @@ mod tests {
         assert_eq!(acc.output_tokens, 5);
     }
 
+    #[tokio::test]
+    async fn streamed_reasoning_tokens_are_preserved_when_reported() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
+        let data = r#"{
+            "type":"response.completed",
+            "response":{
+                "usage":{
+                    "input_tokens":10,
+                    "output_tokens":25,
+                    "output_tokens_details":{"reasoning_tokens":20}
+                },
+                "output":[{"type":"message","role":"assistant","content":[
+                    {"type":"output_text","text":"answer"}
+                ]}]
+            }
+        }"#;
+
+        acc.process_event("response.completed", data, &tx)
+            .await
+            .expect("handler should preserve terminal usage");
+        let response = acc.into_response().expect("stream should normalize");
+
+        assert_eq!(response.usage.reasoning_tokens, Some(20));
+    }
+
     /// `OpenAI`'s cached-read and cache-write details are both subsets of
     /// `input_tokens`; normalization splits both without changing context usage.
     #[tokio::test]
@@ -3732,6 +3923,7 @@ mod tests {
                     cached_tokens: acc.cached_tokens,
                     cache_write_tokens: acc.cache_write_tokens,
                 },
+                output_tokens_details: None,
             },
         })
         .expect("a response with a message item normalizes");
@@ -3900,6 +4092,7 @@ mod tests {
                     cached_tokens: 0,
                     cache_write_tokens: 0,
                 },
+                output_tokens_details: None,
             },
         })
         .expect_err("empty content with billed output tokens must fail");
@@ -3935,6 +4128,7 @@ mod tests {
                     cached_tokens: 0,
                     cache_write_tokens: 0,
                 },
+                output_tokens_details: None,
             },
         })
         .expect("a refusal is valid content, not a billed-but-empty failure");

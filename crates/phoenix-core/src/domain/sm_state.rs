@@ -2282,6 +2282,8 @@ pub struct ConvContext {
     pub execution_environment: ConversationExecutionEnvironment,
     #[allow(dead_code)] // Used by LLM client selection
     pub model_id: String,
+    pub effort: Option<crate::domain::llm_types::ModelEffort>,
+    pub effective_effort: crate::domain::llm_types::EffectiveEffort,
     /// Whether this is a sub-agent conversation
     pub is_sub_agent: bool,
     /// Model's context window size in tokens
@@ -2358,6 +2360,8 @@ impl ConvContext {
             execution_environment,
             model_id: model_id.into(),
             is_sub_agent: false,
+            effort: None,
+            effective_effort: crate::domain::llm_types::EffectiveEffort::native_unknown(),
             context_window,
             context_exhaustion_behavior: ContextExhaustionBehavior::ThresholdBasedContinuation,
             mode_context: None,
@@ -2424,6 +2428,8 @@ impl ConvContext {
             execution_environment: ConversationExecutionEnvironment::Filesystem { working_dir },
             model_id: model_id.into(),
             is_sub_agent: true,
+            effort: None,
+            effective_effort: crate::domain::llm_types::EffectiveEffort::native_unknown(),
             context_window,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             mode_context: None,

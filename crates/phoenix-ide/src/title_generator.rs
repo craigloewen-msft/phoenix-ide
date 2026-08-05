@@ -29,6 +29,8 @@ const CHAIN_NAME_TOTAL_CHARS: usize = 4000;
 pub async fn generate_title(
     message_text: &str,
     llm_service: Arc<dyn LlmService>,
+    effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
+    max_output_tokens: Option<u32>,
 ) -> Option<String> {
     // Truncate very long messages for the prompt
     let truncated = if message_text.len() > 500 {
@@ -46,7 +48,8 @@ pub async fn generate_title(
             content: vec![ContentBlock::text(prompt)],
         }],
         tools: vec![],
-        max_tokens: Some(50), // Title should be very short
+        max_tokens: Some(max_output_tokens.map_or(50, |limit| limit.min(50))), // Title should be very short
+        effective_effort,
         telemetry: None,
         // Shared by every title-generation call so TITLE_PROMPT caches.
         cache_key: PromptCacheKey::stable("title-generator"),
@@ -93,6 +96,8 @@ pub async fn generate_title(
 pub async fn generate_chain_name(
     first_messages: &[String],
     llm_service: Arc<dyn LlmService>,
+    effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
+    max_output_tokens: Option<u32>,
 ) -> Option<String> {
     if first_messages.is_empty() {
         return None;
@@ -126,7 +131,8 @@ pub async fn generate_chain_name(
             content: vec![ContentBlock::text(prompt)],
         }],
         tools: vec![],
-        max_tokens: Some(50), // Name should be very short
+        max_tokens: Some(max_output_tokens.map_or(50, |limit| limit.min(50))), // Name should be very short
+        effective_effort,
         telemetry: None,
         // Distinct key from the title generator so the two prompts cache
         // independently — they have different prefixes and output shapes.

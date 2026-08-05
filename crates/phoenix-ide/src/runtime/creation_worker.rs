@@ -12,9 +12,28 @@ use fs2::FileExt;
 use phoenix_core::domain::creation_protocol::{
     CreationClaimToken, CreationStatus, CreationWorkerId,
 };
+use phoenix_llm::ModelRegistry;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+pub(crate) fn resolve_creation_model(
+    registry: &ModelRegistry,
+    explicit_model: Option<&str>,
+    requested_mode: &str,
+    repo_present: bool,
+) -> String {
+    if let Some(model) = explicit_model {
+        return registry.resolve_model_id(model);
+    }
+
+    let registry_default = registry.default_model_id();
+    if requested_mode == "managed" || (requested_mode == "auto" && repo_present) {
+        registry.cheap_model_id_for_provider(&registry_default)
+    } else {
+        registry_default.clone()
+    }
+}
 
 pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<(), String> {
     let worker_id = CreationWorkerId(format!("creation-worker-{}", uuid::Uuid::new_v4()));
@@ -314,16 +333,12 @@ async fn provision_conversation(
     let repo_root = phoenix_core::git::detect_git_repo_root(Path::new(&initial_cwd));
     let requested_mode = intent.mode.as_deref().unwrap_or("direct");
 
-    let registry_default = manager.llm_registry.default_model_id();
-    let mut resolved_model = intent.model.clone().unwrap_or_else(|| {
-        if requested_mode == "managed" {
-            manager
-                .llm_registry
-                .cheap_model_id_for_provider(&registry_default)
-        } else {
-            registry_default.clone()
-        }
-    });
+    let mut resolved_model = resolve_creation_model(
+        &manager.llm_registry,
+        intent.model.as_deref(),
+        requested_mode,
+        repo_root.is_some(),
+    );
 
     let mut conv_mode = ConvMode::Direct;
     let mut effective_cwd = initial_cwd.clone();
@@ -541,17 +556,19 @@ async fn provision_conversation(
                 })?),
                 next_taskmd_id_hint,
             };
-            resolved_model = intent.model.clone().unwrap_or_else(|| {
-                manager
-                    .llm_registry
-                    .cheap_model_id_for_provider(&registry_default)
-            });
+
+            resolved_model = resolve_creation_model(
+                &manager.llm_registry,
+                intent.model.as_deref(),
+                requested_mode,
+                true,
+            );
         }
         other => {
             return Err((
                 format!("Invalid mode '{other}'. Expected one of: direct, managed, branch, auto"),
                 ErrorKind::InvalidRequest,
-            ))
+            ));
         }
     }
 
@@ -591,8 +608,19 @@ async fn provision_conversation(
         );
     }
     let generated_title = if seed_title.is_none() && !title_source.is_empty() {
-        if let Some(cheap_model) = manager.model_registry().get_cheap_model() {
-            crate::title_generator::generate_title(&title_source, cheap_model).await
+        if let Some((cheap_model_id, cheap_model)) =
+            manager.model_registry().get_cheap_model_with_id()
+        {
+            let effective_effort = manager
+                .model_registry()
+                .effective_effort(&cheap_model_id, None);
+            crate::title_generator::generate_title(
+                &title_source,
+                cheap_model,
+                effective_effort,
+                manager.model_registry().output_token_limit(&cheap_model_id),
+            )
+            .await
         } else {
             None
         }
@@ -656,6 +684,18 @@ async fn provision_conversation(
     } else {
         phoenix_core::domain::creation_protocol::CreationStage::ExpandInitialMessage
     };
+
+    if let Some(effort) = intent.effort {
+        if !manager
+            .llm_registry
+            .supports_effort(&resolved_model, effort)
+        {
+            return Err((
+                format!("Effort '{effort}' is not supported by resolved model '{resolved_model}'"),
+                ErrorKind::InvalidRequest,
+            ));
+        }
+    }
 
     if creation_metadata_needs_commit(job.protocol.stage) {
         let metadata_outcome = manager
@@ -1038,6 +1078,7 @@ mod temporary_creation_branch_tests {
             intent: phoenix_core::domain::db_schema::ConversationCreationIntent {
                 cwd: "/tmp".to_string(),
                 model: None,
+                effort: None,
                 text: String::new(),
                 expansion_preflighted: false,
                 llm_text: None,
@@ -1486,5 +1527,51 @@ fn app_error_to_kind(error: AppError) -> (String, ErrorKind) {
             (message, ErrorKind::ServerError)
         }
         AppError::Forbidden(message) => (message, ErrorKind::Auth),
+    }
+}
+
+#[cfg(test)]
+mod model_resolution_tests {
+    use super::resolve_creation_model;
+    use phoenix_llm::ModelRegistry;
+
+    fn registry() -> ModelRegistry {
+        ModelRegistry::new_empty()
+    }
+
+    #[test]
+    fn managed_creation_defaults_to_cheap_model() {
+        let registry = registry();
+        assert_eq!(
+            resolve_creation_model(&registry, None, "managed", true),
+            registry.cheap_model_id_for_provider(&registry.default_model_id())
+        );
+    }
+
+    #[test]
+    fn auto_creation_uses_direct_default_without_repository() {
+        let registry = registry();
+        assert_eq!(
+            resolve_creation_model(&registry, None, "auto", false),
+            registry.default_model_id()
+        );
+    }
+
+    #[test]
+    fn retired_creation_job_model_resolves_to_current_route() {
+        let registry = registry();
+        assert_eq!(
+            resolve_creation_model(&registry, Some("gpt-5.3-codex"), "direct", false),
+            "gpt-5.4"
+        );
+    }
+
+    #[test]
+    fn explicit_model_wins_over_mode_defaults() {
+        let registry = registry();
+        assert_eq!(
+            resolve_creation_model(&registry, Some("gpt-5.4"), "managed", true),
+            "gpt-5.4"
+        );
     }
 }

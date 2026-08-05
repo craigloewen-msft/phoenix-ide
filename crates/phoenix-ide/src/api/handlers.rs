@@ -1773,16 +1773,6 @@ async fn create_conversation_with_id(
         }
     }
 
-    // Validate requested model exists in the registry
-    if let Some(ref model) = req.model {
-        if state.llm_registry.get(model).is_none() {
-            let available = state.llm_registry.available_models().join(", ");
-            return Err(AppError::BadRequest(format!(
-                "Model '{model}' is not available. Available models: {available}"
-            )));
-        }
-    }
-
     if let Ok(conv) = state.runtime.db().get_conversation(&id).await {
         if let Some(existing_job) = state
             .runtime
@@ -1860,6 +1850,22 @@ async fn create_conversation_with_id(
         }
     }
 
+    if state.llm_registry.get(&req.model).is_none() {
+        let available = state.llm_registry.available_models().join(", ");
+        return Err(AppError::BadRequest(format!(
+            "Model '{}' is not available. Available models: {available}",
+            req.model
+        )));
+    }
+    let selected_model = req.model.clone();
+    if let Some(effort) = req.effort {
+        if !state.llm_registry.supports_effort(&selected_model, effort) {
+            return Err(AppError::BadRequest(format!(
+                "Effort '{effort}' is not supported by model '{selected_model}'"
+            )));
+        }
+    }
+
     let requested_mode = req.mode.as_deref().unwrap_or("direct");
     let persisted_prompt_text = req.text.clone();
 
@@ -1868,12 +1874,8 @@ async fn create_conversation_with_id(
     let conv_mode = crate::db::ConvMode::Direct;
     let effective_cwd = req.cwd.clone();
     let desired_base_branch = req.base_branch.as_deref();
-    let registry_default_model = state.llm_registry.default_model_id();
-    let shell_model = req
-        .model
-        .clone()
-        .unwrap_or_else(|| registry_default_model.clone());
-    let intent_model = req.model.clone();
+    let shell_model = selected_model.clone();
+    let intent_model = Some(req.model.clone());
     let resolved_mode_for_intent = match requested_mode {
         "direct" => None,
         other => Some(other.to_string()),
@@ -1929,6 +1931,7 @@ async fn create_conversation_with_id(
     let intent = crate::db::ConversationCreationIntent {
         cwd: effective_cwd.clone(),
         model: intent_model,
+        effort: req.effort,
         text: persisted_prompt_text,
         expansion_preflighted: false,
         llm_text: None,
@@ -4170,6 +4173,14 @@ async fn upgrade_conversation_model(
             state.llm_registry.available_models()
         )));
     }
+    if let crate::api::types::EffortUpdate::Set(effort) = req.effort {
+        if !state.llm_registry.supports_effort(&req.model, effort) {
+            return Err(AppError::BadRequest(format!(
+                "Effort '{effort}' is not supported by model '{}'",
+                req.model
+            )));
+        }
+    }
 
     // Validate conversation exists and is in a state that allows model change
     let conv = state
@@ -4186,11 +4197,26 @@ async fn upgrade_conversation_model(
         )));
     }
 
+    let next_effort = match req.effort {
+        crate::api::types::EffortUpdate::Omitted => match conv.effort {
+            Some(effort) if state.llm_registry.supports_effort(&req.model, effort) => Some(effort),
+            Some(effort) => {
+                return Err(AppError::BadRequest(format!(
+                    "Effort '{effort}' is not supported by model '{}'; send effort: null to reset or provide a compatible replacement",
+                    req.model
+                )));
+            }
+            None => None,
+        },
+        crate::api::types::EffortUpdate::Reset => None,
+        crate::api::types::EffortUpdate::Set(effort) => Some(effort),
+    };
+
     // Update in DB
     state
         .runtime
         .db()
-        .update_conversation_model(&id, &req.model)
+        .update_conversation_model_and_effort(&id, &req.model, next_effort)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -5543,19 +5569,30 @@ async fn regenerate_conversation_name(
             )
         })?;
 
-    let cheap_model = state.llm_registry.get_cheap_model().ok_or_else(|| {
-        AppError::Internal("no cheap LLM model is available for name regeneration".to_string())
-    })?;
+    let (cheap_model_id, cheap_model) =
+        state
+            .llm_registry
+            .get_cheap_model_with_id()
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "no cheap LLM model is available for name regeneration".to_string(),
+                )
+            })?;
+    let effective_effort = state.llm_registry.effective_effort(&cheap_model_id, None);
 
-    let generated = crate::title_generator::generate_title(&opening, cheap_model)
-        .await
-        .filter(|slug| !slug.is_empty())
-        .ok_or_else(|| {
-            AppError::Internal(
-                "conversation name regeneration failed — the existing name is unchanged"
-                    .to_string(),
-            )
-        })?;
+    let generated = crate::title_generator::generate_title(
+        &opening,
+        cheap_model,
+        effective_effort,
+        state.llm_registry.output_token_limit(&cheap_model_id),
+    )
+    .await
+    .filter(|slug| !slug.is_empty())
+    .ok_or_else(|| {
+        AppError::Internal(
+            "conversation name regeneration failed — the existing name is unchanged".to_string(),
+        )
+    })?;
 
     rename_conversation_slug(&state, &id, &generated).await?;
     conversation_response(&state, &id).await
@@ -5633,15 +5670,24 @@ async fn suggest_handler(
         return Err(AppError::BadRequest("query must not be empty".to_string()));
     }
 
-    let llm = match &req.model {
-        Some(id) => state.llm_registry.get(id),
-        None => state.llm_registry.get_cheap_model(),
+    let (model_id, llm) = match &req.model {
+        Some(id) => state
+            .llm_registry
+            .get(id)
+            .map(|service| (id.clone(), service)),
+        None => state.llm_registry.get_cheap_model_with_id(),
     }
     .ok_or_else(|| AppError::Internal("no LLM model available".to_string()))?;
+    let effective_effort = state.llm_registry.effective_effort(&model_id, None);
 
-    let commands = crate::suggest::suggest_commands(query, llm)
-        .await
-        .map_err(AppError::Internal)?;
+    let commands = crate::suggest::suggest_commands(
+        query,
+        llm,
+        effective_effort,
+        state.llm_registry.output_token_limit(&model_id),
+    )
+    .await
+    .map_err(AppError::Internal)?;
 
     Ok(Json(SuggestResponse { commands }))
 }
@@ -7601,7 +7647,8 @@ mod conversation_cwd_validation_tests {
         CreateConversationRequest {
             conversation_id: None,
             cwd,
-            model: None,
+            model: "claude-sonnet-5".to_string(),
+            effort: None,
             text: "hello".to_string(),
             message_id: uuid::Uuid::new_v4().to_string(),
             images: Vec::new(),
@@ -7659,7 +7706,7 @@ mod conversation_cwd_validation_tests {
     }
 
     #[tokio::test]
-    async fn create_conversation_preserves_omitted_model_in_durable_intent() {
+    async fn create_conversation_preserves_explicit_model_in_durable_intent() {
         let state = hard_delete_cascade_tests::make_test_state().await;
         let conversation_id = uuid::Uuid::new_v4().to_string();
         let mut request = create_request("/".to_string());
@@ -7677,7 +7724,7 @@ mod conversation_cwd_validation_tests {
             .expect("job lookup")
             .expect("creation job");
 
-        assert_eq!(job.intent.model, None);
+        assert_eq!(job.intent.model.as_deref(), Some("claude-sonnet-5"));
     }
 
     #[tokio::test]
@@ -7781,6 +7828,7 @@ mod conversation_cwd_validation_tests {
                 intent: crate::db::ConversationCreationIntent {
                     cwd: tmp.path().to_string_lossy().to_string(),
                     model: None,
+                    effort: None,
                     text: "retry".to_string(),
                     expansion_preflighted: false,
                     llm_text: None,
@@ -7882,6 +7930,7 @@ mod conversation_cwd_validation_tests {
                 intent: crate::db::ConversationCreationIntent {
                     cwd: "/tmp".to_string(),
                     model: None,
+                    effort: None,
                     text: "original".to_string(),
                     expansion_preflighted: false,
                     llm_text: None,
@@ -8089,13 +8138,35 @@ pub(crate) mod hard_delete_cascade_tests {
     use phoenix_llm::ModelRegistry;
     use std::sync::Arc;
 
+    struct TestLlm;
+
+    #[async_trait::async_trait]
+    impl phoenix_llm::LlmService for TestLlm {
+        async fn complete(
+            &self,
+            _request: &phoenix_llm::LlmRequest,
+        ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
+            Ok(phoenix_llm::LlmResponse {
+                content: vec![],
+                end_turn: true,
+                usage: phoenix_llm::Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            })
+        }
+
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn model_id(&self) -> &str {
+            "claude-sonnet-5"
+        }
+    }
+
     /// Construct a minimal `AppState` backed by an in-memory database.
     /// The state machine handler is started so `runtime.try_get_handle`
     /// works when the test wants to verify SSE events; conversations
     /// are otherwise inert (no LLM calls fire).
     pub(crate) async fn make_test_state() -> AppState {
         let db = Database::open_in_memory().await.expect("open db");
-        let llm_registry = Arc::new(ModelRegistry::new_empty());
+        let llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(TestLlm)));
         let platform = PlatformCapability::None {
             details: "test".into(),
         };
@@ -13406,6 +13477,7 @@ mod upgrade_model_state_guard_tests {
             Path(id.to_string()),
             Json(UpgradeModelRequest {
                 model: model.to_string(),
+                effort: crate::api::types::EffortUpdate::Reset,
             }),
         )
         .await
@@ -13421,7 +13493,7 @@ mod upgrade_model_state_guard_tests {
         // Start from a non-default model so a successful switch is observable.
         state
             .db
-            .update_conversation_model(id, "claude-opus-4-7")
+            .update_conversation_model_and_effort(id, "claude-opus-4-7", None)
             .await
             .expect("seed model");
     }
@@ -14194,7 +14266,8 @@ mod attachment_storage_tests {
         let stored_path = "/tmp/phoenix-creation-job-attachment.txt".to_string();
         let intent = crate::db::ConversationCreationIntent {
             cwd: "/tmp".to_string(),
-            model: None,
+            model: Some("mock".to_string()),
+            effort: None,
             text: "with attachment".to_string(),
             expansion_preflighted: false,
             llm_text: None,

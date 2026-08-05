@@ -3,6 +3,8 @@
 pub const LLM_SOURCE_HEADER: &str = "phoenix-ide";
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 /// Identifier for `OpenAI`'s `prompt_cache_key` Responses-API field. Required
@@ -56,7 +58,164 @@ impl PromptCacheKey {
     }
 }
 
-/// Content-free correlation fields attached to one provider attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ModelEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ModelEffort {
+    pub const ALL: [Self; 7] = [
+        Self::None,
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Xhigh,
+        Self::Max,
+    ];
+
+    #[must_use]
+    pub const fn needs_extended_output_headroom(self) -> bool {
+        matches!(self, Self::Xhigh | Self::Max)
+    }
+
+    #[must_use]
+    pub const fn as_wire_name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+impl fmt::Display for ModelEffort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_wire_name())
+    }
+}
+
+impl FromStr for ModelEffort {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "none" => Ok(Self::None),
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::Xhigh),
+            "max" => Ok(Self::Max),
+            other => Err(format!("unknown effort level '{other}'")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum EffortSource {
+    NativeKnown,
+    NativeUnknown,
+    Explicit,
+    Unsupported,
+}
+
+impl EffortSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeKnown => "native_known",
+            Self::NativeUnknown => "native_unknown",
+            Self::Explicit => "explicit",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+impl FromStr for EffortSource {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "native_known" => Ok(Self::NativeKnown),
+            "native_unknown" => Ok(Self::NativeUnknown),
+            "explicit" => Ok(Self::Explicit),
+            "unsupported" => Ok(Self::Unsupported),
+            other => Err(format!("unknown effort source '{other}'")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveEffort {
+    Explicit(ModelEffort),
+    NativeKnown(ModelEffort),
+    NativeUnknown,
+    Unsupported,
+}
+
+impl EffectiveEffort {
+    #[must_use]
+    pub const fn explicit(level: ModelEffort) -> Self {
+        Self::Explicit(level)
+    }
+
+    #[must_use]
+    pub const fn native_known(level: ModelEffort) -> Self {
+        Self::NativeKnown(level)
+    }
+
+    #[must_use]
+    pub const fn native_unknown() -> Self {
+        Self::NativeUnknown
+    }
+
+    #[must_use]
+    pub const fn unsupported() -> Self {
+        Self::Unsupported
+    }
+
+    #[must_use]
+    pub const fn source(self) -> EffortSource {
+        match self {
+            Self::Explicit(_) => EffortSource::Explicit,
+            Self::NativeKnown(_) => EffortSource::NativeKnown,
+            Self::NativeUnknown => EffortSource::NativeUnknown,
+            Self::Unsupported => EffortSource::Unsupported,
+        }
+    }
+
+    #[must_use]
+    pub const fn level(self) -> Option<ModelEffort> {
+        match self {
+            Self::Explicit(level) | Self::NativeKnown(level) => Some(level),
+            Self::NativeUnknown | Self::Unsupported => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn explicit_level(self) -> Option<ModelEffort> {
+        match self {
+            Self::Explicit(level) => Some(level),
+            Self::NativeKnown(_) | Self::NativeUnknown | Self::Unsupported => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LlmRequestTelemetry {
     pub conversation_id: String,
@@ -305,12 +464,35 @@ pub struct LlmRequest {
     pub messages: Vec<LlmMessage>,
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
+    pub effective_effort: EffectiveEffort,
     pub telemetry: Option<LlmRequestTelemetry>,
     /// Required cache key. See [`PromptCacheKey`] for how to pick one — the
     /// choice is the caller's because only the caller knows its caching
     /// cohort. Used as `prompt_cache_key` on the `OpenAI` Responses path,
     /// ignored by `Anthropic`.
     pub cache_key: PromptCacheKey,
+}
+
+impl LlmRequest {
+    #[must_use]
+    pub fn reserved_output_tokens(&self) -> u32 {
+        self.raised_output_token_ceiling().unwrap_or_else(|| {
+            if self
+                .effective_effort
+                .level()
+                .is_some_and(ModelEffort::needs_extended_output_headroom)
+            {
+                64_000
+            } else {
+                16_384
+            }
+        })
+    }
+
+    #[must_use]
+    pub const fn raised_output_token_ceiling(&self) -> Option<u32> {
+        self.max_tokens
+    }
 }
 
 /// System prompt content
@@ -648,6 +830,9 @@ impl LlmResponse {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    // owned: pre-feature persisted usage blobs had no reasoning token count.
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
     #[serde(default)]
     pub cache_creation_tokens: u64,
     #[serde(default)]
@@ -668,6 +853,33 @@ impl Usage {
 #[cfg(test)]
 mod attempt_capture_tests {
     use super::*;
+
+    #[test]
+    fn historical_usage_without_reasoning_tokens_deserializes_losslessly() {
+        let usage: Usage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 10,
+            "output_tokens": 5
+        }))
+        .unwrap();
+        assert_eq!(usage.reasoning_tokens, None);
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn explicit_utility_cap_is_not_raised_by_effective_effort() {
+        let request = LlmRequest {
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            max_tokens: Some(50),
+            effective_effort: EffectiveEffort::native_known(ModelEffort::Max),
+            telemetry: None,
+            cache_key: PromptCacheKey::ephemeral(),
+        };
+        assert_eq!(request.raised_output_token_ceiling(), Some(50));
+        assert_eq!(request.reserved_output_tokens(), 50);
+    }
 
     #[test]
     fn pre_dispatch_cancellation_is_not_a_provider_attempt() {

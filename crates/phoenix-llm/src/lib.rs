@@ -66,8 +66,8 @@ pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
 // and the executor mapper. CreditsSnapshot / RateLimitWindow live behind it,
 // accessed via the `rate_limit` submodule.
 pub use models::{
-    all_models, merge_model_specs, parse_external_models, ModelBackend, ModelInfo, ModelSource,
-    ModelSpec,
+    all_models, merge_model_specs, parse_external_models, EffortCapabilities, ModelBackend,
+    ModelInfo, ModelSource, ModelSpec, NativeDefault,
 };
 #[allow(unused_imports)]
 pub use rate_limit::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
@@ -257,8 +257,12 @@ impl LoggingService {
             root_conv_id = telemetry.map(|value| value.root_conversation_id.as_str()),
             request_id,
             retry_attempt = telemetry.map_or(1, |value| value.retry_attempt),
+            effort_source = request.effective_effort.source().as_str(),
+            effort_level = request.effective_effort.level().map(ModelEffort::as_wire_name),
+            reserved_output_tokens = request.reserved_output_tokens(),
             input_tokens = tracing::field::Empty,
             output_tokens = tracing::field::Empty,
+            reasoning_tokens = tracing::field::Empty,
             cache_read_tokens = tracing::field::Empty,
             cache_creation_tokens = tracing::field::Empty,
             error.kind = tracing::field::Empty,
@@ -363,6 +367,9 @@ impl LoggingService {
             Ok(response) => {
                 span.record("input_tokens", response.usage.input_tokens);
                 span.record("output_tokens", response.usage.output_tokens);
+                if let Some(reasoning_tokens) = response.usage.reasoning_tokens {
+                    span.record("reasoning_tokens", reasoning_tokens);
+                }
                 span.record("cache_read_tokens", response.usage.cache_read_tokens);
                 span.record(
                     "cache_creation_tokens",

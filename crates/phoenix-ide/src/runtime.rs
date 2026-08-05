@@ -2322,6 +2322,24 @@ impl RuntimeManager {
             }
         };
 
+        if let Some(effort) = parent_conv.effort {
+            if !self.llm_registry.supports_effort(&spec.model_id, effort) {
+                let _ = parent_event_tx
+                    .send(Event::SubAgentResult {
+                        agent_id: spec.agent_id,
+                        outcome: SubAgentOutcome::Failure {
+                            error: format!(
+                                "Parent effort '{effort}' is not supported by sub-agent model '{}'",
+                                spec.model_id
+                            ),
+                            error_kind: crate::db::ErrorKind::SubAgentError,
+                        },
+                    })
+                    .await;
+                return;
+            }
+        }
+
         // Derive sub-agent conv_mode from spec.mode + parent's mode.
         // Explore sub-agents are always Explore. Work sub-agents inherit
         // the parent's Work mode (branch, base_branch, worktree_path).
@@ -2435,6 +2453,10 @@ impl RuntimeManager {
             root_conversation_id,
         );
         conv_context.max_turns = spec.max_turns;
+        conv_context.effort = conv.effort;
+        conv_context.effective_effort = self
+            .llm_registry
+            .effective_effort(&spec.model_id, conv.effort);
         conv_context.resource_scope = crate::work_scope::ResourceScopeKey::Work(
             conv.work_scope_id
                 .clone()
@@ -2821,10 +2843,11 @@ impl RuntimeManager {
         };
 
         // Resolve model once: use conversation's stored model, or fall back to registry default
-        let model_id = conv
+        let stored_model_id = conv
             .model
             .clone()
             .unwrap_or_else(|| self.llm_registry.default_model_id());
+        let model_id = self.llm_registry.resolve_model_id(&stored_model_id);
         let context_window = self.llm_registry.context_window(&model_id);
         let mode_context = conv_mode_to_context(&conv.conv_mode);
         let mut context = if is_sub_agent {
@@ -2866,6 +2889,8 @@ impl RuntimeManager {
             }
         };
         context.mode_context = Some(mode_context);
+        context.effort = conv.effort;
+        context.effective_effort = self.llm_registry.effective_effort(&model_id, conv.effort);
         context.explore_bash = ExploreToolPolicy::from_platform(&self.platform).bash();
         context.desired_base_branch = conv.desired_base_branch.clone();
         context.mode = match &conv.conv_mode {

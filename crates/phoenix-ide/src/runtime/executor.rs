@@ -866,7 +866,14 @@ where
     } else if let Some(mut out) = output {
         if let Some(llm_usage) = out.take_llm_usage() {
             let _ = storage
-                .insert_turn_usage(&conv_id, &root_conv_id, &llm_usage.model, &llm_usage.usage, None)
+                .insert_turn_usage(
+                    &conv_id,
+                    &root_conv_id,
+                    &llm_usage.model,
+                    llm_usage.effective_effort,
+                    &llm_usage.usage,
+                    None,
+                )
                 .await
                 .map_err(|e| {
                     tracing::warn!(conv_id = %conv_id, error = %e, "failed to record tool LLM usage");
@@ -3876,9 +3883,19 @@ where
                 model.to_string()
             } else {
                 match mode {
-                    SubAgentMode::Explore => self
-                        .llm_registry
-                        .cheap_model_id_for_provider(&self.context.model_id),
+                    SubAgentMode::Explore => {
+                        let cheap_model = self
+                            .llm_registry
+                            .cheap_model_id_for_provider(&self.context.model_id);
+                        match self.context.effort {
+                            Some(effort)
+                                if !self.llm_registry.supports_effort(&cheap_model, effort) =>
+                            {
+                                self.context.model_id.clone()
+                            }
+                            _ => cheap_model,
+                        }
+                    }
                     SubAgentMode::Work => self.context.model_id.clone(),
                 }
             };
@@ -4707,6 +4724,30 @@ where
         let context_window = self.context.context_window;
         let root_conv_id = self.context.root_conversation_id.clone();
         let model_id = self.context.model_id.clone();
+        let explicit_effort = self.context.effort;
+        if let Some(effort) = explicit_effort {
+            if !self.llm_registry.supports_effort(&model_id, effort) {
+                return Err(format!(
+                    "Persisted effort '{effort}' is not supported by model '{model_id}'"
+                ));
+            }
+        }
+        let effective_effort = self
+            .llm_registry
+            .effective_effort(&model_id, explicit_effort);
+        let desired_output_tokens = if effective_effort.level().is_some_and(
+            phoenix_core::domain::llm_types::ModelEffort::needs_extended_output_headroom,
+        ) {
+            64_000
+        } else {
+            16_384
+        };
+        let request_output_tokens = self
+            .llm_registry
+            .output_token_limit(&model_id)
+            .map_or(desired_output_tokens, |limit| {
+                limit.min(desired_output_tokens)
+            });
         let working_dir = self
             .context
             .execution_environment
@@ -4892,7 +4933,8 @@ where
                 system,
                 messages,
                 tools,
-                max_tokens: Some(16_384),
+                max_tokens: Some(request_output_tokens),
+                effective_effort,
                 telemetry: Some(phoenix_llm::LlmRequestTelemetry {
                     conversation_id: conv_id.clone(),
                     root_conversation_id: root_conv_id.clone(),
@@ -4904,6 +4946,34 @@ where
                 // (system prompt + earlier turns), so all turns share one key.
                 cache_key: PromptCacheKey::stable(&conv_id),
             };
+
+            let estimated_system_tokens: usize = request
+                .system
+                .iter()
+                .map(|segment| estimate_dispatch_text_tokens(&segment.text))
+                .sum();
+            let estimated_tool_tokens: usize = request
+                .tools
+                .iter()
+                .map(|tool| {
+                    estimate_dispatch_text_tokens(&tool.name)
+                        + estimate_dispatch_text_tokens(&tool.description)
+                        + estimate_dispatch_text_tokens(&tool.input_schema.to_string())
+                })
+                .sum();
+            let estimated_message_tokens: usize = request
+                .messages
+                .iter()
+                .map(estimate_dispatch_message_tokens)
+                .sum();
+            let estimated_input_tokens =
+                estimated_system_tokens + estimated_message_tokens + estimated_tool_tokens;
+            let reserved_output_tokens = usize::try_from(request.reserved_output_tokens())
+                .unwrap_or(usize::MAX);
+            if estimated_input_tokens.saturating_add(reserved_output_tokens) > context_window {
+                let _ = llm_tx.send(LlmOutcome::TokenBudgetExceeded);
+                return;
+            }
 
             // Use streaming — chunk_tx forwards text tokens to SSE clients.
             let llm_outcome = match llm_client.complete_streaming(&request, &chunk_tx).await {
@@ -4996,6 +5066,7 @@ where
                 let conv_id_for_usage = conv_id.clone();
                 let root_id_for_usage = root_conv_id.clone();
                 let model_for_usage = model_id.clone();
+                let effort_for_usage = effective_effort;
                 let usage_for_insert = usage.clone();
                 let first_byte_for_insert = *first_byte_at.lock().await;
                 tokio::spawn(async move {
@@ -5004,6 +5075,7 @@ where
                             &conv_id_for_usage,
                             &root_id_for_usage,
                             &model_for_usage,
+                            effort_for_usage,
                             &usage_for_insert,
                             first_byte_for_insert,
                         )
@@ -5629,6 +5701,37 @@ where
         let request_id = uuid::Uuid::new_v4().to_string();
         let context_window = self.context.context_window;
         let continuation_limits = self.llm_client.continuation_request_limits();
+        let model_id = self.context.model_id.clone();
+        let explicit_effort = self.context.effort;
+        if let Some(effort) = explicit_effort {
+            if !self.llm_registry.supports_effort(&model_id, effort) {
+                let error =
+                    format!("Persisted effort '{effort}' is not supported by model '{model_id}'");
+                let event_tx = self.event_tx.clone();
+                tokio::spawn(async move {
+                    let _ = event_tx.send(Event::ContinuationFailed { error }).await;
+                });
+                return;
+            }
+        }
+        let effective_effort = self
+            .llm_registry
+            .effective_effort(&model_id, explicit_effort);
+        let desired_continuation_output = if effective_effort.level().is_some_and(
+            phoenix_core::domain::llm_types::ModelEffort::needs_extended_output_headroom,
+        ) {
+            64_000
+        } else {
+            CONTINUATION_OUTPUT_RESERVE_TOKENS
+        };
+        let continuation_output_reserve = self.llm_registry.output_token_limit(&model_id).map_or(
+            desired_continuation_output,
+            |limit| {
+                usize::try_from(limit)
+                    .unwrap_or(usize::MAX)
+                    .min(desired_continuation_output)
+            },
+        );
 
         // Build continuation prompt
         let continuation_prompt = build_continuation_prompt(&rejected_tool_calls);
@@ -5670,7 +5773,7 @@ where
             // history has filled the budget.
             let fixed_tokens = estimate_text_tokens(&continuation_prompt)
                 + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT)
-                + CONTINUATION_OUTPUT_RESERVE_TOKENS
+                + continuation_output_reserve
                 + CONTINUATION_SAFETY_MARGIN_TOKENS;
             let history_item_cap = continuation_limits.max_history_messages(1);
             let budget =
@@ -5707,7 +5810,8 @@ where
                 tools: vec![], // No tools for continuation
                 // Handoff quality favors completeness; cap high enough that a
                 // thorough summary is not truncated mid-thought.
-                max_tokens: Some(4096),
+                max_tokens: Some(u32::try_from(continuation_output_reserve).unwrap_or(u32::MAX)),
+                effective_effort,
                 telemetry: Some(phoenix_llm::LlmRequestTelemetry {
                     conversation_id: conv_id.clone(),
                     root_conversation_id: root_conv_id,
@@ -6325,6 +6429,31 @@ fn cap_block_text(text: String) -> String {
     }
     let truncated: String = text.chars().take(CONTINUATION_BLOCK_CHAR_CAP).collect();
     format!("{truncated}…[truncated]")
+}
+
+/// Calibrated pre-dispatch estimate: the normal chars/4 estimate plus a 50%
+/// safety factor. This avoids treating UTF-8 bytes as tokens while bounding
+/// token-dense input more conservatively than the continuation planner.
+fn estimate_dispatch_text_tokens(text: &str) -> usize {
+    estimate_text_tokens(text).saturating_mul(3).div_ceil(2)
+}
+
+fn estimate_dispatch_message_tokens(msg: &LlmMessage) -> usize {
+    let content: usize = msg
+        .content
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
+            ContentBlock::ToolResult {
+                content, images, ..
+            } => {
+                estimate_dispatch_text_tokens(content)
+                    + images.len().saturating_mul(IMAGE_TOKEN_ESTIMATE)
+            }
+            other => estimate_dispatch_text_tokens(&other.render_text()),
+        })
+        .sum();
+    content + MESSAGE_OVERHEAD_TOKENS
 }
 
 /// Estimate the token cost of a single message for the proactive budget.
@@ -10730,6 +10859,7 @@ mod steer_drain_detector_tests {
             usage: phoenix_llm::Usage {
                 input_tokens: 0,
                 output_tokens: 0,
+                reasoning_tokens: None,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
             },
