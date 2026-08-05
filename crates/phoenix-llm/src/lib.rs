@@ -11,15 +11,16 @@
 //! Each model has a [`ModelBackend`] that couples the route/auth family with the
 //! wire protocol. `ModelBackend::Anthropic` uses Anthropic Messages-compatible
 //! requests. `ModelBackend::OpenAIResponses` uses `OpenAI` Responses-compatible
-//! requests. Externally configured models use the same backend values, so the
-//! config says what Phoenix should speak rather than who hosts the model.
+//! requests. `ModelBackend::OpenAIChatCompletions` uses OpenAI-compatible Chat
+//! Completions requests. Externally configured models use the same backend values,
+//! so config says what Phoenix should speak rather than who hosts the model.
 //!
 //! ## Authentication
 //!
 //! Direct Anthropic calls use `x-api-key`. Helper-issued credentials may choose
 //! an alternate header style for provider-compatible endpoints. `OpenAI`
-//! Responses calls use bearer auth. The ChatGPT/Codex bridge only applies to
-//! built-in `OpenAI` Responses models.
+//! Responses and Chat Completions calls use bearer auth. The ChatGPT/Codex bridge
+//! only applies to built-in `OpenAI` Responses models.
 //!
 //! ## Discovery
 //!
@@ -67,7 +68,7 @@ pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
 // accessed via the `rate_limit` submodule.
 pub use models::{
     all_models, merge_model_specs, parse_external_models, EffortCapabilities, ModelBackend,
-    ModelInfo, ModelSource, ModelSpec, NativeDefault,
+    ModelInfo, ModelSource, ModelSpec, NativeDefault, DEFAULT_MAX_OUTPUT_TOKENS,
 };
 #[allow(unused_imports)]
 pub use rate_limit::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
