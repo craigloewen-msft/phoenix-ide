@@ -2738,14 +2738,26 @@ fn chat_message_to_response(
                 "Chat completions tool call omitted its id or function name",
             ));
         }
-        let input = serde_json::from_str(&call.function.arguments).map_err(|error| {
-            tracing::warn!(
-                error = %error,
-                arguments_bytes = call.function.arguments.len(),
-                "failed to parse chat tool call arguments"
+        // A zero-parameter tool call arrives as `arguments: ""` on this wire:
+        // Anthropic-backed gateways carry Anthropic's empty `partial_json`
+        // through untranslated. Empty is "no arguments", not malformed JSON.
+        let arguments = call.function.arguments.trim();
+        let input = if arguments.is_empty() {
+            tracing::debug!(
+                tool = %call.function.name,
+                "chat tool call omitted arguments; treating as an empty object"
             );
-            LlmError::invalid_response("Chat completions returned malformed tool arguments")
-        })?;
+            serde_json::Value::Object(serde_json::Map::new())
+        } else {
+            serde_json::from_str(arguments).map_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    arguments_bytes = call.function.arguments.len(),
+                    "failed to parse chat tool call arguments"
+                );
+                LlmError::invalid_response("Chat completions returned malformed tool arguments")
+            })?
+        };
         content.push(ContentBlock::ToolUse {
             id: call.id,
             name: call.function.name,
@@ -2794,6 +2806,7 @@ struct ChatStreamAccumulator {
     usage: Option<ChatUsage>,
     done: bool,
     terminal_finish_seen: bool,
+    unmodelled_delta_fields: std::collections::BTreeSet<String>,
     telemetry: StreamTelemetryRecorder,
 }
 
@@ -2836,6 +2849,18 @@ fn openai_http_error(status_code: u16, status_display: &str, body: &str) -> LlmE
     LlmError::from_http_status(status_code, body)
 }
 
+/// Whether a JSON value carries no payload, and so cannot be the content a
+/// stream appeared to be missing.
+fn is_payload_free(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(text) => text.is_empty(),
+        serde_json::Value::Array(items) => items.is_empty(),
+        serde_json::Value::Object(map) => map.is_empty(),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => false,
+    }
+}
+
 impl ChatStreamAccumulator {
     fn new(dispatch_at: Instant, request: &LlmRequest) -> Self {
         Self {
@@ -2846,6 +2871,7 @@ impl ChatStreamAccumulator {
             usage: None,
             done: false,
             terminal_finish_seen: false,
+            unmodelled_delta_fields: std::collections::BTreeSet::new(),
             telemetry: StreamTelemetryRecorder::new(
                 dispatch_at,
                 request
@@ -2894,6 +2920,17 @@ impl ChatStreamAccumulator {
                 ));
             }
             self.choice_index = Some(choice.index);
+            for (key, value) in &choice.delta.unmodelled {
+                if is_payload_free(value) {
+                    continue;
+                }
+                if self.unmodelled_delta_fields.insert(key.clone()) {
+                    tracing::debug!(
+                        field = %key,
+                        "chat completions delta carried a field Phoenix does not model"
+                    );
+                }
+            }
             if let Some(reasoning) = choice.delta.reasoning_content {
                 log_dropped_reasoning_content("<streaming-chat-completions>", &reasoning);
                 if !reasoning.is_empty() {
@@ -3021,10 +3058,24 @@ impl ChatStreamAccumulator {
             ));
         }
         if self.content.is_empty() && self.tool_calls.is_empty() {
+            let unmodelled = self
+                .unmodelled_delta_fields
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
             tracing::warn!(
                 done = self.done,
+                provider_events = self.telemetry.provider_event_count(),
+                unmodelled_delta_fields = %unmodelled,
                 "chat stream produced no content and no tool_calls"
             );
+            if !unmodelled.is_empty() {
+                return Err(LlmError::invalid_response(format!(
+                    "Chat completions stream carried no content or tool calls; the provider only \
+                     sent delta fields Phoenix does not understand ({unmodelled})"
+                )));
+            }
         }
         let telemetry = self.telemetry;
         let message = ChatResponseMessage {
@@ -3238,6 +3289,10 @@ struct ChatStreamChoice {
 
 #[derive(Debug, Deserialize)]
 struct ChatDelta {
+    /// Modelled to keep the spec's per-chunk role marker out of `unmodelled`.
+    #[serde(default)]
+    #[allow(dead_code)]
+    role: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
@@ -3246,6 +3301,10 @@ struct ChatDelta {
     refusal: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ChatToolCallDelta>>,
+    /// Gateway-specific delta fields Phoenix does not model. Captured so an
+    /// otherwise-empty stream can name what the provider actually sent.
+    #[serde(flatten)]
+    unmodelled: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5581,6 +5640,118 @@ mod tests {
         assert!(matches!(
             &refusal.into_response().unwrap().content[0],
             ContentBlock::Text { text } if text == "declined"
+        ));
+    }
+
+    /// A zero-parameter tool call arrives with `arguments: ""`; that is an empty
+    /// argument object, not malformed JSON.
+    #[tokio::test]
+    async fn chat_stream_accepts_tool_call_with_empty_arguments() {
+        let request = empty_request();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut acc = ChatStreamAccumulator::new(Instant::now(), &request);
+        acc.process_event(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-0","type":"function","function":{"name":"terminal_last_command","arguments":""}}]},"finish_reason":"tool_calls"}]}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        let response = acc.into_response().unwrap();
+        assert!(matches!(
+            &response.content[0],
+            ContentBlock::ToolUse { id, name, input }
+                if id == "call-0"
+                    && name == "terminal_last_command"
+                    && input == &serde_json::json!({})
+        ));
+    }
+
+    /// Whitespace-only arguments are the same empty-object case as `""`.
+    #[tokio::test]
+    async fn chat_completion_accepts_whitespace_only_tool_arguments() {
+        let response = normalize_chat_response(
+            serde_json::from_str(
+                r#"{"choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"terminal_last_command","arguments":"  "}}]},"finish_reason":"tool_calls"}]}"#,
+            )
+            .unwrap(),
+            "test-model",
+        )
+        .unwrap();
+        assert!(matches!(
+            &response.content[0],
+            ContentBlock::ToolUse { input, .. } if input == &serde_json::json!({})
+        ));
+    }
+
+    /// Genuinely malformed arguments must still be rejected.
+    #[tokio::test]
+    async fn chat_stream_still_rejects_malformed_tool_arguments() {
+        let request = empty_request();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut acc = ChatStreamAccumulator::new(Instant::now(), &request);
+        acc.process_event(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-0","type":"function","function":{"name":"bash","arguments":"{\"cmd\":"}}]},"finish_reason":"tool_calls"}]}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            acc.into_response().unwrap_err().kind,
+            crate::LlmErrorKind::InvalidResponse
+        );
+    }
+
+    /// An empty stream whose deltas carried only unmodelled fields names those
+    /// fields, so the cause is diagnosable instead of an opaque parse failure.
+    #[tokio::test]
+    async fn chat_stream_empty_response_names_unmodelled_delta_fields() {
+        let request = empty_request();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut acc = ChatStreamAccumulator::new(Instant::now(), &request);
+        acc.process_event(
+            r#"{"choices":[{"delta":{"thinking":"pondering"},"index":0}]}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event(
+            r#"{"choices":[{"delta":{},"index":0,"finish_reason":"stop"}]}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        let error = acc.into_response().unwrap_err();
+        assert_eq!(error.kind, crate::LlmErrorKind::InvalidResponse);
+        assert!(
+            error.message.contains("thinking"),
+            "error should name the unmodelled delta field, got: {}",
+            error.message
+        );
+    }
+
+    /// The spec's `role` marker and payload-free extras must not be mistaken for
+    /// missing content.
+    #[tokio::test]
+    async fn chat_stream_ignores_role_and_payload_free_delta_fields() {
+        let request = empty_request();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut acc = ChatStreamAccumulator::new(Instant::now(), &request);
+        acc.process_event(
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"","annotations":[],"audio":null}}]}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event(
+            r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert!(acc.unmodelled_delta_fields.is_empty());
+        assert!(matches!(
+            &acc.into_response().unwrap().content[0],
+            ContentBlock::Text { text } if text == "hi"
         ));
     }
 

@@ -75,6 +75,10 @@ impl StreamTelemetryRecorder {
         }
     }
 
+    pub(crate) fn provider_event_count(&self) -> u32 {
+        self.provider_event_count
+    }
+
     pub(crate) fn record_provider_event_at(&mut self, at: Instant) {
         self.provider_event_count = self.provider_event_count.saturating_add(1);
         if let Some(previous) = self.last_provider_event_at {
