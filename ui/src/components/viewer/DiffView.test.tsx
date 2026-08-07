@@ -78,6 +78,72 @@ describe('DiffView find identities', () => {
 describe('DiffView (Pierre CodeView wiring)', () => {
   beforeEach(() => resetCodeViewMock());
 
+  it('toggles the rendering style between unified and split, persisting the choice', () => {
+    localStorage.removeItem('phoenix-diff-style');
+    const view = renderDiff();
+    expect(codeViewMockState.lastDiffStyle).toBe('unified');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Switch to split view' }));
+    expect(codeViewMockState.lastDiffStyle).toBe('split');
+    expect(localStorage.getItem('phoenix-diff-style')).toBe('split');
+
+    // A freshly mounted diff surface reads the same shared preference.
+    view.unmount();
+    renderDiff();
+    expect(codeViewMockState.lastDiffStyle).toBe('split');
+    fireEvent.click(screen.getByRole('button', { name: 'Switch to unified view' }));
+    expect(codeViewMockState.lastDiffStyle).toBe('unified');
+  });
+
+  it('offers the conversation-collapse toggle only when the host supplies the handler', () => {
+    renderDiff();
+    expect(screen.queryByRole('button', { name: 'Collapse conversation' })).toBeNull();
+  });
+
+  it('reports collapse state and reflects the host toggle', () => {
+    const onToggleReviewFocus = vi.fn();
+    const view = render(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+          inline
+          reviewFocus={false}
+          onToggleReviewFocus={onToggleReviewFocus}
+        />
+      </ReviewNotesProvider>,
+    );
+    const collapse = screen.getByRole('button', { name: 'Collapse conversation' });
+    expect(collapse).toHaveAttribute('aria-pressed', 'false');
+    fireEvent.click(collapse);
+    expect(onToggleReviewFocus).toHaveBeenCalledTimes(1);
+
+    view.rerender(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          checkoutStatus={DEFAULT_CHECKOUT_STATUS}
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+          inline
+          reviewFocus
+          onToggleReviewFocus={onToggleReviewFocus}
+        />
+      </ReviewNotesProvider>,
+    );
+    expect(screen.getByRole('button', { name: 'Show conversation' })).toHaveAttribute('aria-pressed', 'true');
+  });
+
   it('renders the section summary, file header badge, and the parsed file', () => {
     renderDiff();
     expect(screen.getByText(/Committed changes \(vs origin\/main\)/)).toBeInTheDocument();

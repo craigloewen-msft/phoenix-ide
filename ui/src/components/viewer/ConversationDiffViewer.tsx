@@ -24,6 +24,8 @@ interface ConversationDiffViewerProps {
   takeover?: boolean | undefined;
   target?: 'workspace' | 'active_pr' | undefined;
   activePrIdentity?: string | null | undefined;
+  reviewFocus?: boolean | undefined;
+  onToggleReviewFocus?: (() => void) | undefined;
 }
 
 /**
@@ -41,6 +43,8 @@ export function ConversationDiffViewer({
   takeover,
   target = 'workspace',
   activePrIdentity = null,
+  reviewFocus,
+  onToggleReviewFocus,
 }: ConversationDiffViewerProps) {
   const [state, setState] = useState<LoadState>({ status: 'loading' });
 
@@ -86,6 +90,8 @@ export function ConversationDiffViewer({
         onSendNotes={onSendNotes}
         {...(inline !== undefined ? { inline } : {})}
         {...(takeover !== undefined ? { takeover } : {})}
+        {...(reviewFocus !== undefined ? { reviewFocus } : {})}
+        {...(onToggleReviewFocus !== undefined ? { onToggleReviewFocus } : {})}
       />
     );
   }

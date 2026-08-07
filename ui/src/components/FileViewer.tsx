@@ -35,6 +35,10 @@ export interface FileViewerProps {
   onPresentationChange?: ((presentation: 'pane' | 'fullscreen') => void) | undefined;
   /** Render inline (no overlay) for desktop split-pane mode. */
   inline?: boolean | undefined;
+  /** Split-pane review focus state (DIFF mode only); needs `onToggleReviewFocus`. */
+  reviewFocus?: boolean | undefined;
+  /** Supplied only by the split-pane host that owns the conversation collapse. */
+  onToggleReviewFocus?: (() => void) | undefined;
 }
 
 async function readFile(path: string): Promise<ReadFileResult> {
@@ -66,6 +70,8 @@ export function FileViewer({
   canTogglePresentation,
   onPresentationChange,
   inline,
+  reviewFocus,
+  onToggleReviewFocus,
 }: FileViewerProps) {
   const [fileData, setFileData] = useState<ReadFileResult | null>(null);
   const [loading, setLoading] = useState(true);
@@ -129,6 +135,8 @@ export function FileViewer({
         onMarkReviewed={review.markReviewed}
         onUnmarkReviewed={review.unmarkReviewed}
         {...(inline !== undefined ? { inline } : {})}
+        {...(reviewFocus !== undefined ? { reviewFocus } : {})}
+        {...(onToggleReviewFocus !== undefined ? { onToggleReviewFocus } : {})}
       />
     );
   }
