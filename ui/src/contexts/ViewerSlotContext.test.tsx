@@ -299,7 +299,22 @@ describe('ViewerSlot — malformed URL normalization (REQ-VS-012)', () => {
       presentation: 'pane',
       file: { path: '/repo/src/main.ts', rootDir: '/repo', focus: { kind: 'range', startLine: 40, endLine: 64 } },
       patchContext: null,
+      mode: 'source',
     });
+  });
+
+  it('derives review-diff mode from the URL and defaults to source', () => {
+    const base = '/c/conv-A?viewer=prose&file=%2Frepo%2Fa.ts&root=%2Frepo';
+    const source = renderSlot(base).get().slot;
+    expect(source.kind === 'prose' && source.mode).toBe('source');
+
+    const diff = renderSlot(`${base}&mode=diff`).get().slot;
+    expect(diff.kind === 'prose' && diff.mode).toBe('diff');
+
+    // An unknown mode is not a malformed slot — the file still opens, just
+    // in the default rendering.
+    const junk = renderSlot(`${base}&mode=sideways`).get().slot;
+    expect(junk.kind === 'prose' && junk.mode).toBe('source');
   });
 
   it('ignores malformed line params instead of jumping to parsed prefixes', () => {

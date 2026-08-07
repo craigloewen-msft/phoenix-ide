@@ -17,6 +17,8 @@ import { useSeededLiveCount } from '../useWorkScopeSeed';
 import { workScopeLiveCount } from '../workScopeHelpers';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
 import { GroundingSection, GroundingState } from '../GroundingPanel';
+import { ChangedFilesReview } from './ChangedFilesReview';
+import { useReviewContext } from '../../contexts/useReviewContext';
 import { useViewerSlotCommands } from '../../contexts/ViewerSlotContext';
 import { api, type ConversationGitStatusResponse, type SkillEntry, type TaskEntry, type WorkScopeInventory } from '../../api';
 import './FileExplorerPanel.css';
@@ -118,7 +120,8 @@ function GitStatusDetails({ status }: { status: Extract<ConversationGitStatusRes
 
 export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, showError, branchName, activeSlug, width, workScopeKey, liveWorkScope, canOpenWorkspaceDiff = false }: Props) {
   const { openFile, activeFile } = useFileExplorer();
-  const { openDiffFullscreen } = useViewerSlotCommands();
+  const { openDiffFullscreen, openFileDiff } = useViewerSlotCommands();
+  const [reviewExpanded, setReviewExpanded] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
   const gitRequestRef = useRef<AbortController | null>(null);
   const [gitStatus, setGitStatus] = useState<ConversationGitStatusResponse | null>(null);
@@ -197,6 +200,27 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
   const handleFileSelect = useCallback((filePath: string, rootDir: string) => {
     openFile(filePath, rootDir);
   }, [openFile]);
+
+  // Shared with the file viewer's diff mode via ReviewProvider, so marking a
+  // file reviewed in either surface is immediately reflected in the other.
+  const review = useReviewContext();
+  const reviewRoot = rootPath ?? '';
+  const activeReviewPath = useMemo(() => {
+    if (!activeFile || !reviewRoot) return null;
+    const prefix = reviewRoot.endsWith('/') ? reviewRoot : `${reviewRoot}/`;
+    return activeFile.startsWith(prefix) ? activeFile.slice(prefix.length) : null;
+  }, [activeFile, reviewRoot]);
+
+  const handleOpenReviewDiff = useCallback((repoRelativePath: string) => {
+    if (!reviewRoot) return;
+    const prefix = reviewRoot.endsWith('/') ? reviewRoot : `${reviewRoot}/`;
+    openFileDiff(`${prefix}${repoRelativePath}`, reviewRoot);
+  }, [openFileDiff, reviewRoot]);
+
+  const handleCompleteReview = useCallback(() => {
+    showToast('Review complete — all changed files reviewed.');
+    setReviewExpanded(false);
+  }, [showToast]);
 
   if (collapsed) {
     return (
@@ -307,6 +331,27 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
               ) : (
                 <GroundingState tone="loading">Checking workspace status…</GroundingState>
               )}
+            </GroundingSection>
+          )}
+
+          {rootPath && conversationId && canOpenWorkspaceDiff && review && (
+            <GroundingSection
+              icon="✓"
+              title="Review"
+              {...(!reviewExpanded && review.manifest
+                ? { summary: `${review.manifest.reviewed_count}/${review.manifest.total_count} reviewed` }
+                : {})}
+              {...(review.manifest ? { count: review.outstanding.length } : {})}
+              attention={review.outstanding.length > 0}
+              expanded={reviewExpanded}
+              onToggle={() => setReviewExpanded((value) => !value)}
+            >
+              <ChangedFilesReview
+                review={review}
+                activePath={activeReviewPath}
+                onOpenDiff={handleOpenReviewDiff}
+                onCompleteReview={handleCompleteReview}
+              />
             </GroundingSection>
           )}
           <McpStatusPanel showToast={showToast} showError={showError} readOnly={!rootPath} />

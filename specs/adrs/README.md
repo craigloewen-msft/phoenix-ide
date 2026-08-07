@@ -37,6 +37,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [023](023_projects-accept-taskmd-and-plain-markdown-briefs.md) | Projects accept taskmd files by default and plain markdown briefs through one task-source seam | Accepted | REQ-PROJ-003, REQ-PROJ-004, REQ-PROJ-006, REQ-PROJ-012, REQ-PROJ-033, REQ-PROJ-034, REQ-PROJ-037 |
 | [024](024_direct-turn-authority-is-partitioned-by-semantic-fact.md) | Direct-turn authority is partitioned by semantic fact | Accepted | REQ-DWF-CHAT-001 through REQ-DWF-CHAT-014 |
 | [025](025_continuation-compaction-is-an-idempotent-durable-operation.md) | Continuation compaction is an idempotent durable operation | Accepted | REQ-BED-020 |
+| [026](026_review-progress-is-a-content-addressed-checkpoint.md) | Review progress is a content-addressed checkpoint, not the git index | Accepted | REQ-RV-001 … REQ-RV-009 |
 
 ## For agents: which decisions bind your task
 
@@ -66,6 +67,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying the Coordinator surface, current-activity orientation, or database read boundary | 022, then 021 for chat-only UI history |
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
+| Storing per-file review progress, or anything that would contend for the git index | 026 |
 
 ## Decision dependencies
 

@@ -6,15 +6,17 @@ use super::handlers::AppError;
 use super::types::{
     ActivePrIdentityResponse, ActivePrSelectionMutationResponse,
     ActivePrSelectionProvenanceResponse, ActivePrSelectionResponse, AssociatedPrStatusEnvelope,
-    AssociatedPrSummaryResponse, BranchRemoteStatus, CheckoutStatus, ConversationDiffResponse,
-    ConversationGitStatusResponse, GitBranchEntry, GitBranchesQuery, GitBranchesResponse,
-    GitChangedPath, GitFileStatus, GitStatusCounts, ObservedBranchSummaryResponse,
-    PinAssociatedPrRequest, PrAutoFixContextResponse, PrFeedbackStatus, PrStatusResponse,
-    PrUnavailableReason, WorkChangeNeedsReviewReason, WorkChangeSummary,
+    AssociatedPrSummaryResponse, BranchRemoteStatus, CheckoutStatus, ConflictErrorResponse,
+    ConversationDiffResponse, ConversationGitStatusResponse, FileReviewState, GitBranchEntry,
+    GitBranchesQuery, GitBranchesResponse, GitChangedPath, GitFileStatus, GitStatusCounts,
+    MarkReviewedRequest, ObservedBranchSummaryResponse, PinAssociatedPrRequest,
+    PrAutoFixContextResponse, PrFeedbackStatus, PrStatusResponse, PrUnavailableReason,
+    ReviewFileDiffQuery, ReviewFileDiffResponse, ReviewFileEntry, ReviewManifestResponse,
+    UnmarkReviewedRequest, WorkChangeNeedsReviewReason, WorkChangeSummary,
 };
 use super::AppState;
 use crate::db::ConvMode;
-use crate::git_ops::{capture_branch_diff, run_git};
+use crate::git_ops::{capture_branch_diff, review, run_git};
 
 use axum::http::StatusCode;
 use axum::{
@@ -2264,6 +2266,297 @@ pub(crate) async fn get_conversation_git_status(
     .await
     .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?
     .map(Json)
+}
+
+/// Resolves the worktree, base branch, and work scope for a conversation
+/// under review.
+///
+/// Review requires all three: the worktree to inspect, the base to compare
+/// against, and the scope that owns the checkpoints.
+async fn review_context(
+    state: &AppState,
+    id: &str,
+) -> Result<(PathBuf, String, phoenix_core::work_scope::WorkScopeId), AppError> {
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let (worktree_path, base_branch) = match &conv.conv_mode {
+        ConvMode::Work {
+            worktree_path,
+            base_branch,
+            ..
+        }
+        | ConvMode::Branch {
+            worktree_path,
+            base_branch,
+            ..
+        } => (worktree_path.to_string(), base_branch.to_string()),
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation is not in Work or Branch mode (nothing to review)".to_string(),
+            ));
+        }
+    };
+
+    let work_scope = conv
+        .work_scope_id
+        .clone()
+        .ok_or_else(|| AppError::Internal("conversation has no work scope".to_string()))?;
+
+    let wt = PathBuf::from(&worktree_path);
+    if !wt.exists() {
+        return Err(AppError::NotFound(format!(
+            "Worktree no longer exists: {worktree_path}"
+        )));
+    }
+
+    Ok((wt, base_branch, work_scope))
+}
+
+/// Joins a changed file against its stored checkpoint.
+///
+/// A checkpoint recorded against a different comparator is treated as absent:
+/// after a re-scope it would otherwise render a reviewed marker for a review
+/// that never happened against the current base.
+fn resolve_review_state(
+    checkpoints: &[phoenix_db::ReviewCheckpoint],
+    path: &str,
+    current_blob: &str,
+    comparator: &str,
+) -> FileReviewState {
+    let Some(cp) = checkpoints.iter().find(|c| c.file_path == path) else {
+        return FileReviewState::Unreviewed;
+    };
+    if cp.comparator != comparator {
+        tracing::debug!(
+            path,
+            stored = %cp.comparator,
+            current = %comparator,
+            "ignoring review checkpoint recorded against a different comparator"
+        );
+        return FileReviewState::Unreviewed;
+    }
+    if cp.reviewed_blob_sha == current_blob {
+        FileReviewState::Reviewed {
+            at_blob: cp.reviewed_blob_sha.clone(),
+        }
+    } else {
+        FileReviewState::ReviewedStale {
+            at_blob: cp.reviewed_blob_sha.clone(),
+            current_blob: current_blob.to_string(),
+        }
+    }
+}
+
+/// `GET /api/conversations/:id/review/files` — the review manifest: every file
+/// changed relative to the local base, each tagged with its review state.
+pub(crate) async fn get_review_files(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ReviewManifestResponse>, AppError> {
+    let (wt, base_branch, work_scope) = review_context(&state, &id).await?;
+
+    let checkpoints = state
+        .runtime
+        .db()
+        .list_review_checkpoints(&work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    tokio::task::spawn_blocking(move || {
+        let comparator = review::review_comparator(&wt, &base_branch);
+        let changed = review::list_changed_files(&wt, &comparator);
+
+        let files: Vec<ReviewFileEntry> = changed
+            .into_iter()
+            .map(|f| {
+                let review =
+                    resolve_review_state(&checkpoints, &f.path, &f.current_blob_sha, &comparator);
+                ReviewFileEntry {
+                    path: f.path,
+                    status: f.status.as_wire().to_string(),
+                    insertions: f.insertions,
+                    deletions: f.deletions,
+                    current_blob_sha: f.current_blob_sha,
+                    review,
+                }
+            })
+            .collect();
+
+        let reviewed_count = files
+            .iter()
+            .filter(|f| matches!(f.review, FileReviewState::Reviewed { .. }))
+            .count();
+
+        Ok(ReviewManifestResponse {
+            comparator,
+            reviewed_count: u32::try_from(reviewed_count).unwrap_or(u32::MAX),
+            total_count: u32::try_from(files.len()).unwrap_or(u32::MAX),
+            files,
+        })
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?
+    .map(Json)
+}
+
+/// `GET /api/conversations/:id/review/file-diff` — one file's diff, either in
+/// full against the base or restricted to what changed since the user last
+/// reviewed it.
+pub(crate) async fn get_review_file_diff(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ReviewFileDiffQuery>,
+) -> Result<Json<ReviewFileDiffResponse>, AppError> {
+    const MAX_DIFF_BYTES: usize = 256 * 1024;
+
+    let (wt, base_branch, work_scope) = review_context(&state, &id).await?;
+    let scope = query.scope.as_deref().unwrap_or("full").to_string();
+    if scope != "full" && scope != "since_review" {
+        return Err(AppError::BadRequest(format!(
+            "Unknown review diff scope: {scope}"
+        )));
+    }
+
+    let checkpoints = state
+        .runtime
+        .db()
+        .list_review_checkpoints(&work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let path = query.path.clone();
+    tokio::task::spawn_blocking(move || {
+        let comparator = review::review_comparator(&wt, &base_branch);
+        let current_blob_sha = review::current_blob_sha(&wt, &path);
+        let review_state =
+            resolve_review_state(&checkpoints, &path, &current_blob_sha, &comparator);
+        let hard_limit = (MAX_DIFF_BYTES as u64).saturating_mul(8);
+
+        let captured = if scope == "since_review" {
+            // Degrading to the full diff here would silently answer a
+            // different question than the one asked.
+            let (FileReviewState::Reviewed { at_blob }
+            | FileReviewState::ReviewedStale { at_blob, .. }) = &review_state
+            else {
+                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    format!("No review checkpoint for {path}; nothing to diff since review"),
+                    "no_review_checkpoint",
+                ))));
+            };
+            review::file_diff_since_review(&wt, &path, at_blob, MAX_DIFF_BYTES, hard_limit)
+        } else {
+            review::file_diff_full(&wt, &comparator, &path, MAX_DIFF_BYTES, hard_limit)
+        };
+
+        Ok(ReviewFileDiffResponse {
+            path,
+            comparator,
+            scope,
+            truncated_kib: truncated_kib(
+                &captured.stdout,
+                captured.total_bytes,
+                captured.saturated,
+            ),
+            saturated: captured.saturated,
+            diff: captured.stdout,
+            current_blob_sha,
+        })
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?
+    .map(Json)
+}
+
+/// `POST /api/conversations/:id/review/files/mark` — record that the user
+/// reviewed a file at the content they were shown.
+///
+/// Rejects with 409 when the file changed between render and click, so a
+/// checkpoint can never claim the user reviewed bytes they never saw.
+pub(crate) async fn mark_file_reviewed(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<MarkReviewedRequest>,
+) -> Result<Json<ReviewManifestResponse>, AppError> {
+    let (wt, base_branch, work_scope) = review_context(&state, &id).await?;
+
+    let path = body.path.clone();
+    let observed = body.observed_blob_sha.clone();
+    let wt_probe = wt.clone();
+    let base_probe = base_branch.clone();
+    let (comparator, actual_blob) = tokio::task::spawn_blocking(move || {
+        let comparator = review::review_comparator(&wt_probe, &base_probe);
+        let actual = review::current_blob_sha(&wt_probe, &path);
+        (comparator, actual)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+
+    if actual_blob != observed {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            format!(
+                "{} changed since it was displayed; re-open the diff before marking it reviewed",
+                body.path
+            ),
+            "review_target_changed",
+        ))));
+    }
+
+    let existing = state
+        .runtime
+        .db()
+        .list_review_checkpoints(&work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let expected = existing
+        .iter()
+        .find(|c| c.file_path == body.path)
+        .map(|c| c.reviewed_blob_sha.clone());
+
+    let accepted = state
+        .runtime
+        .db()
+        .upsert_review_checkpoint(
+            &work_scope,
+            &body.path,
+            &actual_blob,
+            &comparator,
+            expected.as_deref(),
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    if !accepted {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            format!("Review state for {} changed concurrently", body.path),
+            "review_state_conflict",
+        ))));
+    }
+
+    get_review_files(State(state), Path(id)).await
+}
+
+/// `POST /api/conversations/:id/review/files/unmark` — drop a file's review
+/// checkpoint.
+pub(crate) async fn unmark_file_reviewed(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<UnmarkReviewedRequest>,
+) -> Result<Json<ReviewManifestResponse>, AppError> {
+    let (_wt, _base, work_scope) = review_context(&state, &id).await?;
+
+    state
+        .runtime
+        .db()
+        .clear_review_checkpoint(&work_scope, &body.path)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    get_review_files(State(state), Path(id)).await
 }
 
 /// Convert the streamed-capture metadata into the wire `Option<u32>`:

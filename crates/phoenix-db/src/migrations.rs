@@ -316,7 +316,26 @@ const MIGRATIONS: &[Migration] = &[
         name: "enforce_conversation_state_kind_consistency",
         sql: MIGRATION_060,
     },
+    Migration {
+        version: 61,
+        name: "create_work_scope_review_checkpoints",
+        sql: MIGRATION_061,
+    },
 ];
+
+const MIGRATION_061: &str = r"
+CREATE TABLE IF NOT EXISTS work_scope_review_checkpoints (
+    work_scope_id TEXT NOT NULL REFERENCES work_scopes(id) ON DELETE CASCADE,
+    file_path TEXT NOT NULL CHECK (file_path <> ''),
+    reviewed_blob_sha TEXT NOT NULL CHECK (reviewed_blob_sha <> ''),
+    comparator TEXT NOT NULL CHECK (comparator <> ''),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (work_scope_id, file_path)
+);
+CREATE INDEX IF NOT EXISTS idx_review_checkpoints_scope
+    ON work_scope_review_checkpoints(work_scope_id);
+";
 
 const MIGRATION_058: &str = r"
 ALTER TABLE conversations ADD COLUMN effort TEXT

@@ -475,6 +475,19 @@ pub struct ObservedBranchQualificationInput {
     pub task_relative_work_base_head_oid: String,
 }
 
+/// A user's record that they reviewed a file at a specific content blob.
+///
+/// Keyed on content rather than on the git index or a ref, so it survives
+/// commits, amends, and rebases performed by the agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCheckpoint {
+    pub file_path: String,
+    pub reviewed_blob_sha: String,
+    pub comparator: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkScopeObservedBranchUpsert {
     pub repository_identity: String,
@@ -1212,6 +1225,17 @@ impl Database {
                 "work scope {scope_id} has no normalized environment"
             )));
         }
+
+        // Re-scoping invalidates every review judgement made against the old
+        // environment. Clearing here rather than at call sites makes this
+        // unskippable: a checkpoint can never outlive the base it was taken
+        // against, so a reviewed marker can never vouch for a review that
+        // never happened against the current comparator.
+        sqlx::query("DELETE FROM work_scope_review_checkpoints WHERE work_scope_id = ?1")
+            .bind(scope_id.as_str())
+            .execute(&mut **tx)
+            .await?;
+
         Ok(())
     }
 
@@ -1663,6 +1687,130 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(work_scope_id)
+    }
+
+    /// Records that the user reviewed `file_path` at `reviewed_blob_sha`.
+    ///
+    /// Compare-and-set: when `expected_blob_sha` is `Some`, the write only
+    /// lands if the stored checkpoint currently matches it (or, for `None`
+    /// stored state, if no row exists). Returns `false` without writing when
+    /// the precondition fails, so a caller can surface a conflict rather than
+    /// checkpointing content the user never saw.
+    ///
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn upsert_review_checkpoint(
+        &self,
+        scope: &phoenix_core::work_scope::WorkScopeId,
+        file_path: &str,
+        reviewed_blob_sha: &str,
+        comparator: &str,
+        expected_blob_sha: Option<&str>,
+    ) -> DbResult<bool> {
+        let work_scope_id = self.ensure_work_scope_id(scope).await?;
+        let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+
+        let stored = sqlx::query_scalar::<_, String>(
+            "SELECT reviewed_blob_sha FROM work_scope_review_checkpoints
+             WHERE work_scope_id = ?1 AND file_path = ?2",
+        )
+        .bind(work_scope_id.as_str())
+        .bind(file_path)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if stored.as_deref() != expected_blob_sha {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        sqlx::query(
+            "INSERT INTO work_scope_review_checkpoints (
+                work_scope_id, file_path, reviewed_blob_sha, comparator, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(work_scope_id, file_path) DO UPDATE SET
+                reviewed_blob_sha = excluded.reviewed_blob_sha,
+                comparator = excluded.comparator,
+                updated_at = excluded.updated_at",
+        )
+        .bind(work_scope_id.as_str())
+        .bind(file_path)
+        .bind(reviewed_blob_sha)
+        .bind(comparator)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn list_review_checkpoints(
+        &self,
+        scope: &phoenix_core::work_scope::WorkScopeId,
+    ) -> DbResult<Vec<ReviewCheckpoint>> {
+        if !self.work_scope_exists(scope).await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT file_path, reviewed_blob_sha, comparator, created_at, updated_at
+             FROM work_scope_review_checkpoints
+             WHERE work_scope_id = ?1
+             ORDER BY file_path ASC",
+        )
+        .bind(scope.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ReviewCheckpoint {
+                file_path: row.get("file_path"),
+                reviewed_blob_sha: row.get("reviewed_blob_sha"),
+                comparator: row.get("comparator"),
+                created_at: row.get("created_at"),
+                updated_at: row.get("updated_at"),
+            })
+            .collect())
+    }
+
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn clear_review_checkpoint(
+        &self,
+        scope: &phoenix_core::work_scope::WorkScopeId,
+        file_path: &str,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "DELETE FROM work_scope_review_checkpoints
+             WHERE work_scope_id = ?1 AND file_path = ?2",
+        )
+        .bind(scope.as_str())
+        .bind(file_path)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Drops every checkpoint for a scope.
+    ///
+    /// Called when a work scope's identity-defining fields change: a checkpoint
+    /// whose comparator no longer matches the scope would render a reviewed
+    /// marker for a review that never happened against the current base.
+    ///
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn clear_all_review_checkpoints(
+        &self,
+        scope: &phoenix_core::work_scope::WorkScopeId,
+    ) -> DbResult<()> {
+        sqlx::query("DELETE FROM work_scope_review_checkpoints WHERE work_scope_id = ?1")
+            .bind(scope.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// # Errors
@@ -17805,5 +17953,132 @@ mod tests {
             !columns.iter().any(|c| c == "state_data"),
             "state_data should be dropped on upgrade, got: {columns:?}"
         );
+    }
+
+    fn test_scope() -> phoenix_core::work_scope::WorkScopeId {
+        phoenix_core::work_scope::WorkScopeId::new()
+    }
+
+    #[tokio::test]
+    async fn review_checkpoint_roundtrips_and_lists() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = test_scope();
+
+        assert!(db
+            .upsert_review_checkpoint(&scope, "src/b.rs", "blob-b", "main", None)
+            .await
+            .unwrap());
+        assert!(db
+            .upsert_review_checkpoint(&scope, "src/a.rs", "blob-a", "main", None)
+            .await
+            .unwrap());
+
+        let rows = db.list_review_checkpoints(&scope).await.unwrap();
+        let paths: Vec<&str> = rows.iter().map(|r| r.file_path.as_str()).collect();
+        assert_eq!(paths, vec!["src/a.rs", "src/b.rs"], "ordered by path");
+        assert_eq!(rows[0].reviewed_blob_sha, "blob-a");
+        assert_eq!(rows[0].comparator, "main");
+    }
+
+    #[tokio::test]
+    async fn review_checkpoint_compare_and_set_rejects_stale_mark() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = test_scope();
+
+        db.upsert_review_checkpoint(&scope, "src/a.rs", "blob-v1", "main", None)
+            .await
+            .unwrap();
+
+        // The user's view was built from blob-v1, but the agent has since
+        // rewritten the file. Marking against the stale observation must fail
+        // rather than checkpoint content the user never saw.
+        let accepted = db
+            .upsert_review_checkpoint(&scope, "src/a.rs", "blob-v3", "main", None)
+            .await
+            .unwrap();
+        assert!(!accepted, "expected-absent CAS must fail when a row exists");
+
+        let rows = db.list_review_checkpoints(&scope).await.unwrap();
+        assert_eq!(
+            rows[0].reviewed_blob_sha, "blob-v1",
+            "rejected CAS must not mutate the stored checkpoint"
+        );
+
+        let accepted = db
+            .upsert_review_checkpoint(&scope, "src/a.rs", "blob-v2", "main", Some("blob-v1"))
+            .await
+            .unwrap();
+        assert!(accepted, "CAS matching stored state must land");
+        let rows = db.list_review_checkpoints(&scope).await.unwrap();
+        assert_eq!(rows[0].reviewed_blob_sha, "blob-v2");
+    }
+
+    #[tokio::test]
+    async fn review_checkpoints_clear_individually_and_wholesale() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = test_scope();
+
+        for path in ["a.rs", "b.rs", "c.rs"] {
+            db.upsert_review_checkpoint(&scope, path, "blob", "main", None)
+                .await
+                .unwrap();
+        }
+
+        db.clear_review_checkpoint(&scope, "b.rs").await.unwrap();
+        let rows = db.list_review_checkpoints(&scope).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.file_path != "b.rs"));
+
+        // Re-scoping the work discards the whole review: a checkpoint whose
+        // comparator no longer matches the scope would show a reviewed marker
+        // for a review that never happened against the current base.
+        db.clear_all_review_checkpoints(&scope).await.unwrap();
+        assert!(db.list_review_checkpoints(&scope).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rescoping_a_conversation_discards_its_review() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-rescope", "conv-rescope", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let conv = db.get_conversation("conv-rescope").await.unwrap();
+        let scope = conv
+            .work_scope_id
+            .clone()
+            .expect("conversation has a scope");
+
+        db.upsert_review_checkpoint(&scope, "src/a.rs", "blob-a", "main", None)
+            .await
+            .unwrap();
+        assert_eq!(db.list_review_checkpoints(&scope).await.unwrap().len(), 1);
+
+        // Re-point the scope at different work. Every review judgement was
+        // made against the old base and must not survive.
+        db.update_conversation_mode_and_cwd(
+            "conv-rescope",
+            &ConvMode::Work {
+                worktree_path: schema::NonEmptyString::new("/tmp/wt".to_string()).unwrap(),
+                branch_name: schema::NonEmptyString::new("task-1-other".to_string()).unwrap(),
+                base_branch: schema::NonEmptyString::new("release".to_string()).unwrap(),
+                task_id: schema::NonEmptyString::new("T1".to_string()).unwrap(),
+                task_title: schema::NonEmptyString::new("Other work".to_string()).unwrap(),
+            },
+            "/tmp/wt",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.list_review_checkpoints(&scope).await.unwrap().is_empty(),
+            "a checkpoint must never outlive the base it was taken against"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_checkpoints_absent_for_unknown_scope() {
+        let db = Database::open_in_memory().await.unwrap();
+        let rows = db.list_review_checkpoints(&test_scope()).await.unwrap();
+        assert!(rows.is_empty());
     }
 }

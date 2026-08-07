@@ -1,0 +1,287 @@
+-- allium: 3
+-- iterative-review.allium
+--
+-- Phoenix Iterative Review: Behavioural Specification
+--
+-- Scope: The per-file review loop on Work and Branch conversations. Governs
+--        the review manifest (which files changed and their review state),
+--        review checkpoints (the durable "I read this content" record), the
+--        staleness that follows an agent's later edit, and the scoped diffs
+--        the user reads.
+-- Includes: Marking and unmarking a file reviewed, the compare-and-set that
+--           protects a mark against a concurrent agent edit, checkpoint
+--           lifetime across a work scope's life and re-scoping, and the
+--           derivation of review state from stored and current content.
+-- Excludes:
+--   - The whole-branch diff viewer and the viewer slot's open/close mutex.
+--     See viewer_slot.allium.
+--   - Review note capture, formatting, and injection into the composer.
+--     See specs/prose-feedback/. Diff-mode annotation routes through that
+--     machinery unchanged.
+--   - Terminal actions (abandon, mark-merged) and their git side effects.
+--     See specs/work-lifecycle/.
+--   - Which git commands produce a diff, and diff rendering. Review state is
+--     independent of how the bytes are displayed.
+--
+-- Architecture: review progress is content-addressed. A checkpoint records
+--   the blob hash of the content the user saw, not a position in git's index
+--   or a ref. Three consequences follow, and they are the reason for the
+--   design (see ADR-026):
+--     1. A checkpoint survives commit, amend, and rebase, because unchanged
+--        bytes hash identically regardless of history rewriting.
+--     2. Staleness is a comparison, not an event: a file is stale exactly
+--        when its checkpoint disagrees with current content. No notification
+--        can be missed, because nothing is notified.
+--     3. The agent's index and refs are untouched, so the user reviewing and
+--        the agent committing cannot interfere.
+--
+-- Requirement traceability: REQ-RV-001 through REQ-RV-009
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- The durable-owner key for work-affine resources, mirroring
+-- pr-association.allium's WorkScope. Review checkpoints are owned by a work
+-- scope: they are meaningful only against the body of work they were taken
+-- on, and they die with it.
+value WorkScope {
+    inner: String       -- non-empty, opaque scope identity
+    comparator: Comparator
+}
+
+-- A git blob hash. The empty-blob hash represents "reviewed as absent",
+-- which is how a deleted file is checkpointed -- absence is a content state,
+-- not a missing value, so it needs no nullable field.
+value BlobSha {
+    sha: String     -- non-empty
+}
+
+-- The ref a review is performed against. Recorded on each checkpoint so a
+-- checkpoint taken against a different base is detectable rather than
+-- silently trusted.
+value Comparator {
+    ref: String     -- non-empty
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- How a path differs from the comparator.
+enum ChangeStatus { added | modified | deleted | renamed }
+
+-- A file's review state, derived -- never stored directly. `reviewed_stale`
+-- is the state that makes the loop iterative: it is how a file the user
+-- already approved returns for re-review after the agent revises it.
+-- Deriving rather than storing means "reviewed and also not reviewed" is
+-- unrepresentable rather than merely unlikely.
+enum ReviewState { unreviewed | reviewed | reviewed_stale }
+
+-- Which changes a per-file diff covers.
+enum DiffScope { full | since_review }
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A file changed by the work under review. One per changed path, derived
+-- from the repository on each manifest read -- this entity is a projection
+-- of the working tree, never a stored record.
+entity ChangedFile {
+    scope: WorkScope
+    path: String                    -- non-empty, repo-relative
+    status: ChangeStatus
+
+    -- Hash of the file's content right now. For a deleted file this is the
+    -- empty-blob hash.
+    current_blob: BlobSha
+
+    insertions: Integer             -- >= 0
+    deletions: Integer              -- >= 0
+}
+
+-- The user's durable record that they reviewed a file at a specific content.
+-- Exists only for files the user has marked; absence is "unreviewed".
+entity ReviewCheckpoint {
+    scope: WorkScope
+    path: String                    -- non-empty, repo-relative
+
+    -- The content the user actually read. Compared against a ChangedFile's
+    -- current_blob to derive review state.
+    reviewed_blob: BlobSha
+
+    -- The base this review was performed against. A checkpoint whose
+    -- comparator no longer matches the scope's is not trusted (see
+    -- CheckpointComparatorMatchesScope).
+    comparator: Comparator
+}
+
+-- Events are implicit in the `when:` clauses below:
+--   UserMarksFileReviewed(scope, path, observed_blob)
+--     `observed_blob` is the content the client rendered -- carried
+--     explicitly so a mark is validated against what the human saw rather
+--     than against whatever is on disk when the request arrives.
+--   UserUnmarksFileReviewed(scope, path)
+--   UserRequestsFileDiff(scope, path, diff_scope)
+--   ReviewStateEvaluated(file, checkpoint?)
+--   WorkScopeRescoped(scope)
+--     A scope's identity-defining fields change (branch, base branch, or
+--     worktree). Distinct from deletion: the scope survives, but what it
+--     meant to have reviewed against it does not.
+--   WorkScopeDeleted(scope)
+--     The scope is torn down. See specs/work-lifecycle/.
+
+------------------------------------------------------------
+-- Derivation (REQ-RV-003)
+------------------------------------------------------------
+
+-- Review state is a function of stored and current content, evaluated on
+-- read. Nothing observes an agent's edit and flips a flag: the flag would be
+-- a second representation of a fact the two hashes already carry, and could
+-- be missed or set wrongly. Expressed as invariants rather than a rule
+-- because there is no triggering event -- the relationship simply always
+-- holds.
+
+-- Absence of a checkpoint is exactly "unreviewed". There is no other way to
+-- reach that state, and no way to be in it while a valid checkpoint exists.
+invariant UnreviewedIffNoValidCheckpoint {
+    for f in ChangedFiles:
+        (f.review_state = unreviewed) =
+            (not exists c in ReviewCheckpoints where
+                 c.scope = f.scope and c.path = f.path
+                 and c.comparator = f.scope.comparator)
+}
+
+------------------------------------------------------------
+-- IR 1. MARKING A FILE REVIEWED (REQ-RV-004)
+------------------------------------------------------------
+
+-- @guidance
+--   Marking is compare-and-set on two independent axes, and both must hold:
+--   the file must still hold the content the user was shown, and the stored
+--   checkpoint must still be what the client's view was derived from.
+--   The first guards against the agent rewriting the file between render and
+--   click; the second against a concurrent mark from another client.
+--
+--   Sequence: resolve the comparator, hash current content, compare against
+--   the user's observed blob, then write under the stored-state precondition.
+--   Hashing must persist the blob (git hash-object -w) so a later
+--   since-review diff can still read the content the user approved.
+
+rule MarkRecordsTheContentTheUserSaw {
+    when: UserMarksFileReviewed(scope, path, observed_blob)
+    requires: observed_blob = current_blob_of(scope, path)
+    ensures: exists c in ReviewCheckpoints where
+                 c.scope = scope and c.path = path
+                 and c.reviewed_blob = observed_blob
+                 and c.comparator = scope.comparator
+}
+
+-- A file that moved under the user is not marked. Accepting the mark would
+-- record a review that never happened, and -- worse -- would suppress the
+-- staleness that should have brought the file back for re-review.
+rule MarkRejectedWhenFileChangedUnderTheUser {
+    when: UserMarksFileReviewed(scope, path, observed_blob)
+    requires: observed_blob != current_blob_of(scope, path)
+    ensures: not changed(ReviewCheckpoints)
+    ensures: conflict_reported
+}
+
+rule UnmarkRemovesTheCheckpoint {
+    when: UserUnmarksFileReviewed(scope, path)
+    ensures: not exists c in ReviewCheckpoints where c.scope = scope and c.path = path
+}
+
+------------------------------------------------------------
+-- IR 2. SCOPED DIFFS (REQ-RV-007)
+------------------------------------------------------------
+
+-- The delta the user asked for: what the agent did after the previous pass.
+rule SinceReviewDiffComparesCheckpointToCurrent {
+    when: UserRequestsFileDiff(scope, path, since_review)
+    requires: exists c in ReviewCheckpoints where c.scope = scope and c.path = path
+    ensures: diff_compares(checkpoint_blob_of(scope, path), current_blob_of(scope, path))
+}
+
+-- Widening the scope silently would answer a different question than the one
+-- asked, and the user would have no way to tell it had happened.
+rule SinceReviewDiffRefusedWithoutCheckpoint {
+    when: UserRequestsFileDiff(scope, path, since_review)
+    requires: not exists c in ReviewCheckpoints where c.scope = scope and c.path = path
+    ensures: conflict_reported
+    ensures: not diff_returned
+}
+
+------------------------------------------------------------
+-- IR 3. CHECKPOINT LIFETIME (REQ-RV-008)
+------------------------------------------------------------
+
+-- Review is meaningful only against the body of work it was performed on.
+-- Re-pointing a scope at a different branch or base invalidates every
+-- judgement made against the old one.
+rule RescopingDiscardsReview {
+    when: WorkScopeRescoped(scope)
+    ensures: not exists c in ReviewCheckpoints where c.scope = scope
+}
+
+rule ScopeDeletionDiscardsReview {
+    when: WorkScopeDeleted(scope)
+    ensures: not exists c in ReviewCheckpoints where c.scope = scope
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- The defining property of the loop: staleness is exactly a content
+-- disagreement. If this can be false, a file the agent edited could still
+-- read as reviewed, and the user would skip code no human has read.
+invariant StaleIffCheckpointDisagreesWithContent {
+    for f in ChangedFiles:
+        for c in ReviewCheckpoints where c.scope = f.scope and c.path = f.path:
+            (c.comparator = f.scope.comparator) implies
+                ((f.review_state = reviewed_stale) = (c.reviewed_blob != f.current_blob))
+}
+
+-- A file is reviewed only if some checkpoint vouches for its exact content.
+-- No path exists to a reviewed marker without a stored, matching hash.
+invariant ReviewedRequiresMatchingCheckpoint {
+    for f in ChangedFiles:
+        (f.review_state = reviewed) implies
+            (exists c in ReviewCheckpoints where
+                 c.scope = f.scope and c.path = f.path
+                 and c.reviewed_blob = f.current_blob
+                 and c.comparator = f.scope.comparator)
+}
+
+-- At most one checkpoint per file per scope: review state for a file is a
+-- single fact, so two rows could disagree about it.
+invariant OneCheckpointPerFilePerScope {
+    for a in ReviewCheckpoints:
+        for b in ReviewCheckpoints where b != a:
+            not (a.scope = b.scope and a.path = b.path)
+}
+
+-- A checkpoint recorded against a stale comparator never renders as
+-- reviewed. Trusting it would show a green marker for a review that never
+-- happened against the current base -- strictly worse than no marker,
+-- because it invites skipping a file the user never read.
+invariant CheckpointComparatorMatchesScope {
+    for f in ChangedFiles:
+        for c in ReviewCheckpoints where c.scope = f.scope and c.path = f.path:
+            (c.comparator != f.scope.comparator) implies (f.review_state = unreviewed)
+}
+
+------------------------------------------------------------
+-- Design Decisions
+------------------------------------------------------------
+
+-- Completing a review pass (REQ-RV-009) is deliberately not modelled as a
+-- state transition here. It records that the user finished looking; it grants
+-- no permission and gates no action, so it has no preconditions and no
+-- postconditions any other rule reads. Modelling it would imply a lifecycle
+-- it does not have.
+--
+-- The manifest is not an entity with a stored review_count. Progress is a
+-- fold over ChangedFiles, so a count cannot drift from the files it counts.

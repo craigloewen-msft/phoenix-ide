@@ -302,6 +302,51 @@ export interface ConversationDiffResponse {
   pr_number?: number;
 }
 
+/**
+ * Whether the user has reviewed a file, and whether that review is current.
+ *
+ * `reviewed_stale` — reviewed, then changed by the agent — is the state that
+ * drives the iterative loop: it is what makes a file reappear for re-review
+ * after a follow-up turn.
+ */
+export type FileReviewState =
+  | { kind: 'unreviewed' }
+  | { kind: 'reviewed'; at_blob: string }
+  | { kind: 'reviewed_stale'; at_blob: string; current_blob: string };
+
+export interface ReviewFileEntry {
+  path: string;
+  status: 'added' | 'modified' | 'deleted' | 'renamed';
+  insertions: number;
+  deletions: number;
+  /** Echoed back when marking reviewed so a changed file is rejected. */
+  current_blob_sha: string;
+  review: FileReviewState;
+}
+
+export interface ReviewManifestResponse {
+  comparator: string;
+  files: ReviewFileEntry[];
+  reviewed_count: number;
+  total_count: number;
+}
+
+export type ReviewDiffScope = 'full' | 'since_review';
+
+/**
+ * One file's diff. Carries no review state: the manifest owns that, so the
+ * viewer header and sidebar cannot disagree.
+ */
+export interface ReviewFileDiffResponse {
+  path: string;
+  comparator: string;
+  scope: ReviewDiffScope;
+  diff: string;
+  truncated_kib?: number;
+  saturated?: boolean;
+  current_blob_sha: string;
+}
+
 export interface PrCheckSummary {
   passing: number;
   pending: number;
@@ -2165,6 +2210,57 @@ export const api = {
   async getActivePrDiff(conversationId: string): Promise<ConversationDiffResponse> {
     const resp = await fetch(`/api/conversations/${conversationId}/active-pr/diff`);
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to fetch PR diff'); }
+    return resp.json();
+  },
+
+  /** GET /api/conversations/:id/review/files — the per-file review manifest. */
+  async getReviewFiles(conversationId: string, signal?: AbortSignal): Promise<ReviewManifestResponse> {
+    const resp = await fetch(`/api/conversations/${conversationId}/review/files`, signal ? { signal } : undefined);
+    if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err.error || 'Failed to fetch review files'); }
+    return resp.json();
+  },
+
+  /**
+   * GET /api/conversations/:id/review/file-diff — one file's diff.
+   *
+   * `since_review` throws when the file has no checkpoint; the caller should
+   * only offer that scope for a file the manifest reports as reviewed.
+   */
+  async getReviewFileDiff(
+    conversationId: string,
+    path: string,
+    scope: ReviewDiffScope,
+    signal?: AbortSignal,
+  ): Promise<ReviewFileDiffResponse> {
+    const qs = new URLSearchParams({ path, scope });
+    const resp = await fetch(`/api/conversations/${conversationId}/review/file-diff?${qs}`, signal ? { signal } : undefined);
+    if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err.error || 'Failed to fetch file diff'); }
+    return resp.json();
+  },
+
+  /**
+   * Marks a file reviewed at the content the caller rendered.
+   *
+   * `observedBlobSha` must be the sha the user actually saw: the server
+   * rejects the mark if the file changed underneath them.
+   */
+  async markFileReviewed(conversationId: string, path: string, observedBlobSha: string): Promise<ReviewManifestResponse> {
+    const resp = await fetch(`/api/conversations/${conversationId}/review/files/mark`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path, observed_blob_sha: observedBlobSha }),
+    });
+    if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err.error || 'Failed to mark file reviewed'); }
+    return resp.json();
+  },
+
+  async unmarkFileReviewed(conversationId: string, path: string): Promise<ReviewManifestResponse> {
+    const resp = await fetch(`/api/conversations/${conversationId}/review/files/unmark`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path }),
+    });
+    if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err.error || 'Failed to unmark file'); }
     return resp.json();
   },
 

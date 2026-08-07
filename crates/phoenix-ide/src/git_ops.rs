@@ -6,6 +6,8 @@
 
 use std::path::Path;
 
+pub(crate) mod review;
+
 /// Walks back from `end` until the byte slice `bytes[..end]` is on a
 /// valid UTF-8 character boundary. Used by `run_git_capped` so the
 /// truncated buffer is always parseable as UTF-8 (any incomplete
@@ -429,7 +431,7 @@ pub(crate) struct CapturedDiff {
 
 /// RAII guard that removes a temp file on drop. Used by `capture_branch_diff`
 /// to ensure the `GIT_INDEX_FILE` temp index is cleaned up even on panic.
-struct TempPath(std::path::PathBuf);
+pub(crate) struct TempPath(pub(crate) std::path::PathBuf);
 
 impl Drop for TempPath {
     fn drop(&mut self) {
@@ -552,7 +554,7 @@ fn capture_uncommitted_diff(worktree: &Path, max_bytes: usize, hard_limit: u64) 
 /// Find the worktree's git index, copy it to a unique temp path, and
 /// return a guard that cleans up the copy on drop. Returns `None` if any
 /// step fails.
-fn prepare_temp_index(worktree: &Path) -> Option<TempPath> {
+pub(crate) fn prepare_temp_index(worktree: &Path) -> Option<TempPath> {
     let git_dir = run_git(worktree, &["rev-parse", "--git-dir"]).ok()?;
     // `git rev-parse --git-dir` returns a path that may be relative to
     // `worktree`. Resolve it.
