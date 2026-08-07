@@ -103,7 +103,8 @@ cat skills/phoenix-perf-hunt/resources/db/<id>.yaml
 
 ## Prerequisites
 
-- Phoenix dev server running (`./dev.py up`) + seeded DB (`./dev.py seed`)
+- Phoenix dev server running (`./dev.py up`) + seeded DB (`./dev.py seed`; on an
+  already-populated DB restore missing perf fixtures with `./dev.py seed --repair-fixtures`)
 - `browser_profile` tool available in the LLM runtime (default transport; provided by
   Phoenix's in-agent context — confirm before a hunt; cannot be shell-checked)
 - `agent-browser` on PATH (optional; only needed for `--transport agent-browser` legacy parity)

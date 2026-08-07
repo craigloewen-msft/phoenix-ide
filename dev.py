@@ -2199,7 +2199,9 @@ def cmd_up(
 #   - Work mode: NOT seeded -- only reachable via propose_task / approval
 #     (human-in-the-loop by design; cannot be faked without a real commit).
 #
-# Idempotent: if any active conversations exist the seeder skips.
+# Idempotent: if any active conversations exist the seeder leaves the database
+# alone. QA/perf fixtures are recreated only under `./dev.py seed
+# --repair-fixtures`, and never when the fixture is archived.
 
 _SEED_DIRECT_STANDALONES = [
     "Review the recent changes to the authentication middleware and identify any security concerns",
@@ -2258,14 +2260,21 @@ def _migrate_seed_database(*, build: bool) -> None:
     )
 
 
-def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
+def cmd_seed(
+    quiet_if_populated: bool = False,
+    *,
+    build: bool = True,
+    repair_fixtures: bool = False,
+) -> None:
     """Populate the dev DB with representative conversations.
 
     Runs offline after the Phoenix binary applies the canonical Rust migration
     chain. Refuses if a live Phoenix owns this worktree's database.
 
-    Idempotent: populated databases are unchanged unless a required fixture is
-    missing or stale.
+    On an empty database, seeds the full representative set. On a populated
+    database, does nothing unless `repair_fixtures` is set, in which case the
+    QA/perf fixtures are recreated when missing or stale. An archived fixture is
+    never resurrected: archiving is a developer decision, not drift.
     """
     import sqlite3
     import uuid as _uuid
@@ -2513,6 +2522,8 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
         ).fetchone()
         if existing is not None:
             conv_id, archived = existing
+            if archived != 0:
+                return False
             message_count = conn.execute(
                 "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
                 (conv_id,),
@@ -2529,7 +2540,7 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
                 " AND e.base_branch = 'main'",
                 (conv_id, str(worktree), str(worktree)),
             ).fetchone()
-            if archived == 0 and message_count == 1 and scope_valid is not None:
+            if message_count == 1 and scope_valid is not None:
                 return False
             retained_scope = _delete_fixture_conversation(conn, conv_id)
             if retained_scope is not None:
@@ -2661,6 +2672,8 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
         ).fetchone()
         if existing is not None:
             conv_id, archived = existing
+            if archived != 0:
+                return False
             message_count = conn.execute(
                 "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
                 (conv_id,),
@@ -2683,7 +2696,7 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
                     "task-22001-redesign-conversation-grounding-side-panel",
                 ),
             ).fetchone()
-            if archived == 0 and message_count >= 1 and scope_valid is not None:
+            if message_count >= 1 and scope_valid is not None:
                 return False
             retained_scope = _delete_fixture_conversation(conn, conv_id)
         else:
@@ -2877,11 +2890,13 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
         ).fetchone()
         if existing is not None:
             conv_id, archived = existing
+            if archived != 0:
+                return False
             message_count = conn.execute(
                 "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
                 (conv_id,),
             ).fetchone()[0]
-            if archived == 0 and message_count == 47:
+            if message_count == 47:
                 return False
             _delete_fixture_conversation(conn, conv_id)
 
@@ -2954,11 +2969,13 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
         ).fetchone()
         if existing is not None:
             conv_id, archived = existing
+            if archived != 0:
+                return False
             message_count = conn.execute(
                 "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
                 (conv_id,),
             ).fetchone()[0]
-            if archived == 0 and message_count == expected_count:
+            if message_count == expected_count:
                 return False
             _delete_fixture_conversation(conn, conv_id)
 
@@ -3132,6 +3149,14 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
         project_id = _find_or_create_project(conn, str(ROOT))
 
         if _existing_active_count(conn) > 0:
+            if not repair_fixtures:
+                if not quiet_if_populated:
+                    count = _existing_active_count(conn)
+                    print(
+                        f"✓ Dev DB already populated ({count} conversations) — skipping seed.\n"
+                        f"  Use './dev.py seed --repair-fixtures' to restore QA/perf fixtures."
+                    )
+                return
             created_fixture = _ensure_conversation_load_fixture(
                 conn,
                 project_id=project_id,
@@ -9668,7 +9693,11 @@ def main():
     )
 
     # seed (offline)
-    sub.add_parser("seed", help="Populate dev DB with representative conversations (offline; refuses if Phoenix is running)")
+    seed_parser = sub.add_parser("seed", help="Populate dev DB with representative conversations (offline; refuses if Phoenix is running)")
+    seed_parser.add_argument(
+        "--repair-fixtures", action="store_true", default=False,
+        help="On an already-populated DB, recreate missing/stale QA and perf fixtures (archived fixtures are left archived)",
+    )
 
     # qa
     qa_parser = sub.add_parser("qa", help="Run local QA capture workflows")
@@ -9831,7 +9860,7 @@ def main():
             fmt=args.format,
         )
     elif args.command == "seed":
-        cmd_seed()
+        cmd_seed(repair_fixtures=args.repair_fixtures)
     elif args.command == "qa":
         if args.qa_command == "grounding-panel":
             cmd_qa_grounding_panel()

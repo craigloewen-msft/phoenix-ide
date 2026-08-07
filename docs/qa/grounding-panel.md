@@ -4,6 +4,8 @@ The grounding panel uses a layered QA workflow:
 
 1. Vitest covers logic and regression behavior.
 2. `./dev.py seed` creates a real integration conversation backed by a real Git worktree.
+   On an already-populated DB, use `./dev.py seed --repair-fixtures` (an archived fixture is
+   left archived — unarchive it in the UI instead).
 3. Ladle renders deterministic visual scenarios from typed fixture data in `ui/src/fixtures/groundingPanel/`.
 4. Screenshot tooling regenerates local review artifacts on demand.
 
