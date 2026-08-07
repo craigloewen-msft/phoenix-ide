@@ -202,6 +202,11 @@ export function FileReviewDiffView({
           </div>
         ) : (
           <PhoenixDiffCodeView
+            // The two scopes are different documents that happen to describe
+            // the same path. Pierre's reconciler keys records by file path, so
+            // without a remount it treats a scope switch as an update to the
+            // record it is already showing and keeps the previous content.
+            key={`${path}:${scope}`}
             ref={codeViewRef}
             committedDiff={data.diff}
             uncommittedDiff=""
