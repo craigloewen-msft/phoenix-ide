@@ -121,6 +121,7 @@ export function MobileMultiPrConversationFixture({ scenario }: Props) {
             convModeLabel="Work"
             phaseType="idle"
             continuedInConvId={null}
+            baseBranch="main"
             onSendMessage={async () => undefined}
             prStatusHandle={prStatusHandle}
           />

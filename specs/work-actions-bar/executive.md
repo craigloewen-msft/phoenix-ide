@@ -52,12 +52,12 @@ a status display; no button requires a second click to arm.
 | ID | Summary |
 |----|---------|
 | REQ-WAB-001 | Bar visibility: Work/Branch mode AND phase ∈ {idle, error, recoverable_continuation_failure} |
-| REQ-WAB-002 | Responsive presentation: stable compact desktop rail; mobile PR rail; hero and supporting action groups; freshness stays an actionability cue, not PR status |
+| REQ-WAB-002 | Responsive presentation: stable compact desktop rail; mobile PR rail; hero and supporting action groups; freshness stays an actionability cue, not PR status; FINISH zone carries Clean up, Merge to base, and Abandon |
 | REQ-WAB-003 | Exactly one primary (glowing) verb across the bar — or none, in the continuation case |
 | REQ-WAB-004 | WorkDisposition derivation: a single derived state, total over every open-PR and stuck-with-PR case |
 | REQ-WAB-005 | RESOLVE zone suppressed in stuck phases (`error`, `recoverable_continuation_failure`) |
 | REQ-WAB-006 | View Browser is not in this bar; the browser session affordance belongs to the work scope, surfaced via the viewer slot |
-| REQ-WAB-007 | Clean up and Abandon: info-icon tooltips explain intent and the diff-snapshot/confirm difference, mode-sensitive |
+| REQ-WAB-007 | Clean up, Merge to base, and Abandon: info-icon tooltips explain intent and the snapshot/confirm/merge differences, mode-sensitive |
 | REQ-WAB-008 | No disabled-as-status buttons; StateBar owns stable PR identity/status; no two-step toggle affordances |
 | REQ-WAB-009 | Continuation mute: when continued_in_conv_id is set, RESOLVE and FINISH are suppressed and there is no primary |
 | REQ-WAB-010 | PR link verbs (Merge / Open PR) are GitHub links; Phoenix has no merge API |

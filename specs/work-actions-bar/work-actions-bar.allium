@@ -20,7 +20,7 @@
 --   - WorkDisposition: the single derived state selecting the primary verb,
 --     total over every open-PR and stuck-with-PR case.
 --   - Three-zone layout: REVIEW (View Diff), RESOLVE (push-forward), FINISH
---     (terminal verbs Clean up and Abandon).
+--     (terminal verbs Clean up, Merge to base, and Abandon).
 --   - RESOLVE suppression in the error phase.
 --   - Single primary across the whole bar, encoded structurally.
 --   - View Browser exclusion from this bar.
@@ -107,6 +107,11 @@ value ResolveZone {
 value FinishZone {
     show_clean_up: Boolean
     show_abandon: Boolean
+    -- Merge to the local base branch (work-lifecycle REQ-WL-004). Present in
+    -- every visible non-continued disposition and never a primary slot: it is
+    -- always available as a way to finish, and never the bar's answer to
+    -- "what do I do next?".
+    show_merge_to_local_base: Boolean
 }
 
 value RailPrEntry {
@@ -741,7 +746,19 @@ invariant ContinuedSuppressesTerminalVerbs {
         b.presentation.disposition = continued implies
             (b.presentation.finish_zone.show_clean_up = false
              and b.presentation.finish_zone.show_abandon = false
+             and b.presentation.finish_zone.show_merge_to_local_base = false
              and b.presentation.primary = none)
+}
+
+-- REQ-WAB-002: the local-merge FINISH verb is offered by every visible
+-- disposition except continued. Unlike Clean up, no PR state withholds it:
+-- landing work on the local base branch is legal whatever a remote PR says,
+-- and its own preconditions are enforced by work-lifecycle REQ-WL-004 at
+-- invocation time rather than by hiding the verb.
+invariant MergeToLocalBaseOfferedWheneverActionable {
+    for b in WorkActionsBar:
+        (b.presentation.visible = true and b.presentation.disposition != continued)
+            implies b.presentation.finish_zone.show_merge_to_local_base = true
 }
 
 -- ResolveZone.verb is present exactly when the zone is visible. A visible

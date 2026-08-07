@@ -787,6 +787,202 @@ pub(crate) async fn mark_merged(
 }
 
 // ============================================================
+// Merge to local base branch (REQ-WL-004)
+// ============================================================
+
+/// The shared admission gate for terminal actions: no owed background work, no
+/// live turn, and legal under REQ-BED-031. Returns the conversation row so the
+/// caller reads it once, under the admission lock.
+///
+/// `action` is the verb phrase used in the rejection messages.
+async fn admit_terminal_action(
+    state: &AppState,
+    id: &str,
+    action: &str,
+) -> Result<Conversation, AppError> {
+    if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+        .has_owed_work_for_conversation(id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Conversation has pending background work",
+            "pending_wake",
+        ))));
+    }
+    if state
+        .runtime
+        .effective_conversation_state(id)
+        .await
+        .is_some_and(|runtime_state| !runtime_state.allows_terminal_action())
+    {
+        return Err(AppError::BadRequest(format!(
+            "Conversation has active work; wait for it to settle before {action}"
+        )));
+    }
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    ensure_terminal_action_legal(&conv, action)?;
+    Ok(conv)
+}
+
+/// Merge a Work or Branch conversation's branch into the local base branch,
+/// then run the same terminal cleanup as mark-as-merged.
+///
+/// The merge runs in the repository root, which must have the base branch
+/// checked out. Any precondition failure or merge conflict aborts before a
+/// single resource is torn down, so a refused merge leaves the conversation
+/// exactly where it was.
+pub(crate) async fn merge_to_local_base(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission = admission.lock().await;
+    let conv = admit_terminal_action(&state, &id, "merging").await?;
+
+    let is_work_mode = match &conv.conv_mode {
+        ConvMode::Work { .. } => true,
+        ConvMode::Branch { .. } => false,
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation must be in Work or Branch mode to merge".to_string(),
+            ));
+        }
+    };
+    let branch_name = conv
+        .conv_mode
+        .branch_name()
+        .ok_or_else(|| AppError::BadRequest("Conversation has no branch to merge".to_string()))?
+        .to_string();
+
+    let project_id = conv
+        .project_id
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("Conversation is not project-scoped".to_string()))?;
+    let project = state
+        .db
+        .get_project(project_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let repo_root = PathBuf::from(&project.canonical_path);
+    let repo_root_str = repo_root.display().to_string();
+
+    let target_branch = merge_target_branch(&conv, &repo_root)?;
+
+    let merged =
+        crate::git_ops::merge_branch_into_local_target(&repo_root, &branch_name, &target_branch)
+            .map_err(|refusal| merge_refusal_to_error(&refusal, &branch_name))?;
+
+    // Only past this point is anything destroyed: the merge landed.
+    let cleanup = run_resource_cleanup_cascade(&state, &conv).await?;
+
+    let disposition = if is_work_mode {
+        ", task branch deleted"
+    } else {
+        ""
+    };
+    let how = if merged.fast_forwarded {
+        "fast-forward"
+    } else {
+        "merge commit"
+    };
+    let system_message = format!(
+        "Merged {branch_name} into local {} ({how}). Worktree removed{disposition}.",
+        merged.target
+    );
+    tracing::info!(
+        conversation_id = %id,
+        mode = if is_work_mode { "Work" } else { "Branch" },
+        branch = %branch_name,
+        target = %merged.target,
+        fast_forwarded = merged.fast_forwarded,
+        "Merge-to-local-base complete"
+    );
+
+    if let Err(error) = state
+        .runtime
+        .send_event_and_wait_for_state(
+            &id,
+            Event::TaskResolved {
+                system_message,
+                repo_root: repo_root_str,
+            },
+            |settled| matches!(settled, ConvState::Terminal),
+        )
+        .await
+    {
+        reopen_bash_after_failed_lifecycle_mutation(&state, &conv, &cleanup).await;
+        return Err(AppError::BadRequest(error));
+    }
+
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+/// The branch the work should land on: the base branch recorded when the
+/// worktree was created, falling back to the repository's default branch for
+/// rows whose mode carries no base.
+fn merge_target_branch(conv: &Conversation, repo_root: &StdPath) -> Result<String, AppError> {
+    if let Some(base) = conv.conv_mode.base_branch() {
+        return Ok(base.to_string());
+    }
+    phoenix_core::git::resolve_default_branch(repo_root).ok_or_else(|| {
+        AppError::BadRequest(
+            "Could not determine which branch to merge into: the repository has no default branch"
+                .to_string(),
+        )
+    })
+}
+
+/// Map a refusal to an HTTP error. Conflicts and unmergeable-state refusals are
+/// 409 so the UI can distinguish "try again after fixing your checkout" from a
+/// malformed request.
+fn merge_refusal_to_error(refusal: &crate::git_ops::LocalMergeRefusal, branch: &str) -> AppError {
+    use crate::git_ops::LocalMergeRefusal as R;
+    match refusal {
+        R::RootNotOnTarget { current, target } => {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                format!(
+                    "Cannot merge into {target}: the repository is on {current}. \
+                     Check out {target} in the main checkout and try again."
+                ),
+                "merge_target_not_checked_out",
+            )))
+        }
+        R::RootDirty { files } => {
+            let mut response = ConflictErrorResponse::new(
+                "Cannot merge: the main checkout has uncommitted changes. \
+                 Commit or stash them and try again.",
+                "dirty_main_checkout",
+            );
+            response.dirty_files.clone_from(files);
+            AppError::Conflict(Box::new(response))
+        }
+        R::BranchMissing { branch } => {
+            AppError::BadRequest(format!("Branch {branch} no longer exists"))
+        }
+        R::AlreadyMerged { branch, target } => {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                format!(
+                    "{branch} is already contained in {target}; there is nothing to merge. \
+                     Use Clean up to finish."
+                ),
+                "already_merged",
+            )))
+        }
+        R::Conflict { details } => AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            format!("Merge conflict merging {branch}; nothing was changed.\n{details}"),
+            "merge_conflict",
+        ))),
+        R::GitError(message) => AppError::Internal(message.clone()),
+    }
+}
+
+// ============================================================
 // Tests
 // ============================================================
 

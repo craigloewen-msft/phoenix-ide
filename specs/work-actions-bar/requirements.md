@@ -72,10 +72,14 @@ THE SYSTEM SHALL organize available work actions into three logical zones:
 **FINISH zone** — terminal verbs:
 - `Clean up` — calls `mark-merged`. Its git effects (worktree deletion, mode-dependent branch
   disposition) are owned by `work-lifecycle` REQ-WL-002.
+- `Merge to {base}` — merges the branch into the local base branch and then performs the same
+  cleanup, per `work-lifecycle` REQ-WL-004. Present in every visible non-continued
+  disposition, whatever the PR state; its preconditions are enforced at invocation, not by
+  hiding the verb. Never the primary (REQ-WAB-003).
 - `Abandon` — initiates the abandon flow: a diff snapshot and a confirmation dialog precede
   the same mode-dependent git effects, per `work-lifecycle` REQ-WL-001.
-- One of the two terminal verbs may be suppressed in specific `WorkDisposition` cases
-  (REQ-WAB-004).
+- One of the two cleanup verbs (`Clean up`, `Abandon`) may be suppressed in specific
+  `WorkDisposition` cases (REQ-WAB-004).
 
 WHEN the conversation is presented in a narrow mobile viewport
 THE SYSTEM SHALL replace the persistent multi-zone action bar with one thin horizontally scrollable
@@ -120,6 +124,11 @@ WHEN dirty no-PR work has no honest PR-creation link, `View Diff` in the REVIEW 
 primary so the user reviews the work before any terminal cleanup.
 WHEN `WorkDisposition` is `continued`, there is no primary verb and all terminal verbs are
 suppressed (REQ-WAB-009).
+
+The `Merge to {base}` FINISH verb is never a primary in any disposition. It is a way to finish,
+not an answer to "what do I do next?" — and it is the one terminal verb whose preconditions live
+in the repository rather than in the bar's inputs, so glowing it would promise an outcome the
+bar cannot predict.
 
 A RESOLVE disposition may additionally carry a single **secondary** link-out (the
 `Merge on GitHub #N ↗` link beside an `Address feedback` primary). The secondary is structurally distinct from
@@ -242,10 +251,11 @@ the appropriate REVIEW verb.
 
 ### REQ-WAB-007: Terminal Verb Tooltips
 
-EACH terminal verb (`Clean up`, `Abandon`) SHALL carry an info-icon (ⓘ) tooltip that conveys
-the verb's intent AND the key behavioral difference between the two verbs: Abandon captures a
+EACH terminal verb (`Clean up`, `Merge to {base}`, `Abandon`) SHALL carry an info-icon (ⓘ)
+tooltip that conveys the verb's intent AND how it differs from its siblings: Abandon captures a
 diff snapshot first and requires a confirmation dialog before any destructive git operation;
-Clean up does neither.
+Clean up does neither; `Merge to {base}` performs a local merge first and does nothing at all if
+that merge cannot proceed.
 
 The tooltip copy SHALL be mode-sensitive, because branch disposition depends on mode (per
 `work-lifecycle` REQ-WL-002: Work mode deletes the managed task branch, Branch mode keeps the
@@ -263,11 +273,18 @@ Requires confirmation."
 **Abandon (Branch mode):** "Capture a diff snapshot and delete the worktree; your branch is
 kept. Requires confirmation."
 
+**Merge to {base} (Work mode):** "Merges this branch into your local {base}, then deletes the
+worktree and the task branch. Stops without changing anything if the merge conflicts."
+
+**Merge to {base} (Branch mode):** "Merges this branch into your local {base}, then deletes the
+worktree; your branch is kept. Stops without changing anything if the merge conflicts."
+
 **Design:** For a given mode, Clean up and Abandon produce the **same** git side effects —
 worktree deleted, task branch deleted (Work) or kept (Branch) — per `work-lifecycle`
 REQ-WL-001/002. The real differences are Abandon's diff snapshot and its confirmation dialog.
 The tooltips convey intent and that snapshot/confirm difference; they must not pretend the git
-effects differ between the two verbs.
+effects differ between the two verbs. `Merge to {base}` genuinely does differ: it moves a branch
+ref before cleaning up, so its tooltip names both the merge and its all-or-nothing failure mode.
 
 ---
 

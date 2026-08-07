@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { requestActivePrSelectorOpen } from './activePrSelectorIntent';
 import { api } from '../api';
 import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatus';
@@ -15,6 +16,9 @@ interface WorkControlBarProps {
   convModeLabel: string | undefined;
   phaseType: string;
   continuedInConvId: string | null | undefined;
+  /** The branch this work lands on when merged locally. Null when the
+   *  conversation carries no base branch. */
+  baseBranch: string | null | undefined;
   onSendMessage?: (text: string) => Promise<void> | void;
   showError?: (message: string) => void;
   prStatusHandle: ConversationPrStatusHandle;
@@ -93,6 +97,13 @@ function cleanUpHintText(isBranch: boolean): string {
     : 'Mark as merged. Deletes the worktree and the task branch Phoenix created. No confirmation — use Abandon if you want a diff snapshot first.';
 }
 
+function mergeToLocalBaseHintText(baseBranch: string | null | undefined, isBranch: boolean): string {
+  const target = baseBranch ?? 'the base branch';
+  return isBranch
+    ? `Merges this branch into your local ${target}, then deletes the worktree; your branch is kept. Stops without changing anything if the merge conflicts.`
+    : `Merges this branch into your local ${target}, then deletes the worktree and the task branch. Stops without changing anything if the merge conflicts.`;
+}
+
 function abandonHintText(isBranch: boolean): string {
   return isBranch
     ? 'Captures a diff snapshot and deletes the worktree; your branch is kept. Asks for confirmation.'
@@ -115,19 +126,22 @@ export function WorkControlBar({
   convModeLabel,
   phaseType,
   continuedInConvId,
+  baseBranch,
   onSendMessage,
   showError,
   prStatusHandle,
 }: WorkControlBarProps) {
   const [error, setError] = useState<string | null>(null);
   const [markingMerged, setMarkingMerged] = useState(false);
+  const [mergingToLocalBase, setMergingToLocalBase] = useState(false);
   const [abandoning, setAbandoning] = useState(false);
   const [capturing, setCapturing] = useState(false);
   const [openSelectorAfterRefresh, setOpenSelectorAfterRefresh] = useState(false);
   const [expandedPrIdentity, setExpandedPrIdentity] = useState<string | null>(null);
   const [savingPrIdentity, setSavingPrIdentity] = useState<string | null>(null);
   const isMobile = useIsMobile();
-  const isLoading = markingMerged || abandoning;
+  const navigate = useNavigate();
+  const isLoading = markingMerged || abandoning || mergingToLocalBase;
   const { openDiffFullscreen } = useViewerSlotCommands();
 
   const prLoading = prStatusHandle.state.status === 'loading';
@@ -215,6 +229,23 @@ export function WorkControlBar({
     }
   };
 
+  const handleMergeToLocalBase = async () => {
+    setError(null);
+    setMergingToLocalBase(true);
+    try {
+      if (!(await terminalActionStillSafe())) return;
+      await api.mergeToLocalBase(conversationId);
+      // The merge landed and the backend already tore the work down; the
+      // conversation record is only useful as history from here.
+      await api.archiveConversation(conversationId);
+      navigate('/');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to merge');
+    } finally {
+      setMergingToLocalBase(false);
+    }
+  };
+
   const handleAbandon = async () => {
     const confirmText = isBranch
       ? 'Abandon this conversation? The worktree will be deleted but your branch will be kept.'
@@ -285,6 +316,9 @@ export function WorkControlBar({
     return true;
   };
 
+  const mergeLocalLabel = `Merge to ${baseBranch ?? 'base'}`;
+  const mergeLocalPendingLabel = 'Merging…';
+
   const note = disposition.note;
   const addressFeedbackLabel = capturing ? `Capturing ${activePrLabel}…` : `Address ${activePrLabel} feedback`;
   const addressFeedbackAriaLabel = canShowPrDiff
@@ -324,6 +358,18 @@ export function WorkControlBar({
               onClick={handleCleanUp}
             >
               Clean up
+            </button>
+          )}
+          {disposition.showMergeToLocalBase && !cleanupBlockedByAmbiguity && (
+            <button
+              type="button"
+              className="mobile-pr-action mobile-pr-action--cleanup"
+              aria-label={`${mergeLocalLabel}. ${mergeToLocalBaseHintText(baseBranch, isBranch)}`}
+              title={mergeToLocalBaseHintText(baseBranch, isBranch)}
+              disabled={isLoading}
+              onClick={handleMergeToLocalBase}
+            >
+              {mergingToLocalBase ? mergeLocalPendingLabel : mergeLocalLabel}
             </button>
           )}
           {disposition.showAbandon && !cleanupBlockedByAmbiguity && (
@@ -423,6 +469,18 @@ export function WorkControlBar({
                   onClick={handleCleanUp}
                 >
                   <span className="mobile-pr-action-icon" aria-hidden="true">—</span><span>Clean up</span>
+                </button>
+              )}
+              {!cleanupBlockedByAmbiguity && disposition.showMergeToLocalBase && (
+                <button
+                  type="button"
+                  className="mobile-pr-action mobile-pr-action--cleanup"
+                  aria-label={`${mergeLocalLabel}. ${mergeToLocalBaseHintText(baseBranch, isBranch)}`}
+                  title={mergeToLocalBaseHintText(baseBranch, isBranch)}
+                  disabled={isLoading}
+                  onClick={handleMergeToLocalBase}
+                >
+                  <span className="mobile-pr-action-icon" aria-hidden="true">⇥</span><span>{mergingToLocalBase ? mergeLocalPendingLabel : mergeLocalLabel}</span>
                 </button>
               )}
               {!cleanupBlockedByAmbiguity && disposition.showAbandon && disposition.primary !== 'abandon' && (
@@ -565,6 +623,21 @@ export function WorkControlBar({
               {markingMerged ? 'Cleaning…' : 'Clean up'}
             </button>
             <InfoHint text={cleanUpHintText(isBranch)} />
+          </div>
+        )}
+        {!cleanupBlockedByAmbiguity && disposition.showMergeToLocalBase && (
+          <div className="desktop-work-actions-terminal">
+            <button
+              className="work-actions-btn work-actions-merge-local"
+              data-testid="merge-to-local-base-button"
+              aria-label={`${mergeLocalLabel}. ${mergeToLocalBaseHintText(baseBranch, isBranch)}`}
+              title={mergeToLocalBaseHintText(baseBranch, isBranch)}
+              disabled={isLoading}
+              onClick={handleMergeToLocalBase}
+            >
+              {mergingToLocalBase ? mergeLocalPendingLabel : mergeLocalLabel}
+            </button>
+            <InfoHint text={mergeToLocalBaseHintText(baseBranch, isBranch)} />
           </div>
         )}
         {!cleanupBlockedByAmbiguity && disposition.showAbandon && (

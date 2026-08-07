@@ -8,7 +8,9 @@
 -- Includes: Abandon (confirmation gate, diff snapshot, worktree + branch
 --             cleanup with mode-dependent disposition),
 --           Mark as merged (worktree + branch cleanup, mode-dependent
---             disposition, no squash, no push),
+--             disposition, no merge, no push),
+--           Merge to the local base branch (precondition-gated local merge
+--             followed by the same cleanup; abort-and-refuse on conflict),
 --           PR merge state as the advisory cleanup-affordance gate for one
 --             task/worktree lifecycle even when multiple associated PRs exist.
 -- Excludes: the canonical scope boundary is stated in requirements.md and
@@ -17,7 +19,7 @@
 --           auto-fix is the pr-association spec; UI surface composition is the
 --           work-actions-bar spec). Not re-duplicated here.
 --
--- Requirement traceability: REQ-WL-001 through REQ-WL-003
+-- Requirement traceability: REQ-WL-001 through REQ-WL-004
 -- Increment-1 clarification: plural PR association belongs to
 -- pr-association; this spec remains singular in ownership of cleanup. Multiple
 -- associated PRs may be summarized by sibling surfaces, and one explicit active
@@ -48,6 +50,9 @@ external entity Worktree {
 -- identifier. The two user-initiated terminal actions in this spec resolve a
 -- Work/Branch conversation with one of exactly two outcomes: `merged` (Mark
 -- as merged) or `abandoned` (Abandon), passed as bare identifiers below.
+-- Merge to the local base branch (REQ-WL-004) also resolves with `merged`:
+-- from the conversation's point of view the work shipped, and only the means
+-- differ.
 
 enum PrDisplayState  { open | draft | merged | closed }
 enum PrCheckState    { passing | pending | failing | unknown }
@@ -75,6 +80,29 @@ enum PrCheckState    { passing | pending | failing | unknown }
 --       still in use by another live conversation. This is the same
 --       any-live-owner signal that gates the bedrock terminal cascade
 --       (cascade_projects_on_delete, REQ-BED-032).
+--
+--   merge_target_branch(conversation: Conversation) -> String
+--       The branch this work lands on: the base branch recorded when the
+--       worktree was created, else the repository's default branch.
+--
+--   root_checkout_branch(conversation: Conversation) -> String
+--       The branch currently checked out in the repository root — the
+--       checkout that owns the target ref.
+--
+--   root_checkout_is_clean(conversation: Conversation) -> Boolean
+--       True when the repository root has no uncommitted changes.
+--
+--   branch_exists(branch_name: String) -> Boolean
+--       True when refs/heads/{branch_name} resolves.
+--
+--   branch_contained_in(branch_name: String, target: String) -> Boolean
+--       True when branch_name is already an ancestor of target — the merge
+--       would contribute nothing.
+--
+--   merge_is_conflict_free(branch_name: String, target: String) -> Boolean
+--       True when merging branch_name into target completes without
+--       conflicts. A false result leaves the repository unchanged: the
+--       attempted merge is aborted.
 
 ------------------------------------------------------------
 -- Value Types
@@ -244,7 +272,60 @@ rule MarkAsMerged {
 }
 
 -- ===========================================================
--- 3. PR MERGE STATE AS CLEANUP GATE (REQ-WL-003)
+-- 3. MERGE TO THE LOCAL BASE BRANCH (REQ-WL-004)
+-- ===========================================================
+--
+-- A single user action that lands the branch on the local base branch and
+-- then performs exactly the mark-as-merged cleanup. Every precondition is
+-- checked, and a conflicting merge aborted, before any cleanup runs, so a
+-- refusal leaves the repository and the conversation untouched.
+
+rule MergeToLocalBase {
+    when: UserMergesToLocalBase(conversation)
+
+    let worktree = Worktree{conversation: conversation}
+    let target = merge_target_branch(conversation)
+
+    requires: exists worktree
+    requires: root_checkout_branch(conversation) = target
+    requires: root_checkout_is_clean(conversation)
+    requires: branch_exists(worktree.branch_name)
+    requires: not branch_contained_in(worktree.branch_name, target)
+    requires: merge_is_conflict_free(worktree.branch_name, target)
+
+    ensures: BranchMergedInto(worktree.branch_name, target)
+
+    ensures:
+        if not has_live_worktree_co_owner(conversation):
+            not exists worktree
+
+    ensures:
+        if is_managed_mode(conversation) and not has_live_worktree_co_owner(conversation):
+            BranchDeleted(worktree.branch_name)
+
+    ensures: bedrock/TaskResolved(conversation, merged)
+    ensures: SystemMessageEmitted(conversation, "Merged into the base branch. Worktree deleted.")
+
+    @guidance
+        -- Sequence:
+        --   1. Validate legality (mode, core_status, parent_status,
+        --      continued_in_conv_id) — HTTP 409 on failure.
+        --   2. Evaluate every merge precondition in the repository root.
+        --      Any failure returns before a single git write.
+        --   3. `git merge --no-edit {branch}` in the repository root.
+        --      Non-zero exit: `git merge --abort`, return the conflict output,
+        --      and run NO cleanup and NO state transition.
+        --   4. Only on success: the mark-as-merged cleanup cascade
+        --      (worktree remove; managed-mode branch delete).
+        --   5. Send TaskResolved(conversation, merged) and emit the system
+        --      message naming the target branch and merge shape.
+        --
+        -- The merge must run in the checkout that has `target` checked out, so
+        -- ref, index, and working tree move together. Never push to origin.
+}
+
+-- ===========================================================
+-- 4. PR MERGE STATE AS CLEANUP GATE (REQ-WL-003)
 -- ===========================================================
 --
 -- Phoenix queries `gh` for the branch's PR state. The result is advisory:

@@ -17,8 +17,8 @@ use super::git_handlers::{
 use super::global_read;
 use super::lifecycle_handlers::{
     abandon_task, approve_commission_review, approve_fork_proposal, approve_task,
-    dismiss_fork_proposal, list_fork_proposals, mark_merged, reject_commission_review, reject_task,
-    request_changes_on_fork_proposal, task_feedback,
+    dismiss_fork_proposal, list_fork_proposals, mark_merged, merge_to_local_base,
+    reject_commission_review, reject_task, request_changes_on_fork_proposal, task_feedback,
 };
 use super::sse::{sse_stream, SseInitTrace};
 use super::types::{
@@ -246,6 +246,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/abandon-task", post(abandon_task))
         // Mark as merged (REQ-PROJ-026)
         .route("/api/conversations/:id/mark-merged", post(mark_merged))
+        // Merge into the local base branch, then clean up (REQ-WL-004)
+        .route(
+            "/api/conversations/:id/merge-to-local-base",
+            post(merge_to_local_base),
+        )
         // Lifecycle (REQ-API-006). Archive and delete are both terminal
         // transitions that run the resource-cleanup cascade (REQ-BED-032);
         // archive preserves the row, delete removes it. There is no
