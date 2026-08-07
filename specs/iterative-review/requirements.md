@@ -245,3 +245,26 @@ AND the guide SHALL list every keyboard command the review surfaces accept
 generated from the same table that resolves the key presses, so a command cannot
 be added without becoming documented — the alternative, a hand-maintained list,
 drifts on the first change and then actively misinforms.
+
+---
+
+### REQ-RV-013: The Reader Controls How Much Screen the Review Gets
+
+WHERE a diff is presented for review
+THE SYSTEM SHALL let the user choose between an inline and a side-by-side rendering
+AND SHALL apply that choice to every diff surface and remember it across sessions
+
+WHERE a diff is presented beside the conversation
+THE SYSTEM SHALL offer an explicit control that collapses the conversation so the
+  review occupies the full window, and restores it on demand
+AND SHALL restore the conversation when the diff is no longer presented beside it
+
+**Design:** Rendering style is a property of the reader, not of a particular
+diff — a user who reads side-by-side reads side-by-side everywhere, so one
+remembered choice governs both the whole-branch diff and the per-file review
+diff. Collapsing is an explicit act rather than a side effect of clicking into
+the diff: reviewing involves clicking constantly (lines, notes, files), and a
+layout that moved under those clicks would be unpredictable. Because collapsing
+is a transient reading posture rather than an addressable place, it is not part
+of the viewer's addressable state, and it lapses when the surface it belongs to
+goes away.

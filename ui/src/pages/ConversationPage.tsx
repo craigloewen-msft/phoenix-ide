@@ -412,6 +412,18 @@ function ConversationPageContent({
     collapseThreshold: 280,
   });
 
+  // Review focus: collapse the conversation column so a split-pane diff review
+  // gets the whole window. Transient layout state, not URL state — the viewer
+  // slot's `presentation` owns the durable pane/fullscreen distinction.
+  // Offered only on the diff surfaces, which are the ones that benefit.
+  const reviewFocusEligible = isWideDesktop && (paneDiffOpen || proseSlot?.mode === 'diff');
+  const [reviewFocus, setReviewFocus] = useState(false);
+  const toggleReviewFocus = useCallback(() => setReviewFocus((prev) => !prev), []);
+  useEffect(() => {
+    if (!reviewFocusEligible) setReviewFocus(false);
+  }, [reviewFocusEligible]);
+  const reviewFocusActive = reviewFocusEligible && reviewFocus;
+
   // The viewer pane (`--viewer-pane-width`) and the terminal pane
   // (`--terminal-pane-height`, read by `TerminalPanel`) are sized from CSS
   // variables on `#app`. Each variable is owned imperatively (NOT via the React
@@ -2285,7 +2297,7 @@ function ConversationPageContent({
     <div
       id="app"
       ref={setAppElement}
-      className={showSplitPaneViewer ? 'app-split-pane' : undefined}
+      className={showSplitPaneViewer ? (reviewFocusActive ? 'app-split-pane app-split-pane--review-focus' : 'app-split-pane') : undefined}
     >
       <div className="conversation-column">
       <ConversationReturnBreadcrumb />
@@ -2880,6 +2892,7 @@ function ConversationPageContent({
         <>
           <div
             className="viewer-pane-divider"
+            hidden={reviewFocusActive}
             title="Drag to resize the viewer pane • Double-click to collapse"
             role="separator"
             aria-orientation="vertical"
@@ -2923,6 +2936,8 @@ function ConversationPageContent({
                   activePrIdentity={activePrIdentity}
                   onClose={handleCloseDiff}
                   onSendNotes={handleSendNotes}
+                  reviewFocus={reviewFocusActive}
+                  onToggleReviewFocus={toggleReviewFocus}
                   inline
                 />
               ) : splitPanePrs ? (
@@ -2936,6 +2951,9 @@ function ConversationPageContent({
                   presentation={proseSlot?.presentation ?? 'pane'}
                   canTogglePresentation
                   onPresentationChange={viewerSlot.setPresentation}
+                  {...(proseSlot?.mode === 'diff'
+                    ? { reviewFocus: reviewFocusActive, onToggleReviewFocus: toggleReviewFocus }
+                    : {})}
                   inline
                 />
               ) : browserViewerOpen && conversationId ? (

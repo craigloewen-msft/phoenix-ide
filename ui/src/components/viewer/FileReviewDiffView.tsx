@@ -20,6 +20,8 @@ import { useReviewKeyboard } from './useReviewKeyboard';
 import { useRefreshOnWindowFocus } from './useRefreshOnWindowFocus';
 import type { ReviewCommand } from './reviewKeymap';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
+import { useDiffStyle } from './useDiffStyle';
+import { DiffStyleToggleButton, ReviewFocusToggleButton } from './DiffHeaderControls';
 import { api, type FileReviewState, type ReviewDiffScope, type ReviewFileDiffResponse } from '../../api';
 import './FileReviewDiffView.css';
 
@@ -52,6 +54,10 @@ export interface FileReviewDiffViewProps {
   /** Re-read the review manifest; the diff itself is refetched locally. */
   onRefreshManifest?: (() => void) | undefined;
   inline?: boolean | undefined;
+  /** Split-pane review focus state; meaningful only with `onToggleReviewFocus`. */
+  reviewFocus?: boolean | undefined;
+  /** Supplied only by the split-pane host that owns the conversation collapse. */
+  onToggleReviewFocus?: (() => void) | undefined;
 }
 
 function anchorDialogLabel(target: AnnotateTarget): string {
@@ -78,9 +84,12 @@ export function FileReviewDiffView({
   onNextFile,
   onRefreshManifest,
   inline,
+  reviewFocus = false,
+  onToggleReviewFocus,
 }: FileReviewDiffViewProps) {
   useRegisterFocusScope(FILE_REVIEW_SCOPE);
   const notes = useDiffReviewNotes(onSendNotes);
+  const { diffStyle, toggleDiffStyle } = useDiffStyle();
   const { diffNotes } = notes;
   const codeViewRef = useRef<React.ComponentRef<typeof PhoenixDiffCodeView>>(null);
 
@@ -236,6 +245,7 @@ export function FileReviewDiffView({
               Mark reviewed
             </button>
           )}
+          <DiffStyleToggleButton diffStyle={diffStyle} onToggle={toggleDiffStyle} />
           <button
             type="button"
             className="viewer-shell-btn"
@@ -254,6 +264,9 @@ export function FileReviewDiffView({
           >
             <Keyboard size={16} />
           </button>
+          {onToggleReviewFocus && (
+            <ReviewFocusToggleButton reviewFocus={reviewFocus} onToggle={onToggleReviewFocus} />
+          )}
         </>
       }
       noteCount={diffNotes.length}
@@ -315,7 +328,7 @@ export function FileReviewDiffView({
             ref={codeViewRef}
             committedDiff={data.diff}
             uncommittedDiff=""
-            diffStyle="unified"
+            diffStyle={diffStyle}
             notes={diffNotes}
             highlightedNoteId={notes.highlightedNoteId}
             onAnnotateLine={notes.startAnnotateLine}

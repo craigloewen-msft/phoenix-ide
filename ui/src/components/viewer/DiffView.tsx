@@ -11,7 +11,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Columns2, GitBranch, Keyboard, RefreshCw, Rows3 } from 'lucide-react';
+import { GitBranch, Keyboard, RefreshCw } from 'lucide-react';
 import type { BranchRemoteStatus, CheckoutStatus, ReviewFileEntry } from '../../api';
 import type { DiffSection, ReviewNote } from '../../contexts/ReviewNotesContext';
 import { useReviewContext } from '../../contexts/useReviewContext';
@@ -38,6 +38,8 @@ import { openShortcutHelp } from './openShortcutHelp';
 import { useReviewKeyboard } from './useReviewKeyboard';
 import { useRefreshOnWindowFocus } from './useRefreshOnWindowFocus';
 import type { ReviewCommand } from './reviewKeymap';
+import { useDiffStyle } from './useDiffStyle';
+import { DiffStyleToggleButton, ReviewFocusToggleButton } from './DiffHeaderControls';
 import './DiffView.css';
 
 export interface DiffViewProps {
@@ -65,18 +67,18 @@ export interface DiffViewProps {
   /** Refetch the diff payload. Absent when the host has no way to reload (a
    *  statically-supplied diff), which is what makes `R` a no-op there. */
   onRefresh?: (() => void) | undefined;
+  /** Split-pane review focus: whether the conversation column is collapsed.
+   *  Meaningful only when `onToggleReviewFocus` is supplied. */
+  reviewFocus?: boolean | undefined;
+  /** Supplied only by the split-pane host, which owns the collapse. Its absence
+   *  is what keeps the affordance off overlay/takeover surfaces that already
+   *  own the whole screen. */
+  onToggleReviewFocus?: (() => void) | undefined;
 }
 
-type DiffStyle = 'unified' | 'split';
-const DIFF_STYLE_KEY = 'phoenix-diff-style';
 const DIFF_FIND_SURFACE_KEY = createSurfaceKey('diff-viewer');
 
 type DiffFindFocusOrigin = HTMLElement | { readonly token: 'diff-find-button' };
-
-function initialDiffStyle(): DiffStyle {
-  const stored = localStorage.getItem(DIFF_STYLE_KEY);
-  return stored === 'split' ? 'split' : 'unified';
-}
 
 export function DiffView({
   open,
@@ -95,6 +97,8 @@ export function DiffView({
   inline = false,
   takeover = false,
   onRefresh,
+  reviewFocus = false,
+  onToggleReviewFocus,
 }: DiffViewProps) {
   useRegisterFocusScope(open ? 'diff-viewer' : null);
   const notes = useDiffReviewNotes(onSendNotes);
@@ -102,7 +106,7 @@ export function DiffView({
   const findButtonRef = useRef<HTMLButtonElement>(null);
   const findPreviousFocusRef = useRef<HTMLElement | null>(null);
 
-  const [diffStyle, setDiffStyle] = useState<DiffStyle>(initialDiffStyle);
+  const { diffStyle, toggleDiffStyle } = useDiffStyle();
   const restoreFocus = useCallback((focusOrigin: DiffFindFocusOrigin) => {
     if (focusOrigin instanceof HTMLElement) {
       queueMicrotask(() => focusOrigin.focus());
@@ -189,14 +193,6 @@ export function DiffView({
     () => (findSession ? findSession.matches.map((match) => match.target) : []),
     [findSession],
   );
-
-  const toggleDiffStyle = useCallback(() => {
-    setDiffStyle((prev) => {
-      const next = prev === 'unified' ? 'split' : 'unified';
-      localStorage.setItem(DIFF_STYLE_KEY, next);
-      return next;
-    });
-  }, []);
 
   const diffNotes = notes.diffNotes;
   const { highlight, closePanel } = notes;
@@ -375,14 +371,7 @@ export function DiffView({
           >
             Find
           </button>
-          <button
-            className="viewer-shell-btn"
-            onClick={toggleDiffStyle}
-            aria-label={diffStyle === 'unified' ? 'Switch to split view' : 'Switch to unified view'}
-            title={diffStyle === 'unified' ? 'Split view' : 'Unified view'}
-          >
-            {diffStyle === 'unified' ? <Columns2 size={18} /> : <Rows3 size={18} />}
-          </button>
+          <DiffStyleToggleButton diffStyle={diffStyle} onToggle={toggleDiffStyle} />
           <button
             className="viewer-shell-btn"
             type="button"
@@ -401,6 +390,9 @@ export function DiffView({
           >
             <Keyboard size={18} />
           </button>
+          {onToggleReviewFocus && (
+            <ReviewFocusToggleButton reviewFocus={reviewFocus} onToggle={onToggleReviewFocus} />
+          )}
         </>
       }
       banner={findSession ? (

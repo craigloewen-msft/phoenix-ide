@@ -28,6 +28,7 @@ and commit with.
 | **REQ-RV-010:** Keyboard-complete review pass | ✅ Complete | `reviewKeymap.ts` (binding table + resolver); `useReviewKeyboard`; `DiffView` file cursor; `FileReviewDiffView` |
 | **REQ-RV-011:** Reconciles with edits made outside Phoenix | ✅ Complete | `R` command and header button on both surfaces; `useRefreshOnWindowFocus` |
 | **REQ-RV-012:** Keyboard commands are discoverable | ✅ Complete | `REVIEW_BINDINGS` → `ShortcutHelpPanel` "Diff Review" group; keyboard button in both viewer headers |
+| **REQ-RV-013:** Reader controls the review's screen | ✅ Complete | `useDiffStyle` + `DiffStyleToggleButton` shared by `DiffView` and `FileReviewDiffView`; `ConversationPage` review-focus state → `.app-split-pane--review-focus` |
 
 ## Current reality
 
@@ -68,6 +69,12 @@ regains focus. Phoenix has no filesystem-watch subsystem, and adding one (a
 separable piece of work; a real watcher would replace the focus trigger without
 changing the requirement.
 
+**Reading posture.** Rendering style is one `phoenix-diff-style` preference read
+by `useDiffStyle` on every diff surface. Review focus lives in `ConversationPage`
+component state and applies `.app-split-pane--review-focus`, which overrides the
+reserved chat width in CSS — `--viewer-pane-width` keeps its two imperative
+writers (the pane layout effect and the divider's live-drag channel).
+
 ## Verification
 
 - Rust (`git_ops::review::tests`): checkpoint stability across commit/amend/rebase;
@@ -90,6 +97,10 @@ changing the requirement.
 - UI (`FileReviewDiffView.keyboard.test.tsx`): mark at the rendered blob then
   advance, unmark without advancing, file motion, refresh, close.
 - UI (`ShortcutHelpPanel.test.tsx`): every binding in the table reaches the guide.
+- UI (`DiffView.test.tsx`, `FileReviewDiffView.test.tsx`): the unified/split toggle
+  driving Pierre's `diffStyle`, the shared persisted preference across both diff
+  surfaces, and that the conversation-collapse control appears only on the
+  split-pane surfaces that supply the handler.
 - Manual: the full loop exercised against the seeded `diff-review-fixture`
   conversation — mark → agent edit → stale marker → since-review delta.
 

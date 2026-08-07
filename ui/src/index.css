@@ -11365,6 +11365,17 @@ html * {
   padding-right: var(--viewer-pane-width, 600px);
 }
 
+/* Review focus: the diff viewer takes the whole window while reviewing.
+ * Overrides the reserved chat width rather than writing --viewer-pane-width,
+ * whose two imperative writers (layout effect + live drag) stay the only ones. */
+#app.app-split-pane--review-focus {
+  padding-right: 0;
+}
+
+#app.app-split-pane--review-focus > .conversation-column {
+  display: none;
+}
+
 .conversation-viewer-pane {
   position: absolute;
   top: 0;
@@ -11377,6 +11388,11 @@ html * {
   background: var(--bg-primary);
   overflow: hidden;
   z-index: 5;
+}
+
+#app.app-split-pane--review-focus > .conversation-viewer-pane {
+  width: 100%;
+  border-left: none;
 }
 
 /* Vertical pane divider for the viewer split — sits at the
