@@ -1,4 +1,4 @@
-import { type ReactElement } from 'react';
+import { StrictMode, type ReactElement } from 'react';
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { VirtualTranscript, type VirtualTranscriptHandle, type VirtualTranscriptPhysicalSnapshot } from './VirtualTranscript';
@@ -664,5 +664,46 @@ describe('VirtualTranscript', () => {
     expect(screen.getByTestId('mounted-b')).toBe(originalB);
     expect(screen.getByTestId('mounted-c')).toBe(originalC);
     expect(rowIndexes()).toEqual([0, 1, 2, 3]);
+  });
+
+  // StrictMode's simulated remount runs every mount-only effect cleanup while the
+  // elements stay mounted, and React does not invoke ref callbacks again. Any
+  // cleanup that tears down the store's element identity therefore detaches it
+  // from the DOM for good: scroll events and resize measurements stop reaching
+  // the store, the rendered range freezes, and the viewport ends up inside a
+  // spacer with no rows in it.
+  it('keeps the store wired to the scroller across a StrictMode remount', () => {
+    render(
+      <StrictMode>
+        <VirtualTranscript
+          items={makeItems(200)}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={0}
+          initialTail={false}
+          renderItem={renderRow}
+        />
+      </StrictMode>,
+    );
+
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+    const initialIndexes = rowIndexes();
+    expect(initialIndexes.length).toBeGreaterThan(0);
+
+    // The scroller is still wired up, so a scroll recomputes the rendered range.
+    scroller.scrollTop = 1000;
+    fireEvent.scroll(scroller);
+
+    const scrolledIndexes = rowIndexes();
+    expect(scrolledIndexes).not.toEqual(initialIndexes);
+    expect(scrolledIndexes[0]).toBeGreaterThan(initialIndexes[0]!);
+
+    // The rendered rows cover the viewport rather than leaving it on a spacer.
+    expect(scrolledIndexes[0]!).toBeLessThanOrEqual(1000 / 20);
+    expect(scrolledIndexes[scrolledIndexes.length - 1]!).toBeGreaterThanOrEqual(1000 / 20);
+
+    // The ResizeObserver survived the remount, so rows are still measured.
+    const observer = resizeObservers.at(-1)!;
+    expect(observer.elements.has(scroller)).toBe(true);
   });
 });
