@@ -554,18 +554,29 @@ function VirtualTranscriptInner<T>(
     publish();
   }, [estimatedExtent, getKey, items, overscan, publish, resolvedPhysicalKeys]);
 
+  // Element identity is owned by the ref callbacks; this effect owns only the
+  // ResizeObserver subscription. React invokes a ref callback again only when the
+  // element or the callback identity changes, so anything this cleanup tears down
+  // is never rebuilt by the refs alone. StrictMode's simulated remount runs the
+  // cleanup while the elements stay mounted, so tearing down element identity here
+  // would detach the store from its scroller for good: scroll events and resize
+  // measurements stop reaching it, the rendered range freezes wherever it was, and
+  // the viewport lands inside a spacer with no rows in it. Re-observing what the
+  // store still references keeps this effect symmetric with its cleanup.
   useLayoutEffect(() => {
     const current = storeRef.current;
+    if (current) {
+      if (current.scroller) observeElement(current, publish, current.scroller);
+      if (current.headerElement) observeElement(current, publish, current.headerElement);
+      for (const element of current.rowElements.values()) {
+        observeElement(current, publish, element);
+      }
+    }
     return () => {
       current?.resizeObserver?.disconnect();
-      current?.rowElements.clear();
-      if (current) {
-        current.headerElement = null;
-        current.scroller = null;
-        current.resizeObserver = null;
-      }
+      if (current) current.resizeObserver = null;
     };
-  }, []);
+  }, [publish]);
 
   useLayoutEffect(() => {
     onRangeChange?.(buildPhysicalSnapshot(store));
