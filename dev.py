@@ -2245,10 +2245,20 @@ def _title_from_slug(slug: str) -> str:
     return " ".join(w[:1].upper() + w[1:] for w in slug.split("-") if w)
 
 
-def _migrate_seed_database(*, build: bool) -> None:
+def _migrate_seed_database(*, build: bool, release: bool = True) -> None:
+    """Apply the canonical Rust migration chain to the seed database.
+
+    `release` selects which binary profile to build and run. The binary is
+    invoked with `--migrate-only` and exits immediately, so the profile has no
+    bearing on correctness — it only trades build time against a runtime speed
+    that this call never uses. Callers that already pay for a debug build (the
+    check pipeline) pass release=False to reuse it instead of provoking a
+    second, slower compile of the whole workspace.
+    """
+    profile = "release" if release else "debug"
     if build:
-        build_rust(release=True)
-    binary = ROOT / "target" / "release" / "phoenix_ide"
+        build_rust(release=release)
+    binary = ROOT / "target" / profile / "phoenix_ide"
     if not binary.exists():
         raise RuntimeError(f"Phoenix binary not found after build: {binary}")
     env = os.environ.copy()
@@ -2266,6 +2276,7 @@ def cmd_seed(
     *,
     build: bool = True,
     repair_fixtures: bool = False,
+    release: bool = True,
 ) -> None:
     """Populate the dev DB with representative conversations.
 
@@ -3143,7 +3154,7 @@ def cmd_seed(
     direct_mode = {"mode": "Direct"}
     explore_mode = {"mode": "Explore"}
 
-    _migrate_seed_database(build=build)
+    _migrate_seed_database(build=build, release=release)
     with sqlite3.connect(str(db_path), timeout=10) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
 
@@ -5774,7 +5785,14 @@ def cmd_check(
                 nextest_profile_args = [
                     "--config-file", str(nextest_config), "--profile", "phoenix-cpu",
                 ]
+            # --no-fail-fast: nextest stops the run on the first failure by
+            # default, but `check` is a batch gate whose contract is that one
+            # invocation surfaces every failure (the same reason
+            # codegen-stale records rather than aborts). Fail-fast would hide
+            # failures 2..n behind a re-run each, and `cargo test` — the
+            # fallback this must stay equivalent to — does not fail fast.
             test_cmd = ["cargo", "nextest", *nextest_profile_args, "run", *_pflags(),
+                        "--no-fail-fast",
                         "-E", "not test(/export_bindings/)",
                         "--test-threads", str(test_threads)]
             codegen_cmd = ["cargo", "nextest", "run", *codegen_p,
