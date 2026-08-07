@@ -239,3 +239,106 @@ grind worth doing on its own merits. Don't block the speed win on the cleanup.
   the fix.
 - No coverage is lost by accident: the doctest question is answered explicitly,
   and every deleted test is deleted deliberately, one commit at a time.
+
+---
+
+## Outcome (measured)
+
+Both runs are the full 13-lane fan-out on the same tree and machine
+(16 cores, 15 GiB RAM, WSL2), captured from `./dev.py check`'s own summary.
+
+| | before | after |
+|---|---|---|
+| **total** | **807.5 s** (cold worktree) | **166.2 s** (warm) |
+| cargo test compile | 600.0 s (TIMEOUT, 554.2 s lock-blocked) | 53.6 s |
+| cargo clippy | 480.8 s | 37.7 s |
+| e2e | 580.4 s | 55.6 s |
+| dev.py unit tests | 600.0 s (TIMEOUT) | 65.1 s |
+| tsc typecheck | 116.4 s | 0.7 s |
+| eslint | 66.6 s | 24.9 s |
+
+The two figures are not a like-for-like A/B: the "before" run was also a cold
+worktree populating an empty `target/` and an empty sccache, so it carries
+one-time build cost the warm run does not. The honest claim is narrower and
+still decisive: the before run could not finish at all (two steps hit the 600 s
+timeout), and the specific defect that caused that is fixed and measured.
+
+### What actually dominated, and it was not what the plan predicted
+
+Findings 1-3 (missing accelerators) were real but secondary. The dominant cost
+was a bug the investigation had not found:
+
+`tests/devpy/test_seed.py::setUpClass` ran `build_rust(release=True)` — a full
+**release** build of the workspace — inside the parallel fan-out. Cargo's target
+lock is **per-directory, not per-profile**, so it contended with the debug
+builds in the rust and e2e lanes. `cargo test compile` spent **554.2 s of its
+600 s budget blocked on the cargo file lock** and then timed out. Two of the
+five reported "failures" were this starvation, not broken code.
+
+The binary is only ever invoked `--migrate-only`, so the profile cannot affect
+what the suite asserts. Building debug instead reuses the binary the e2e lane
+already produces. Lock-wait on the warm run dropped to 33.8 s.
+
+This is the same pathology task 76001 investigated and closed as resolved. It
+was not resolved; it had moved to a third contender the earlier analysis did
+not enumerate.
+
+## Delivered
+
+- **Stage 1** — accelerator advisory in the existing check summary, naming the
+  cost and install command for nextest, compiler cache, and linker. Silent when
+  fully accelerated; distinguishes "never probed" from "probed, absent" so a
+  UI-only check never advertises Rust tooling it did not need. 13 unit tests in
+  `tests/devpy/test_accelerators.py`.
+- **Stage 2** — installed cargo-nextest (14 MB, no cache of its own) and
+  sccache (settled at **1.2 GB**, far under dev.py's 20 GB LRU ceiling); lld
+  selected via RUSTFLAGS when present. Chose RUSTFLAGS over a generated
+  `.cargo/config.local.toml` because cargo's `include` is a hard error when its
+  target is missing, which would break a fresh clone until the first check ran.
+- **Stage 3** — fixed the release-build lock starvation described above.
+- Added `--no-fail-fast` to nextest: it stops at the first failure by default,
+  but check is a batch gate contracted to surface every failure in one pass, and
+  the `cargo test` fallback it must stay equivalent to does not fail fast. The
+  before run stopped at 844 of 3006 tests on a single failure.
+
+### Doctest question — answered
+
+This was the one way installing nextest could have silently lost coverage. The
+workspace has **zero runnable doctests**: all 7 doc-comment code fences are
+`text` or `ignore`. No `cargo test --doc` step is owed.
+
+## Not done, and why
+
+**Stage 4 (test-suite cleanup) is deliberately not in this branch.** The
+measurement is why: wall clock was compile, link, and lock contention — not test
+execution. `cargo test` runs 3006 tests in 90.6 s. Deleting even a few hundred
+microsecond-scale unit tests would not move the total, and would mix
+judgement-heavy deletions into a branch whose value is a mechanical, verifiable
+speedup. Worth doing on maintenance merits; it is not a speed lever. Groundwork
+for the follow-up:
+
+- The 26 `parity_*` tests **are** a dead migration scaffold — confirmed:
+  `legacy_sse_event_to_json` is `#[cfg(test)]`-only, so the production `json!()`
+  path they defend no longer exists.
+- 187 test fns match plumbing-name patterns; task 36021 already owns the 34
+  remaining sleep-bearing tests, the only cluster that burns real wall clock.
+
+## Pre-existing failures found, filed not fixed
+
+- `registry::tests::test_no_api_keys_no_models` reads `PHOENIX_ENABLE_MOCK_MODEL`
+  from ambient env, which `.phoenix-ide.dev.env` sets — filed as **82005**.
+- `allium specs` unknown import alias — already filed as **28008**.
+- `bare_supervisor` — already filed.
+- vitest passes standalone (2198 tests, 143 files); it flaked only under
+  parallel load, matching the known flake in task 08691.
+- 7 `git_start` / `approve_task_branch_collision` failures were an artifact of
+  the authoring agent's sandbox (`GIT_CONFIG_KEY_0=safe.bareRepository=explicit`),
+  not real failures: all 16 pass with that override removed. No task filed.
+
+## Acceptance
+
+- Warm check on a branch touching `crates/` and `ui/`: **807.5 s → 166.2 s**,
+  measured from check's own summary rather than asserted. ✓
+- No accelerator can be absent without the summary naming it and its fix. ✓
+- No coverage lost by accident: doctests verified absent; no tests deleted;
+  `--no-fail-fast` strictly increases what one run reports. ✓
