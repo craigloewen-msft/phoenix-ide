@@ -1175,16 +1175,19 @@ impl ModelRegistry {
     }
 
     /// Get a cheap/fast model for auxiliary tasks like title generation.
-    /// Prefers: claude-haiku-4-5 > gpt-5.4-mini > any available model
+    ///
+    /// Selection is anchored to the default model's provider so an auxiliary
+    /// task never reaches for a model whose credential does not apply. A
+    /// deployment that supplies its own catalog (`PHOENIX_LLM_MODELS`) keeps
+    /// auxiliary traffic on that catalog rather than falling through to a
+    /// built-in id that shares the registry but not the credential.
     pub fn get_cheap_model_with_id(&self) -> Option<(String, Arc<dyn LlmService>)> {
-        const CHEAP_MODELS: &[&str] = &["claude-haiku-4-5", "gpt-5.4-mini"];
-        for model_id in CHEAP_MODELS {
-            if let Some(service) = self.get(model_id) {
-                return Some(((*model_id).to_string(), service));
-            }
+        let default_id = self.default_model_id();
+        let cheap_id = self.cheap_model_id_for_provider(&default_id);
+        if let Some(service) = self.get(&cheap_id) {
+            return Some((cheap_id, service));
         }
-        self.default()
-            .map(|service| (self.default_model_id(), service))
+        self.default().map(|service| (default_id, service))
     }
 
     pub fn get_cheap_model(&self) -> Option<Arc<dyn LlmService>> {
@@ -1207,7 +1210,9 @@ impl ModelRegistry {
         };
 
         if parent_source == ModelSource::External {
-            return parent_model_id.to_string();
+            return self
+                .cheap_external_model_id(parent_model_id)
+                .unwrap_or_else(|| parent_model_id.to_string());
         }
 
         let candidates: &[&str] = match parent_backend {
@@ -1225,6 +1230,39 @@ impl ModelRegistry {
                 || parent_model_id.to_string(),
                 std::string::ToString::to_string,
             )
+    }
+
+    /// Cheap auxiliary models an operator-supplied catalog may expose, matched
+    /// on provider `api_name` in preference order.
+    ///
+    /// A catalog republishes upstream models under its own ids
+    /// (`copilot/gpt-5.4-mini`), so the id is the operator's namespace while the
+    /// `api_name` is the stable upstream identity worth matching.
+    const CHEAP_EXTERNAL_API_NAMES: &'static [&'static str] =
+        &["gpt-5.4-mini", "claude-haiku-4.5", "claude-haiku-4-5"];
+
+    /// Find a cheap model inside the same operator-supplied catalog as `parent_model_id`.
+    ///
+    /// Restricted to `ModelSource::External` so auxiliary traffic keeps using the
+    /// credential and endpoint that the parent model already proved usable; a
+    /// built-in id would share the registry but not necessarily the credential.
+    fn cheap_external_model_id(&self, parent_model_id: &str) -> Option<String> {
+        let specs = self.specs.read().expect("specs lock poisoned");
+        let services = self.services.read().expect("services lock poisoned");
+        Self::CHEAP_EXTERNAL_API_NAMES.iter().find_map(|api_name| {
+            let mut matches: Vec<&String> = specs
+                .iter()
+                .filter(|(id, spec)| {
+                    spec.source == ModelSource::External
+                        && spec.api_name == **api_name
+                        && id.as_str() != parent_model_id
+                        && services.contains_key(*id)
+                })
+                .map(|(id, _)| id)
+                .collect();
+            matches.sort();
+            matches.first().map(|id| (*id).clone())
+        })
     }
 
     pub fn current_codex_credential(&self) -> Option<Arc<CodexCredential>> {
@@ -1999,6 +2037,61 @@ mod tests {
         assert_eq!(
             registry.cheap_model_id_for_provider("gateway-provider/example-org/Chat-Model"),
             "gateway-provider/example-org/Chat-Model"
+        );
+    }
+
+    /// A catalog that republishes upstream models under its own namespace keeps
+    /// auxiliary traffic on that catalog. Falling through to the built-in
+    /// `claude-haiku-4-5` id would send the request to the built-in provider
+    /// endpoint, which the catalog's credential does not authenticate.
+    #[test]
+    fn cheap_model_for_external_parent_prefers_catalog_cheap_model() {
+        let models = parse_external_models(
+            r#"[
+                {"id":"copilot/claude-opus-5","api_name":"claude-opus-5","backend":"openai_chat_completions","description":"Opus via catalog","context_window":1000000,"recommended":true,"supports_tool_search":true},
+                {"id":"copilot/gpt-5.4-mini","api_name":"gpt-5.4-mini","backend":"openai_responses","description":"Mini via catalog","context_window":400000,"recommended":false,"supports_tool_search":true},
+                {"id":"copilot/claude-haiku-4.5","api_name":"claude-haiku-4.5","backend":"openai_chat_completions","description":"Haiku via catalog","context_window":200000,"recommended":false,"supports_tool_search":true}
+            ]"#,
+        )
+        .unwrap();
+        let config = LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            openai_api_key: Some("test-key".to_string()),
+            default_model: Some("copilot/claude-opus-5".to_string()),
+            external_models: models,
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        assert_eq!(
+            registry.cheap_model_id_for_provider("copilot/claude-opus-5"),
+            "copilot/gpt-5.4-mini"
+        );
+        let (cheap_id, _) = registry
+            .get_cheap_model_with_id()
+            .expect("catalog registry must expose a cheap model");
+        assert_eq!(cheap_id, "copilot/gpt-5.4-mini");
+    }
+
+    /// The cheap model must never be the parent itself when the catalog offers a
+    /// cheaper sibling, and must fall back to the parent when it does not.
+    #[test]
+    fn cheap_model_for_external_parent_falls_back_to_parent_without_cheap_sibling() {
+        let models = parse_external_models(
+            r#"[{"id":"copilot/claude-opus-5","api_name":"claude-opus-5","backend":"openai_chat_completions","description":"Opus via catalog","context_window":1000000,"recommended":true,"supports_tool_search":true}]"#,
+        )
+        .unwrap();
+        let config = LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            default_model: Some("copilot/claude-opus-5".to_string()),
+            external_models: models,
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        assert_eq!(
+            registry.cheap_model_id_for_provider("copilot/claude-opus-5"),
+            "copilot/claude-opus-5"
         );
     }
 

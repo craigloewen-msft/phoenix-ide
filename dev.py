@@ -1968,9 +1968,12 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
         print(f"  Loaded env from {env_file}")
     if dev_env_file:
         print(f"  Loaded dev overrides from {dev_env_file}")
-    # Default to debug logging in dev, can be overridden via RUST_LOG env var
+    # Default to debug logging in dev, can be overridden via RUST_LOG env var.
+    # phoenix_llm is included so provider auth failures, capability-gap drops,
+    # and response-parse errors are visible in phoenix.log; without it the
+    # backend reports only the generic conversation-level error.
     if "RUST_LOG" not in env:
-        env["RUST_LOG"] = "phoenix_ide=debug,tower_http=debug"
+        env["RUST_LOG"] = "phoenix_ide=debug,phoenix_llm=debug,tower_http=debug"
 
     # Fresh log per restart, then append: the binary's appender and this
     # redirect both open the file with O_APPEND, so their writes interleave
