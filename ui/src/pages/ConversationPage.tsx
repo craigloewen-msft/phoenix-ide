@@ -2652,7 +2652,7 @@ function ConversationPageContent({
         </RenderProfiler>
         </>
       ) : null}
-      <WakeStatusBar conversationId={conversationId!} />
+      {conversationId ? <WakeStatusBar conversationId={conversationId} /> : null}
       <RenderProfiler id="StateBar">
       <ConnectedStateBar
         slug={slug!}

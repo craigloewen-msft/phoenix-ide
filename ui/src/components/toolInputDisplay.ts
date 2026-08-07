@@ -12,6 +12,17 @@ export function truncateToolInputValue(value: string, max = 40): string {
   return value.length > max ? `${value.slice(0, max)}…` : value;
 }
 
+// Tool input is raw model output validated only by the tool that consumes it, so
+// a field declared as an array in the tool schema can arrive as any JSON value.
+// Narrow before use — a bare cast makes a malformed argument a render crash.
+function toolInputArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function toolInputStringArray(value: unknown): string[] {
+  return toolInputArray(value).map(String);
+}
+
 function isFiniteInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value);
 }
@@ -83,7 +94,7 @@ function formatBrowserInput(name: string, input: Record<string, unknown>): strin
     case 'browser_type': return `${input['clear'] === true ? 'replace' : 'type'} "${String(input['selector'] || '')}" = "${truncateToolInputValue(String(input['text'] || ''))}"`;
     case 'browser_key_press': {
       const key = String(input['key'] || '');
-      const modifiers = (input['modifiers'] as string[]) || [];
+      const modifiers = toolInputStringArray(input['modifiers']);
       return `key: ${modifiers.length > 0 ? `${modifiers.join('+')}+${key}` : key}`;
     }
     case 'browser_profile': {
@@ -135,19 +146,19 @@ export function formatToolInput(name: string, input: Record<string, unknown>, di
       if (legacyCommand) return { display: `$ ${displayOverride || legacyCommand}`, isMultiline: legacyCommand.includes('\n') };
       return { display: `bash ${JSON.stringify(input)}`, isMultiline: false };
     }
-    case 'tmux': return { display: `tmux ${((input['args'] as unknown[] | undefined) ?? []).map(String).join(' ')}`, isMultiline: false };
+    case 'tmux': return { display: `tmux ${toolInputStringArray(input['args']).join(' ')}`, isMultiline: false };
     case 'think': {
       const display = cleanToolThoughts(String(input['thoughts'] || ''));
       return { display, isMultiline: display.includes('\n') };
     }
     case 'patch': {
-      const patches = input['patches'] as Array<{ operation?: string }> | undefined;
-      const count = patches?.length || 1;
-      return { display: count > 1 ? `${String(input['path'] || '')}: ${count} patches` : `${String(input['path'] || '')}: ${patches?.[0]?.operation || 'modify'}`, isMultiline: false };
+      const patches = toolInputArray(input['patches']) as Array<{ operation?: string } | undefined>;
+      const count = patches.length || 1;
+      return { display: count > 1 ? `${String(input['path'] || '')}: ${count} patches` : `${String(input['path'] || '')}: ${patches[0]?.operation || 'modify'}`, isMultiline: false };
     }
     case 'keyword_search': {
       const query = String(input['query'] || '');
-      const terms = (input['search_terms'] as string[]) || [];
+      const terms = toolInputStringArray(input['search_terms']);
       const termsText = terms.length > 0 ? `${terms.slice(0, 3).join(', ')}${terms.length > 3 ? '...' : ''}` : '';
       return { display: termsText ? `"${query}" [${termsText}]` : query, isMultiline: false };
     }
@@ -162,13 +173,14 @@ export function formatToolInput(name: string, input: Record<string, unknown>, di
       return { display, isMultiline: false };
     }
     case 'spawn_agents': {
-      const count = ((input['tasks'] as unknown[] | undefined) ?? []).length;
+      const count = toolInputArray(input['tasks']).length;
       return { display: `${count} parallel task${count === 1 ? '' : 's'}`, isMultiline: false };
     }
     case 'ask_user_question': {
-      const questions = (input['questions'] as Array<{ question?: string; options?: unknown[] }> | undefined) ?? [];
+      const questions = toolInputArray(input['questions']) as Array<{ question?: string; options?: unknown } | undefined>;
       const text = String(questions[0]?.question || '').replace(/\s+/g, ' ').trim();
-      const suffix = questions.length > 1 ? ` [+${questions.length - 1} more]` : (questions[0]?.options?.length ?? 0) > 0 ? ` [${questions[0]!.options!.length} options]` : '';
+      const optionCount = toolInputArray(questions[0]?.options).length;
+      const suffix = questions.length > 1 ? ` [+${questions.length - 1} more]` : optionCount > 0 ? ` [${optionCount} options]` : '';
       return { display: `"${truncateToolInputValue(text, 80)}"${suffix}`, isMultiline: false };
     }
     case 'search': {

@@ -3837,3 +3837,33 @@ describe('AgentMessage compact find reveal', () => {
     expect(highlight).toHaveTextContent('alpha target');
   });
 });
+
+describe('tool cards with schema-violating model arguments', () => {
+  it('renders a keyword_search card when search_terms arrives as a string', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-malformed-kw', [{
+            type: 'tool_use',
+            id: 'tool-malformed-kw',
+            name: 'keyword_search',
+            input: {
+              query: 'license agreement PDF download sign and re-upload flow',
+              search_terms: 'license_agreement", "licence", "agreement", "signed_pdf", "upload"]',
+            },
+          }])}
+          toolResults={new Map([[
+            'tool-malformed-kw',
+            toolMessage('tool-malformed-kw', 'Invalid input: invalid type: string, expected a sequence'),
+          ]])}
+          onOpenFile={undefined}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('keyword_search')).toBeInTheDocument();
+    expect(
+      screen.getByText('license agreement PDF download sign and re-upload flow')
+    ).toBeInTheDocument();
+  });
+});
