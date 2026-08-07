@@ -145,7 +145,8 @@ Mid-QA on a sub-agent's commit you spot drift in a file that was out of their sc
 ./dev.py reap        # Kill dev servers orphaned by deleted worktrees (--dry-run to preview)
 ./dev.py restart     # Rebuild Rust, restart Phoenix (Vite keeps running)
 ./dev.py status      # Check what's running
-./dev.py seed        # Populate dev DB with representative conversations (idempotent)
+./dev.py seed        # Populate dev DB with representative conversations (no-op if populated)
+./dev.py seed --repair-fixtures   # Also restore missing/stale QA + perf fixtures
 ./dev.py check       # clippy + fmt + tests + task validation
 ```
 

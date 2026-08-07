@@ -103,7 +103,7 @@ class ModernSeedTest(unittest.TestCase):
                     )
                     conn.commit()
 
-                self.dev.cmd_seed(build=False)
+                self.dev.cmd_seed(build=False, repair_fixtures=True)
 
                 with sqlite3.connect(db_path) as conn:
                     self.assertEqual(
@@ -157,6 +157,86 @@ class ModernSeedTest(unittest.TestCase):
                         ).fetchone()[0],
                         "allocated_worktree",
                     )
+
+
+    def test_populated_db_left_alone_unless_repair_requested(self):
+        with tempfile.TemporaryDirectory(prefix="phoenix-seed-repair-") as directory:
+            db_path = Path(directory) / "seed.db"
+            seed_worktree_root = Path(directory) / "seed-worktrees"
+            with (
+                mock.patch.object(self.dev, "get_db_path", return_value=db_path),
+                mock.patch.object(self.dev, "get_pid", return_value=None),
+                mock.patch.object(self.dev, "SEED_WORKTREE_ROOT", seed_worktree_root),
+            ):
+                self.dev.cmd_seed(build=False)
+
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute(
+                        "DELETE FROM messages WHERE conversation_id IN"
+                        " (SELECT id FROM conversations WHERE slug = 'fixture-turn-one')"
+                    )
+                    conn.commit()
+
+                # Default: a populated DB is not touched, so the gutted fixture stays gutted.
+                self.dev.cmd_seed(build=False)
+                with sqlite3.connect(db_path) as conn:
+                    self.assertEqual(self._fixture_message_count(conn, "fixture-turn-one"), 0)
+
+                self.dev.cmd_seed(build=False, repair_fixtures=True)
+                with sqlite3.connect(db_path) as conn:
+                    self.assertEqual(self._fixture_message_count(conn, "fixture-turn-one"), 47)
+
+    def test_archived_fixture_is_never_resurrected(self):
+        with tempfile.TemporaryDirectory(prefix="phoenix-seed-archived-") as directory:
+            db_path = Path(directory) / "seed.db"
+            seed_worktree_root = Path(directory) / "seed-worktrees"
+            archivable = [
+                "fixture-turn-one",
+                "fixture-heavy-prod-shape",
+                "fixture-diff-review",
+                "fixture-grounding-panel-qa",
+            ]
+            with (
+                mock.patch.object(self.dev, "get_db_path", return_value=db_path),
+                mock.patch.object(self.dev, "get_pid", return_value=None),
+                mock.patch.object(self.dev, "SEED_WORKTREE_ROOT", seed_worktree_root),
+            ):
+                self.dev.cmd_seed(build=False)
+
+                with sqlite3.connect(db_path) as conn:
+                    for slug in archivable:
+                        self.assertIsNotNone(
+                            conn.execute(
+                                "SELECT id FROM conversations WHERE slug = ?", (slug,)
+                            ).fetchone(),
+                            f"{slug} was not seeded",
+                        )
+                    conn.execute(
+                        "UPDATE conversations SET archived = 1 WHERE slug IN"
+                        f" ({', '.join('?' for _ in archivable)})",
+                        tuple(archivable),
+                    )
+                    conn.commit()
+
+                # Even an explicit repair leaves an archived fixture archived: archiving
+                # is a developer decision, not fixture drift.
+                self.dev.cmd_seed(build=False, repair_fixtures=True)
+
+                with sqlite3.connect(db_path) as conn:
+                    for slug in archivable:
+                        rows = conn.execute(
+                            "SELECT archived FROM conversations WHERE slug = ?", (slug,)
+                        ).fetchall()
+                        self.assertEqual(rows, [(1,)], f"{slug} was resurrected")
+
+    @staticmethod
+    def _fixture_message_count(conn: sqlite3.Connection, slug: str) -> int:
+        return conn.execute(
+            "SELECT COUNT(*) FROM messages m"
+            " JOIN conversations c ON c.id = m.conversation_id"
+            " WHERE c.slug = ?",
+            (slug,),
+        ).fetchone()[0]
 
 
 if __name__ == "__main__":
