@@ -1,0 +1,45 @@
+/* FileReviewDiffView — per-file review diff mode of the file viewer. */
+
+.frd-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
+.frd-title-mode {
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--bg-tertiary, rgb(255 255 255 / 10%));
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  vertical-align: middle;
+}
+
+.frd-modes {
+  display: inline-flex;
+  gap: 2px;
+}
+
+.frd-mode--active {
+  background: var(--bg-selected, rgb(255 255 255 / 12%));
+  font-weight: 600;
+}
+
+.frd-mark {
+  border-color: var(--success-color, #3fb950);
+  color: var(--success-color, #3fb950);
+  font-weight: 600;
+}
+
+.frd-banner {
+  flex-shrink: 0;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-color);
+  background: color-mix(in srgb, var(--warning-color, #d29922) 12%, transparent);
+  color: var(--text-primary);
+  font-size: 12px;
+}

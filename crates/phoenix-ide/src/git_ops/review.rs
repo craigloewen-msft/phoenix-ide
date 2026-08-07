@@ -289,9 +289,16 @@ fn relabel_blob_diff(captured: &CappedStdout, path: &str) -> CappedStdout {
         }
         out.push('\n');
     }
+    // Rewriting changes the rendered length, so shift the byte total by the
+    // same delta. Otherwise `total_bytes > stdout.len()` would read as
+    // truncation and the UI would claim a complete diff was cut short.
+    let total_bytes = captured
+        .total_bytes
+        .saturating_add(out.len() as u64)
+        .saturating_sub(captured.stdout.len() as u64);
     CappedStdout {
         stdout: out,
-        total_bytes: captured.total_bytes,
+        total_bytes,
         saturated: captured.saturated,
     }
 }
@@ -415,6 +422,24 @@ mod tests {
             diff.stdout.contains("a/kept.txt"),
             "blob diff must be relabelled with the real path: {}",
             diff.stdout
+        );
+    }
+
+    #[test]
+    fn since_review_diff_is_not_reported_as_truncated() {
+        let tmp = repo_with_branch_work();
+        let p = tmp.path();
+        let reviewed = current_blob_sha(p, "kept.txt");
+        write(p, "kept.txt", "changed\nplus a new line\n");
+
+        let diff = file_diff_since_review(p, "kept.txt", &reviewed, 64 * 1024, 512 * 1024);
+        assert!(!diff.saturated);
+        assert!(
+            diff.total_bytes <= diff.stdout.len() as u64,
+            "a complete diff must not look truncated after header relabelling \
+             (total {} vs rendered {})",
+            diff.total_bytes,
+            diff.stdout.len()
         );
     }
 

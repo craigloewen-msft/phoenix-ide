@@ -2465,7 +2465,6 @@ pub(crate) async fn get_review_file_diff(
             saturated: captured.saturated,
             diff: captured.stdout,
             current_blob_sha,
-            review: review_state,
         })
     })
     .await

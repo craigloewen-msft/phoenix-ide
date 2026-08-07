@@ -970,6 +970,9 @@ pub struct ReviewManifestResponse {
 }
 
 /// Response for `GET /api/conversations/:id/review/file-diff`.
+///
+/// Deliberately carries no review state: the manifest owns that, and a second
+/// copy here would go stale the moment the user marks the file.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct ReviewFileDiffResponse {
     pub path: String,
@@ -982,7 +985,6 @@ pub struct ReviewFileDiffResponse {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub saturated: bool,
     pub current_blob_sha: String,
-    pub review: FileReviewState,
 }
 
 #[derive(Debug, Deserialize)]

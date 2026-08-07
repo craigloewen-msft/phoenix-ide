@@ -11,6 +11,7 @@ import { api, type Conversation } from '../api';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
+import { ReviewProvider } from '../contexts/ReviewContext';
 import { useConversationReadiness } from '../contexts/useConversationReadiness';
 import { SubAgentViewerProvider, useSubAgentViewer } from '../contexts/SubAgentViewerContext';
 // Code-split: the panel pulls MessageComponents (markdown + syntax highlighting),
@@ -252,6 +253,11 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
       browserSessionStateLoaded={browserSessionStateLoaded}
     >
      <FileExplorerProvider>
+      <ReviewProvider
+        conversationId={activeConversation?.id}
+        rootDir={effectiveCwd ?? null}
+        enabled={activeConversation?.conv_mode_label === 'Work' || activeConversation?.conv_mode_label === 'Branch'}
+      >
       <div
         ref={layoutRef}
         className={[
@@ -310,6 +316,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
         {isDesktop && <CommandPalette conversations={conversations} activeConversation={activeConversation} />}
         <Toast messages={toasts} onDismiss={dismissToast} />
       </div>
+      </ReviewProvider>
      </FileExplorerProvider>
     </ViewerSlotProvider>
     </SubAgentViewerProvider>

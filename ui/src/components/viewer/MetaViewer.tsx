@@ -47,6 +47,9 @@ import type { HtmlViewMode } from './HtmlViewerBody';
 import { ImageViewerBody } from './ImageViewerBody';
 import type { ViewerBodyProps } from './AnnotatableBlock';
 import { useFocusedReviewExit } from './useFocusedReviewExit';
+import { useOptionalViewerSlotCommands } from '../../contexts/ViewerSlotContext';
+import { useReviewContext } from '../../contexts/useReviewContext';
+import './FileReviewDiffView.css';
 
 export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   useRegisterFocusScope('file-viewer');
@@ -61,6 +64,19 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
 
   const notes = useFileReviewNotes(absolutePath, onSendNotes, patchContext);
   const supportsFocusedReview = payload.kind === 'markdown';
+
+  const slotCommands = useOptionalViewerSlotCommands();
+  const review = useReviewContext();
+  // A DIFF affordance is meaningful only for a file the review manifest
+  // actually lists as changed.
+  const reviewableFile = useMemo(() => {
+    const root = review?.rootDir;
+    if (!root || !review?.manifest || !slotCommands) return false;
+    const prefix = root.endsWith('/') ? root : `${root}/`;
+    if (!absolutePath.startsWith(prefix)) return false;
+    const relative = absolutePath.slice(prefix.length);
+    return review.manifest.files.some((f) => f.path === relative);
+  }, [absolutePath, review?.rootDir, review?.manifest, slotCommands]);
   const focused = supportsFocusedReview && presentation === 'fullscreen' && canTogglePresentation;
   const returnToPane = useCallback(() => onPresentationChange?.('pane'), [onPresentationChange]);
   const focusedExit = useFocusedReviewExit({
@@ -417,6 +433,23 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
 
   const headerExtras: ReactNode = textLike ? (
     <>
+      {/* Offered only for a file that is part of the change set — a DIFF
+          button on an untouched file would have nothing to show. */}
+      {reviewableFile && (
+        <div className="frd-modes" role="group" aria-label="File view mode">
+          <button type="button" className="viewer-shell-btn frd-mode--active" aria-pressed="true" title="Showing file source">
+            FILE
+          </button>
+          <button
+            type="button"
+            className="viewer-shell-btn"
+            onClick={() => slotCommands?.setFileViewMode('diff')}
+            title="Show this file's review diff"
+          >
+            DIFF
+          </button>
+        </div>
+      )}
       {findEligible && (
         <button
           ref={findButtonRef}

@@ -1,0 +1,128 @@
+/* ChangedFilesReview — review checklist in the grounding sidebar. */
+
+.cfr {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.cfr-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 2px 2px;
+  font-size: 11px;
+}
+
+.cfr-progress {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.cfr-comparator {
+  color: var(--text-tertiary, var(--text-secondary));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cfr-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.cfr-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px;
+  border: none;
+  border-radius: 3px;
+  background: none;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.cfr-row:hover {
+  background: var(--bg-hover, rgb(255 255 255 / 6%));
+}
+
+.cfr-row--active {
+  background: var(--bg-selected, rgb(255 255 255 / 10%));
+}
+
+.cfr-marker {
+  flex-shrink: 0;
+  width: 10px;
+  text-align: center;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.cfr-marker--reviewed {
+  color: var(--success-color, #3fb950);
+}
+
+.cfr-marker--stale {
+  color: var(--warning-color, #d29922);
+}
+
+/* Unreviewed is the absence of a mark, not a third symbol — the eye should
+   land on what has been dealt with, not on what hasn't. */
+.cfr-marker--unreviewed::before {
+  content: '·';
+  color: var(--text-tertiary, var(--text-secondary));
+  opacity: 0.5;
+}
+
+.cfr-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+
+.cfr-counts {
+  flex-shrink: 0;
+  display: flex;
+  gap: 4px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.cfr-ins {
+  color: var(--success-color, #3fb950);
+}
+
+.cfr-del {
+  color: var(--error-color, #f85149);
+}
+
+.cfr-complete {
+  margin-top: 4px;
+  padding: 5px 8px;
+  border: 1px solid var(--success-color, #3fb950);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--success-color, #3fb950) 12%, transparent);
+  color: var(--success-color, #3fb950);
+  font-size: 12px;
+  font-family: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.cfr-complete:hover {
+  background: color-mix(in srgb, var(--success-color, #3fb950) 22%, transparent);
+}

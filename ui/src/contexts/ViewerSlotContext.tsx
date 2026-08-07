@@ -36,11 +36,21 @@ export interface ProseFile {
   focus?: ViewerFocus | undefined;
 }
 
+/**
+ * How the file viewer renders its file.
+ *
+ * `source` shows current content; `diff` shows the file's review diff against
+ * the base. This is a render mode of one open file, not a separate viewer:
+ * toggling preserves which file is open, which is what makes
+ * "open the file, flip to DIFF, review, flip back" a single continuous act.
+ */
+export type FileViewMode = 'source' | 'diff';
+
 export type DiffTarget = 'workspace' | 'active_pr';
 
 export type ViewerSlot =
   | { kind: 'none' }
-  | { kind: 'prose'; presentation: ViewerPresentation; file: ProseFile; patchContext: PatchContext | null }
+  | { kind: 'prose'; presentation: ViewerPresentation; file: ProseFile; patchContext: PatchContext | null; mode: FileViewMode }
   | { kind: 'diff'; presentation: DiffPresentation; target: DiffTarget }
   | { kind: 'browser' }
   | { kind: 'inspect'; handleId: string }
@@ -52,6 +62,10 @@ export type ViewerSlot =
  *  re-render when the open viewer or the session flag changes. */
 export interface ViewerSlotCommands {
   openProse: (path: string, rootDir: string, options?: OpenFileOptions) => void;
+  /** Open a file directly in review-diff mode (from the changed-files list). */
+  openFileDiff: (path: string, rootDir: string) => void;
+  /** Flip the open file between source and diff without changing which file. */
+  setFileViewMode: (mode: FileViewMode) => void;
   openDiff: (presentation: DiffPresentation, target?: DiffTarget) => void;
   openDiffFullscreen: (target?: DiffTarget) => void;
   openBrowser: () => void;
@@ -91,6 +105,8 @@ const END_LINE_PARAM = 'endLine';
 const HANDLE_PARAM = 'handle';
 const MESSAGE_PARAM = 'message';
 const REVIEW_PARAM = 'review';
+/** File-viewer render mode: source (default) or per-file review diff. */
+const FILE_MODE_PARAM = 'mode';
 
 /** The full set of slot-owned search params. Every transition clears all of
  *  them and writes only the ones its kind needs, so a stale param from a prior
@@ -106,6 +122,7 @@ const SLOT_PARAMS = [
   HANDLE_PARAM,
   MESSAGE_PARAM,
   REVIEW_PARAM,
+  FILE_MODE_PARAM,
 ] as const;
 
 function clearSlotParams(next: URLSearchParams) {
@@ -149,8 +166,9 @@ function deriveSlot(
         : endLine !== undefined && endLine >= lineNumber
           ? { kind: 'range', startLine: lineNumber, endLine }
           : { kind: 'line', lineNumber };
+      const mode: FileViewMode = searchParams.get(FILE_MODE_PARAM) === 'diff' ? 'diff' : 'source';
       return {
-        slot: { kind: 'prose', presentation, file: { path: file, rootDir: root, focus }, patchContext },
+        slot: { kind: 'prose', presentation, file: { path: file, rootDir: root, focus }, patchContext, mode },
         malformed: false,
       };
     }
@@ -275,6 +293,33 @@ export function ViewerSlotProvider({
       });
     },
     [setPatchContext, writeUrl],
+  );
+
+  const openFileDiff = useCallback(
+    (path: string, rootDir: string) => {
+      setPatchContext(null);
+      writeUrl((next) => {
+        clearSlotParams(next);
+        next.set(VIEWER_PARAM, 'prose');
+        next.set(DIFF_PRESENTATION_PARAM, 'pane');
+        next.set(FILE_PARAM, path);
+        next.set(ROOT_PARAM, rootDir);
+        next.set(FILE_MODE_PARAM, 'diff');
+      });
+    },
+    [setPatchContext, writeUrl],
+  );
+
+  // Mode is written on its own so the open file, its focus, and the
+  // presentation all survive a toggle.
+  const setFileViewMode = useCallback(
+    (mode: FileViewMode) => {
+      writeUrl((next) => {
+        if (mode === 'diff') next.set(FILE_MODE_PARAM, 'diff');
+        else next.delete(FILE_MODE_PARAM);
+      });
+    },
+    [writeUrl],
   );
 
   const openDiff = useCallback((presentation: DiffPresentation, target: DiffTarget = 'workspace') => {
@@ -491,8 +536,8 @@ export function ViewerSlotProvider({
   ]);
 
   const commands = useMemo<ViewerSlotCommands>(
-    () => ({ openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, openCommissionReview, setPresentation, close }),
-    [openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, openCommissionReview, setPresentation, close],
+    () => ({ openProse, openFileDiff, setFileViewMode, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, openCommissionReview, setPresentation, close }),
+    [openProse, openFileDiff, setFileViewMode, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, openCommissionReview, setPresentation, close],
   );
 
   return (
@@ -524,6 +569,22 @@ export function useViewerSlotData(): ViewerSlot {
     throw new Error('useViewerSlotData must be used inside <ViewerSlotProvider>.');
   }
   return ctx;
+}
+
+/**
+ * Slot commands when a provider is present, else null.
+ *
+ * For surfaces that also render standalone (isolated stories, unit tests): an
+ * optional slot-driven affordance is absent rather than a crash. Callers that
+ * structurally require the slot keep using the throwing variants.
+ */
+export function useOptionalViewerSlotCommands(): ViewerSlotCommands | null {
+  return useContext(ViewerSlotCommandsContext);
+}
+
+/** The current slot union when a provider is present, else null. */
+export function useOptionalViewerSlotData(): ViewerSlot | null {
+  return useContext(ViewerSlotDataContext);
 }
 
 /** The live browser-session flag. Re-renders only when the flag changes. */

@@ -1,10 +1,13 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AlertCircle, Loader2 } from 'lucide-react';
 import { ViewerShell } from './viewer/ViewerShell';
 import { MetaViewer } from './viewer/MetaViewer';
 import { classifyViewerFile } from './viewer/viewerFileTypes';
 import type { MetaViewerPayload, PatchContext, TextRenderMode, ViewerFocus } from './viewer/metaViewerTypes';
 import type { TextCategory } from '../generated/TextCategory';
+import { useOptionalViewerSlotCommands, useOptionalViewerSlotData } from '../contexts/ViewerSlotContext';
+import { useReviewContext } from '../contexts/useReviewContext';
+import { FileReviewDiffView } from './viewer/FileReviewDiffView';
 
 /**
  * FileViewer — the file loader/adapter.
@@ -67,12 +70,29 @@ export function FileViewer({
   const [fileData, setFileData] = useState<ReadFileResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const viewerSlot = useOptionalViewerSlotData();
+  const slotCommands = useOptionalViewerSlotCommands();
+  const review = useReviewContext();
 
   const absolutePath = useMemo(() => {
     if (filePath.startsWith('/')) return filePath;
     return rootDir.endsWith('/') ? rootDir + filePath : rootDir + '/' + filePath;
   }, [filePath, rootDir]);
   const fileName = filePath.split('/').pop() || filePath;
+
+  // Repo-relative identity: the review manifest keys on it, not on the
+  // absolute path the viewer otherwise uses.
+  const repoRelativePath = useMemo(() => {
+    const root = review?.rootDir;
+    if (!root) return null;
+    const prefix = root.endsWith('/') ? root : `${root}/`;
+    return absolutePath.startsWith(prefix) ? absolutePath.slice(prefix.length) : null;
+  }, [absolutePath, review?.rootDir]);
+
+  const diffModeRequested = viewerSlot?.kind === 'prose' && viewerSlot.mode === 'diff';
+  const reviewEntry = review?.manifest?.files.find((f) => f.path === repoRelativePath);
+
+  const showSource = useCallback(() => slotCommands?.setFileViewMode('source'), [slotCommands]);
 
   useEffect(() => {
     let cancelled = false;
@@ -92,6 +112,26 @@ export function FileViewer({
     load();
     return () => { cancelled = true; };
   }, [absolutePath]);
+
+  // Only a file that is actually part of the change set has a review diff.
+  // Placed after all hooks so the hook order is identical in both modes.
+  if (diffModeRequested && review?.conversationId && repoRelativePath && reviewEntry) {
+    return (
+      <FileReviewDiffView
+        conversationId={review.conversationId}
+        path={repoRelativePath}
+        fileName={fileName}
+        absolutePath={absolutePath}
+        review={reviewEntry.review}
+        onClose={onClose}
+        onSendNotes={(notes) => void onSendNotes(notes)}
+        onShowSource={showSource}
+        onMarkReviewed={review.markReviewed}
+        onUnmarkReviewed={review.unmarkReviewed}
+        {...(inline !== undefined ? { inline } : {})}
+      />
+    );
+  }
 
   if (fileData) {
     const payload = buildPayload(fileData, {
