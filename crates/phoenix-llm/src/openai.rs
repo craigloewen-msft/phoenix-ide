@@ -2790,7 +2790,7 @@ struct ChatStreamAccumulator {
     content: String,
     visible_kind: Option<ChatVisibleKind>,
     choice_index: Option<usize>,
-    tool_calls: Vec<ChatToolCallBuilder>,
+    tool_calls: Vec<ChatToolCallSlot>,
     usage: Option<ChatUsage>,
     done: bool,
     terminal_finish_seen: bool,
@@ -2967,15 +2967,20 @@ impl ChatStreamAccumulator {
                         "Chat completions tool delta omitted its index",
                     ));
                 };
-                if index > self.tool_calls.len() {
-                    return Err(LlmError::invalid_response(
-                        "Chat completions tool delta used a sparse index",
-                    ));
-                }
-                if index == self.tool_calls.len() {
-                    self.tool_calls.push(ChatToolCallBuilder::default());
-                }
-                let builder = &mut self.tool_calls[index];
+                let slot = if let Some(position) = self
+                    .tool_calls
+                    .iter()
+                    .position(|slot| slot.provider_index == index)
+                {
+                    position
+                } else {
+                    self.tool_calls.push(ChatToolCallSlot {
+                        provider_index: index,
+                        builder: ChatToolCallBuilder::default(),
+                    });
+                    self.tool_calls.len() - 1
+                };
+                let builder = &mut self.tool_calls[slot].builder;
                 if let Some(tool_type) = tool_delta.r#type {
                     if tool_type != "function" {
                         return Err(LlmError::invalid_response(
@@ -3036,7 +3041,7 @@ impl ChatStreamAccumulator {
                 Some(
                     self.tool_calls
                         .into_iter()
-                        .map(ChatToolCallBuilder::build)
+                        .map(|slot| slot.builder.build())
                         .collect::<Result<Vec<_>, _>>()?,
                 )
             },
@@ -3046,6 +3051,17 @@ impl ChatStreamAccumulator {
         telemetry.attach_success(&mut response);
         Ok(response)
     }
+}
+
+/// A streaming tool call, keyed by the `index` the provider stamps on its deltas.
+///
+/// The index is a correlation key, not a position in this list: an
+/// Anthropic-backed Chat Completions gateway numbers tool deltas by content
+/// block, so a message that opens with text yields its first tool call at
+/// index 1. Slots are matched by key and ordered by first appearance.
+struct ChatToolCallSlot {
+    provider_index: usize,
+    builder: ChatToolCallBuilder,
 }
 
 #[derive(Default)]
@@ -5392,12 +5408,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_stream_rejects_multiple_choices_and_invalid_tool_indices() {
+    async fn chat_stream_rejects_multiple_choices_and_indexless_tool_delta() {
         let request = empty_request();
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         for event in [
             r#"{"choices":[{"delta":{"content":"a"}},{"delta":{"content":"b"}}]}"#,
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":1000000,"id":"call","function":{"name":"bash","arguments":"{}"}}]}}]}"#,
             r#"{"choices":[{"delta":{"tool_calls":[{"id":"call","function":{"name":"bash","arguments":"{}"}}]}}]}"#,
         ] {
             let mut acc = ChatStreamAccumulator::new(Instant::now(), &request);
@@ -5406,6 +5421,63 @@ mod tests {
                 crate::LlmErrorKind::InvalidResponse
             );
         }
+    }
+
+    #[tokio::test]
+    async fn chat_stream_accepts_non_dense_tool_delta_indices() {
+        // An Anthropic-backed gateway numbers tool deltas by content block, so a
+        // message that opens with text yields its first tool call at index 1.
+        let request = empty_request();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut acc = ChatStreamAccumulator::new(Instant::now(), &request);
+        for event in [
+            r#"{"choices":[{"index":0,"delta":{"content":"checking both cities"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"toolu_a","type":"function","function":{"name":"get_weather"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"city\":\"Paris\"}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":2,"id":"toolu_b","type":"function","function":{"name":"get_weather"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":2,"function":{"arguments":"{\"city\":\"Tokyo\"}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ] {
+            acc.process_event(event, &tx).await.unwrap();
+        }
+        let response = acc.into_response().unwrap();
+        assert!(matches!(
+            &response.content[0],
+            ContentBlock::Text { text } if text == "checking both cities"
+        ));
+        assert!(matches!(
+            &response.content[1],
+            ContentBlock::ToolUse { id, name, input }
+                if id == "toolu_a" && name == "get_weather" && input["city"] == "Paris"
+        ));
+        assert!(matches!(
+            &response.content[2],
+            ContentBlock::ToolUse { id, name, input }
+                if id == "toolu_b" && name == "get_weather" && input["city"] == "Tokyo"
+        ));
+        assert_eq!(response.content.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn chat_stream_orders_tool_calls_by_first_appearance_not_index() {
+        let request = empty_request();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut acc = ChatStreamAccumulator::new(Instant::now(), &request);
+        for event in [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":7,"id":"call-first","function":{"name":"bash","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":3,"id":"call-second","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+        ] {
+            acc.process_event(event, &tx).await.unwrap();
+        }
+        let response = acc.into_response().unwrap();
+        assert!(matches!(
+            &response.content[0],
+            ContentBlock::ToolUse { id, .. } if id == "call-first"
+        ));
+        assert!(matches!(
+            &response.content[1],
+            ContentBlock::ToolUse { id, .. } if id == "call-second"
+        ));
     }
 
     #[tokio::test]
