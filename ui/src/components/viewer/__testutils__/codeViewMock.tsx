@@ -16,16 +16,18 @@
  */
 import React from 'react';
 
-export const codeViewMockState: { scrollToCalls: unknown[]; lastItems: unknown[]; lastUnsafeCss: string } = {
+export const codeViewMockState: { scrollToCalls: unknown[]; lastItems: unknown[]; lastUnsafeCss: string; scrollTop: number } = {
   scrollToCalls: [],
   lastItems: [],
   lastUnsafeCss: '',
+  scrollTop: 0,
 };
 
 export function resetCodeViewMock(): void {
   codeViewMockState.scrollToCalls = [];
   codeViewMockState.lastItems = [];
   codeViewMockState.lastUnsafeCss = '';
+  codeViewMockState.scrollTop = 0;
 }
 
 /** Latest controlled `version` Pierre would reconcile against for an item. */
@@ -57,6 +59,11 @@ export function makeCodeViewMock() {
       getSelectedLines: () => null,
       clearSelectedLines: () => undefined,
       getInstance: () => ({
+        // Fixed metrics: the scroll motions are pure arithmetic over these, so a
+        // constant viewport makes the resulting scrollTo targets assertable.
+        getScrollTop: () => codeViewMockState.scrollTop,
+        getHeight: () => 400,
+        getScrollHeight: () => 4000,
         getRenderedItems: () =>
           (props.items ?? [])
             .filter((it: any) => itemEls.current.has(it.id))

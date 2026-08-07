@@ -63,6 +63,13 @@ export function ConversationDiffViewer({
     return () => { cancelled = true; };
   }, [conversationId, activePrIdentity, loadDiff]);
 
+  const reload = useCallback(() => {
+    void loadDiff().then((result) => {
+      if (result.ok) setState({ status: 'ready', payload: result.payload, conversationId });
+      else setState({ status: 'error', message: result.message, conversationId });
+    });
+  }, [conversationId, loadDiff]);
+
   // Treat a resolved state from a previous conversation as still-loading until
   // the effect refetches for the current conversationId.
   const resolved = state.status !== 'loading' && state.conversationId === conversationId;
@@ -84,6 +91,7 @@ export function ConversationDiffViewer({
         checkoutStatus={p.checkout_status}
         onClose={onClose}
         onSendNotes={onSendNotes}
+        onRefresh={reload}
         {...(inline !== undefined ? { inline } : {})}
         {...(takeover !== undefined ? { takeover } : {})}
       />
@@ -107,10 +115,7 @@ export function ConversationDiffViewer({
             <span>{state.message}</span>
             {target === 'active_pr' && <span>Compare against the selected PR base branch when available.</span>}
             <div className="viewer-error-actions">
-              <button onClick={() => { void loadDiff().then((result) => {
-                if (result.ok) setState({ status: 'ready', payload: result.payload, conversationId });
-                else setState({ status: 'error', message: result.message, conversationId });
-              }); }}>Retry</button>
+              <button onClick={reload}>Retry</button>
               <button onClick={onClose}>Close</button>
             </div>
           </div>

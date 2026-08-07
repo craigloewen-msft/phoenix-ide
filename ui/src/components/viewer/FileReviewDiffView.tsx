@@ -8,13 +8,18 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Loader2, AlertCircle } from 'lucide-react';
+import { Loader2, AlertCircle, Keyboard, RefreshCw } from 'lucide-react';
 import { ViewerShell } from './ViewerShell';
 import { NotesPanel } from './NotesPanel';
 import { AnnotationDialog } from './AnnotationDialog';
 import { useDiffReviewNotes } from './useDiffReviewNotes';
 import type { AnnotateTarget } from './useDiffReviewNotes';
 import { PhoenixDiffCodeView } from './PhoenixDiffCodeView';
+import { openShortcutHelp } from './openShortcutHelp';
+import { useReviewKeyboard } from './useReviewKeyboard';
+import { useRefreshOnWindowFocus } from './useRefreshOnWindowFocus';
+import type { ReviewCommand } from './reviewKeymap';
+import { useRegisterFocusScope } from '../../hooks/useFocusScope';
 import { api, type FileReviewState, type ReviewDiffScope, type ReviewFileDiffResponse } from '../../api';
 import './FileReviewDiffView.css';
 
@@ -40,6 +45,12 @@ export interface FileReviewDiffViewProps {
   onUnmarkReviewed: (path: string) => void | Promise<void>;
   /** Advance to the next file still needing review, when there is one. */
   onNextUnreviewed?: (() => void) | undefined;
+  /** Move to the previous / next file in the changed-files list. Absent when
+   *  the surface has no list to walk (a lone file opened outside review). */
+  onPreviousFile?: (() => void) | undefined;
+  onNextFile?: (() => void) | undefined;
+  /** Re-read the review manifest; the diff itself is refetched locally. */
+  onRefreshManifest?: (() => void) | undefined;
   inline?: boolean | undefined;
 }
 
@@ -48,6 +59,8 @@ function anchorDialogLabel(target: AnnotateTarget): string {
   const line = target.newLine ?? target.oldLine;
   return `${target.filePath}:${line ?? '?'}`;
 }
+
+const FILE_REVIEW_SCOPE = 'file-review-diff';
 
 export function FileReviewDiffView({
   conversationId,
@@ -61,8 +74,12 @@ export function FileReviewDiffView({
   onMarkReviewed,
   onUnmarkReviewed,
   onNextUnreviewed,
+  onPreviousFile,
+  onNextFile,
+  onRefreshManifest,
   inline,
 }: FileReviewDiffViewProps) {
+  useRegisterFocusScope(FILE_REVIEW_SCOPE);
   const notes = useDiffReviewNotes(onSendNotes);
   const { diffNotes } = notes;
   const codeViewRef = useRef<React.ComponentRef<typeof PhoenixDiffCodeView>>(null);
@@ -71,6 +88,9 @@ export function FileReviewDiffView({
   const [data, setData] = useState<ReviewFileDiffResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Bumping this refetches the diff without changing which file or scope is
+  // shown, so an external edit can be pulled in on demand.
+  const [reloadToken, setReloadToken] = useState(0);
 
   // Refetch when the file's reviewed blob changes: after marking, the
   // since-review diff has a new baseline.
@@ -91,7 +111,7 @@ export function FileReviewDiffView({
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [conversationId, path, scope, reviewedBlob]);
+  }, [conversationId, path, scope, reviewedBlob, reloadToken]);
 
   // A file with no checkpoint has no "since review" to show; fall back rather
   // than leave the user on a scope the server will reject.
@@ -107,6 +127,73 @@ export function FileReviewDiffView({
   }, [data, onMarkReviewed, path, onNextUnreviewed]);
 
   const reviewedNow = review.kind === 'reviewed';
+
+  const refresh = useCallback(() => {
+    setReloadToken((token) => token + 1);
+    onRefreshManifest?.();
+  }, [onRefreshManifest]);
+
+  // The user edits these files in another editor; coming back to the tab is the
+  // moment the rendered diff is most likely stale.
+  useRefreshOnWindowFocus(refresh);
+
+  // Un-marking is a correction, not progress, so only marking advances.
+  const toggleReviewed = useCallback(() => {
+    if (reviewedNow) {
+      void onUnmarkReviewed(path);
+      return;
+    }
+    void handleMark();
+  }, [handleMark, onUnmarkReviewed, path, reviewedNow]);
+
+  const runCommand = useCallback(
+    (command: ReviewCommand) => {
+      const codeView = codeViewRef.current;
+      switch (command.kind) {
+        case 'scroll-lines':
+          codeView?.scrollByLines(command.lines);
+          return;
+        case 'scroll-page':
+          codeView?.scrollPage(command.direction);
+          return;
+        case 'scroll-edge':
+          codeView?.scrollToEdge(command.edge);
+          return;
+        case 'toggle-reviewed':
+          toggleReviewed();
+          return;
+        case 'next-file':
+          onNextFile?.();
+          return;
+        case 'prev-file':
+          onPreviousFile?.();
+          return;
+        case 'next-unreviewed':
+          onNextUnreviewed?.();
+          return;
+        case 'annotate-file':
+          notes.startAnnotateFile('committed', path);
+          return;
+        case 'refresh':
+          refresh();
+          return;
+        case 'close':
+          onClose();
+          return;
+        case 'help':
+          openShortcutHelp();
+          return;
+      }
+    },
+    [notes, onClose, onNextFile, onNextUnreviewed, onPreviousFile, path, refresh, toggleReviewed],
+  );
+
+  useReviewKeyboard({
+    scopeId: FILE_REVIEW_SCOPE,
+    id: 'file-review-diff',
+    onCommand: runCommand,
+    dialogOpen: notes.annotating !== null,
+  });
 
   return (
     <ViewerShell
@@ -149,6 +236,24 @@ export function FileReviewDiffView({
               Mark reviewed
             </button>
           )}
+          <button
+            type="button"
+            className="viewer-shell-btn"
+            onClick={refresh}
+            aria-label="Refresh diff from disk"
+            title="Refresh from disk (R)"
+          >
+            <RefreshCw size={16} />
+          </button>
+          <button
+            type="button"
+            className="viewer-shell-btn"
+            onClick={openShortcutHelp}
+            aria-label="Keyboard shortcuts"
+            title="Keyboard shortcuts (?)"
+          >
+            <Keyboard size={16} />
+          </button>
         </>
       }
       noteCount={diffNotes.length}

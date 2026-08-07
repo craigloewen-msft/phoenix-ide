@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { useRegisterFocusScope } from '../hooks';
 import { formatShortcut } from '../utils';
+import { REVIEW_BINDINGS } from './viewer/reviewKeymap';
 import './ShortcutHelpPanel.css';
 
 interface ShortcutHelpPanelProps {
@@ -55,6 +56,15 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { key: 'Enter', description: 'Open conversation' },
       { key: 'n', description: 'New conversation' },
     ],
+  },
+  // Derived from the keymap's binding table so a review key cannot exist
+  // without being documented here.
+  {
+    label: 'Diff Review',
+    shortcuts: REVIEW_BINDINGS.map((binding) => ({
+      key: binding.keys,
+      description: binding.description,
+    })),
   },
 ];
 
