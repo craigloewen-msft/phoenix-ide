@@ -924,6 +924,86 @@ pub enum CheckoutStatus {
     },
 }
 
+/// Whether the user has reviewed a file, and whether that review is still
+/// current.
+///
+/// Modelled as a sum type so "reviewed" and "reviewed but changed since"
+/// cannot be set inconsistently: `ReviewedStale` — the case that drives the
+/// iterative loop — is only constructible with both blobs in hand.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileReviewState {
+    Unreviewed,
+    Reviewed {
+        at_blob: String,
+    },
+    ReviewedStale {
+        at_blob: String,
+        current_blob: String,
+    },
+}
+
+/// One row of the review manifest: a changed file plus its review state.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ReviewFileEntry {
+    pub path: String,
+    /// `added` | `modified` | `deleted` | `renamed`.
+    pub status: String,
+    pub insertions: u32,
+    pub deletions: u32,
+    /// Blob SHA of current content. The client echoes this back when marking
+    /// the file reviewed, so a file rewritten between render and click is
+    /// rejected rather than checkpointed at content the user never saw.
+    pub current_blob_sha: String,
+    pub review: FileReviewState,
+}
+
+/// Response for `GET /api/conversations/:id/review/files`.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ReviewManifestResponse {
+    /// The ref being reviewed against, surfaced so the user is never guessing
+    /// what the diff is relative to.
+    pub comparator: String,
+    pub files: Vec<ReviewFileEntry>,
+    pub reviewed_count: u32,
+    pub total_count: u32,
+}
+
+/// Response for `GET /api/conversations/:id/review/file-diff`.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ReviewFileDiffResponse {
+    pub path: String,
+    pub comparator: String,
+    /// `full` | `since_review`.
+    pub scope: String,
+    pub diff: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated_kib: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub saturated: bool,
+    pub current_blob_sha: String,
+    pub review: FileReviewState,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReviewFileDiffQuery {
+    pub path: String,
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MarkReviewedRequest {
+    pub path: String,
+    /// The blob the client rendered. Must match server-side current content.
+    pub observed_blob_sha: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UnmarkReviewedRequest {
+    pub path: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GitFileStatus {

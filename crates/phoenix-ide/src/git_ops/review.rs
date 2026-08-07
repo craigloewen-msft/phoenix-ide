@@ -7,7 +7,9 @@
 
 use std::path::Path;
 
-use super::{prepare_temp_index, run_git, run_git_bytes, run_git_capped, run_git_with_env, CappedStdout, TempPath};
+use super::{
+    prepare_temp_index, run_git, run_git_capped, run_git_with_env, CappedStdout, TempPath,
+};
 
 /// Git's hash of the empty blob. Used as the checkpoint for a file the user
 /// reviewed as deleted, so "reviewed as absent" is representable without a
@@ -292,14 +294,6 @@ fn relabel_blob_diff(captured: &CappedStdout, path: &str) -> CappedStdout {
         total_bytes: captured.total_bytes,
         saturated: captured.saturated,
     }
-}
-
-/// Reads a blob's bytes. Used to render the "before" side of a review diff.
-pub(crate) fn read_blob(worktree: &Path, blob_sha: &str) -> Option<Vec<u8>> {
-    if blob_sha == EMPTY_BLOB_SHA {
-        return Some(Vec::new());
-    }
-    run_git_bytes(worktree, &["cat-file", "-p", blob_sha]).ok()
 }
 
 fn empty_capture() -> CappedStdout {
