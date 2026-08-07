@@ -25,6 +25,9 @@ and commit with.
 | **REQ-RV-007:** Only what changed since last review | ✅ Complete | `git_ops::review::file_diff_since_review`; `scope=since_review`; 409 when no checkpoint |
 | **REQ-RV-008:** Checkpoints live and die with the work scope | ✅ Complete | `ON DELETE CASCADE` on scope deletion; re-scope clears in `update_work_scope_environment_tx`; comparator mismatch → unreviewed |
 | **REQ-RV-009:** Completing a pass does not gate merging | ✅ Complete | `ChangedFilesReview` complete action; `WorkActions` untouched |
+| **REQ-RV-010:** Keyboard-complete review pass | ✅ Complete | `reviewKeymap.ts` (binding table + resolver); `useReviewKeyboard`; `DiffView` file cursor; `FileReviewDiffView` |
+| **REQ-RV-011:** Reconciles with edits made outside Phoenix | ✅ Complete | `R` command and header button on both surfaces; `useRefreshOnWindowFocus` |
+| **REQ-RV-012:** Keyboard commands are discoverable | ✅ Complete | `REVIEW_BINDINGS` → `ShortcutHelpPanel` "Diff Review" group; keyboard button in both viewer headers |
 
 ## Current reality
 
@@ -46,6 +49,25 @@ carry `(file, side, line)` anchors and flow into the composer through the existi
 `specs/prose-feedback/` machinery. Notes remain session-local; durable review
 comments are not implemented.
 
+**Keyboard.** Bindings are vim-flavoured: `j`/`k` and `Ctrl+d`/`Ctrl+u` for the
+viewport, `gg`/`G` for the edges, `]f`/`[f` (aliased `n`/`N`) between files, `]u`
+for the next outstanding file, `m` to toggle reviewed, `c` to annotate, `R` to
+refresh, `q` to close. `reviewKeymap.ts` holds the resolver and the binding table;
+`useReviewKeyboard` adds only the pending-prefix state for the two-key sequences.
+Registration goes through the shared keyboard router
+(`specs/keyboard-interaction/`) on the `viewer` layer, so bare letters reach a
+review surface only while it is topmost and no field has focus.
+
+In the whole-branch diff, the "current file" is an explicit cursor over the parsed
+item list, marked in the file header; `PhoenixDiffCodeView` publishes that list and
+exposes typed scroll motions, so the keymap never reaches into Pierre's DOM.
+
+**Freshness.** Pull-based: explicit `R` plus a debounced refresh when the window
+regains focus. Phoenix has no filesystem-watch subsystem, and adding one (a
+`notify` watcher per worktree, a new SSE event, ignore rules, teardown) is a
+separable piece of work; a real watcher would replace the focus trigger without
+changing the requirement.
+
 ## Verification
 
 - Rust (`git_ops::review::tests`): checkpoint stability across commit/amend/rebase;
@@ -60,6 +82,14 @@ comments are not implemented.
   three-state markers, open-for-review, and that completion is withheld while any
   file is stale.
 - UI (`ViewerSlotContext.test.tsx`): `?mode=diff` derivation and its default.
+- UI (`reviewKeymap.test.ts`): every binding, prefix sequences and their
+  abandonment, modifier guards, and that unknown keys are left alone.
+- UI (`DiffView.keyboard.test.tsx`): file-cursor motion, mark-and-advance versus
+  unmark-and-stay, the untracked-file report, refresh, close, and that review keys
+  stand down while the annotation dialog is open.
+- UI (`FileReviewDiffView.keyboard.test.tsx`): mark at the rendered blob then
+  advance, unmark without advancing, file motion, refresh, close.
+- UI (`ShortcutHelpPanel.test.tsx`): every binding in the table reaches the guide.
 - Manual: the full loop exercised against the seeded `diff-review-fixture`
   conversation — mark → agent edit → stale marker → since-review delta.
 
@@ -70,3 +100,7 @@ comments are not implemented.
   diff for that file. Accepted per ADR-026.
 - **Review comments are session-local.** They survive until sent to the composer,
   not across a reload.
+- **No filesystem watcher.** A diff edited outside Phoenix updates on explicit
+  refresh or on window focus, not the moment the file changes.
+- **The keyboard cursor is per-file, not per-line.** `c` therefore annotates the
+  file; line-anchored annotation remains a pointer action.
