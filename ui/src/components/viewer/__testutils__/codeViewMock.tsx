@@ -16,16 +16,18 @@
  */
 import React from 'react';
 
-export const codeViewMockState: { scrollToCalls: unknown[]; lastItems: unknown[]; lastUnsafeCss: string } = {
+export const codeViewMockState: { scrollToCalls: unknown[]; lastItems: unknown[]; lastUnsafeCss: string; lastDiffStyle: string } = {
   scrollToCalls: [],
   lastItems: [],
   lastUnsafeCss: '',
+  lastDiffStyle: '',
 };
 
 export function resetCodeViewMock(): void {
   codeViewMockState.scrollToCalls = [];
   codeViewMockState.lastItems = [];
   codeViewMockState.lastUnsafeCss = '';
+  codeViewMockState.lastDiffStyle = '';
 }
 
 /** Latest controlled `version` Pierre would reconcile against for an item. */
@@ -73,6 +75,7 @@ export function makeCodeViewMock() {
 
     codeViewMockState.lastItems = [...(props.items ?? [])];
     codeViewMockState.lastUnsafeCss = props.options?.unsafeCSS ?? '';
+    codeViewMockState.lastDiffStyle = props.options?.diffStyle ?? '';
     return (
       <div data-testid="codeview-mock" className={props.className} ref={props.containerRef}>
         {(props.items ?? []).map((item: any) => {

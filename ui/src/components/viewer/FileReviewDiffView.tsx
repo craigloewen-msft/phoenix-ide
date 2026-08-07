@@ -15,6 +15,8 @@ import { AnnotationDialog } from './AnnotationDialog';
 import { useDiffReviewNotes } from './useDiffReviewNotes';
 import type { AnnotateTarget } from './useDiffReviewNotes';
 import { PhoenixDiffCodeView } from './PhoenixDiffCodeView';
+import { useDiffStyle } from './useDiffStyle';
+import { DiffStyleToggleButton, ReviewFocusToggleButton } from './DiffHeaderControls';
 import { api, type FileReviewState, type ReviewDiffScope, type ReviewFileDiffResponse } from '../../api';
 import './FileReviewDiffView.css';
 
@@ -41,6 +43,10 @@ export interface FileReviewDiffViewProps {
   /** Advance to the next file still needing review, when there is one. */
   onNextUnreviewed?: (() => void) | undefined;
   inline?: boolean | undefined;
+  /** Split-pane review focus state; meaningful only with `onToggleReviewFocus`. */
+  reviewFocus?: boolean | undefined;
+  /** Supplied only by the split-pane host that owns the conversation collapse. */
+  onToggleReviewFocus?: (() => void) | undefined;
 }
 
 function anchorDialogLabel(target: AnnotateTarget): string {
@@ -62,8 +68,11 @@ export function FileReviewDiffView({
   onUnmarkReviewed,
   onNextUnreviewed,
   inline,
+  reviewFocus = false,
+  onToggleReviewFocus,
 }: FileReviewDiffViewProps) {
   const notes = useDiffReviewNotes(onSendNotes);
+  const { diffStyle, toggleDiffStyle } = useDiffStyle();
   const { diffNotes } = notes;
   const codeViewRef = useRef<React.ComponentRef<typeof PhoenixDiffCodeView>>(null);
 
@@ -149,6 +158,10 @@ export function FileReviewDiffView({
               Mark reviewed
             </button>
           )}
+          <DiffStyleToggleButton diffStyle={diffStyle} onToggle={toggleDiffStyle} />
+          {onToggleReviewFocus && (
+            <ReviewFocusToggleButton reviewFocus={reviewFocus} onToggle={onToggleReviewFocus} />
+          )}
         </>
       }
       noteCount={diffNotes.length}
@@ -210,7 +223,7 @@ export function FileReviewDiffView({
             ref={codeViewRef}
             committedDiff={data.diff}
             uncommittedDiff=""
-            diffStyle="unified"
+            diffStyle={diffStyle}
             notes={diffNotes}
             highlightedNoteId={notes.highlightedNoteId}
             onAnnotateLine={notes.startAnnotateLine}
