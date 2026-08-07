@@ -988,8 +988,7 @@ def _port_is_available(port: int) -> bool:
     return True
 
 
-def _listening_pids(port: int) -> list[int]:
-    """PIDs holding a LISTEN socket on the TCP port ([] on lsof failure)."""
+def _listening_pids_lsof(port: int) -> list[int]:
     try:
         out = subprocess.run(
             ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
@@ -1000,6 +999,40 @@ def _listening_pids(port: int) -> list[int]:
     except (OSError, subprocess.SubprocessError):
         return []
     return [int(x) for x in out.split() if x.strip().isdigit()]
+
+
+def _listening_pids_ss(port: int) -> list[int]:
+    try:
+        out = subprocess.run(
+            ["ss", "-ltnpH"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pids: list[int] = []
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        local = fields[3]
+        if local.rpartition(":")[2] != str(port):
+            continue
+        pids.extend(int(m) for m in re.findall(r"pid=(\d+)", line))
+    return pids
+
+
+def _listening_pids(port: int) -> list[int]:
+    """PIDs holding a LISTEN socket on the TCP port ([] if none can be resolved).
+
+    Tries `lsof`, then `ss`. Neither is guaranteed to exist: `lsof` is absent
+    from many minimal Linux images, and `ss` (iproute2) is absent on macOS. An
+    empty result from the first tool is indistinguishable from "tool missing",
+    so always try the second before concluding nothing is listening — a false
+    empty here makes `_wait_for_port` report a healthy server as failed to bind.
+    """
+    return _listening_pids_lsof(port) or _listening_pids_ss(port)
 
 
 def _is_descendant_of(pid: int, ancestor: int) -> bool:
