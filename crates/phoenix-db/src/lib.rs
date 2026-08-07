@@ -1225,6 +1225,17 @@ impl Database {
                 "work scope {scope_id} has no normalized environment"
             )));
         }
+
+        // Re-scoping invalidates every review judgement made against the old
+        // environment. Clearing here rather than at call sites makes this
+        // unskippable: a checkpoint can never outlive the base it was taken
+        // against, so a reviewed marker can never vouch for a review that
+        // never happened against the current comparator.
+        sqlx::query("DELETE FROM work_scope_review_checkpoints WHERE work_scope_id = ?1")
+            .bind(scope_id.as_str())
+            .execute(&mut **tx)
+            .await?;
+
         Ok(())
     }
 
@@ -17953,16 +17964,14 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         let scope = test_scope();
 
-        assert!(
-            db.upsert_review_checkpoint(&scope, "src/b.rs", "blob-b", "main", None)
-                .await
-                .unwrap()
-        );
-        assert!(
-            db.upsert_review_checkpoint(&scope, "src/a.rs", "blob-a", "main", None)
-                .await
-                .unwrap()
-        );
+        assert!(db
+            .upsert_review_checkpoint(&scope, "src/b.rs", "blob-b", "main", None)
+            .await
+            .unwrap());
+        assert!(db
+            .upsert_review_checkpoint(&scope, "src/a.rs", "blob-a", "main", None)
+            .await
+            .unwrap());
 
         let rows = db.list_review_checkpoints(&scope).await.unwrap();
         let paths: Vec<&str> = rows.iter().map(|r| r.file_path.as_str()).collect();
@@ -18025,6 +18034,45 @@ mod tests {
         // for a review that never happened against the current base.
         db.clear_all_review_checkpoints(&scope).await.unwrap();
         assert!(db.list_review_checkpoints(&scope).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rescoping_a_conversation_discards_its_review() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-rescope", "conv-rescope", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let conv = db.get_conversation("conv-rescope").await.unwrap();
+        let scope = conv
+            .work_scope_id
+            .clone()
+            .expect("conversation has a scope");
+
+        db.upsert_review_checkpoint(&scope, "src/a.rs", "blob-a", "main", None)
+            .await
+            .unwrap();
+        assert_eq!(db.list_review_checkpoints(&scope).await.unwrap().len(), 1);
+
+        // Re-point the scope at different work. Every review judgement was
+        // made against the old base and must not survive.
+        db.update_conversation_mode_and_cwd(
+            "conv-rescope",
+            &ConvMode::Work {
+                worktree_path: schema::NonEmptyString::new("/tmp/wt".to_string()).unwrap(),
+                branch_name: schema::NonEmptyString::new("task-1-other".to_string()).unwrap(),
+                base_branch: schema::NonEmptyString::new("release".to_string()).unwrap(),
+                task_id: schema::NonEmptyString::new("T1".to_string()).unwrap(),
+                task_title: schema::NonEmptyString::new("Other work".to_string()).unwrap(),
+            },
+            "/tmp/wt",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.list_review_checkpoints(&scope).await.unwrap().is_empty(),
+            "a checkpoint must never outlive the base it was taken against"
+        );
     }
 
     #[tokio::test]

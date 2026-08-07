@@ -83,7 +83,16 @@ pub(crate) fn review_comparator(worktree: &Path, base_branch: &str) -> String {
 }
 
 fn rev_exists(worktree: &Path, rev: &str) -> bool {
-    run_git(worktree, &["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")]).is_ok()
+    run_git(
+        worktree,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ],
+    )
+    .is_ok()
 }
 
 /// Hashes the working-tree content of `path` and stores it in the object
@@ -126,7 +135,11 @@ fn merge_base(worktree: &Path, comparator: &str) -> String {
 fn temp_index_env(worktree: &Path) -> Option<(TempPath, String)> {
     let temp = prepare_temp_index(worktree)?;
     let path = temp.0.to_string_lossy().into_owned();
-    let _ = run_git_with_env(worktree, &["add", "-N", "."], &[("GIT_INDEX_FILE", path.as_str())]);
+    let _ = run_git_with_env(
+        worktree,
+        &["add", "-N", "."],
+        &[("GIT_INDEX_FILE", path.as_str())],
+    );
     Some((temp, path))
 }
 
@@ -275,15 +288,16 @@ pub(crate) fn file_diff_since_review(
 /// path. The UI parser keys hunks by path, so without this the since-review
 /// diff would render against a meaningless header.
 fn relabel_blob_diff(captured: &CappedStdout, path: &str) -> CappedStdout {
+    use std::fmt::Write as _;
+
     let mut out = String::with_capacity(captured.stdout.len() + 2 * path.len());
     for line in captured.stdout.lines() {
         if line.starts_with("--- ") {
-            out.push_str(&format!("--- a/{path}"));
+            let _ = write!(out, "--- a/{path}");
         } else if line.starts_with("+++ ") {
-            out.push_str(&format!("+++ b/{path}"));
-        } else if let Some(rest) = line.strip_prefix("diff --git ") {
-            let _ = rest;
-            out.push_str(&format!("diff --git a/{path} b/{path}"));
+            let _ = write!(out, "+++ b/{path}");
+        } else if line.starts_with("diff --git ") {
+            let _ = write!(out, "diff --git a/{path} b/{path}");
         } else {
             out.push_str(line);
         }

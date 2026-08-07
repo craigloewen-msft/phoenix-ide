@@ -257,6 +257,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
         conversationId={activeConversation?.id}
         rootDir={effectiveCwd ?? null}
         enabled={activeConversation?.conv_mode_label === 'Work' || activeConversation?.conv_mode_label === 'Branch'}
+        agentState={activeConversation?.state?.type}
       >
       <div
         ref={layoutRef}
