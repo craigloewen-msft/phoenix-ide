@@ -13,6 +13,8 @@ This spec governs the **action semantics and git side effects** of:
 
 - **Abandon** — discarding a Work or Branch conversation.
 - **Mark as merged** — signalling that a Work or Branch conversation's work has shipped.
+- **Merge to the local base branch** — landing a Work or Branch conversation's commits on the
+  user's local base branch and then cleaning up.
 - **PR merge state** as the advisory gate that guides (but never triggers) the cleanup path.
 
 It does **not** own:
@@ -80,7 +82,7 @@ AND apply the mode-dependent branch disposition (Managed: delete the task branch
 AND resolve the conversation via bedrock's `TaskResolved` with outcome `merged`
 AND emit a synthetic system message describing the outcome
 
-THE SYSTEM SHALL NOT squash-merge to the base branch
+THE SYSTEM SHALL NOT merge the branch anywhere as part of this action
 THE SYSTEM SHALL NOT push to origin (push is the agent's responsibility, run through the bash
   tool when the user requests it)
 THE SYSTEM SHALL NOT perform any git operation before the user initiates the action
@@ -90,10 +92,9 @@ THE SYSTEM SHALL commit the task file on the task branch (never on main/base); t
 
 **Design:** "Mark as merged" is a user assertion that the work has shipped via the user's
 normal PR workflow — the actual merge happened outside Phoenix. Phoenix performs worktree
-cleanup only. Many repositories protect their main branch and require PR-based merges;
-squash-merging inside Phoenix would bypass code review and branch protection, so Phoenix never
-merges or pushes on the user's behalf. The task branch is deleted for Managed mode (Phoenix
-created it) and kept for Branch mode (the user owns it).
+cleanup only. Merging is the separate, explicitly-chosen action in REQ-WL-004; conflating the
+two would let a cleanup click silently move a branch ref. The task branch is deleted for
+Managed mode (Phoenix created it) and kept for Branch mode (the user owns it).
 
 **Legality gate:** bedrock's `TaskResolved` rule (REQ-BED-029, REQ-BED-031) governs when Mark
 as Merged may be initiated.
@@ -138,3 +139,57 @@ condition the user is always better positioned to assert than Phoenix is to dete
 knows when they clicked Merge. The data source is `GET /api/conversations/:id/pr-status`;
 `gh` failures are logged at `debug` and surfaced as compact, non-blocking UI hints so the
 conversation page stays usable without `gh`.
+
+---
+
+### REQ-WL-004: Merge to the Local Base Branch
+
+WHEN the user initiates "Merge to the base branch" on a Work or Branch conversation
+THE SYSTEM SHALL evaluate every precondition before performing any git write:
+
+- the repository root checkout SHALL have the target branch checked out
+- the repository root checkout SHALL have no uncommitted changes
+- the conversation's branch SHALL exist
+- the conversation's branch SHALL NOT already be contained in the target branch
+
+WHEN any precondition fails
+THE SYSTEM SHALL refuse the action with a reason naming the failed precondition
+AND SHALL make no change to any branch, worktree, or conversation state
+
+WHEN all preconditions hold
+THE SYSTEM SHALL merge the branch into the target branch, fast-forwarding when the target has
+  not diverged and creating a merge commit otherwise
+
+WHEN the merge reports conflicts
+THE SYSTEM SHALL abort the merge
+AND SHALL surface git's conflict output to the user
+AND SHALL make no change to any branch, worktree, or conversation state
+
+WHEN the merge succeeds
+THE SYSTEM SHALL delete the worktree
+AND apply the mode-dependent branch disposition (Managed: delete the task branch; Branch:
+  keep the branch)
+AND resolve the conversation via bedrock's `TaskResolved` with outcome `merged`
+AND emit a synthetic system message naming the target branch and whether the merge
+  fast-forwarded
+
+THE SYSTEM SHALL NOT push to origin
+THE SYSTEM SHALL NOT move the target branch ref through any checkout other than the one that
+  has it checked out
+
+**Design:** This is the local-only counterpart to the GitHub link-outs: work that never needs
+a pull request can be landed and cleaned up in one action. The merge runs in the checkout that
+owns the target branch — required, not incidental. Moving `refs/heads/<target>` behind a
+checkout's back would leave that checkout's index and working tree describing a commit that is
+no longer its branch tip; running the merge through the owning checkout updates ref, index, and
+working tree together. Requiring that checkout to be clean means a conflicted or unexpected
+merge cannot destroy uncommitted work. Every precondition is evaluated, and a conflicting merge
+aborted, strictly before the irreversible cleanup, so a refusal is always a no-op the user can
+retry after fixing the cause.
+
+A branch already contained in the target is refused rather than reported as a successful no-op:
+the user asked to land work, and silently cleaning up a branch that contributed nothing would
+misreport what happened. `Mark as merged` is the action for that case.
+
+**Legality gate:** bedrock's `TaskResolved` rule (REQ-BED-029, REQ-BED-031) governs when this
+action may be initiated.

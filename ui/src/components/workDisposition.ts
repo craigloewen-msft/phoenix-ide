@@ -47,6 +47,7 @@ interface HiddenDisposition {
   secondaryResolve: null;
   showCleanUp: false;
   showAbandon: false;
+  showMergeToLocalBase: false;
   note: null;
 }
 
@@ -57,6 +58,7 @@ interface ContinuedDisposition {
   secondaryResolve: null;
   showCleanUp: false;
   showAbandon: false;
+  showMergeToLocalBase: false;
   note: Extract<DispositionNote, { kind: 'continued' }>;
 }
 
@@ -67,6 +69,7 @@ interface AddressFeedbackDisposition {
   secondaryResolve: PrLinkVerb | null;
   showCleanUp: false;
   showAbandon: true;
+  showMergeToLocalBase: true;
   note: null;
 }
 
@@ -77,6 +80,7 @@ interface LinkResolveDisposition {
   secondaryResolve: null;
   showCleanUp: false;
   showAbandon: true;
+  showMergeToLocalBase: true;
   note: Extract<DispositionNote, { kind: 'no_pr_dirty' }> | null;
 }
 
@@ -87,6 +91,7 @@ interface ReviewDisposition {
   secondaryResolve: null;
   showCleanUp: false;
   showAbandon: true;
+  showMergeToLocalBase: true;
   note: Extract<DispositionNote, { kind: 'no_pr_dirty' }>;
 }
 
@@ -97,6 +102,7 @@ interface CleanUpDisposition {
   secondaryResolve: null;
   showCleanUp: true;
   showAbandon: true;
+  showMergeToLocalBase: true;
   note: Extract<DispositionNote, { kind: 'gh_unavailable' }> | null;
 }
 
@@ -107,6 +113,7 @@ interface AbandonDisposition {
   secondaryResolve: null;
   showCleanUp: boolean;
   showAbandon: true;
+  showMergeToLocalBase: true;
   note: Extract<DispositionNote, { kind: 'checking' | 'pr_closed' | 'pr_open_stuck' }> | null;
 }
 
@@ -152,6 +159,7 @@ function hidden(): HiddenDisposition {
     secondaryResolve: null,
     showCleanUp: false,
     showAbandon: false,
+    showMergeToLocalBase: false,
     note: null,
   };
 }
@@ -192,6 +200,7 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
       secondaryResolve: null,
       showCleanUp: false,
       showAbandon: false,
+      showMergeToLocalBase: false,
       note: { kind: 'continued', text: NOTE_CONTINUED },
     };
   }
@@ -206,6 +215,7 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
       secondaryResolve: null,
       showCleanUp: false,
       showAbandon: true,
+      showMergeToLocalBase: true,
       note: { kind: 'checking', text: NOTE_CHECKING },
     };
   }
@@ -356,6 +366,7 @@ function addressFeedback(secondaryResolve: PrLinkVerb | null): AddressFeedbackDi
     secondaryResolve,
     showCleanUp: false,
     showAbandon: true,
+    showMergeToLocalBase: true,
     note: null,
   };
 }
@@ -371,6 +382,7 @@ function linkResolve(
     secondaryResolve: null,
     showCleanUp: false,
     showAbandon: true,
+    showMergeToLocalBase: true,
     note,
   };
 }
@@ -383,6 +395,7 @@ function reviewPrimary(text: string): ReviewDisposition {
     secondaryResolve: null,
     showCleanUp: false,
     showAbandon: true,
+    showMergeToLocalBase: true,
     note: { kind: 'no_pr_dirty', text },
   };
 }
@@ -395,6 +408,7 @@ function cleanUp(opts: { note?: CleanUpDisposition['note'] }): CleanUpDispositio
     secondaryResolve: null,
     showCleanUp: true,
     showAbandon: true,
+    showMergeToLocalBase: true,
     note: opts.note ?? null,
   };
 }
@@ -410,6 +424,7 @@ function abandon(opts: {
     secondaryResolve: null,
     showCleanUp: opts.showCleanUp ?? false,
     showAbandon: true,
+    showMergeToLocalBase: true,
     note: opts.note ?? null,
   };
 }

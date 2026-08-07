@@ -484,6 +484,30 @@ describe('structural invariants', () => {
     >();
   });
 
+  it('offers Merge to base in every visible non-continued disposition, never as primary', () => {
+    const cases: WorkDisposition[] = [
+      deriveWorkDisposition(input({ prLoading: true, prStatus: null })),
+      deriveWorkDisposition(input({ phaseType: 'error', prStatus: foundPr('open') })),
+      deriveWorkDisposition(input({ prStatus: foundPr('open') })),
+      deriveWorkDisposition(input({ prStatus: foundPr('merged') })),
+      deriveWorkDisposition(input({ prStatus: foundPr('closed') })),
+      deriveWorkDisposition(input({ prStatus: notFound('unavailable') })),
+      deriveWorkDisposition(input({ prStatus: notFound('fresh') })),
+    ];
+    for (const d of cases) {
+      expect(d.visible).toBe(true);
+      expect(d.showMergeToLocalBase).toBe(true);
+    }
+    // Never a primary slot: merging locally is a FINISH verb, not the answer to
+    // "what do I do next?" (REQ-WAB-003).
+    expectTypeOf<WorkDisposition['primary']>().not.toEqualTypeOf<'merge_to_local_base'>();
+  });
+
+  it('withholds Merge to base when the bar is hidden or the work was continued', () => {
+    expect(deriveWorkDisposition(input({ convModeLabel: 'Explore' })).showMergeToLocalBase).toBe(false);
+    expect(deriveWorkDisposition(input({ continuedInConvId: 'conv-2' })).showMergeToLocalBase).toBe(false);
+  });
+
   it('restricts gh-unavailable notes to Clean up', () => {
     type CleanUp = Extract<WorkDisposition, { primary: 'clean_up' }>;
     type OtherDispositions = Exclude<WorkDisposition, CleanUp>;

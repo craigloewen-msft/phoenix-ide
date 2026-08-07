@@ -995,6 +995,277 @@ pub(crate) fn ensure_local_exclude_has_phoenix(dir: &Path) -> Result<(), String>
     Ok(())
 }
 
+/// Why a merge into the local default branch was refused. Every variant is a
+/// pre-merge precondition failure or an aborted merge: the repository is left
+/// exactly as it was found, so the caller may surface the reason and stop
+/// without any compensating cleanup.
+pub(crate) enum LocalMergeRefusal {
+    /// The checkout that owns the target branch is on something else. Merging
+    /// would mean moving `refs/heads/<target>` behind a checkout's back.
+    RootNotOnTarget {
+        current: String,
+        target: String,
+    },
+    /// The target checkout has uncommitted changes; a merge could clobber them.
+    RootDirty {
+        files: Vec<String>,
+    },
+    BranchMissing {
+        branch: String,
+    },
+    /// The branch is already an ancestor of the target — nothing to merge.
+    AlreadyMerged {
+        branch: String,
+        target: String,
+    },
+    /// git refused the merge (conflicts, or any other merge-time failure). The
+    /// merge has been aborted; `details` is git's combined output.
+    Conflict {
+        details: String,
+    },
+    /// A git invocation failed outside the merge itself.
+    GitError(String),
+}
+
+/// A completed merge of `branch` into the local target branch.
+pub(crate) struct LocalMergeSuccess {
+    pub target: String,
+    /// True when the target ref simply advanced to the branch tip.
+    pub fast_forwarded: bool,
+}
+
+/// Merge `branch` into `target` inside `repo_root`, the checkout that has
+/// `target` checked out.
+///
+/// Requiring `target` to be `repo_root`'s current branch is what makes this
+/// safe under the worktree-ownership rule: the ref moves through the checkout
+/// that owns it, with its index and working tree updated in the same
+/// operation. Every precondition is evaluated before `git merge` runs, and a
+/// failing merge is aborted, so a refusal never leaves a partial merge behind.
+pub(crate) fn merge_branch_into_local_target(
+    repo_root: &Path,
+    branch: &str,
+    target: &str,
+) -> Result<LocalMergeSuccess, LocalMergeRefusal> {
+    let current = run_git(repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .map_err(LocalMergeRefusal::GitError)?;
+    if current != target {
+        return Err(LocalMergeRefusal::RootNotOnTarget {
+            current,
+            target: target.to_string(),
+        });
+    }
+
+    let status =
+        run_git(repo_root, &["status", "--porcelain"]).map_err(LocalMergeRefusal::GitError)?;
+    if !status.is_empty() {
+        return Err(LocalMergeRefusal::RootDirty {
+            files: status.lines().map(|l| l.trim().to_string()).collect(),
+        });
+    }
+
+    let branch_ref = format!("refs/heads/{branch}");
+    if run_git(
+        repo_root,
+        &["rev-parse", "--verify", "--quiet", &branch_ref],
+    )
+    .is_err()
+    {
+        return Err(LocalMergeRefusal::BranchMissing {
+            branch: branch.to_string(),
+        });
+    }
+
+    if run_git(repo_root, &["merge-base", "--is-ancestor", branch, target]).is_ok() {
+        return Err(LocalMergeRefusal::AlreadyMerged {
+            branch: branch.to_string(),
+            target: target.to_string(),
+        });
+    }
+
+    let before = run_git(repo_root, &["rev-parse", "HEAD"]).map_err(LocalMergeRefusal::GitError)?;
+
+    // Captured directly rather than through `run_git` because git reports
+    // conflicts ("CONFLICT (content): …") on stdout, and that list is the whole
+    // value of the error message to the user.
+    let output = git_command()
+        .args(["merge", "--no-edit", branch])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| LocalMergeRefusal::GitError(format!("Failed to run git merge: {e}")))?;
+    if !output.status.success() {
+        let mut details = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !stderr.is_empty() {
+            if !details.is_empty() {
+                details.push('\n');
+            }
+            details.push_str(&stderr);
+        }
+        if let Err(abort_err) = run_git(repo_root, &["merge", "--abort"]) {
+            tracing::debug!(
+                error = %abort_err,
+                "git merge --abort after a failed merge reported an error (usually: no merge was in progress)"
+            );
+        }
+        return Err(LocalMergeRefusal::Conflict { details });
+    }
+
+    let branch_tip =
+        run_git(repo_root, &["rev-parse", branch]).map_err(LocalMergeRefusal::GitError)?;
+    let after = run_git(repo_root, &["rev-parse", "HEAD"]).map_err(LocalMergeRefusal::GitError)?;
+    Ok(LocalMergeSuccess {
+        target: target.to_string(),
+        fast_forwarded: after == branch_tip && after != before,
+    })
+}
+
+#[cfg(test)]
+mod local_merge_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn init_repo(dir: &Path) {
+        run_git(dir, &["init", "--quiet", "--initial-branch=main"]).unwrap();
+        run_git(dir, &["config", "user.email", "probe@test"]).unwrap();
+        run_git(dir, &["config", "user.name", "probe"]).unwrap();
+        run_git(dir, &["commit", "--allow-empty", "-q", "-m", "init"]).unwrap();
+    }
+
+    fn write_commit(dir: &Path, name: &str, contents: &str, message: &str) {
+        std::fs::write(dir.join(name), contents).unwrap();
+        run_git(dir, &["add", name]).unwrap();
+        run_git(dir, &["commit", "-q", "-m", message]).unwrap();
+    }
+
+    /// A feature branch that only adds commits on top of main fast-forwards.
+    #[test]
+    fn fast_forwards_when_target_has_not_moved() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        init_repo(root);
+        run_git(root, &["checkout", "-q", "-b", "feature"]).unwrap();
+        write_commit(root, "a.txt", "a", "feature work");
+        run_git(root, &["checkout", "-q", "main"]).unwrap();
+
+        let merged = merge_branch_into_local_target(root, "feature", "main")
+            .unwrap_or_else(|_| panic!("merge should succeed"));
+        assert!(merged.fast_forwarded);
+        assert_eq!(merged.target, "main");
+        assert!(root.join("a.txt").exists());
+    }
+
+    /// Divergent-but-compatible histories produce a merge commit, not a refusal.
+    #[test]
+    fn creates_a_merge_commit_when_target_moved() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        init_repo(root);
+        run_git(root, &["checkout", "-q", "-b", "feature"]).unwrap();
+        write_commit(root, "a.txt", "a", "feature work");
+        run_git(root, &["checkout", "-q", "main"]).unwrap();
+        write_commit(root, "b.txt", "b", "main work");
+
+        let merged = merge_branch_into_local_target(root, "feature", "main")
+            .unwrap_or_else(|_| panic!("merge should succeed"));
+        assert!(!merged.fast_forwarded);
+        assert!(root.join("a.txt").exists());
+        assert!(root.join("b.txt").exists());
+    }
+
+    /// A conflicting merge is aborted: main's tip and the branch both survive.
+    #[test]
+    fn conflict_aborts_and_leaves_target_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        init_repo(root);
+        write_commit(root, "shared.txt", "base\n", "base");
+        run_git(root, &["checkout", "-q", "-b", "feature"]).unwrap();
+        write_commit(root, "shared.txt", "feature\n", "feature edit");
+        run_git(root, &["checkout", "-q", "main"]).unwrap();
+        write_commit(root, "shared.txt", "main\n", "main edit");
+        let before = run_git(root, &["rev-parse", "HEAD"]).unwrap();
+
+        let refusal = merge_branch_into_local_target(root, "feature", "main")
+            .err()
+            .expect("conflicting merge must be refused");
+        let LocalMergeRefusal::Conflict { details } = refusal else {
+            panic!("expected a conflict refusal");
+        };
+        assert!(details.contains("shared.txt"));
+        assert_eq!(run_git(root, &["rev-parse", "HEAD"]).unwrap(), before);
+        assert_eq!(run_git(root, &["status", "--porcelain"]).unwrap(), "");
+        assert!(run_git(root, &["rev-parse", "--verify", "refs/heads/feature"]).is_ok());
+    }
+
+    #[test]
+    fn refuses_when_target_checkout_is_on_another_branch() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        init_repo(root);
+        run_git(root, &["checkout", "-q", "-b", "feature"]).unwrap();
+        write_commit(root, "a.txt", "a", "feature work");
+
+        let Err(LocalMergeRefusal::RootNotOnTarget { current, target }) =
+            merge_branch_into_local_target(root, "feature", "main")
+        else {
+            panic!("expected a not-on-target refusal");
+        };
+        assert_eq!(current, "feature");
+        assert_eq!(target, "main");
+    }
+
+    #[test]
+    fn refuses_a_dirty_target_checkout() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        init_repo(root);
+        run_git(root, &["checkout", "-q", "-b", "feature"]).unwrap();
+        write_commit(root, "a.txt", "a", "feature work");
+        run_git(root, &["checkout", "-q", "main"]).unwrap();
+        std::fs::write(root.join("dirty.txt"), "uncommitted").unwrap();
+
+        let Err(LocalMergeRefusal::RootDirty { files }) =
+            merge_branch_into_local_target(root, "feature", "main")
+        else {
+            panic!("expected a dirty-checkout refusal");
+        };
+        assert!(files.iter().any(|f| f.contains("dirty.txt")));
+    }
+
+    #[test]
+    fn refuses_a_missing_branch() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        init_repo(root);
+
+        let Err(LocalMergeRefusal::BranchMissing { branch }) =
+            merge_branch_into_local_target(root, "nope", "main")
+        else {
+            panic!("expected a missing-branch refusal");
+        };
+        assert_eq!(branch, "nope");
+    }
+
+    /// An already-merged branch is refused rather than reported as a no-op
+    /// success, so the UI never claims to have landed work twice.
+    #[test]
+    fn refuses_an_already_merged_branch() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        init_repo(root);
+        run_git(root, &["branch", "feature"]).unwrap();
+
+        let Err(LocalMergeRefusal::AlreadyMerged { branch, target }) =
+            merge_branch_into_local_target(root, "feature", "main")
+        else {
+            panic!("expected an already-merged refusal");
+        };
+        assert_eq!(branch, "feature");
+        assert_eq!(target, "main");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

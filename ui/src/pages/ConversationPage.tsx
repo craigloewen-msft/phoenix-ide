@@ -2555,6 +2555,7 @@ function ConversationPageContent({
           convModeLabel={conversation.conv_mode_label}
           phaseType={convStateForChildren.type}
           continuedInConvId={conversation.continued_in_conv_id}
+          baseBranch={conversation.base_branch}
           showError={showError}
           prStatusHandle={prStatusHandle}
         />}
@@ -2618,6 +2619,7 @@ function ConversationPageContent({
             convModeLabel={conversation.conv_mode_label}
             phaseType={convStateForChildren.type}
             continuedInConvId={conversation.continued_in_conv_id}
+            baseBranch={conversation.base_branch}
             onSendMessage={handleSendTextOnly}
             showError={showError}
             prStatusHandle={prStatusHandle}

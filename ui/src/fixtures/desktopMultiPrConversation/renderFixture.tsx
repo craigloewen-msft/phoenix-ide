@@ -91,6 +91,7 @@ export function DesktopMultiPrConversationFixture({ scenario }: { scenario: Desk
             convModeLabel="Work"
             phaseType="idle"
             continuedInConvId={null}
+            baseBranch="main"
             onSendMessage={async () => undefined}
             prStatusHandle={handle}
           />

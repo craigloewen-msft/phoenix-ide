@@ -2179,6 +2179,16 @@ export const api = {
     return resp.json();
   },
 
+  /** POST /api/conversations/:id/merge-to-local-base — merge the conversation's
+   *  branch into the local base branch, then run the same cleanup as
+   *  `markMerged`. Rejects (without changing anything) on merge conflict or an
+   *  unmergeable main checkout; the thrown message carries git's reason. */
+  async mergeToLocalBase(conversationId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${conversationId}/merge-to-local-base`, { method: 'POST' });
+    if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err.error || 'Failed to merge'); }
+    return resp.json();
+  },
+
   async getPrStatus(conversationId: string): Promise<PrStatusResponse> {
     const resp = await fetch(`/api/conversations/${conversationId}/pr-status`);
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to fetch PR status'); }
