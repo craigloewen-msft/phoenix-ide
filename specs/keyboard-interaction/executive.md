@@ -39,8 +39,9 @@ shortcuts use modifier keys and are never blocked by panel-level handlers.
 | **REQ-KB-006:** Shortcut Help Panel | ✅ Complete | `?` key opens `ShortcutHelpPanel` |
 | **REQ-KB-007:** Tooltip Shortcut Hints | ✅ Complete | Shortcut-bearing controls expose their key hints in tooltips or labels |
 | **REQ-KB-008:** Prevent Key Leak to Inactive Scopes | ✅ Complete | Lower-priority keyboard navigation stays gated behind the active scope |
+| **REQ-KB-009:** Unmodified-letter shortcuts yield to text fields | ✅ Complete | Router's `review-key` registrations stand down for any typing target, find query included; the review resolver claims an event only when it produces a command |
 
-**Progress:** 10 of 10 complete
+**Progress:** 11 of 11 complete
 
 ## Cross-Spec References
 
@@ -50,3 +51,4 @@ shortcuts use modifier keys and are never blocked by panel-level handlers.
 - `specs/command-palette/` -- Must comply with REQ-KB-001, REQ-KB-002
 - `specs/inline-references/` -- Input area shortcuts reference REQ-KB-003
 - `specs/viewer-find/` -- In-viewer find owns `Cmd/Ctrl+F`, local focus restoration, and Escape behavior within the topmost eligible viewer scope
+- `specs/iterative-review/` -- The diff-review keymap registers bare-letter shortcuts on the `viewer` layer and depends on REQ-KB-002A and REQ-KB-009

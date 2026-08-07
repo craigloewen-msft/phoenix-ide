@@ -187,3 +187,22 @@ affect components outside that scope
 keys in the QuestionPanel also navigated the sidebar conversation list. When
 REQ-KB-001 and REQ-KB-003 are correctly implemented, key leak is structurally
 impossible -- this requirement exists as a testable statement of that property.
+
+---
+
+### REQ-KB-009: Unmodified-Letter Shortcuts Yield to Any Text Field
+
+WHERE a scope claims shortcuts that are bare letters or punctuation
+THE SYSTEM SHALL leave those keys to the focused control whenever focus is in a
+text input, textarea, or contenteditable element
+AND SHALL claim the key event only when the scope acts on it
+
+**Rationale:** A modified shortcut (`Cmd/Ctrl+F`) can coexist with typing because
+the modifier disambiguates it; a bare `m` cannot. A scope that owns bare letters
+must therefore stand down for any field, including fields the scope itself renders
+such as an in-viewer find query — otherwise the user's search string loses
+characters to commands.
+
+Claiming only on action matters for multi-key sequences: a prefix followed by an
+unrecognised key must abandon the sequence and leave the second key alone rather
+than swallow it.

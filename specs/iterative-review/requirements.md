@@ -177,3 +177,71 @@ step into a flow whose value is informational, and would compete with the work
 action bar's single-primary-action rule (`specs/work-actions-bar/` REQ-WAB-003).
 The completion affordance appears only when there is nothing outstanding, so it
 reports a fact rather than inviting a premature claim.
+
+---
+
+### REQ-RV-010: A Review Pass Is Completable From the Keyboard Alone
+
+WHILE a review surface is the topmost focus scope and no text field has focus
+THE SYSTEM SHALL accept keyboard commands to scroll the viewport, move between
+  changed files, toggle a file's reviewed state, annotate the current file,
+  refresh the surface, and dismiss the surface
+AND SHALL apply those commands to the whole-branch diff and the per-file review
+  diff alike
+
+WHEN the user toggles a file that is unreviewed or stale
+THE SYSTEM SHALL mark it reviewed and then move to the next file still needing
+  review
+
+WHEN the user toggles a file that is already reviewed
+THE SYSTEM SHALL clear its checkpoint and leave the current file selected
+
+WHERE a keyboard command names a file the review manifest does not track
+THE SYSTEM SHALL report why the command had no effect
+
+**Design:** Reviewing a colleague's change is a reading task, and reaching for the
+mouse between every file is what breaks its rhythm. The commands are the ones the
+loop already has as buttons, so the keyboard is a second route to the same
+behaviour rather than a parallel one that can diverge.
+
+Marking advances because it is the act that completes a file; un-marking is a
+correction to the file in front of the user, so moving away from it would discard
+the context that prompted the correction.
+
+The whole-branch diff can render files outside the manifest (a diff taken against
+another branch), so marking there can find no file to mark. Doing nothing is
+indistinguishable from a broken key, hence the explicit report.
+
+---
+
+### REQ-RV-011: The Review Surface Reconciles With Edits Made Outside Phoenix
+
+WHEN the user requests a refresh of a review surface
+THE SYSTEM SHALL re-read the rendered diff and the review manifest from the
+  working tree
+
+WHEN the browser window regains focus while a review surface is open
+THE SYSTEM SHALL perform the same refresh
+
+**Design:** The working tree is shared with whatever editor the user also has
+open, so a rendered diff is a snapshot that can silently fall behind. Returning to
+the Phoenix window is both the moment the staleness starts to matter and an action
+the user took, which makes it a truthful trigger; polling would spend requests
+while nobody is looking and still lag the edit that prompted the switch.
+
+Refreshing re-reads rather than patching: the manifest is server-owned
+(REQ-RV-002), so the surface asks again instead of reconciling a local copy.
+
+---
+
+### REQ-RV-012: Keyboard Commands Are Discoverable Without Being Known
+
+WHERE a review surface offers keyboard commands
+THE SYSTEM SHALL provide an affordance on that surface that opens the keyboard
+  guide
+AND the guide SHALL list every keyboard command the review surfaces accept
+
+**Design:** A keymap nobody can find is a keymap nobody uses. The guide is
+generated from the same table that resolves the key presses, so a command cannot
+be added without becoming documented — the alternative, a hand-maintained list,
+drifts on the first change and then actively misinforms.

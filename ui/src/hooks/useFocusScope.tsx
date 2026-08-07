@@ -9,6 +9,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
+import { isReviewKeyCandidate } from '../components/viewer/reviewKeymap';
 
 interface FocusScopeCommands {
   pushScope(id: string): void;
@@ -24,7 +25,10 @@ interface FocusScopeState {
 type FocusScopeContextValue = FocusScopeCommands & FocusScopeState;
 
 type KeyboardRouterLayer = 'modal' | 'viewer' | 'passive-content';
-type KeyboardRouterKey = 'mod+f' | 'Escape';
+/** `review-key` is the diff-review vim keymap; its own resolver decides which
+ *  bare keys it owns, so the router only asks whether the event is a
+ *  candidate. */
+type KeyboardRouterKey = 'mod+f' | 'Escape' | 'review-key';
 
 interface KeyboardShortcutRegistration {
   id: string;
@@ -68,6 +72,7 @@ const LAYER_PRIORITY: Record<KeyboardRouterLayer, number> = {
 
 function matchesShortcut(event: KeyboardEvent, key: KeyboardRouterKey): boolean {
   if (key === 'Escape') return event.key === 'Escape';
+  if (key === 'review-key') return isReviewKeyCandidate(event);
   return (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f';
 }
 
@@ -82,6 +87,13 @@ function isEditableTarget(target: EventTarget | null): boolean {
   if (isViewerFindInputTarget(element)) return false;
   const tag = element.tagName;
   return tag === 'INPUT' || tag === 'TEXTAREA' || element.isContentEditable;
+}
+
+/** Any field that swallows text, including the find input. `mod+f` is
+ *  deliberately still live inside find (it re-focuses the query), but a bare
+ *  review letter typed there must reach the field. */
+function isTypingTarget(target: EventTarget | null): boolean {
+  return isEditableTarget(target) || isViewerFindInputTarget(target);
 }
 
 export function FocusScopeProvider({ children }: { children: ReactNode }) {
@@ -122,7 +134,11 @@ export function FocusScopeProvider({ children }: { children: ReactNode }) {
           ? true
           : activeScope === registration.scopeId || (registration.allowWhenNoActiveScope && activeScope === null);
         if (!ownsScope) return false;
+        // Both are typing-hostile, but differently: `mod+f` only has to yield
+        // to a genuine text field, while the review keys are bare letters that
+        // must reach any field at all, find input included.
         if (registration.key === 'mod+f' && isEditableTarget(event.target)) return false;
+        if (registration.key === 'review-key' && isTypingTarget(event.target)) return false;
         return true;
       });
       if (eligible.length === 0) return;

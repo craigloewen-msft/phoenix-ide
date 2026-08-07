@@ -50,8 +50,22 @@ export interface PhoenixDiffCodeViewProps {
   notes: readonly ReviewNote[];
   /** Note id to flash after a jump, or null. */
   highlightedNoteId: string | null;
+  /** Item id the keyboard file cursor is on, marked in the file header so the
+   *  cursor is never invisible state. */
+  cursorItemId?: string | null | undefined;
   onAnnotateLine: (target: Omit<LineAnnotateTarget, 'kind'>) => void;
   onAnnotateFile: (section: DiffSection, filePath: string) => void;
+  /** Ordered files as parsed, so the caller can drive a file cursor without
+   *  parsing the diff a second time. Parsing is owned here; the caller gets the
+   *  result rather than duplicating the work. */
+  onFilesChange?: ((files: readonly DiffFileRef[]) => void) | undefined;
+}
+
+/** Identity of one rendered file in the diff surface. */
+export interface DiffFileRef {
+  itemId: string;
+  section: DiffSection;
+  filePath: string;
 }
 
 export interface PhoenixDiffCodeViewHandle {
@@ -59,13 +73,25 @@ export interface PhoenixDiffCodeViewHandle {
    *  Pierre's typed scroll target — never DOM lookup. */
   scrollToNote: (note: ReviewNote) => void;
   scrollToFindTarget: (target: DiffSearchMatchTarget) => void;
+  /** Keyboard viewport motions. Negative `lines` scrolls up. */
+  scrollByLines: (lines: number) => void;
+  scrollPage: (direction: 'down' | 'up') => void;
+  scrollToEdge: (edge: 'top' | 'bottom') => void;
+  /** Bring one parsed file item into view by its structural item id. */
+  scrollToItem: (itemId: string) => void;
 }
+
+/** Approximate row height used to translate `j`/`k` into a scroll delta.
+ *  Pierre owns the real row metrics behind its virtualizer; a fixed step keeps
+ *  this side of the boundary free of layout probing, and one line of drift is
+ *  imperceptible for a motion whose only job is "nudge the viewport". */
+const LINE_SCROLL_PX = 24;
 
 type Meta = PhoenixDiffAnnotationMeta;
 
 export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, PhoenixDiffCodeViewProps>(
   function PhoenixDiffCodeView(
-    { committedDiff, uncommittedDiff, diffStyle, findMatches = [], activeFindMatch = null, notes, highlightedNoteId, onAnnotateLine, onAnnotateFile },
+    { committedDiff, uncommittedDiff, diffStyle, findMatches = [], activeFindMatch = null, notes, highlightedNoteId, onAnnotateLine, onAnnotateFile, onFilesChange, cursorItemId = null },
     ref,
   ) {
     const { theme } = useTheme();
@@ -114,14 +140,28 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
           // Bump the controlled-item version whenever this item's rendered
           // content changes, so Pierre reconciles instead of keeping a stale
           // annotation/flash/header-count record.
-          const sig = `${itemRenderSignature(it.fileDiff, notes, section, highlightedNoteId)}|find:${isMatchedFindHeaderItem(it.id) ? (isActiveFindHeaderItem(it.id) ? activeFindHeaderKey : 'matched') : ''}`;
+          const sig = `${itemRenderSignature(it.fileDiff, notes, section, highlightedNoteId)}|find:${isMatchedFindHeaderItem(it.id) ? (isActiveFindHeaderItem(it.id) ? activeFindHeaderKey : 'matched') : ''}|cursor:${cursorItemId === it.id ? '1' : ''}`;
           const prev = vmap.get(it.id);
           const version = prev && prev.sig === sig ? prev.version : (prev?.version ?? 0) + 1;
           if (!prev || prev.sig !== sig) vmap.set(it.id, { sig, version });
           return anns.length > 0 ? { ...it, annotations: anns, version } : { ...it, version };
         });
       return [...attach(committed.items), ...attach(uncommitted.items)];
-    }, [committed.items, uncommitted.items, notes, highlightedNoteId, activeFindHeaderKey, isActiveFindHeaderItem, isMatchedFindHeaderItem]);
+    }, [committed.items, uncommitted.items, notes, highlightedNoteId, activeFindHeaderKey, isActiveFindHeaderItem, isMatchedFindHeaderItem, cursorItemId]);
+
+    // Publish the parsed file order to the caller's file cursor. Derived from
+    // the parse, not from a second scan of the raw diff, so the cursor and the
+    // rendered surface cannot disagree about which files exist.
+    const files = useMemo<DiffFileRef[]>(
+      () => [...committed.items, ...uncommitted.items].flatMap((item) => {
+        const section = sectionFromItemId(item.id);
+        return section ? [{ itemId: item.id, section, filePath: item.fileDiff.name }] : [];
+      }),
+      [committed.items, uncommitted.items],
+    );
+    useEffect(() => {
+      onFilesChange?.(files);
+    }, [files, onFilesChange]);
 
     const findLineDecorationCss = useMemo(() => diffFindDecorationCSS(findMatches, activeFindMatch), [findMatches, activeFindMatch]);
 
@@ -247,18 +287,25 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
         const matched = isMatchedFindHeaderItem(item.id);
         const active = isActiveFindHeaderItem(item.id);
         return (
-          <span
-            className={[
-              `phoenix-diff-section-badge phoenix-diff-section-badge--${section}`,
-              matched && 'phoenix-diff-section-badge--find-match',
-              active && 'phoenix-diff-section-badge--find-active',
-            ].filter(Boolean).join(' ')}
-          >
-            {section}
-          </span>
+          <>
+            {cursorItemId === item.id && (
+              <span className="phoenix-diff-file-cursor" aria-label="Keyboard cursor" title="Keyboard cursor">
+                ›
+              </span>
+            )}
+            <span
+              className={[
+                `phoenix-diff-section-badge phoenix-diff-section-badge--${section}`,
+                matched && 'phoenix-diff-section-badge--find-match',
+                active && 'phoenix-diff-section-badge--find-active',
+              ].filter(Boolean).join(' ')}
+            >
+              {section}
+            </span>
+          </>
         );
 
-    }, [isActiveFindHeaderItem, isMatchedFindHeaderItem]);
+    }, [cursorItemId, isActiveFindHeaderItem, isMatchedFindHeaderItem]);
 
     const renderHeaderMetadata = useCallback(
       (item: CodeViewItem<Meta>) => {
@@ -322,23 +369,58 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
 
     useImperativeHandle(
       ref,
-      () => ({
-        scrollToNote: (note: ReviewNote) => {
-          const target = scrollTargetForNote(note);
-          if (!target) return;
-          scrollCodeViewToTarget(codeViewRef.current, target);
-        },
-        scrollToFindTarget: (target: DiffSearchMatchTarget) => {
-          if (target.kind === 'diff-line' && target.lineNumber && target.side) {
-            scrollCodeViewToTarget(codeViewRef.current, {
-              id: target.itemId,
-              line: { lineNumber: target.lineNumber, side: target.side },
-            });
-            return;
-          }
-          scrollCodeViewToTarget(codeViewRef.current, { id: target.itemId });
-        },
-      }),
+      () => {
+        // Relative motions need the current scroll position and viewport size.
+        // Pierre exposes both as typed getters on the instance, so this stays
+        // inside the wrapper's contract rather than measuring the DOM.
+        const scrollToPosition = (position: number, behavior: 'smooth' | 'instant') => {
+          const instance = codeViewRef.current?.getInstance();
+          if (!instance) return;
+          const maxPosition = Math.max(0, instance.getScrollHeight() - instance.getHeight());
+          codeViewRef.current?.scrollTo({
+            type: 'position',
+            position: Math.min(Math.max(position, 0), maxPosition),
+            behavior,
+          });
+        };
+        const scrollByPixels = (delta: number, behavior: 'smooth' | 'instant') => {
+          const instance = codeViewRef.current?.getInstance();
+          if (!instance) return;
+          scrollToPosition(instance.getScrollTop() + delta, behavior);
+        };
+        return {
+          scrollToNote: (note: ReviewNote) => {
+            const target = scrollTargetForNote(note);
+            if (!target) return;
+            scrollCodeViewToTarget(codeViewRef.current, target);
+          },
+          scrollToFindTarget: (target: DiffSearchMatchTarget) => {
+            if (target.kind === 'diff-line' && target.lineNumber && target.side) {
+              scrollCodeViewToTarget(codeViewRef.current, {
+                id: target.itemId,
+                line: { lineNumber: target.lineNumber, side: target.side },
+              });
+              return;
+            }
+            scrollCodeViewToTarget(codeViewRef.current, { id: target.itemId });
+          },
+          // Held-key repeat makes smooth animation feel laggy and imprecise, so
+          // the incremental motions land instantly and only the jumps animate.
+          scrollByLines: (lines: number) => scrollByPixels(lines * LINE_SCROLL_PX, 'instant'),
+          scrollPage: (direction: 'down' | 'up') => {
+            const instance = codeViewRef.current?.getInstance();
+            if (!instance) return;
+            const half = instance.getHeight() / 2;
+            scrollByPixels(direction === 'down' ? half : -half, 'instant');
+          },
+          scrollToEdge: (edge: 'top' | 'bottom') => {
+            scrollToPosition(edge === 'top' ? 0 : Number.MAX_SAFE_INTEGER, 'smooth');
+          },
+          scrollToItem: (itemId: string) => {
+            scrollCodeViewToTarget(codeViewRef.current, { id: itemId });
+          },
+        };
+      },
       [],
     );
 

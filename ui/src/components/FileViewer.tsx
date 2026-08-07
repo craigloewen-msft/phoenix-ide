@@ -7,6 +7,7 @@ import type { MetaViewerPayload, PatchContext, TextRenderMode, ViewerFocus } fro
 import type { TextCategory } from '../generated/TextCategory';
 import { useOptionalViewerSlotCommands, useOptionalViewerSlotData } from '../contexts/ViewerSlotContext';
 import { useReviewContext } from '../contexts/useReviewContext';
+import type { ReviewFileEntry } from '../api';
 import { FileReviewDiffView } from './viewer/FileReviewDiffView';
 
 /**
@@ -94,6 +95,43 @@ export function FileViewer({
 
   const showSource = useCallback(() => slotCommands?.setFileViewMode('source'), [slotCommands]);
 
+  // Keyboard file navigation walks the manifest, which is the same ordering the
+  // sidebar checklist shows, so `]f` and clicking down the list agree.
+  const reviewFiles = review?.manifest?.files;
+  const reviewRoot = review?.rootDir;
+  const openReviewFileAt = useCallback(
+    (resolve: (files: readonly ReviewFileEntry[], currentIndex: number) => ReviewFileEntry | undefined) => {
+      if (!reviewFiles || !reviewRoot || repoRelativePath === null) return;
+      const currentIndex = reviewFiles.findIndex((f) => f.path === repoRelativePath);
+      const next = resolve(reviewFiles, currentIndex);
+      if (!next || next.path === repoRelativePath) return;
+      const prefix = reviewRoot.endsWith('/') ? reviewRoot : `${reviewRoot}/`;
+      slotCommands?.openFileDiff(`${prefix}${next.path}`, reviewRoot);
+    },
+    [repoRelativePath, reviewFiles, reviewRoot, slotCommands],
+  );
+
+  // File motion stops at the ends rather than wrapping: silently landing back
+  // at the first file reads as "nothing happened".
+  const goToNextFile = useCallback(
+    () => openReviewFileAt((files, index) => files[index + 1]),
+    [openReviewFileAt],
+  );
+  const goToPreviousFile = useCallback(
+    () => openReviewFileAt((files, index) => (index > 0 ? files[index - 1] : undefined)),
+    [openReviewFileAt],
+  );
+  // Outstanding search *does* wrap, so a reviewer who marked files out of order
+  // still reaches the ones left behind.
+  const goToNextUnreviewed = useCallback(
+    () => openReviewFileAt((files, index) => {
+      const outstanding = (file: ReviewFileEntry) => file.review.kind !== 'reviewed';
+      const after = files.slice(index + 1).find(outstanding);
+      return after ?? files.slice(0, Math.max(index, 0)).find(outstanding);
+    }),
+    [openReviewFileAt],
+  );
+
   useEffect(() => {
     let cancelled = false;
     async function load() {
@@ -128,6 +166,10 @@ export function FileViewer({
         onShowSource={showSource}
         onMarkReviewed={review.markReviewed}
         onUnmarkReviewed={review.unmarkReviewed}
+        onNextUnreviewed={goToNextUnreviewed}
+        onNextFile={goToNextFile}
+        onPreviousFile={goToPreviousFile}
+        onRefreshManifest={review.refresh}
         {...(inline !== undefined ? { inline } : {})}
       />
     );

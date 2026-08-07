@@ -11,9 +11,10 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Columns2, GitBranch, Rows3 } from 'lucide-react';
-import type { BranchRemoteStatus, CheckoutStatus } from '../../api';
+import { Columns2, GitBranch, Keyboard, RefreshCw, Rows3 } from 'lucide-react';
+import type { BranchRemoteStatus, CheckoutStatus, ReviewFileEntry } from '../../api';
 import type { DiffSection, ReviewNote } from '../../contexts/ReviewNotesContext';
+import { useReviewContext } from '../../contexts/useReviewContext';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
 import {
   FindBar,
@@ -32,7 +33,11 @@ import { AnnotationDialog } from './AnnotationDialog';
 import { useDiffReviewNotes } from './useDiffReviewNotes';
 import type { AnnotateTarget } from './useDiffReviewNotes';
 import { PhoenixDiffCodeView } from './PhoenixDiffCodeView';
-import type { PhoenixDiffCodeViewHandle } from './PhoenixDiffCodeView';
+import type { DiffFileRef, PhoenixDiffCodeViewHandle } from './PhoenixDiffCodeView';
+import { openShortcutHelp } from './openShortcutHelp';
+import { useReviewKeyboard } from './useReviewKeyboard';
+import { useRefreshOnWindowFocus } from './useRefreshOnWindowFocus';
+import type { ReviewCommand } from './reviewKeymap';
 import './DiffView.css';
 
 export interface DiffViewProps {
@@ -57,6 +62,9 @@ export interface DiffViewProps {
   inline?: boolean;
   /** Render as a focused full-screen surface above app chrome. */
   takeover?: boolean;
+  /** Refetch the diff payload. Absent when the host has no way to reload (a
+   *  statically-supplied diff), which is what makes `R` a no-op there. */
+  onRefresh?: (() => void) | undefined;
 }
 
 type DiffStyle = 'unified' | 'split';
@@ -86,6 +94,7 @@ export function DiffView({
   onSendNotes,
   inline = false,
   takeover = false,
+  onRefresh,
 }: DiffViewProps) {
   useRegisterFocusScope(open ? 'diff-viewer' : null);
   const notes = useDiffReviewNotes(onSendNotes);
@@ -221,6 +230,124 @@ export function DiffView({
     sendFind({ type: 'previous' });
   }, [sendFind]);
 
+  // --- keyboard review -----------------------------------------------------
+
+  const review = useReviewContext();
+  const [files, setFiles] = useState<readonly DiffFileRef[]>([]);
+  const [cursorItemId, setCursorItemId] = useState<string | null>(null);
+  // Why a keyboard action did nothing. Shown in the shell banner; a silently
+  // ignored key is indistinguishable from a broken one.
+  const [keyboardNotice, setKeyboardNotice] = useState<string | null>(null);
+
+  // The cursor names a file, but the identity that survives a re-parse is the
+  // item id, so a vanished file drops the cursor to the first remaining file
+  // rather than leaving it pointing at nothing.
+  useEffect(() => {
+    setCursorItemId((current) => {
+      if (current !== null && files.some((file) => file.itemId === current)) return current;
+      return files[0]?.itemId ?? null;
+    });
+  }, [files]);
+
+  const cursorIndex = files.findIndex((file) => file.itemId === cursorItemId);
+  const cursorFile = cursorIndex >= 0 ? files[cursorIndex] : undefined;
+
+  const moveCursorTo = useCallback((file: DiffFileRef | undefined) => {
+    if (!file) return;
+    setCursorItemId(file.itemId);
+    codeViewRef.current?.scrollToItem(file.itemId);
+  }, []);
+
+  const refresh = useCallback(() => {
+    onRefresh?.();
+    review?.refresh();
+  }, [onRefresh, review]);
+
+  // The reviewer edits these files in another editor; returning to the tab is
+  // when the rendered diff is most likely stale.
+  useRefreshOnWindowFocus(refresh, open);
+
+  // The whole-branch diff can show files the review manifest does not track
+  // (a PR diff against another branch), so resolving is a lookup that may fail.
+  const manifestEntryFor = useCallback(
+    (file: DiffFileRef | undefined): ReviewFileEntry | undefined =>
+      file ? review?.manifest?.files.find((entry) => entry.path === file.filePath) : undefined,
+    [review?.manifest],
+  );
+
+  const toggleReviewed = useCallback(() => {
+    if (!cursorFile) return;
+    const entry = manifestEntryFor(cursorFile);
+    if (!entry || !review) {
+      setKeyboardNotice(`${cursorFile.filePath} is not on this conversation's review checklist.`);
+      return;
+    }
+    setKeyboardNotice(null);
+    if (entry.review.kind === 'reviewed') {
+      void review.unmarkReviewed(entry.path);
+      return;
+    }
+    void review.markReviewed(entry.path, entry.current_blob_sha);
+    const outstanding = files.slice(cursorIndex + 1).find((file) => {
+      const next = manifestEntryFor(file);
+      return next !== undefined && next.review.kind !== 'reviewed';
+    });
+    moveCursorTo(outstanding);
+  }, [cursorFile, cursorIndex, files, manifestEntryFor, moveCursorTo, review]);
+
+  const runCommand = useCallback(
+    (command: ReviewCommand) => {
+      const codeView = codeViewRef.current;
+      switch (command.kind) {
+        case 'scroll-lines':
+          codeView?.scrollByLines(command.lines);
+          return;
+        case 'scroll-page':
+          codeView?.scrollPage(command.direction);
+          return;
+        case 'scroll-edge':
+          codeView?.scrollToEdge(command.edge);
+          return;
+        case 'next-file':
+          moveCursorTo(files[cursorIndex + 1]);
+          return;
+        case 'prev-file':
+          if (cursorIndex > 0) moveCursorTo(files[cursorIndex - 1]);
+          return;
+        case 'next-unreviewed':
+          moveCursorTo(files.slice(cursorIndex + 1).find((file) => {
+            const entry = manifestEntryFor(file);
+            return entry !== undefined && entry.review.kind !== 'reviewed';
+          }));
+          return;
+        case 'toggle-reviewed':
+          toggleReviewed();
+          return;
+        case 'annotate-file':
+          if (cursorFile) notes.startAnnotateFile(cursorFile.section, cursorFile.filePath);
+          return;
+        case 'refresh':
+          refresh();
+          return;
+        case 'close':
+          onClose();
+          return;
+        case 'help':
+          openShortcutHelp();
+          return;
+      }
+    },
+    [cursorFile, cursorIndex, files, manifestEntryFor, moveCursorTo, notes, onClose, refresh, toggleReviewed],
+  );
+
+  useReviewKeyboard({
+    scopeId: 'diff-viewer',
+    id: 'diff-view',
+    onCommand: runCommand,
+    enabled: open,
+    dialogOpen: notes.annotating !== null || findOpen,
+  });
+
   if (!open) return null;
 
   const empty = !commitLog.trim() && !committedDiff.trim() && !uncommittedDiff.trim();
@@ -256,6 +383,24 @@ export function DiffView({
           >
             {diffStyle === 'unified' ? <Columns2 size={18} /> : <Rows3 size={18} />}
           </button>
+          <button
+            className="viewer-shell-btn"
+            type="button"
+            onClick={refresh}
+            aria-label="Refresh diff from disk"
+            title="Refresh from disk (R)"
+          >
+            <RefreshCw size={18} />
+          </button>
+          <button
+            className="viewer-shell-btn"
+            type="button"
+            onClick={openShortcutHelp}
+            aria-label="Keyboard shortcuts"
+            title="Keyboard shortcuts (?)"
+          >
+            <Keyboard size={18} />
+          </button>
         </>
       }
       banner={findSession ? (
@@ -270,6 +415,8 @@ export function DiffView({
           onClose={closeFind}
           autoFocus
         />
+      ) : keyboardNotice ? (
+        <div className="diff-keyboard-notice" role="status">{keyboardNotice}</div>
       ) : undefined}
       noteCount={diffNotes.length}
       onToggleNotes={notes.togglePanel}
@@ -336,6 +483,8 @@ export function DiffView({
               activeFindMatch={activeFindMatchTarget}
               notes={diffNotes}
               highlightedNoteId={notes.highlightedNoteId}
+              cursorItemId={cursorItemId}
+              onFilesChange={setFiles}
               onAnnotateLine={notes.startAnnotateLine}
               onAnnotateFile={notes.startAnnotateFile}
             />
