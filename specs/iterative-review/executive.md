@@ -25,6 +25,7 @@ and commit with.
 | **REQ-RV-007:** Only what changed since last review | ✅ Complete | `git_ops::review::file_diff_since_review`; `scope=since_review`; 409 when no checkpoint |
 | **REQ-RV-008:** Checkpoints live and die with the work scope | ✅ Complete | `ON DELETE CASCADE` on scope deletion; re-scope clears in `update_work_scope_environment_tx`; comparator mismatch → unreviewed |
 | **REQ-RV-009:** Completing a pass does not gate merging | ✅ Complete | `ChangedFilesReview` complete action; `WorkActions` untouched |
+| **REQ-RV-010:** Reader controls the review's screen | ✅ Complete | `useDiffStyle` + `DiffStyleToggleButton` shared by `DiffView` and `FileReviewDiffView`; `ConversationPage` review-focus state → `.app-split-pane--review-focus` |
 
 ## Current reality
 
@@ -46,6 +47,12 @@ carry `(file, side, line)` anchors and flow into the composer through the existi
 `specs/prose-feedback/` machinery. Notes remain session-local; durable review
 comments are not implemented.
 
+**Reading posture.** Rendering style is one `phoenix-diff-style` preference read
+by `useDiffStyle` on every diff surface. Review focus lives in `ConversationPage`
+component state and applies `.app-split-pane--review-focus`, which overrides the
+reserved chat width in CSS — `--viewer-pane-width` keeps its two imperative
+writers (the pane layout effect and the divider's live-drag channel).
+
 ## Verification
 
 - Rust (`git_ops::review::tests`): checkpoint stability across commit/amend/rebase;
@@ -60,6 +67,10 @@ comments are not implemented.
   three-state markers, open-for-review, and that completion is withheld while any
   file is stale.
 - UI (`ViewerSlotContext.test.tsx`): `?mode=diff` derivation and its default.
+- UI (`DiffView.test.tsx`, `FileReviewDiffView.test.tsx`): the unified/split toggle
+  driving Pierre's `diffStyle`, the shared persisted preference across both diff
+  surfaces, and that the conversation-collapse control appears only on the
+  split-pane surfaces that supply the handler.
 - Manual: the full loop exercised against the seeded `diff-review-fixture`
   conversation — mark → agent edit → stale marker → since-review delta.
 
