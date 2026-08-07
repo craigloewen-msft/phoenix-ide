@@ -3846,6 +3846,8 @@ async fn send_chat(
     Path(id): Path<String>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission_guard = admission.lock().await;
     let service = crate::send_chat_service::SendChatApplicationService::new(
         state.db.clone(),
         state.runtime.clone(),
@@ -4157,8 +4159,8 @@ async fn cancel_conversation(
 }
 
 /// Upgrade a conversation's model (e.g., from 200k to 1M context).
-/// Allowed from `Idle` or `Error` -- cannot upgrade while an LLM request,
-/// tool execution, or other operation is in flight (see
+/// Allowed from `Idle`, `Error`, or `RecoverableContinuationFailure` -- cannot
+/// upgrade while an LLM request, tool execution, or other operation is in flight (see
 /// `ConvState::allows_model_change`).
 async fn upgrade_conversation_model(
     State(state): State<AppState>,
@@ -4166,6 +4168,9 @@ async fn upgrade_conversation_model(
     Json(req): Json<UpgradeModelRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     // Validate the target model exists
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission = admission.lock().await;
+
     if state.llm_registry.get(&req.model).is_none() {
         return Err(AppError::BadRequest(format!(
             "Unknown model '{}'. Available: {:?}",
@@ -4190,10 +4195,15 @@ async fn upgrade_conversation_model(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    if !conv.state.allows_model_change() {
+    let effective_state = state
+        .runtime
+        .effective_conversation_state(&id)
+        .await
+        .unwrap_or_else(|| conv.state.clone());
+    if !effective_state.allows_model_change() {
         return Err(AppError::BadRequest(format!(
             "Cannot change model while conversation is {} -- finish or cancel the current operation first",
-            conv.state.variant_name()
+            effective_state.variant_name()
         )));
     }
 
@@ -4236,18 +4246,73 @@ async fn upgrade_conversation_model(
     Ok(Json(SuccessResponse { success: true }))
 }
 
+fn continuation_operation_id(state: ConvState) -> String {
+    match state {
+        ConvState::RecoverableContinuationFailure { failure } => failure.request.operation_id,
+        _ => uuid::Uuid::new_v4().to_string(),
+    }
+}
+
 /// Manually trigger context continuation (REQ-BED-023)
 async fn trigger_continuation(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission = admission.lock().await;
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    if conversation.archived {
+        return Err(AppError::BadRequest(
+            "Cannot retry continuation for an archived conversation".to_string(),
+        ));
+    }
+    let effective_state = match state.runtime.effective_conversation_state(&id).await {
+        Some(runtime_state) => runtime_state,
+        None => {
+            state
+                .runtime
+                .db()
+                .get_conversation(&id)
+                .await
+                .map_err(|error| AppError::NotFound(error.to_string()))?
+                .state
+        }
+    };
+    let operation_id = continuation_operation_id(effective_state);
     state
         .runtime
-        .send_event(&id, Event::UserTriggerContinuation)
+        .admit_continuation_retry(&id, operation_id)
         .await
         .map_err(AppError::BadRequest)?;
 
     Ok(Json(SuccessResponse { success: true }))
+}
+
+#[cfg(test)]
+mod continuation_operation_id_tests {
+    use super::*;
+
+    #[test]
+    fn retained_failure_reuses_durable_operation_id() {
+        let state = ConvState::RecoverableContinuationFailure {
+            failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                    operation_id: "durable-operation".to_string(),
+                    rejected_tool_calls: Vec::new(),
+                    attempt: 1,
+                },
+                error_kind: crate::db::ErrorKind::ServerError,
+                message: "failed".to_string(),
+            },
+        };
+
+        assert_eq!(continuation_operation_id(state), "durable-operation");
+    }
 }
 
 /// Cancel a specific queued steering message (task 01001).
@@ -4720,6 +4785,8 @@ async fn archive_conversation(
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     refuse_if_chain_member(&state, &id, "archive").await?;
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission_guard = admission.lock().await;
     run_archive_cascade(&state, &id).await?;
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -4751,6 +4818,13 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
         .get_conversation(id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if matches!(conv.state, ConvState::AwaitingContinuation { .. }) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Cannot archive while a continuation summary is pending",
+            "cancel_first",
+        ))));
+    }
 
     if conv.state.is_busy() {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
@@ -5085,6 +5159,8 @@ async fn delete_conversation(
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     refuse_if_chain_member(&state, &id, "delete").await?;
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission_guard = admission.lock().await;
     run_hard_delete_cascade(&state, &id).await?;
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -5142,6 +5218,12 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Cannot hard-delete a busy conversation. Cancel the in-flight \
              operation first, then retry.",
+            "cancel_first",
+        ))));
+    }
+    if matches!(conv.state, ConvState::AwaitingContinuation { .. }) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Cannot hard-delete while a continuation summary is pending",
             "cancel_first",
         ))));
     }
@@ -11461,8 +11543,11 @@ pub(crate) mod hard_delete_cascade_tests {
             .update_conversation_state(
                 "c-continuation",
                 &ConvState::AwaitingContinuation {
-                    rejected_tool_calls: vec![],
-                    attempt: 1,
+                    request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                        operation_id: "cancel-test-op".to_string(),
+                        rejected_tool_calls: vec![],
+                        attempt: 1,
+                    },
                 },
             )
             .await
@@ -11484,7 +11569,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("conversation still exists");
         assert!(matches!(
             conv.state,
-            ConvState::AwaitingContinuation { attempt: 1, .. }
+            ConvState::AwaitingContinuation { request } if request.attempt == 1
         ));
     }
 

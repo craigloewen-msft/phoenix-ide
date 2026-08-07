@@ -6,7 +6,7 @@ Bedrock provides the core conversation state machine for PhoenixIDE. Users inter
 
 ## Technical Summary
 
-Implements Elm Architecture with a typed-effect executor boundary. The SM has two pure entry points: `handle_user_event()` for API-initiated events and `handle_outcome()` for executor results. Effects carry oneshot channels typed to their expected outcome (`LlmOutcome`, `ToolOutcome`, `SubAgentOutcome`, `PersistOutcome`) — the compiler prevents invalid event/state combinations. Persistence uses `CheckpointData::ToolRound` which structurally requires matched `tool_use`/`tool_result` pairs. Error classification is exhaustive with no `Unknown` variant. Executor loop uses `StepResult::Terminal` to force explicit exit on terminal states. Token streaming uses fire-and-forget `StreamToken` effects routed to SSE without SM state transitions. Sub-agents require mandatory `timeout: Duration` with deadline enforcement in executor `select!`. On server restart, conversations resume from idle with full message history preserved.
+Implements Elm Architecture with a typed-effect executor boundary. The SM has two pure entry points: `handle_user_event()` for API-initiated events and `handle_outcome()` for executor results. Effects carry oneshot channels typed to their expected outcome (`LlmOutcome`, `ToolOutcome`, `SubAgentOutcome`, `PersistOutcome`) — the compiler prevents invalid event/state combinations. Persistence uses `CheckpointData::ToolRound` which structurally requires matched `tool_use`/`tool_result` pairs. Error classification is exhaustive with no `Unknown` variant. Executor loop uses `StepResult::Terminal` to force explicit exit on terminal states. Token streaming uses fire-and-forget `StreamToken` effects routed to SSE without SM state transitions. Sub-agents require mandatory `timeout: Duration` with deadline enforcement in executor `select!`. On server restart, ordinary interrupted conversations resume from idle with full message history preserved; durable continuation operations retain their operation identity and recovery state.
 
 ## Status Summary
 
@@ -18,7 +18,7 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-004:** Tool Execution Coordination | ✅ Complete | Serial execution with state tracking |
 | **REQ-BED-005:** Cancellation Handling | ✅ Complete | Synthetic tool results for cancelled tools |
 | **REQ-BED-006:** Error Recovery | ✅ Complete | Retry logic with exponential backoff, ErrorKind |
-| **REQ-BED-007:** State Persistence | ✅ Complete | Database persistence, resume from idle on restart |
+| **REQ-BED-007:** State Persistence | ✅ Complete | Database persistence; ordinary turns resume from idle while durable continuation operations retain recovery state |
 | **REQ-BED-008:** Sub-Agent Spawning | ✅ Complete | State machine support (runtime not fully implemented in MVP) |
 | **REQ-BED-009:** Sub-Agent Isolation | ✅ Complete | Tool set restriction defined |
 | **REQ-BED-010:** Fixed Working Directory | ✅ Complete | Set at creation, passed to tools |
@@ -31,7 +31,7 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-017:** Mode Communication | ✅ Complete | Mode-aware tool errors in `crates/phoenix-ide/src/tools.rs:479`; system prompt directs Explore agents to `propose_task` (`system_prompt.rs:578`) |
 | **REQ-BED-018:** Sub-Agent Mode Enforcement | ✅ Complete | Sub-agent tool sets restricted by mode in `crates/phoenix-ide/src/tools.rs:647-677` (tested); sub-agents inherit parent worktree |
 | **REQ-BED-019:** Context Continuation Threshold | ✅ Complete | Check at 90%, reject tools, trigger continuation |
-| **REQ-BED-020:** Continuation Summary Generation | ✅ Complete | Tool-less LLM request, fallback on failure |
+| **REQ-BED-020:** Continuation Summary Generation | ✅ Complete | Durable operation identity, restart resume, transient retry, recoverable failure, atomic idempotent commit |
 | **REQ-BED-021:** Context Exhausted State | ✅ Complete | Read-only terminal state |
 | **REQ-BED-022:** Model-Specific Context Limits | ✅ Complete | Per-model thresholds, conservative default |
 | **REQ-BED-023:** Context Warning Indicator | ✅ Complete | 80% warning, manual trigger option |

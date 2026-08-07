@@ -141,16 +141,16 @@ THE SYSTEM SHALL NOT transition to error state — a cancellation the user reque
 
 ### REQ-BED-006: Error Recovery
 
-WHEN LLM request fails with retryable error (network, rate limit, 5xx)
+WHEN an in-flight conversation-turn LLM request fails with retryable error (network, rate limit, 5xx)
 THE SYSTEM SHALL retry automatically up to 3 times with exponential backoff
 AND remain in LLM requesting state during retries
 AND display retry status to user
 
-WHEN LLM request fails after all retries exhausted
+WHEN an in-flight conversation-turn LLM request fails after all retries are exhausted
 THE SYSTEM SHALL transition to error state
 AND display actionable error message indicating retry failure
 
-WHEN a recoverable LLM operation fails with an auth error while credential recovery is in progress
+WHEN a recoverable LLM-backed operation fails with an auth error while credential recovery is in progress
 THE SYSTEM SHALL transition to awaiting recovery
 AND SHALL carry a typed resume target for the suspended operation
 
@@ -158,11 +158,20 @@ WHEN credential recovery succeeds from awaiting recovery
 THE SYSTEM SHALL resume the operation identified by the typed resume target
 AND SHALL NOT infer the operation from display text, UI state, or the error message
 
-WHEN credential recovery fails from awaiting recovery
+WHEN credential recovery fails from awaiting recovery for a conversation-turn request
 THE SYSTEM SHALL transition to error state
+AND SHALL preserve the failure as turn error state rather than as continuation content
+
+WHEN credential recovery fails from awaiting recovery for continuation-summary generation
+THE SYSTEM SHALL transition to a user-retryable continuation failure state
+AND SHALL preserve the continuation operation identity for an explicit retry
 AND SHALL NOT fabricate continuation summaries or persist auth failure copy as continuation content
 
-WHEN LLM request fails with non-retryable error (4xx other than recoverable auth)
+WHEN continuation-summary generation fails without a durable summary commit
+THE SYSTEM SHALL transition to a user-retryable continuation failure state
+AND SHALL preserve the continuation operation identity and retry context for an explicit retry
+
+WHEN an in-flight conversation-turn LLM request fails with non-retryable error (4xx other than recoverable auth)
 THE SYSTEM SHALL transition to error state immediately
 AND display specific error message
 
@@ -180,10 +189,14 @@ WHEN conversation state changes
 THE SYSTEM SHALL persist the new state before executing effects
 
 WHEN server restarts
-THE SYSTEM SHALL restore all conversations to idle state
+THE SYSTEM SHALL restore ordinary interrupted conversations to idle state
 AND preserve complete message history
 
-**Rationale:** Users expect their conversation history to survive server restarts. Resuming from idle is simple and predictable; users can re-send their last message if interrupted.
+WHEN server restarts with a conversation in `awaiting_continuation`, `recoverable_continuation_failure`, or continuation-summary `awaiting_recovery`
+THE SYSTEM SHALL preserve the durable continuation operation identity and recovery state
+AND materialize the pending continuation operation at startup
+
+**Rationale:** Users expect their conversation history to survive server restarts. Ordinary interrupted turns resume from idle so users can re-send their last message. Durable continuation operations retain their identity and explicit recovery path so restart cannot duplicate or strand compaction.
 
 ---
 
@@ -413,24 +426,28 @@ AND the request SHALL describe any tools that were requested but not executed, i
 AND the request SHALL preserve the prior tool history as text rather than discarding it
 AND the request SHALL be bounded to fit the context window and any request-shape limits declared by the selected provider route
 AND bounded history SHALL retain a contiguous newest suffix and begin with a user-role message when non-empty
+AND the system SHALL persist a stable operation identity and the retry inputs before requesting the summary
 
-WHEN continuation summary is received
-THE SYSTEM SHALL store it as a continuation message
-AND transition to context exhausted state
+IF continuation summary generation is interrupted by process restart
+THEN THE SYSTEM SHALL resume the persisted operation
+
+WHEN continuation summary is received for the active operation
+THE SYSTEM SHALL atomically store one continuation message and transition to context exhausted state
+AND duplicate or stale results SHALL NOT create another summary or overwrite newer state
 
 WHEN continuation request fails after standard retries
-THE SYSTEM SHALL transition to context exhausted state
-AND use a fallback summary indicating the failure
+THE SYSTEM SHALL retain the operation and its retry inputs in a recoverable state
+AND SHALL display the failure and offer an explicit retry action
 
 WHEN the continuation summary is empty or whitespace-only
-THE SYSTEM SHALL treat it as a generation failure and use the fallback summary
+THE SYSTEM SHALL treat it as a recoverable generation failure
 
 WHEN user requests cancellation during continuation summary generation
 THE SYSTEM SHALL reject the request as an invalid cancellation state
 AND SHALL NOT abort the in-flight continuation request
 AND SHALL remain awaiting the continuation summary
 
-**Rationale:** The summary's consumer is a fresh agent that restarts cold in the same worktree, so it is framed as an operational handoff — exact paths, repo state, and an honest verified-vs-assumed split — rather than a human-facing recap, and completeness is favored over brevity. Describing rejected tool calls with their arguments tells the next agent what was about to run, not merely which tool type. The prior tool history is flattened to text rather than deleted so the summary can draw on the actual work record, and the request is bounded to fit the window so it cannot overflow and loop to the fallback. An empty summary would silently seed a blank continuation, so it is treated as a failure. Failures shouldn't block users from moving on.
+**Rationale:** The summary's consumer is a fresh agent that restarts cold in the same worktree, so it is framed as an operational handoff — exact paths, repo state, and an honest verified-vs-assumed split — rather than a human-facing recap, and completeness is favored over brevity. Describing rejected tool calls with their arguments tells the next agent what was about to run, not merely which tool type. The prior tool history is flattened to text rather than deleted so the summary can draw on the actual work record, and the request is bounded to fit the window so it cannot overflow. An empty summary would silently seed a blank continuation, so it is treated as a recoverable failure. Stable operation identity permits provider calls to be retried while summary commit and continuation remain exactly once.
 
 ---
 
