@@ -249,6 +249,15 @@ mod tests {
         );
     }
 
+    // A bare repo reached by discovery is refused under
+    // `safe.bareRepository=explicit`, so fixture remotes are addressed by
+    // `--git-dir` — accepted whether or not the setting is in effect.
+    fn git_bare(git_dir: &Path, args: &[&str]) {
+        let mut full = vec!["--git-dir", git_dir.to_str().unwrap()];
+        full.extend_from_slice(args);
+        git(git_dir, &full);
+    }
+
     fn repo_with_origin() -> (TempDir, TempDir) {
         let origin = TempDir::new().unwrap();
         git(origin.path(), &["init", "--bare", "-q"]);
@@ -263,7 +272,7 @@ mod tests {
         git(clone.path(), &["add", "."]);
         git(clone.path(), &["commit", "-qm", "initial"]);
         git(clone.path(), &["push", "-u", "origin", "main"]);
-        git(origin.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git_bare(origin.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
         git(clone.path(), &["remote", "set-head", "origin", "-a"]);
         (origin, clone)
     }

@@ -10708,6 +10708,25 @@ mod approve_task_branch_collision_tests {
     use super::test_git_helpers::{add_explore_worktree, add_worktree, branch_exists, init_repo};
     use super::*;
 
+    /// Update a ref in a bare fixture remote.
+    ///
+    /// A bare repo reached by discovery is refused under
+    /// `safe.bareRepository=explicit`, so the remote is addressed by
+    /// `--git-dir` — accepted whether or not the setting is in effect.
+    fn update_bare_ref(git_dir: &std::path::Path, ref_name: &str, value: &str) {
+        run_git(
+            git_dir,
+            &[
+                "--git-dir",
+                git_dir.to_str().unwrap(),
+                "update-ref",
+                ref_name,
+                value,
+            ],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn approve_task_uses_suffixed_fallback_when_target_branch_exists_locally() {
         let (_tmp, repo_root) = init_repo();
@@ -10786,15 +10805,11 @@ mod approve_task_branch_collision_tests {
         run_git(&repo_root, &["push", "-u", "origin", "main"]).unwrap();
         let desired_branch = "task-12345-fix-the-login-bug";
         let head = run_git(&repo_root, &["rev-parse", "HEAD"]).unwrap();
-        run_git(
+        update_bare_ref(
             origin.path(),
-            &[
-                "update-ref",
-                &format!("refs/heads/{desired_branch}/foo"),
-                &head,
-            ],
-        )
-        .unwrap();
+            &format!("refs/heads/{desired_branch}/foo"),
+            &head,
+        );
 
         let conv_id = "namespace-remote";
         add_explore_worktree(&repo_root, conv_id, "main");
@@ -10914,11 +10929,7 @@ mod approve_task_branch_collision_tests {
 
         let target_branch = "task-12345-fix-the-login-bug";
         let head = run_git(&repo_root, &["rev-parse", "HEAD"]).unwrap();
-        run_git(
-            origin.path(),
-            &["update-ref", &format!("refs/heads/{target_branch}"), &head],
-        )
-        .unwrap();
+        update_bare_ref(origin.path(), &format!("refs/heads/{target_branch}"), &head);
 
         let conv_id = "unfetched-remote";
         let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
@@ -10963,15 +10974,11 @@ mod approve_task_branch_collision_tests {
 
         let target_branch = "task-12345-fix-the-login-bug";
         let head = run_git(&repo_root, &["rev-parse", "HEAD"]).unwrap();
-        run_git(
+        update_bare_ref(
             origin.path(),
-            &[
-                "update-ref",
-                &format!("refs/heads/alice/{target_branch}"),
-                &head,
-            ],
-        )
-        .unwrap();
+            &format!("refs/heads/alice/{target_branch}"),
+            &head,
+        );
 
         let conv_id = "namespaced-remote";
         let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
