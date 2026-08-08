@@ -31,6 +31,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 
 ROOT = Path(__file__).parent.resolve()
@@ -2244,10 +2245,20 @@ def _title_from_slug(slug: str) -> str:
     return " ".join(w[:1].upper() + w[1:] for w in slug.split("-") if w)
 
 
-def _migrate_seed_database(*, build: bool) -> None:
+def _migrate_seed_database(*, build: bool, release: bool = True) -> None:
+    """Apply the canonical Rust migration chain to the seed database.
+
+    `release` selects which binary profile to build and run. The binary is
+    invoked with `--migrate-only` and exits immediately, so the profile has no
+    bearing on correctness — it only trades build time against a runtime speed
+    that this call never uses. Callers that already pay for a debug build (the
+    check pipeline) pass release=False to reuse it instead of provoking a
+    second, slower compile of the whole workspace.
+    """
+    profile = "release" if release else "debug"
     if build:
-        build_rust(release=True)
-    binary = ROOT / "target" / "release" / "phoenix_ide"
+        build_rust(release=release)
+    binary = ROOT / "target" / profile / "phoenix_ide"
     if not binary.exists():
         raise RuntimeError(f"Phoenix binary not found after build: {binary}")
     env = os.environ.copy()
@@ -2265,6 +2276,7 @@ def cmd_seed(
     *,
     build: bool = True,
     repair_fixtures: bool = False,
+    release: bool = True,
 ) -> None:
     """Populate the dev DB with representative conversations.
 
@@ -3142,7 +3154,7 @@ def cmd_seed(
     direct_mode = {"mode": "Direct"}
     explore_mode = {"mode": "Explore"}
 
-    _migrate_seed_database(build=build)
+    _migrate_seed_database(build=build, release=release)
     with sqlite3.connect(str(db_path), timeout=10) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
 
@@ -4671,6 +4683,128 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
     return backend
 
 
+# ===========================================================================
+# Accelerator advisories
+# ===========================================================================
+# `check`'s Rust critical path is designed around three host tools. When one
+# is absent cargo still works, so the run stays green while silently taking
+# its slowest documented path. These advisories make that cost visible in the
+# summary the user already reads, with the exact command that fixes it.
+
+
+class Advisory(NamedTuple):
+    """One missing accelerator: what it costs and how to install it."""
+    what: str
+    cost: str
+    install: str
+
+
+# A shared lld is a link-time win for the debug test harnesses and the e2e
+# bin, which link serially at the tail of the critical path. mold is strictly
+# faster where available, so it is probed first.
+_LINKERS = ("mold", "ld.lld", "lld")
+
+
+def _linker_available() -> str | None:
+    """Name of the fastest alternative linker on PATH, or None."""
+    for name in _LINKERS:
+        if shutil.which(name):
+            return name
+    return None
+
+
+def _accelerator_advisories(
+    *,
+    nextest: bool | None,
+    compiler_cache: str | None,
+    linker_configured: bool,
+) -> list[Advisory]:
+    """Collect advisories for accelerators the check ran without.
+
+    `nextest` and `compiler_cache` are None when no cargo lane ran and the
+    probe therefore never happened — absence of a probe is not evidence of a
+    missing tool, so those cases yield no advisory.
+    """
+    advisories = []
+    if nextest is False:
+        advisories.append(Advisory(
+            "cargo-nextest not installed",
+            "plain `cargo test` runs test binaries sequentially and holds the "
+            "cargo target lock for the whole run, serializing the e2e bin build "
+            "behind it",
+            "cargo install cargo-nextest --locked",
+        ))
+    if compiler_cache == "none":
+        advisories.append(Advisory(
+            "no compiler cache",
+            "the clippy lane's separate target dir and every other worktree "
+            "recompile identical dependencies from scratch",
+            "cargo install sccache --locked",
+        ))
+    if not linker_configured:
+        linker = _linker_available()
+        if linker is None:
+            advisories.append(Advisory(
+                "default linker (no mold/lld on PATH)",
+                "debug linking is a serial single-threaded phase at the tail of "
+                "the critical path",
+                "install mold or lld, then re-run `./dev.py check`",
+            ))
+        else:
+            advisories.append(Advisory(
+                f"default linker ({linker} is installed but unused)",
+                "debug linking is a serial single-threaded phase at the tail of "
+                "the critical path",
+                "./dev.py check   # dev.py sets RUSTFLAGS automatically",
+            ))
+    return advisories
+
+
+def _print_accelerator_advisories(advisories: list[Advisory]) -> None:
+    if not advisories:
+        return
+    print(f"\n  \u26a0 slow path: this check ran without {len(advisories)} "
+          f"accelerator{'s' if len(advisories) > 1 else ''}")
+    for item in advisories:
+        print(f"      - {item.what}")
+        print(f"        {item.cost}")
+        print(f"        install: {item.install}")
+
+
+# The alternative linker is applied via RUSTFLAGS on the cargo subprocesses
+# dev.py spawns, not via a generated `.cargo/config.local.toml`. Cargo's
+# `include` directive is a hard error when its target is missing, so a
+# generated-and-gitignored file would break a fresh clone until the first
+# check ran. An env var has no such failure mode and leaves no host-specific
+# file in the tree. The trade is that a bare `cargo build` outside dev.py does
+# not get the faster linker — acceptable, since `check` is what we are here to
+# speed up.
+
+
+def _configure_linker() -> bool:
+    """Point rustc at mold/lld when one is on PATH. Returns True if configured.
+
+    Sets RUSTFLAGS for every cargo subprocess this invocation spawns. The value
+    is stable across runs, so it costs one rebuild the first time and nothing
+    after — changing RUSTFLAGS between runs would invalidate the cache every
+    time, which is why this must never vary on anything but the linker choice.
+    """
+    if os.environ.get("PHOENIX_NO_LINKER_CONFIG") == "1":
+        return False
+    # An explicit RUSTFLAGS is the caller's business; appending to it could
+    # silently contradict a deliberate choice.
+    if "RUSTFLAGS" in os.environ:
+        return False
+    linker = _linker_available()
+    if linker is None:
+        return False
+    # `-fuse-ld=` is consumed by the C compiler rustc drives as its linker
+    # driver, so it takes the linker's short name, not a path.
+    short = "mold" if linker == "mold" else "lld"
+    os.environ["RUSTFLAGS"] = f"-Clink-arg=-fuse-ld={short}"
+    return True
+
+
 _CARGO_CHECK_LANES = frozenset({"rust", "clippy", "e2e"})
 
 
@@ -5509,8 +5643,10 @@ def cmd_check(
     # Share compiler outputs across worktrees and independent target dirs.
     # The selected wrapper is inherited by every cargo subprocess below.
     selected_compiler_cache = None
+    linker_configured = False
     if cargo_active:
         selected_compiler_cache = _configure_compiler_cache(compiler_cache)
+        linker_configured = _configure_linker()
     if _CHECK_PROFILE is not None:
         _CHECK_PROFILE.metadata["compiler_cache"] = selected_compiler_cache
     if _CHECK_PROFILE is not None and _DEV_TRACING is not None:
@@ -5552,6 +5688,9 @@ def cmd_check(
         _append_git_config_override("commit.gpgsign", "false")
 
     # nextest probe, thread sizing, and codegen command shapes are rust-only.
+    # None until the probe runs: "never probed" and "probed, absent" are
+    # different facts, and only the latter earns a summary advisory.
+    has_nextest = None
     if "rust" in active:
         # Probe nextest and size the test-thread cap here in cmd_check scope
         # (not in lane_rust) so the closed-over commands are built once.
@@ -5572,7 +5711,6 @@ def cmd_check(
         except (subprocess.TimeoutExpired, OSError):
             has_nextest = False
         if not has_nextest:
-            reporter.info("cargo nextest unavailable — using plain `cargo test`")
             if _CHECK_PROFILE is not None:
                 _CHECK_PROFILE.metadata["rust_per_test_attribution"] = "unavailable_without_nextest"
             if profile_work:
@@ -5647,7 +5785,14 @@ def cmd_check(
                 nextest_profile_args = [
                     "--config-file", str(nextest_config), "--profile", "phoenix-cpu",
                 ]
+            # --no-fail-fast: nextest stops the run on the first failure by
+            # default, but `check` is a batch gate whose contract is that one
+            # invocation surfaces every failure (the same reason
+            # codegen-stale records rather than aborts). Fail-fast would hide
+            # failures 2..n behind a re-run each, and `cargo test` — the
+            # fallback this must stay equivalent to — does not fail fast.
             test_cmd = ["cargo", "nextest", *nextest_profile_args, "run", *_pflags(),
+                        "--no-fail-fast",
                         "-E", "not test(/export_bindings/)",
                         "--test-threads", str(test_threads)]
             codegen_cmd = ["cargo", "nextest", "run", *codegen_p,
@@ -5850,6 +5995,14 @@ def cmd_check(
     for message in profile_messages:
         print(f"  i  {message}")
 
+    advisories = _accelerator_advisories(
+        nextest=has_nextest,
+        compiler_cache=selected_compiler_cache,
+        # A check with no cargo lane never consults the linker, so its
+        # absence cost nothing and is not worth reporting.
+        linker_configured=linker_configured or not cargo_active,
+    )
+
     total_elapsed = time.monotonic() - t_start
     if failures:
         print()
@@ -5859,9 +6012,11 @@ def cmd_check(
                 print(output)
             print()
         print(f"\u2717 {len(failures)} of {len(results)} checks failed ({total_elapsed:.1f}s)")
+        _print_accelerator_advisories(advisories)
         sys.exit(1)
     else:
         print(f"\n\u2713 All {len(results)} checks passed ({total_elapsed:.1f}s)")
+        _print_accelerator_advisories(advisories)
 
 
 # =============================================================================

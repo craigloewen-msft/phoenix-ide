@@ -20,10 +20,18 @@ class ModernSeedTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.dev = load_devpy()
-        binary = ROOT / "target" / "release" / "phoenix_ide"
-        cls.dev.build_rust(release=True)
+        # Debug, not release. This binary is only ever invoked as
+        # `--migrate-only`, which exits as soon as the migration chain is
+        # applied, so the profile cannot affect what this suite asserts. It
+        # does affect the check pipeline enormously: a release build here
+        # holds the shared workspace target lock against the concurrent
+        # debug builds in the rust and e2e lanes, which starved the rust
+        # lane's test compile into its timeout. Debug also reuses the binary
+        # the e2e lane already builds.
+        binary = ROOT / "target" / "debug" / "phoenix_ide"
+        cls.dev.build_rust(release=False)
         if not binary.exists():
-            raise AssertionError(f"release phoenix_ide binary was not built: {binary}")
+            raise AssertionError(f"debug phoenix_ide binary was not built: {binary}")
 
     def test_fresh_seed_and_fixture_repair_use_migrated_schema(self):
         with tempfile.TemporaryDirectory(prefix="phoenix-modern-seed-") as directory:
@@ -38,7 +46,7 @@ class ModernSeedTest(unittest.TestCase):
                     seed_worktree_root,
                 ),
             ):
-                self.dev.cmd_seed(build=False)
+                self.dev.cmd_seed(build=False, release=False)
                 with sqlite3.connect(db_path) as conn:
                     columns = {
                         row[1] for row in conn.execute("PRAGMA table_info(conversations)")
@@ -103,7 +111,7 @@ class ModernSeedTest(unittest.TestCase):
                     )
                     conn.commit()
 
-                self.dev.cmd_seed(build=False, repair_fixtures=True)
+                self.dev.cmd_seed(build=False, release=False, repair_fixtures=True)
 
                 with sqlite3.connect(db_path) as conn:
                     self.assertEqual(
@@ -168,7 +176,7 @@ class ModernSeedTest(unittest.TestCase):
                 mock.patch.object(self.dev, "get_pid", return_value=None),
                 mock.patch.object(self.dev, "SEED_WORKTREE_ROOT", seed_worktree_root),
             ):
-                self.dev.cmd_seed(build=False)
+                self.dev.cmd_seed(build=False, release=False)
 
                 with sqlite3.connect(db_path) as conn:
                     conn.execute(
@@ -178,11 +186,11 @@ class ModernSeedTest(unittest.TestCase):
                     conn.commit()
 
                 # Default: a populated DB is not touched, so the gutted fixture stays gutted.
-                self.dev.cmd_seed(build=False)
+                self.dev.cmd_seed(build=False, release=False)
                 with sqlite3.connect(db_path) as conn:
                     self.assertEqual(self._fixture_message_count(conn, "fixture-turn-one"), 0)
 
-                self.dev.cmd_seed(build=False, repair_fixtures=True)
+                self.dev.cmd_seed(build=False, release=False, repair_fixtures=True)
                 with sqlite3.connect(db_path) as conn:
                     self.assertEqual(self._fixture_message_count(conn, "fixture-turn-one"), 47)
 
@@ -201,7 +209,7 @@ class ModernSeedTest(unittest.TestCase):
                 mock.patch.object(self.dev, "get_pid", return_value=None),
                 mock.patch.object(self.dev, "SEED_WORKTREE_ROOT", seed_worktree_root),
             ):
-                self.dev.cmd_seed(build=False)
+                self.dev.cmd_seed(build=False, release=False)
 
                 with sqlite3.connect(db_path) as conn:
                     for slug in archivable:
@@ -220,7 +228,7 @@ class ModernSeedTest(unittest.TestCase):
 
                 # Even an explicit repair leaves an archived fixture archived: archiving
                 # is a developer decision, not fixture drift.
-                self.dev.cmd_seed(build=False, repair_fixtures=True)
+                self.dev.cmd_seed(build=False, release=False, repair_fixtures=True)
 
                 with sqlite3.connect(db_path) as conn:
                     for slug in archivable:
