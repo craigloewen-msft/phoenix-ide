@@ -225,6 +225,43 @@ pub enum WakeObservationCandidateReason {
     ExpiredLease,
 }
 
+/// Which bindings/deliveries a retirement sweep is allowed to touch.
+///
+/// `All` is the startup sweep. `Conversation` is the per-conversation reap a
+/// terminal lifecycle action performs on the way down; it must not disturb
+/// wake obligations owned by conversations the user did not ask to terminate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeRetirementScope {
+    All,
+    Conversation(String),
+}
+
+/// A wake obligation cleared by a retirement sweep, named well enough for an
+/// operator to correlate it with the tmux window or bash handle it guarded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeReapedContract {
+    pub workflow_id: WorkflowId,
+    pub conversation_id: String,
+    pub contract_id: String,
+}
+
+/// A wake obligation that blocks a lifecycle action, for rejection payloads and
+/// status responses. `Unresolved` is a live binding awaiting its terminal;
+/// `OwedDelivery` is a fired terminal whose delivery was never consumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeOwedWork {
+    pub workflow_id: WorkflowId,
+    pub contract_id: String,
+    pub expires_at: Timestamp,
+    pub kind: WakeOwedWorkKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeOwedWorkKind {
+    Unresolved,
+    OwedDelivery,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeObservationCandidateRow {
     pub workflow_id: WorkflowId,
@@ -1833,63 +1870,127 @@ impl WakeRepository {
     /// legacy. Startup calls this before runtime bridges or the wake worker can
     /// mutate wake workflows.
     pub async fn retire_all_registrations(&self, now: Timestamp) -> DbResult<usize> {
+        let reaped = self.retire_scope(now, &WakeRetirementScope::All).await?;
+        Ok(reaped
+            .iter()
+            .map(|entry| entry.workflow_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len())
+    }
+
+    /// Clears every wake obligation owned by one conversation: cancels bindings
+    /// still awaiting a terminal, and suppresses deliveries whose terminal fired
+    /// but was never consumed.
+    ///
+    /// This is the teardown a destructive lifecycle action performs on its way
+    /// down, so a wake obligation is a resource to reclaim rather than a reason
+    /// to refuse the user (`specs/wake-contracts/requirements.md` REQ-WAKE-004
+    /// permits serializing the transition instead of rejecting it).
+    pub async fn reap_owed_work_for_conversation(
+        &self,
+        conversation_id: &str,
+        now: Timestamp,
+    ) -> DbResult<Vec<WakeReapedContract>> {
+        self.retire_scope(
+            now,
+            &WakeRetirementScope::Conversation(conversation_id.to_string()),
+        )
+        .await
+    }
+
+    /// Shared body of the startup sweep and the per-conversation reap, so the
+    /// two cannot drift in what counts as an obligation or how it is cleared.
+    async fn retire_scope(
+        &self,
+        now: Timestamp,
+        scope: &WakeRetirementScope,
+    ) -> DbResult<Vec<WakeReapedContract>> {
+        let conversation_filter = match scope {
+            WakeRetirementScope::All => None,
+            WakeRetirementScope::Conversation(id) => Some(id.as_str()),
+        };
+
         let unresolved = sqlx::query(
             "SELECT b.workflow_id, b.conversation_id, b.contract_id
              FROM wake_bindings b
              JOIN workflows w ON w.workflow_id = b.workflow_id
              WHERE w.status = 'Active'
+               AND (?1 IS NULL OR b.conversation_id = ?1)
                AND NOT EXISTS (
                    SELECT 1 FROM wake_terminal_receipts r
                    WHERE r.workflow_id = b.workflow_id
                )
              ORDER BY b.workflow_id",
         )
+        .bind(conversation_filter)
         .fetch_all(&self.workflow_repo.pool)
         .await?;
 
-        let mut retired = std::collections::BTreeSet::new();
+        let mut reaped = std::collections::BTreeMap::<WorkflowId, WakeReapedContract>::new();
         for row in unresolved {
             let workflow_id = WorkflowId(to_u64(row.get("workflow_id"), "workflow_id")?);
+            let conversation_id: String = row.get("conversation_id");
+            let contract_id: String = row.get("contract_id");
             if matches!(
                 self.cancel_allocated(&WakeCancelIfUnresolvedInput {
                     workflow_id,
-                    expected_conversation_id: Some(row.get("conversation_id")),
-                    expected_contract_id: Some(row.get("contract_id")),
+                    expected_conversation_id: Some(conversation_id.clone()),
+                    expected_contract_id: Some(contract_id.clone()),
                     timestamp: now,
                     reason: WakeCancellationReason::ExplicitCancel,
                 })
                 .await?,
                 WakeCancellationOutcome::Cancelled { .. }
             ) {
-                retired.insert(workflow_id);
+                reaped.insert(
+                    workflow_id,
+                    WakeReapedContract {
+                        workflow_id,
+                        conversation_id,
+                        contract_id,
+                    },
+                );
             }
         }
 
+        // Cancelling a binding above writes the terminal receipt but leaves its
+        // delivery Pending, so this sweep must run after — it is what actually
+        // clears the row `has_owed_work_for_conversation` keys on.
         let pending = sqlx::query(
-            "SELECT d.workflow_id, d.delivery_id
+            "SELECT d.workflow_id, d.delivery_id, b.conversation_id, b.contract_id
              FROM workflow_deliveries d
              JOIN wake_bindings b ON b.workflow_id = d.workflow_id
-             WHERE d.status = 'Pending'
+             WHERE (d.status = 'Pending' OR d.runtime_acceptance_status = 'Owed')
+               AND (?1 IS NULL OR b.conversation_id = ?1)
              ORDER BY d.workflow_id, d.delivery_id",
         )
+        .bind(conversation_filter)
         .fetch_all(&self.workflow_repo.pool)
         .await?;
-        let mut by_workflow = std::collections::BTreeMap::<WorkflowId, Vec<DeliveryId>>::new();
+        let mut by_workflow =
+            std::collections::BTreeMap::<WorkflowId, (Vec<DeliveryId>, String, String)>::new();
         for row in pending {
-            by_workflow
-                .entry(WorkflowId(to_u64(row.get("workflow_id"), "workflow_id")?))
-                .or_default()
+            let workflow_id = WorkflowId(to_u64(row.get("workflow_id"), "workflow_id")?);
+            let entry = by_workflow.entry(workflow_id).or_insert_with(|| {
+                (
+                    Vec::new(),
+                    row.get("conversation_id"),
+                    row.get("contract_id"),
+                )
+            });
+            entry
+                .0
                 .push(DeliveryId(to_u64(row.get("delivery_id"), "delivery_id")?));
         }
 
-        for (workflow_id, delivery_ids) in by_workflow {
+        for (workflow_id, (delivery_ids, conversation_id, contract_id)) in by_workflow {
             let head = self
                 .workflow_repo
                 .fetch_workflow_head(workflow_id)
                 .await?
                 .ok_or_else(|| {
                     DbError::Serialization(format!(
-                        "wake workflow {} disappeared during startup retirement",
+                        "wake workflow {} disappeared during retirement",
                         workflow_id.0
                     ))
                 })?;
@@ -1905,20 +2006,82 @@ impl WakeRepository {
                 .await?
             {
                 WakeResolvePendingOutcome::Resolved => {
-                    retired.insert(workflow_id);
+                    reaped.insert(
+                        workflow_id,
+                        WakeReapedContract {
+                            workflow_id,
+                            conversation_id,
+                            contract_id,
+                        },
+                    );
                 }
                 WakeResolvePendingOutcome::AlreadyResolved => {}
                 WakeResolvePendingOutcome::VersionConflict
                 | WakeResolvePendingOutcome::SetMismatch => {
                     return Err(DbError::Serialization(format!(
-                        "wake workflow {} changed during startup retirement",
+                        "wake workflow {} changed during retirement",
                         workflow_id.0
                     )));
                 }
             }
         }
 
-        Ok(retired.len())
+        Ok(reaped.into_values().collect())
+    }
+
+    /// Every wake obligation blocking a lifecycle action on this conversation.
+    ///
+    /// This is the enumerating counterpart of `has_owed_work_for_conversation`
+    /// and keys on the same two conditions, so a caller can always name what is
+    /// blocking rather than only that something is.
+    pub async fn list_owed_work_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Vec<WakeOwedWork>> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let rows = sqlx::query(
+            "SELECT b.workflow_id, b.contract_id, b.expires_at,
+                    EXISTS (
+                        SELECT 1 FROM workflow_deliveries d
+                        WHERE d.workflow_id = b.workflow_id
+                          AND (d.status = 'Pending' OR d.runtime_acceptance_status = 'Owed')
+                    ) AS owed_delivery
+             FROM wake_bindings b
+             JOIN workflows w ON w.workflow_id = b.workflow_id
+             WHERE b.conversation_id = ?1
+               AND (
+                 (w.status = 'Active' AND b.resolved_at IS NULL)
+                 OR EXISTS (
+                     SELECT 1 FROM workflow_deliveries d
+                     WHERE d.workflow_id = b.workflow_id
+                       AND (d.status = 'Pending' OR d.runtime_acceptance_status = 'Owed')
+                 )
+               )
+             ORDER BY b.workflow_id",
+        )
+        .bind(conversation_id)
+        .fetch_all(&mut *tx.tx)
+        .await?;
+        let out = rows
+            .into_iter()
+            .map(|row| {
+                Ok(WakeOwedWork {
+                    workflow_id: WorkflowId(to_u64(
+                        row.get::<i64, _>("workflow_id"),
+                        "workflow_id",
+                    )?),
+                    contract_id: row.get("contract_id"),
+                    expires_at: Timestamp(to_u64(row.get::<i64, _>("expires_at"), "expires_at")?),
+                    kind: if row.get::<i64, _>("owed_delivery") != 0 {
+                        WakeOwedWorkKind::OwedDelivery
+                    } else {
+                        WakeOwedWorkKind::Unresolved
+                    },
+                })
+            })
+            .collect::<DbResult<Vec<_>>>()?;
+        tx.commit().await?;
+        Ok(out)
     }
 
     pub async fn list_pending_global(
@@ -8618,5 +8781,185 @@ mod tests {
             pending[0].receipt.terminal,
             WakeTerminalPayload::Fired { .. }
         ));
+    }
+
+    /// The production shape that bricked merge: cancelling a wake writes the
+    /// terminal receipt and moves the workflow to `Cancelled`, but leaves its
+    /// delivery `Pending`. With the wake worker disabled nothing clears that
+    /// row until the next server start, so the conversation reports owed work
+    /// indefinitely.
+    async fn cancelled_workflow_with_stranded_delivery(
+        repo: &WakeRepository,
+        workflow_id: WorkflowId,
+    ) {
+        assert!(matches!(
+            repo.register_allocated(workflow_id, &tmux_intent(), "fp-strand", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        assert!(matches!(
+            repo.cancel_allocated(&WakeCancelIfUnresolvedInput {
+                workflow_id,
+                expected_conversation_id: None,
+                expected_contract_id: None,
+                timestamp: Timestamp(20),
+                reason: WakeCancellationReason::ExplicitCancel,
+            })
+            .await
+            .unwrap(),
+            WakeCancellationOutcome::Cancelled { .. }
+        ));
+        assert!(
+            repo.has_owed_work_for_conversation("conv-1").await.unwrap(),
+            "cancelling strands a Pending delivery -- the condition being reaped"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaping_clears_delivery_stranded_by_cancellation() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        cancelled_workflow_with_stranded_delivery(&repo, WorkflowId(910)).await;
+
+        let reaped = repo
+            .reap_owed_work_for_conversation("conv-1", Timestamp(30))
+            .await
+            .unwrap();
+
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].workflow_id, WorkflowId(910));
+        assert_eq!(reaped[0].contract_id, "contract-2");
+        assert!(
+            !repo.has_owed_work_for_conversation("conv-1").await.unwrap(),
+            "a terminal action must leave no owed work behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaping_is_idempotent() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        cancelled_workflow_with_stranded_delivery(&repo, WorkflowId(911)).await;
+
+        repo.reap_owed_work_for_conversation("conv-1", Timestamp(30))
+            .await
+            .unwrap();
+        let second = repo
+            .reap_owed_work_for_conversation("conv-1", Timestamp(31))
+            .await
+            .unwrap();
+
+        assert!(second.is_empty(), "a second reap has nothing left to clear");
+        assert!(!repo.has_owed_work_for_conversation("conv-1").await.unwrap());
+    }
+
+    /// A terminal action on one conversation must not disturb wake obligations
+    /// owned by a conversation the user did not ask to terminate.
+    #[tokio::test]
+    async fn reaping_is_scoped_to_one_conversation() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        insert_conversation(&repo.workflow_repo.pool, "conv-other").await;
+        cancelled_workflow_with_stranded_delivery(&repo, WorkflowId(912)).await;
+
+        let mut other_intent = tmux_intent();
+        other_intent.contract_id = "contract-other".into();
+        other_intent.conversation_id = "conv-other".into();
+        other_intent.root_conversation_id = "conv-other".into();
+        other_intent.registering_tool_use_id = "tool-other".into();
+        other_intent.resource =
+            WakeResourceIdentity::TmuxWindow(wake_types::TmuxResourceIdentity {
+                work_scope: wake_types::WorkScopeIdentity("conv-1".into()),
+                server_token: "srv-1".into(),
+                window_id: "win-other".into(),
+                completion_policy: wake_types::TmuxCompletionPolicy::KeepOpen,
+            });
+        assert!(matches!(
+            repo.register_allocated(WorkflowId(913), &other_intent, "fp-other", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+
+        let reaped = repo
+            .reap_owed_work_for_conversation("conv-1", Timestamp(30))
+            .await
+            .unwrap();
+
+        assert!(reaped.iter().all(|entry| entry.conversation_id == "conv-1"));
+        assert!(!repo.has_owed_work_for_conversation("conv-1").await.unwrap());
+        assert!(
+            repo.has_owed_work_for_conversation("conv-other")
+                .await
+                .unwrap(),
+            "a bystander conversation keeps its wake obligation"
+        );
+    }
+
+    /// The status endpoint reported `pending_count: 0` on the stranded-delivery
+    /// shape while the lifecycle gate reported owed work -- it could not observe
+    /// the condition blocking the user.
+    #[tokio::test]
+    async fn owed_work_listing_sees_stranded_delivery() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        cancelled_workflow_with_stranded_delivery(&repo, WorkflowId(914)).await;
+
+        assert!(
+            repo.list_active_unresolved_for_conversation("conv-1")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the binding is resolved, so the binding-only listing sees nothing"
+        );
+        let owed = repo
+            .list_owed_work_for_conversation("conv-1")
+            .await
+            .unwrap();
+        assert_eq!(owed.len(), 1);
+        assert_eq!(owed[0].workflow_id, WorkflowId(914));
+        assert_eq!(owed[0].kind, WakeOwedWorkKind::OwedDelivery);
+    }
+
+    /// Enumeration must agree with the boolean gate on both arms, so a caller
+    /// can always name what is blocking.
+    #[tokio::test]
+    async fn owed_work_listing_agrees_with_gate_on_unresolved_binding() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        assert!(matches!(
+            repo.register_allocated(WorkflowId(915), &tmux_intent(), "fp-live", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+
+        assert!(repo.has_owed_work_for_conversation("conv-1").await.unwrap());
+        let owed = repo
+            .list_owed_work_for_conversation("conv-1")
+            .await
+            .unwrap();
+        assert_eq!(owed.len(), 1);
+        assert_eq!(owed[0].kind, WakeOwedWorkKind::Unresolved);
+    }
+
+    /// The reap cancels a live binding and must also clear the delivery that
+    /// cancellation strands -- otherwise it would trade one owed row for another.
+    #[tokio::test]
+    async fn reaping_cancels_a_still_unresolved_binding() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        assert!(matches!(
+            repo.register_allocated(WorkflowId(916), &tmux_intent(), "fp-live2", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+
+        let reaped = repo
+            .reap_owed_work_for_conversation("conv-1", Timestamp(30))
+            .await
+            .unwrap();
+
+        assert_eq!(reaped.len(), 1);
+        assert!(
+            !repo.has_owed_work_for_conversation("conv-1").await.unwrap(),
+            "cancelling a binding must also clear the delivery it strands"
+        );
     }
 }

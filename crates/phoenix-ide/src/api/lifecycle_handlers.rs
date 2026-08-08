@@ -387,18 +387,7 @@ pub(crate) async fn abandon_task(
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state.runtime.conversation_admission(&id).await;
     let _admission = admission.lock().await;
-    if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
-        .has_owed_work_for_conversation(&id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    {
-        return Err(AppError::Conflict(Box::new(
-            crate::api::ConflictErrorResponse::new(
-                "Conversation has pending background work",
-                "pending_wake",
-            ),
-        )));
-    }
+    reap_owed_wake_work(&state, &id).await?;
     if state
         .runtime
         .effective_conversation_state(&id)
@@ -688,18 +677,7 @@ pub(crate) async fn mark_merged(
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state.runtime.conversation_admission(&id).await;
     let _admission = admission.lock().await;
-    if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
-        .has_owed_work_for_conversation(&id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    {
-        return Err(AppError::Conflict(Box::new(
-            crate::api::ConflictErrorResponse::new(
-                "Conversation has pending background work",
-                "pending_wake",
-            ),
-        )));
-    }
+    reap_owed_wake_work(&state, &id).await?;
     if state
         .runtime
         .effective_conversation_state(&id)
@@ -790,6 +768,41 @@ pub(crate) async fn mark_merged(
 // Merge to local base branch (REQ-WL-004)
 // ============================================================
 
+/// Clear every wake obligation this conversation owns, as part of tearing it
+/// down.
+///
+/// A destructive lifecycle action is the user saying "I am done with this
+/// conversation; shut down whatever is still attached". A wake obligation on a
+/// tmux window or bash handle is exactly such an attachment, so it belongs in
+/// the same teardown that reclaims worktrees and terminals rather than standing
+/// as a reason to refuse. `specs/wake-contracts/requirements.md` REQ-WAKE-004
+/// admits this: destructive operations may reject *or serialize* the transition
+/// until the obligations resolve.
+///
+/// Callers must already hold the conversation admission lock.
+pub(crate) async fn reap_owed_wake_work(state: &AppState, id: &str) -> Result<(), AppError> {
+    let now = phoenix_workflow::Timestamp(
+        u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
+    );
+    let reaped = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+        .reap_owed_work_for_conversation(id, now)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    if !reaped.is_empty() {
+        tracing::info!(
+            conversation_id = %id,
+            count = reaped.len(),
+            contracts = %reaped
+                .iter()
+                .map(|entry| format!("{}:{}", entry.workflow_id.0, entry.contract_id))
+                .collect::<Vec<_>>()
+                .join(","),
+            "reaped wake obligations during terminal lifecycle action"
+        );
+    }
+    Ok(())
+}
+
 /// The shared admission gate for terminal actions: no owed background work, no
 /// live turn, and legal under REQ-BED-031. Returns the conversation row so the
 /// caller reads it once, under the admission lock.
@@ -800,16 +813,7 @@ async fn admit_terminal_action(
     id: &str,
     action: &str,
 ) -> Result<Conversation, AppError> {
-    if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
-        .has_owed_work_for_conversation(id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Conversation has pending background work",
-            "pending_wake",
-        ))));
-    }
+    reap_owed_wake_work(state, id).await?;
     if state
         .runtime
         .effective_conversation_state(id)
