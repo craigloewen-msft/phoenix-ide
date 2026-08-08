@@ -538,26 +538,41 @@ rule UserCancelsContract {
     ensures: SseEmitted(WakeContractCancelled, contract_id)
 }
 
--- REQ-WAKE-004: lifecycle admission for archive, hard-delete, abandon,
--- and mark-merged must not auto-cancel pending contracts. The request is
--- either rejected while any contract is pending, or serialized only after a
--- wake-aware admission step has closed registration and proven no pending
--- contract remains.
-rule LifecycleAdmissionRejectsPendingContracts {
+-- REQ-WAKE-004: lifecycle admission for archive, hard-delete, abandon, and
+-- mark-merged reclaims the conversation's wake obligations as part of teardown.
+-- The sweep is scoped to the conversation being terminated and runs under its
+-- admission lock, so it cannot race the wake's own terminal observation.
+rule LifecycleAdmissionReapsOwedContracts {
     when: ConversationLifecycleCascadeBegun(conversation)
 
-    requires: exists Contract{conversation: conversation, status: pending}
+    requires: AdmissionLockHeld(conversation)
 
-    ensures: LifecycleTransitionRejected(conversation, reason: wake_contract_pending)
-    ensures: not ResourceCleanupCascadeBegun(conversation)
+    ensures:
+        for contract in owed_contracts_on(conversation):
+            ContractResolved(contract, reason: lifecycle_teardown)
+
+    ensures: not exists Contract{conversation: conversation, status: pending}
+    ensures: ResourceCleanupCascadeBegun(conversation)
 
     @guidance
-        -- Earlier wording auto-cancelled wake contracts during lifecycle
-        -- teardown. That let archive/delete race the wake's own terminal
-        -- observation and rewrote an outstanding wait into cancelled as a side
-        -- effect of lifecycle admission. The durable wake semantics now reject
-        -- (or a higher-level composite action serializes explicitly) instead of
-        -- silently cancelling pending waits.
+        -- A destructive lifecycle action is the user declaring they are done
+        -- with the conversation, so its wake obligations are resources the
+        -- teardown reclaims alongside the worktree and terminals.
+        --
+        -- An earlier form rejected the action whenever a contract was pending,
+        -- to avoid racing the wake's own terminal observation. That trades one
+        -- failure for a worse one: an obligation whose consumer is gone is owed
+        -- to nobody, and rejecting leaves no user-reachable way to clear it.
+        -- The race is instead closed structurally -- the sweep holds the
+        -- conversation's admission lock and resolves each contract through the
+        -- same compare-and-set path a real terminal would use, so a terminal
+        -- landing concurrently either wins or is reported stale.
+        --
+        -- Two obligation shapes must both be cleared: a binding still awaiting
+        -- its terminal, and a delivery whose terminal fired but was never
+        -- consumed. Cancelling a binding produces the second, so the delivery
+        -- sweep must follow the binding sweep or the reap trades one owed row
+        -- for another.
 }
 
 -- REQ-WAKE-012: a continuation that inherits the WorkScope transfers
@@ -675,8 +690,8 @@ rule PendingWakeLeavesRuntimeIdleSemanticsUnchanged {
         -- Pending wake contracts are durable lifecycle obligations, not proof that
         -- the LLM is executing. Runtime busy/idle semantics stay owned by the
         -- normal conversation execution state machine, while archive/hard-delete/
-        -- abandon/mark-merged consult the pending-contract rows directly and reject
-        -- or serialize on that lifecycle conflict instead of overloading is_busy().
+        -- abandon/mark-merged consult the pending-contract rows directly and reap
+        -- them as part of teardown instead of overloading is_busy().
 }
 
 ------------------------------------------------------------

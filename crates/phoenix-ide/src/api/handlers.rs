@@ -3953,6 +3953,10 @@ struct WakeContractStatus {
     workflow_id: u64,
     contract_id: String,
     expires_at: u64,
+    /// `unresolved` for a binding still awaiting its terminal, `owed_delivery`
+    /// for a fired terminal whose delivery was never consumed. Both block a
+    /// lifecycle action, so both must be visible here.
+    kind: &'static str,
 }
 
 async fn get_wake_status(
@@ -3965,7 +3969,7 @@ async fn get_wake_status(
         .await
         .map_err(|error| AppError::NotFound(error.to_string()))?;
     let rows = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
-        .list_active_unresolved_for_conversation(&id)
+        .list_owed_work_for_conversation(&id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
     let contracts: Vec<_> = rows
@@ -3974,6 +3978,10 @@ async fn get_wake_status(
             workflow_id: row.workflow_id.0,
             contract_id: row.contract_id,
             expires_at: row.expires_at.0,
+            kind: match row.kind {
+                phoenix_db::workflow::wake::WakeOwedWorkKind::Unresolved => "unresolved",
+                phoenix_db::workflow::wake::WakeOwedWorkKind::OwedDelivery => "owed_delivery",
+            },
         })
         .collect();
     Ok(axum::Json(WakeStatusResponse {
@@ -4822,16 +4830,7 @@ async fn archive_conversation(
 /// continue; only the final `archived = 1` write is fatal.
 pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
     refuse_if_coordinator(state, id, "archive").await?;
-    if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
-        .has_owed_work_for_conversation(id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Conversation has pending background work",
-            "pending_wake",
-        ))));
-    }
+    super::lifecycle_handlers::reap_owed_wake_work(state, id).await?;
     let conv = state
         .runtime
         .db()
@@ -5192,16 +5191,7 @@ async fn delete_conversation(
 /// log WARN and continue per REQ-BED-032.
 pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
     refuse_if_coordinator(state, id, "delete").await?;
-    if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
-        .has_owed_work_for_conversation(id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Conversation has pending background work",
-            "pending_wake",
-        ))));
-    }
+    super::lifecycle_handlers::reap_owed_wake_work(state, id).await?;
     // Step 1: reject-if-busy. Read the conversation's persisted state
     // (the DB is updated before any side effect per persist-before-broadcast,
     // so DB state is the authoritative answer to "is this conversation busy?").

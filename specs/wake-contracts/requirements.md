@@ -192,14 +192,26 @@ lifecycle
 
 Archive, hard-delete, abandon, mark-merged, and any equivalent destructive
 lifecycle operation SHALL query pending wake contracts, unconsumed wake
-observations, and owed runtime acceptances directly and SHALL reject or serialize
-the lifecycle transition until those obligations are resolved
+observations, and owed runtime acceptances directly, and SHALL resolve those
+obligations as part of the teardown rather than refusing the operation
+
+WHEN a destructive lifecycle operation runs on a conversation holding wake
+obligations
+THE SYSTEM SHALL cancel that conversation's unresolved bindings and suppress its
+owed deliveries, SHALL restrict the sweep to obligations owned by that
+conversation, and SHALL record the cleared contracts in the log
 
 **Rationale:** Wake waits are runtime-owned obligations, not proof that the LLM
 is actively executing. Fabricating `is_busy()` would create a duplicate semantic
 state alongside the durable wake rows and would misrepresent an otherwise idle
-conversation. Lifecycle safety still matters, so the pit-of-success guard moves
-to an explicit pending-wake conflict check rather than overloading runtime busy.
+conversation.
+
+A destructive lifecycle action is the user declaring they are done with the
+conversation, so a wake obligation on one of its tmux windows or bash handles is
+a resource that teardown reclaims — like the worktree and the terminal — not a
+reason to refuse. Refusing instead strands the user whenever an obligation
+outlives the runtime that would have consumed it: the delivery a cancellation
+leaves behind is owed to nobody, and no user-reachable surface clears it.
 
 ---
 
