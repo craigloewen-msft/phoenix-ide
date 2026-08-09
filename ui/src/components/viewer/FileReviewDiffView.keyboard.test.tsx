@@ -5,7 +5,7 @@
  * command reaches the right callback on this surface.
  */
 
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { FileReviewDiffView } from './FileReviewDiffView';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
@@ -51,6 +51,7 @@ function renderView(review: FileReviewState) {
           fileName="a.ts"
           absolutePath="/repo/a.ts"
           review={review}
+          currentBlobSha="blob-a"
           onSendNotes={() => undefined}
           onShowSource={() => undefined}
           {...handlers}
@@ -61,16 +62,33 @@ function renderView(review: FileReviewState) {
   return handlers;
 }
 
+/**
+ * Wait until the surface can act on a counted annotate.
+ *
+ * `{n}c` resolves against the parsed file, and the surface learns that file's
+ * item id from the CodeView's `onFilesChange` — an effect, so it commits a
+ * render after the one that first paints the mock. Awaiting only the mock
+ * leaves the press racing that commit, and a press that lands early is
+ * silently dropped rather than retried. Flushing effects makes the ordering a
+ * fact instead of a timing bet.
+ */
+async function readyForCountedAnnotate() {
+  await screen.findByTestId('codeview-mock');
+  await act(async () => {});
+}
+
 describe('FileReviewDiffView keyboard review', () => {
   beforeEach(() => {
     resetCodeViewMock();
-    vi.spyOn(api, 'getReviewFileDiff').mockResolvedValue({
-      path: 'a.ts',
+    // The real endpoint echoes the path and scope it answered; the view relies
+    // on that to tell its own response from the previous request's.
+    vi.spyOn(api, 'getReviewFileDiff').mockImplementation(async (_conv, path, scope) => ({
+      path,
       diff: DIFF,
       comparator: 'origin/main',
       current_blob_sha: 'blob-a',
-      scope: 'full',
-    } as Awaited<ReturnType<typeof api.getReviewFileDiff>>);
+      scope,
+    }));
   });
 
   it('marks reviewed at the rendered blob, then advances', async () => {
@@ -129,7 +147,7 @@ describe('FileReviewDiffView keyboard review', () => {
 
   it('comments on the line named by a typed count', async () => {
     renderView({ kind: 'unreviewed' });
-    await screen.findByTestId('codeview-mock');
+    await readyForCountedAnnotate();
 
     press('4');
     press('2');
@@ -142,7 +160,7 @@ describe('FileReviewDiffView keyboard review', () => {
 
   it('explains rather than silently ignoring a line that is not in the diff', async () => {
     renderView({ kind: 'unreviewed' });
-    await screen.findByTestId('codeview-mock');
+    await readyForCountedAnnotate();
 
     press('9');
     press('9');

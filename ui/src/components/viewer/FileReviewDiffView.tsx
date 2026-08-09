@@ -41,6 +41,16 @@ export interface FileReviewDiffViewProps {
    * header and the sidebar checklist from disagreeing.
    */
   review: FileReviewState;
+  /**
+   * Blob sha of the file's current working-tree content, from the manifest.
+   *
+   * A review diff is a function of *two* blobs. The checkpoint side alone
+   * cannot report that the rendered diff has gone out of date, because the
+   * event that invalidates it — the agent editing the file — moves only this
+   * side. Carrying it is what makes the surface follow an agent turn instead of
+   * leaving the previous turn's answer on screen under a stale-marked header.
+   */
+  currentBlobSha: string;
   onClose: () => void;
   onSendNotes: (notes: string) => void;
   /** Switch this file back to source rendering. */
@@ -76,6 +86,7 @@ export function FileReviewDiffView({
   fileName,
   absolutePath,
   review,
+  currentBlobSha,
   onClose,
   onSendNotes,
   onShowSource,
@@ -109,19 +120,19 @@ export function FileReviewDiffView({
   // indistinguishable from a broken one.
   const [keyboardNotice, setKeyboardNotice] = useState<string | null>(null);
   const [data, setData] = useState<ReviewFileDiffResponse | null>(null);
-  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // Bumping this refetches the diff without changing which file or scope is
   // shown, so an external edit can be pulled in on demand.
   const [reloadToken, setReloadToken] = useState(0);
 
-  // Refetch when the file's reviewed blob changes: after marking, the
-  // since-review diff has a new baseline.
+  // Both sides of the comparison are dependencies: the checkpoint moves when the
+  // user marks or unmarks, the current content moves when the agent edits. A
+  // diff that watched only one side would keep rendering an answer to the other
+  // side's previous value.
   const reviewedBlob = review.kind === 'unreviewed' ? null : review.at_blob;
 
   useEffect(() => {
     const controller = new AbortController();
-    setLoading(true);
     setError(null);
     api
       .getReviewFileDiff(conversationId, path, scope, controller.signal)
@@ -129,18 +140,22 @@ export function FileReviewDiffView({
       .catch((err: unknown) => {
         if (controller.signal.aborted) return;
         setError(err instanceof Error ? err.message : 'Failed to load diff');
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [conversationId, path, scope, reviewedBlob, reloadToken]);
+  }, [conversationId, path, scope, reviewedBlob, currentBlobSha, reloadToken]);
+
+  // A response answers one request. Matching on the path and scope the server
+  // echoes back means "the previous scope's diff rendered under the new scope's
+  // label" is not a state this component can occupy — a switch shows the loading
+  // state until its own answer arrives. A refetch of the *same* request keeps
+  // the current content on screen, so pulling in an edit does not flash.
+  const shown = data !== null && data.path === path && data.scope === scope ? data : null;
 
   const handleMark = useCallback(async () => {
-    if (!data) return;
-    await onMarkReviewed(path, data.current_blob_sha);
+    if (!shown) return;
+    await onMarkReviewed(path, shown.current_blob_sha);
     onNextUnreviewed?.();
-  }, [data, onMarkReviewed, path, onNextUnreviewed]);
+  }, [shown, onMarkReviewed, path, onNextUnreviewed]);
 
   const reviewedNow = review.kind === 'reviewed';
 
@@ -320,21 +335,21 @@ export function FileReviewDiffView({
             Changed since you reviewed it — switch to <strong>Since review</strong> to see only what is new.
           </div>
         )}
-        {loading && !data ? (
-          <div className="viewer-loading">
-            <Loader2 size={32} className="spinning" />
-            <span>Loading diff…</span>
-          </div>
-        ) : error ? (
+        {error ? (
           <div className="viewer-error">
             <AlertCircle size={32} />
             <span>{error}</span>
           </div>
-        ) : !data?.diff.trim() ? (
+        ) : shown === null ? (
+          <div className="viewer-loading">
+            <Loader2 size={32} className="spinning" />
+            <span>Loading diff…</span>
+          </div>
+        ) : !shown.diff.trim() ? (
           <div className="diff-viewer-empty">
             {scope === 'since_review'
               ? 'Nothing changed since you reviewed this file.'
-              : `No changes vs ${data?.comparator ?? 'base'}.`}
+              : `No changes vs ${shown.comparator}.`}
           </div>
         ) : (
           <PhoenixDiffCodeView
@@ -344,7 +359,7 @@ export function FileReviewDiffView({
             // record it is already showing and keeps the previous content.
             key={`${path}:${scope}`}
             ref={codeViewRef}
-            committedDiff={data.diff}
+            committedDiff={shown.diff}
             uncommittedDiff=""
             diffStyle={diffStyle}
             notes={diffNotes}
