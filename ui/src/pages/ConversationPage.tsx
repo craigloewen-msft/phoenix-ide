@@ -120,6 +120,7 @@ const CommissionReviewViewer = lazy(() =>
 
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useViewerSlot } from '../contexts/ViewerSlotContext';
+import { isReviewFocusEligible, resolvePaneContent, type PaneContent } from './conversationPaneContent';
 import { useConversationReadiness } from '../contexts/useConversationReadiness';
 import {
   ForkProposalsProvider,
@@ -411,18 +412,6 @@ function ConversationPageContent({
     defaultSize: 600,
     collapseThreshold: 280,
   });
-
-  // Review focus: collapse the conversation column so a split-pane diff review
-  // gets the whole window. Transient layout state, not URL state — the viewer
-  // slot's `presentation` owns the durable pane/fullscreen distinction.
-  // Offered only on the diff surfaces, which are the ones that benefit.
-  const reviewFocusEligible = isWideDesktop && (paneDiffOpen || proseSlot?.mode === 'diff');
-  const [reviewFocus, setReviewFocus] = useState(false);
-  const toggleReviewFocus = useCallback(() => setReviewFocus((prev) => !prev), []);
-  useEffect(() => {
-    if (!reviewFocusEligible) setReviewFocus(false);
-  }, [reviewFocusEligible]);
-  const reviewFocusActive = reviewFocusEligible && reviewFocus;
 
   // The viewer pane (`--viewer-pane-width`) and the terminal pane
   // (`--terminal-pane-height`, read by `TerminalPanel`) are sized from CSS
@@ -1957,6 +1946,35 @@ function ConversationPageContent({
   const canOpenMessageSidepanel = !isArchived && !isTerminalConversationState(convStateForChildren);
   const messageViewerOpen = canOpenMessageSidepanel && messageOpen;
   const commissionReviewViewerOpen = canShowCommissionReviewViewer(canOpenMessageSidepanel, commissionReviewOpen, atom.phase.type);
+
+  // What the split-pane viewer actually renders, resolved once. Both this and
+  // the review-focus eligibility below come from the same value, so
+  // "conversation column hidden while the pane renders nothing" is
+  // unrepresentable. See `conversationPaneContent`.
+  const paneContent = resolvePaneContent({
+    conversationId,
+    paneDiffOpen,
+    openFileState,
+    proseSlot,
+    browserViewerOpen,
+    inspectViewerOpen,
+    inspectSlot,
+    messageViewerOpen,
+    messageSlot,
+    commissionReviewViewerOpen,
+    commissionReviewSlot,
+  });
+
+  // Review focus: collapse the conversation column so a split-pane diff review
+  // gets the whole window. Transient layout state, not URL state — the viewer
+  // slot's `presentation` owns the durable pane/fullscreen distinction.
+  const reviewFocusEligible = isReviewFocusEligible(paneContent, isWideDesktop);
+  const [reviewFocus, setReviewFocus] = useState(false);
+  const toggleReviewFocus = useCallback(() => setReviewFocus((prev) => !prev), []);
+  useEffect(() => {
+    if (!reviewFocusEligible) setReviewFocus(false);
+  }, [reviewFocusEligible]);
+  const reviewFocusActive = reviewFocusEligible && reviewFocus;
   const stateBarContinuation = useMemo(
     () => !isArchived && convStateForChildren.type === 'idle'
       ? { phase: 'idle' as const, onTrigger: handleTriggerContinuation }
@@ -2237,18 +2255,89 @@ function ConversationPageContent({
 
   // Wide-desktop pane presentations render beside .conversation-column.
   // Fullscreen message presentations use the takeover branch below.
-  const splitPanePrs = openFileState;
-  const showSplitPaneViewer =
-    isDesktop
-    && isWideDesktop
-    && (
-      splitPanePrs !== null
-      || paneDiffOpen
-      || browserViewerOpen
-      || inspectViewerOpen
-      || (messageViewerOpen && messageSlot?.presentation === 'pane')
-      || commissionReviewViewerOpen
-    );
+  const showSplitPaneViewer = isDesktop && isWideDesktop && paneContent !== null;
+
+  // One branch per PaneContent kind. There is no fallthrough case: the union is
+  // exhaustive and its `null` is handled here, so this cannot render an empty
+  // pane underneath a hidden conversation column.
+  const renderPaneContent = (content: PaneContent) => {
+    switch (content.kind) {
+      case 'diff':
+        return (
+          <ConversationDiffViewer
+            conversationId={content.conversationId}
+            target={diffTarget}
+            activePrIdentity={activePrIdentity}
+            onClose={handleCloseDiff}
+            onSendNotes={handleSendNotes}
+            reviewFocus={reviewFocusActive}
+            onToggleReviewFocus={toggleReviewFocus}
+            inline
+          />
+        );
+      case 'prose':
+        return (
+          <FileViewer
+            filePath={content.file.path}
+            rootDir={content.file.rootDir}
+            onClose={handleCloseFileViewer}
+            onSendNotes={isWideDesktop && content.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
+            patchContext={content.file.patchContext ?? undefined}
+            focus={content.file.focus}
+            presentation={content.presentation}
+            canTogglePresentation
+            onPresentationChange={viewerSlot.setPresentation}
+            {...(content.mode === 'diff'
+              ? { reviewFocus: reviewFocusActive, onToggleReviewFocus: toggleReviewFocus }
+              : {})}
+            inline
+          />
+        );
+      case 'browser':
+        return (
+          <BrowserViewPanel
+            conversationId={content.conversationId}
+            onClose={handleCloseBrowserView}
+            inline
+          />
+        );
+      case 'inspect':
+        return (
+          <ProcessInspectorPanel
+            handleId={content.handleId}
+            conversationId={conversationId}
+            onClose={handleCloseInspector}
+            inline
+          />
+        );
+      case 'message':
+        return (
+          <MessageViewer
+            sequenceId={content.slot.sequenceId}
+            messages={viewableMessages}
+            onClose={handleCloseMessageViewer}
+            onSendNotes={handleSendNotes}
+            presentation={content.slot.presentation}
+            canTogglePresentation
+            onPresentationChange={viewerSlot.setPresentation}
+            inline
+          />
+        );
+      case 'commission-review':
+        return (
+          <CommissionReviewViewer
+            sequenceId={content.slot.requestSequenceId}
+            messages={viewableMessages}
+            onClose={handleCloseMessageViewer}
+            presentation={content.slot.presentation}
+            canTogglePresentation
+            onPresentationChange={viewerSlot.setPresentation}
+            inline
+          />
+        );
+    }
+  };
+  const splitPaneViewer = paneContent === null ? null : renderPaneContent(paneContent);
 
   const terminalSplitPane = showTerminal ? (
     <>
@@ -2931,68 +3020,7 @@ function ConversationPageContent({
           />
           <div className="conversation-viewer-pane">
             <Suspense fallback={null}>
-              {paneDiffOpen && conversationId ? (
-                <ConversationDiffViewer
-                  conversationId={conversationId}
-                  target={diffTarget}
-                  activePrIdentity={activePrIdentity}
-                  onClose={handleCloseDiff}
-                  onSendNotes={handleSendNotes}
-                  reviewFocus={reviewFocusActive}
-                  onToggleReviewFocus={toggleReviewFocus}
-                  inline
-                />
-              ) : splitPanePrs ? (
-                <FileViewer
-                  filePath={splitPanePrs.path}
-                  rootDir={splitPanePrs.rootDir}
-                  onClose={handleCloseFileViewer}
-                  onSendNotes={isWideDesktop && proseSlot?.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
-                  patchContext={splitPanePrs.patchContext ?? undefined}
-                  focus={splitPanePrs.focus}
-                  presentation={proseSlot?.presentation ?? 'pane'}
-                  canTogglePresentation
-                  onPresentationChange={viewerSlot.setPresentation}
-                  {...(proseSlot?.mode === 'diff'
-                    ? { reviewFocus: reviewFocusActive, onToggleReviewFocus: toggleReviewFocus }
-                    : {})}
-                  inline
-                />
-              ) : browserViewerOpen && conversationId ? (
-                <BrowserViewPanel
-                  conversationId={conversationId}
-                  onClose={handleCloseBrowserView}
-                  inline
-                />
-              ) : inspectViewerOpen && inspectSlot ? (
-                <ProcessInspectorPanel
-                  handleId={inspectSlot.handleId}
-                  conversationId={conversationId}
-                  onClose={handleCloseInspector}
-                  inline
-                />
-              ) : messageViewerOpen && messageSlot ? (
-                <MessageViewer
-                  sequenceId={messageSlot.sequenceId}
-                  messages={viewableMessages}
-                  onClose={handleCloseMessageViewer}
-                  onSendNotes={isWideDesktop && messageSlot.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
-                  presentation={messageSlot.presentation}
-                  canTogglePresentation
-                  onPresentationChange={viewerSlot.setPresentation}
-                  inline
-                />
-              ) : commissionReviewViewerOpen && commissionReviewSlot ? (
-                <CommissionReviewViewer
-                  sequenceId={commissionReviewSlot.requestSequenceId}
-                  messages={viewableMessages}
-                  onClose={handleCloseMessageViewer}
-                  presentation={commissionReviewSlot.presentation}
-                  canTogglePresentation
-                  onPresentationChange={viewerSlot.setPresentation}
-                  inline
-                />
-              ) : null}
+              {splitPaneViewer}
             </Suspense>
           </div>
         </>
