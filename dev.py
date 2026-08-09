@@ -1986,6 +1986,7 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
         proc = subprocess.Popen(
             [str(binary)],
             env=env,
+            stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -2076,6 +2077,13 @@ def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False) -> bool:
     # Vite's own output is the only record of why it exited; discarding it makes
     # a crash (node heap OOM, a plugin throwing, a port conflict) undiagnosable
     # after the fact, since the process is gone and leaves no other trace.
+    #
+    # stdin=DEVNULL is load-bearing, not hygiene: Vite binds its CLI shortcuts
+    # (`press h + enter`) whenever `process.stdin.isTTY`, which attaches a
+    # readline reader to the launching terminal. An inherited pty outlives
+    # `./dev.py up` only until that terminal closes, and the dead fd then takes
+    # Vite down silently — leaving a running Phoenix beside a stopped Vite.
+    # A detached server must not hold a handle on a terminal it outlives.
     vite_log = open(VITE_LOG_FILE, "a", buffering=1)
     vite_log.write(
         f"\n===== vite start {datetime.datetime.now().isoformat(timespec='seconds')} "
@@ -2086,6 +2094,7 @@ def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False) -> bool:
             ["pnpm", "run", "dev", "--port", str(port), "--strictPort", "--host", vite_host],
             cwd=UI_DIR,
             env=env,
+            stdin=subprocess.DEVNULL,
             stdout=vite_log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
