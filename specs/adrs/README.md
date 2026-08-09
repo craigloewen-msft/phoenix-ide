@@ -38,6 +38,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [024](024_direct-turn-authority-is-partitioned-by-semantic-fact.md) | Direct-turn authority is partitioned by semantic fact | Accepted | REQ-DWF-CHAT-001 through REQ-DWF-CHAT-014 |
 | [025](025_continuation-compaction-is-an-idempotent-durable-operation.md) | Continuation compaction is an idempotent durable operation | Accepted | REQ-BED-020 |
 | [026](026_review-progress-is-a-content-addressed-checkpoint.md) | Review progress is a content-addressed checkpoint, not the git index | Accepted | REQ-RV-001 … REQ-RV-009 |
+| [027](027_expanded-diff-context-is-addressed-by-blob-object-id.md) | Expanded diff context is addressed by blob object id | Accepted | REQ-DIFFEXP-001 … REQ-DIFFEXP-007 |
 
 ## For agents: which decisions bind your task
 
@@ -68,6 +69,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
 | Storing per-file review progress, or anything that would contend for the git index | 026 |
+| Showing file content alongside a diff, or any content whose version must match a captured snapshot | 027 |
 
 ## Decision dependencies
 

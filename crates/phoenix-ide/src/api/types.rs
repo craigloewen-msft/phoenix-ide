@@ -1172,8 +1172,12 @@ pub struct DiffExpansionFile {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DiffExpansionSide {
-    Available { contents: String },
-    Unavailable { reason: DiffExpansionUnavailableReason },
+    Available {
+        contents: String,
+    },
+    Unavailable {
+        reason: DiffExpansionUnavailableReason,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]

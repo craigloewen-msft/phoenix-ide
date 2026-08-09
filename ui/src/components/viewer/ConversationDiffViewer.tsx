@@ -93,6 +93,7 @@ export function ConversationDiffViewer({
         uncommittedTruncatedKib={p.uncommitted_truncated_kib}
         uncommittedSaturated={p.uncommitted_saturated}
         checkoutStatus={p.checkout_status}
+        conversationId={conversationId}
         onClose={onClose}
         onSendNotes={onSendNotes}
         onRefresh={reload}

@@ -2402,13 +2402,20 @@ def cmd_seed(
             _run_seed_git(fixture, ["config", key, value])
 
         seed_file = fixture / "seed-diff-fixture.txt"
+        # A long file whose edits sit far apart, so the diff has real collapsed
+        # gaps between hunks and at the file head/tail. The short fixture files
+        # below have no unmodified context to speak of, which means they can
+        # never exercise the diff viewer's expand-context affordance.
+        long_file = fixture / "seed-diff-long.txt"
+        long_baseline = "".join(f"context line {i}\n" for i in range(1, 121))
+        _write_text(long_file, long_baseline)
         _write_text(
             seed_file,
             "Phoenix seeded diff fixture\n"
             "baseline line retained for context\n"
             "line changed by branch commit\n",
         )
-        _run_seed_git(fixture, ["add", "seed-diff-fixture.txt"])
+        _run_seed_git(fixture, ["add", "seed-diff-fixture.txt", "seed-diff-long.txt"])
         _run_seed_git(fixture, ["commit", "-q", "-m", "seed baseline"])
 
         _run_seed_git(fixture, ["checkout", "-q", "-b", "seed-diff-review"])
@@ -2422,7 +2429,13 @@ def cmd_seed(
             fixture / "committed-review-note.txt",
             "This file exists only on the seeded review branch.\n",
         )
-        _run_seed_git(fixture, ["add", "seed-diff-fixture.txt", "committed-review-note.txt"])
+        # Two well-separated edits: the gap between them, and the runs before
+        # the first and after the last, are what the expand controls reveal.
+        long_committed = long_baseline.replace(
+            "context line 30\n", "context line 30 (changed on branch)\n"
+        ).replace("context line 90\n", "context line 90 (changed on branch)\n")
+        _write_text(long_file, long_committed)
+        _run_seed_git(fixture, ["add", "seed-diff-fixture.txt", "committed-review-note.txt", "seed-diff-long.txt"])
         _run_seed_git(fixture, ["commit", "-q", "-m", "seed committed diff"])
 
         _write_text(
@@ -2435,6 +2448,14 @@ def cmd_seed(
         _write_text(
             fixture / "uncommitted-review-note.txt",
             "This untracked file demonstrates the uncommitted diff section.\n",
+        )
+        # An uncommitted edit in the same long file, so the expand affordance is
+        # exercised in both diff sections (their new sides resolve differently).
+        _write_text(
+            long_file,
+            long_committed.replace(
+                "context line 60\n", "context line 60 (changed in working tree)\n"
+            ),
         )
         return fixture
 

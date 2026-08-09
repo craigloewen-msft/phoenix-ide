@@ -29,6 +29,7 @@ import {
   annotationsForFile,
   buildSectionItems,
   fileNotesFor,
+  hydrateItem,
   itemRenderSignature,
   lineTextAt,
   resolveDiffAnchorLine,
@@ -37,6 +38,7 @@ import {
   sectionFromItemId,
   type PhoenixDiffAnnotationMeta,
   type PhoenixDiffItem,
+  type SectionFileSource,
 } from './pierreDiffMapping';
 
 export interface PhoenixDiffCodeViewProps {
@@ -59,6 +61,19 @@ export interface PhoenixDiffCodeViewProps {
    *  parsing the diff a second time. Parsing is owned here; the caller gets the
    *  result rather than duplicating the work. */
   onFilesChange?: ((files: readonly DiffFileRef[]) => void) | undefined;
+  /**
+   * Full file contents for context expansion, keyed by item id.
+   *
+   * Supplying an entry lets Pierre render its "expand unchanged lines"
+   * affordance for that file. Absent entries simply render without expansion,
+   * which is the correct outcome for binary, truncated, or moved-on files — so
+   * this is optional rather than an error path.
+   */
+  expansionContents?: ReadonlyMap<string, { oldContents: string; newContents: string }> | undefined;
+  /** Report which files can be expanded, so the host can fetch their contents.
+   *  Derived from the parse (an index line is required for a file to be
+   *  addressable by blob id), not from a second scan of the raw diff. */
+  onExpandableFilesChange?: ((sources: readonly SectionFileSource[]) => void) | undefined;
 }
 
 /** Identity of one rendered file in the diff surface. */
@@ -101,7 +116,7 @@ type Meta = PhoenixDiffAnnotationMeta;
 
 export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, PhoenixDiffCodeViewProps>(
   function PhoenixDiffCodeView(
-    { committedDiff, uncommittedDiff, diffStyle, findMatches = [], activeFindMatch = null, notes, highlightedNoteId, onAnnotateLine, onAnnotateFile, onFilesChange, cursorItemId = null },
+    { committedDiff, uncommittedDiff, diffStyle, findMatches = [], activeFindMatch = null, notes, highlightedNoteId, onAnnotateLine, onAnnotateFile, onFilesChange, cursorItemId = null, expansionContents, onExpandableFilesChange },
     ref,
   ) {
     const { theme } = useTheme();
@@ -142,22 +157,46 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
 
     const items = useMemo<PhoenixDiffItem[]>(() => {
       const vmap = itemVersions.current;
-      const attach = (built: PhoenixDiffItem[]): PhoenixDiffItem[] =>
-        built.map((it) => {
+      const attach = (built: PhoenixDiffItem[], sources: readonly SectionFileSource[]): PhoenixDiffItem[] =>
+        built.map((base) => {
+          // Swap in the whole-file parse when contents are available, so Pierre
+          // renders its expand-context affordance. Hydration reuses the same id
+          // and line numbering, so notes and jumps are unaffected; a file that
+          // cannot be hydrated just keeps the patch-only parse.
+          const contents = expansionContents?.get(base.id);
+          const source = contents ? sources.find((s) => s.itemId === base.id) : undefined;
+          const hydrated = source && contents
+            ? hydrateItem(source, contents.oldContents, contents.newContents)
+            : null;
+          const it = hydrated ?? base;
           const section = sectionFromItemId(it.id);
           if (!section) return it;
           const anns = annotationsForFile(notes, section, it.fileDiff.name);
           // Bump the controlled-item version whenever this item's rendered
           // content changes, so Pierre reconciles instead of keeping a stale
           // annotation/flash/header-count record.
-          const sig = `${itemRenderSignature(it.fileDiff, notes, section, highlightedNoteId)}|find:${isMatchedFindHeaderItem(it.id) ? (isActiveFindHeaderItem(it.id) ? activeFindHeaderKey : 'matched') : ''}|cursor:${cursorItemId === it.id ? '1' : ''}`;
+          const sig = `${itemRenderSignature(it.fileDiff, notes, section, highlightedNoteId)}|find:${isMatchedFindHeaderItem(it.id) ? (isActiveFindHeaderItem(it.id) ? activeFindHeaderKey : 'matched') : ''}|cursor:${cursorItemId === it.id ? '1' : ''}|expanded:${it.fileDiff.isPartial ? '' : '1'}`;
           const prev = vmap.get(it.id);
           const version = prev && prev.sig === sig ? prev.version : (prev?.version ?? 0) + 1;
           if (!prev || prev.sig !== sig) vmap.set(it.id, { sig, version });
           return anns.length > 0 ? { ...it, annotations: anns, version } : { ...it, version };
         });
-      return [...attach(committed.items), ...attach(uncommitted.items)];
-    }, [committed.items, uncommitted.items, notes, highlightedNoteId, activeFindHeaderKey, isActiveFindHeaderItem, isMatchedFindHeaderItem, cursorItemId]);
+      return [
+        ...attach(committed.items, committed.sources),
+        ...attach(uncommitted.items, uncommitted.sources),
+      ];
+    }, [committed.items, committed.sources, uncommitted.items, uncommitted.sources, notes, highlightedNoteId, activeFindHeaderKey, isActiveFindHeaderItem, isMatchedFindHeaderItem, cursorItemId, expansionContents]);
+
+    // Publish which files can be expanded so the host can fetch their contents.
+    // Only files whose patch carried blob object ids appear here: without an id
+    // there is no way to prove the fetched content matches this diff.
+    const expandableSources = useMemo<SectionFileSource[]>(
+      () => [...committed.sources, ...uncommitted.sources],
+      [committed.sources, uncommitted.sources],
+    );
+    useEffect(() => {
+      onExpandableFilesChange?.(expandableSources);
+    }, [expandableSources, onExpandableFilesChange]);
 
     // Publish the parsed file order to the caller's file cursor. Derived from
     // the parse, not from a second scan of the raw diff, so the cursor and the
@@ -205,6 +244,14 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
         diffStyle,
         stickyHeaders: true,
         enableGutterUtility: true,
+        // `line-info` separators are the ones Pierre renders expand controls
+        // into; it only offers them for non-partial (hydrated) files, so files
+        // without fetched contents keep a plain separator.
+        hunkSeparators: 'line-info',
+        // Reveal a screenful at a time rather than Pierre's default 100 lines:
+        // the point of the affordance is "a bit more context", and shift-click
+        // still expands the whole gap at once.
+        expansionLineCount: 20,
         unsafeCSS: findLineDecorationCss,
         // All items are diff items; the file overload never fires at runtime.
         // The option callback is an overload intersection (file + diff); we

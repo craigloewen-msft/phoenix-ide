@@ -508,8 +508,16 @@ pub(crate) fn read_worktree_file_verified(
         return Err(ExpansionUnavailable::ObjectMissing);
     };
     // Diff index lines abbreviate the object id, so compare on that prefix.
+    // Compared by character prefix rather than by byte slice: an object id is
+    // always hex, but slicing a `str` by byte index panics on a non-ASCII
+    // boundary, and the id here is untrusted request input.
     let actual = actual.trim();
-    if actual.get(..expected_oid.len()) != Some(expected_oid) {
+    let matches = expected_oid.len() <= actual.len()
+        && actual
+            .chars()
+            .zip(expected_oid.chars())
+            .all(|(a, b)| a == b);
+    if !matches {
         return Err(ExpansionUnavailable::ContentMoved);
     }
     classify_bytes(bytes)
@@ -1503,10 +1511,10 @@ mod tests {
         commit_file(tmp.path(), "f.txt", "a\nb\n", "add");
         std::fs::write(tmp.path().join("f.txt"), "a\nB\n").unwrap();
         let full_oid = run_git(tmp.path(), &["hash-object", "--", "f.txt"]).unwrap();
-        let abbreviated = &full_oid.trim()[..7];
+        let abbreviated: String = full_oid.trim().chars().take(7).collect();
 
         assert_eq!(
-            read_worktree_file_verified(tmp.path(), "f.txt", abbreviated),
+            read_worktree_file_verified(tmp.path(), "f.txt", &abbreviated),
             Ok("a\nB\n".to_string())
         );
     }
@@ -1529,7 +1537,10 @@ mod tests {
         )
         .unwrap();
 
-        let escaping = format!("../{}/secret.txt", outside.path().file_name().unwrap().to_str().unwrap());
+        let escaping = format!(
+            "../{}/secret.txt",
+            outside.path().file_name().unwrap().to_str().unwrap()
+        );
         assert_eq!(
             read_worktree_file_verified(tmp.path(), &escaping, oid.trim()),
             Err(ExpansionUnavailable::OutsideWorktree)

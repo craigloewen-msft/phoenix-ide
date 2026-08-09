@@ -12,7 +12,7 @@
  * the annotation metadata so the renderer never has to reconstruct it.
  */
 
-import { parsePatchFiles } from '@pierre/diffs';
+import { parsePatchFiles, processFile } from '@pierre/diffs';
 import type {
   AnnotationSide,
   CodeViewDiffItem,
@@ -55,6 +55,10 @@ export function sectionFromItemId(id: string): DiffSection | null {
 export interface BuiltSection {
   /** Parsed file items for this section, with collision-free ids. */
   items: PhoenixDiffItem[];
+  /** Per-item source patch text and blob ids, retained so a file can later be
+   *  re-parsed with full contents to enable context expansion. Keyed by item id
+   *  and ordered alongside `items`. */
+  sources: SectionFileSource[];
   /** Non-null when the raw diff was non-empty but could not be parsed; the
    *  viewer shows a section-scoped fallback rather than crashing. */
   error: string | null;
@@ -73,7 +77,7 @@ export interface BuiltSection {
  * for an input that should not occur.
  */
 export function buildSectionItems(section: DiffSection, rawDiff: string | null | undefined): BuiltSection {
-  if (!rawDiff?.trim()) return { items: [], error: null };
+  if (!rawDiff?.trim()) return { items: [], sources: [], error: null };
 
   let parsed;
   try {
@@ -82,11 +86,18 @@ export function buildSectionItems(section: DiffSection, rawDiff: string | null |
     // partial results and report below rather than crash.
     parsed = parsePatchFiles(rawDiff, section, false);
   } catch (err) {
-    return { items: [], error: err instanceof Error ? err.message : 'Failed to parse diff' };
+    return { items: [], sources: [], error: err instanceof Error ? err.message : 'Failed to parse diff' };
   }
 
+  // The parser does not hand back the slice of text each file came from, so
+  // split the raw diff the same way to pair each item with its own patch text
+  // for later hydration.
+  const patchTexts = splitPatchByFile(rawDiff);
+
   const items: PhoenixDiffItem[] = [];
+  const sources: SectionFileSource[] = [];
   const seen = new Set<string>();
+  let fileIndex = 0;
   for (const patch of parsed) {
     for (const fileDiff of patch.files) {
       const base = itemId(section, fileDiff.name);
@@ -99,13 +110,46 @@ export function buildSectionItems(section: DiffSection, rawDiff: string | null |
         type: 'diff',
         fileDiff: { ...fileDiff, prevName: fileDiff.prevName ?? '' },
       });
+      const patchText = patchTexts[fileIndex];
+      fileIndex += 1;
+      // Expansion needs all three: the text to re-parse and the blob ids that
+      // let the server prove which version of the file to return. A file
+      // missing any of them is simply not hydratable, so it is left out
+      // rather than recorded in a half-usable state.
+      if (patchText !== undefined && fileDiff.prevObjectId && fileDiff.newObjectId) {
+        sources.push({
+          itemId: id,
+          section,
+          filePath: fileDiff.name,
+          prevObjectId: fileDiff.prevObjectId,
+          newObjectId: fileDiff.newObjectId,
+          patchText,
+        });
+      }
     }
   }
 
   // Non-empty input that yielded no files is itself a malformed/unsupported
   // diff — report it so the section shows a fallback instead of silent blank.
-  if (items.length === 0) return { items, error: 'Could not parse any files from this diff.' };
-  return { items, error: null };
+  if (items.length === 0) return { items, sources, error: 'Could not parse any files from this diff.' };
+  return { items, sources, error: null };
+}
+
+/** Split a multi-file patch into its per-file slices, in the same order the
+ *  parser yields files, so each item can be paired with the text it came from. */
+function splitPatchByFile(rawDiff: string): string[] {
+  const slices: string[] = [];
+  let current: string[] | null = null;
+  for (const line of rawDiff.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      if (current) slices.push(current.join('\n'));
+      current = [line];
+      continue;
+    }
+    if (current) current.push(line);
+  }
+  if (current) slices.push(current.join('\n'));
+  return slices;
 }
 
 /**
@@ -272,6 +316,16 @@ export function lineTextAt(
       return stripEol(fileDiff.deletionLines[h.deletionLineIndex + (lineNumber - h.deletionStart)]);
     }
   }
+  // A hydrated file holds every line, including the unmodified ones outside any
+  // hunk that the reviewer can reveal via context expansion. Those are
+  // annotatable, so resolve them from the whole-file arrays, where the 1-based
+  // file line number indexes directly. Only safe when the parse is non-partial:
+  // a partial file's arrays hold just the patched lines, where the same
+  // arithmetic would silently return an unrelated line.
+  if (!fileDiff.isPartial) {
+    const lines = side === 'additions' ? fileDiff.additionLines : fileDiff.deletionLines;
+    return stripEol(lines[lineNumber - 1]);
+  }
   return undefined;
 }
 
@@ -366,4 +420,116 @@ export function resolveTouchedLine(
   }
   if (!item || lineNumber === undefined || lineType === undefined || !codeElement) return null;
   return { item, side: annotationSideFor(lineType, codeElement), lineNumber };
+}
+/**
+ * Hydration: turning a *partial* diff item (only the lines the patch carried)
+ * into a *complete* one (the whole file on both sides), which is what unlocks
+ * `@pierre/diffs`' built-in "expand unchanged lines" affordance.
+ *
+ * Pierre gates expansion on `FileDiffMetadata.isPartial`, which `processFile`
+ * sets to false only when handed both file sides in full. Nothing else about
+ * the item changes: hunk offsets, line numbers and note anchors are produced by
+ * the same parser from the same patch text, so hydration is transparent to
+ * every consumer of the parse.
+ *
+ * Pierre trusts the supplied contents without checking them against the patch.
+ * Contents that do not match the patch's base yield hunk offsets that point at
+ * the wrong lines, with no error raised — so callers must only ever pass
+ * content the server resolved by the patch's own blob object ids. Hydration
+ * additionally verifies the result before returning it (see below); a file that
+ * fails verification stays partial and simply renders without expansion.
+ */
+
+/** The per-file patch text, retained at parse time so hydration can re-run the
+ *  parser with file contents attached. Pierre's `FileDiffMetadata` does not
+ *  retain the source patch, so it has to be kept alongside. */
+export interface SectionFileSource {
+  itemId: string;
+  section: DiffSection;
+  filePath: string;
+  /** Blob object ids from the patch's `index` line. Empty when the patch
+   *  carried no index line, which makes the file non-hydratable: without an id
+   *  there is no way to fetch content that is provably the right version. */
+  prevObjectId: string;
+  newObjectId: string;
+  /** The single-file slice of the raw patch this item was parsed from. */
+  patchText: string;
+}
+
+/**
+ * Re-parse one file's patch with full contents attached, yielding an item Pierre
+ * will render with expansion affordances.
+ *
+ * Returns null when the hydrated parse cannot be trusted, in which case the
+ * caller keeps the partial item. Verification compares the hydrated file's
+ * context lines against the lines the patch itself carried: if the supplied
+ * contents belong to a different version of the file, those disagree, and
+ * rendering would show context that silently does not match the diff.
+ */
+export function hydrateItem(
+  source: SectionFileSource,
+  oldContents: string,
+  newContents: string,
+): PhoenixDiffItem | null {
+  let hydrated: FileDiffMetadata | undefined;
+  try {
+    hydrated = processFile(source.patchText, {
+      cacheKey: `${source.itemId}:hydrated`,
+      oldFile: { name: source.filePath, contents: oldContents },
+      newFile: { name: source.filePath, contents: newContents },
+    });
+  } catch {
+    return null;
+  }
+  if (!hydrated || hydrated.isPartial) return null;
+  if (!hydratedMatchesPatch(hydrated, source.patchText)) return null;
+  return {
+    id: source.itemId,
+    type: 'diff',
+    fileDiff: { ...hydrated, prevName: hydrated.prevName ?? '' },
+  };
+}
+
+/**
+ * Check that a hydrated file's lines agree with the patch that described them.
+ *
+ * This is the guard against Pierre's silent-misalignment failure mode. The
+ * server resolves content by blob object id, so a mismatch should be
+ * unreachable; verifying anyway means a bug in that chain degrades to "no
+ * expansion for this file" instead of "context lines that quietly lie".
+ *
+ * Every hunk's first addition-side line is compared against the file content at
+ * the line number the hunk claims. One anchor per hunk is enough: the failure
+ * being guarded against is a whole-file offset shift, which moves every hunk.
+ */
+function hydratedMatchesPatch(hydrated: FileDiffMetadata, patchText: string): boolean {
+  const patchAdditions = additionLinesFromPatch(patchText);
+  let consumed = 0;
+  for (const hunk of hydrated.hunks) {
+    const expected = patchAdditions[consumed];
+    consumed += hunk.additionCount;
+    if (expected === undefined) continue;
+    const actual = hydrated.additionLines[hunk.additionLineIndex];
+    if (actual === undefined) return false;
+    if (stripEol(actual) !== stripEol(expected)) return false;
+  }
+  return true;
+}
+
+/** The addition-side lines (context + additions) a patch carries, in order —
+ *  the same sequence a hydrated parse reproduces from the real file. */
+function additionLinesFromPatch(patchText: string): string[] {
+  const out: string[] = [];
+  let inHunk = false;
+  for (const line of patchText.split('\n')) {
+    if (line.startsWith('@@')) {
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) continue;
+    // `\ No newline at end of file` is a marker, not content.
+    if (line.startsWith('\\')) continue;
+    if (line.startsWith('+') || line.startsWith(' ')) out.push(line.slice(1));
+  }
+  return out;
 }

@@ -39,6 +39,8 @@ import { useReviewKeyboard } from './useReviewKeyboard';
 import { useRefreshOnWindowFocus } from './useRefreshOnWindowFocus';
 import type { ReviewCommand } from './reviewKeymap';
 import { useDiffStyle } from './useDiffStyle';
+import { useDiffExpansion } from './useDiffExpansion';
+import type { SectionFileSource } from './pierreDiffMapping';
 import { DiffStyleToggleButton, ReviewFocusToggleButton } from './DiffHeaderControls';
 import { ReviewKeyboardNotice } from './ReviewKeyboardNotice';
 import './DiffView.css';
@@ -75,6 +77,10 @@ export interface DiffViewProps {
    *  is what keeps the affordance off overlay/takeover surfaces that already
    *  own the whole screen. */
   onToggleReviewFocus?: (() => void) | undefined;
+  /** Enables context expansion by identifying the conversation whose worktree
+   *  the files can be fetched from. Hosts that supply a static diff omit it and
+   *  simply render without expansion affordances. */
+  conversationId?: string | undefined;
 }
 
 const DIFF_FIND_SURFACE_KEY = createSurfaceKey('diff-viewer');
@@ -100,6 +106,7 @@ export function DiffView({
   onRefresh,
   reviewFocus = false,
   onToggleReviewFocus,
+  conversationId,
 }: DiffViewProps) {
   useRegisterFocusScope(open ? 'diff-viewer' : null);
   const notes = useDiffReviewNotes(onSendNotes);
@@ -108,6 +115,24 @@ export function DiffView({
   const findPreviousFocusRef = useRef<HTMLElement | null>(null);
 
   const { diffStyle, toggleDiffStyle } = useDiffStyle();
+
+  // Context expansion: the code view reports which files carry the blob ids
+  // needed to fetch their contents, and the fetched contents flow back in.
+  const [expandableSources, setExpandableSources] = useState<readonly SectionFileSource[]>([]);
+  // A truncated section's diff text is incomplete, so a whole-file parse of it
+  // would disagree with the file. Suppress expansion there rather than offering
+  // an affordance that cannot produce trustworthy context.
+  const truncatedSections = useMemo(() => {
+    const sections = new Set<SectionFileSource['section']>();
+    if (committedTruncatedKib !== undefined) sections.add('committed');
+    if (uncommittedTruncatedKib !== undefined) sections.add('uncommitted');
+    return sections;
+  }, [committedTruncatedKib, uncommittedTruncatedKib]);
+  const expansionContents = useDiffExpansion({
+    conversationId,
+    sources: expandableSources,
+    truncatedSections,
+  });
   const restoreFocus = useCallback((focusOrigin: DiffFindFocusOrigin) => {
     if (focusOrigin instanceof HTMLElement) {
       queueMicrotask(() => focusOrigin.focus());
@@ -496,6 +521,8 @@ export function DiffView({
               highlightedNoteId={notes.highlightedNoteId}
               cursorItemId={cursorItemId}
               onFilesChange={setFiles}
+              expansionContents={expansionContents}
+              onExpandableFilesChange={setExpandableSources}
               onAnnotateLine={notes.startAnnotateLine}
               onAnnotateFile={notes.startAnnotateFile}
             />

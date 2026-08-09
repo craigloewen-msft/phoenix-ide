@@ -318,6 +318,48 @@ export interface ConversationDiffResponse {
   pr_number?: number;
 }
 
+/** Which diff section a file came from. The uncommitted section's new side is
+ *  the working tree rather than a stored blob, so the server resolves it by a
+ *  different (hash-verified) route and needs to be told which is meant. */
+export type DiffExpansionSection = 'committed' | 'uncommitted';
+
+export interface DiffExpansionFileRequest {
+  path: string;
+  prev_object_id: string;
+  new_object_id: string;
+  section: DiffExpansionSection;
+}
+
+/** Why one side of a file has no content available for expansion.
+ *
+ *  Each is a normal outcome rather than a failure — the file simply renders
+ *  without expansion affordances. `content_moved` is the notable one: the
+ *  working-tree file changed after the diff was captured, so serving it would
+ *  show context that silently disagrees with the diff. */
+export type DiffExpansionUnavailableReason =
+  | 'side_absent'
+  | 'binary'
+  | 'too_large'
+  | 'object_missing'
+  | 'outside_worktree'
+  | 'content_moved';
+
+export type DiffExpansionSide =
+  | { status: 'available'; contents: string }
+  | { status: 'unavailable'; reason: DiffExpansionUnavailableReason };
+
+export interface DiffExpansionFile {
+  path: string;
+  prev_object_id: string;
+  new_object_id: string;
+  old_side: DiffExpansionSide;
+  new_side: DiffExpansionSide;
+}
+
+export interface DiffExpansionResponse {
+  files: DiffExpansionFile[];
+}
+
 /**
  * Whether the user has reviewed a file, and whether that review is current.
  *
@@ -2236,6 +2278,28 @@ export const api = {
   async getActivePrDiff(conversationId: string): Promise<ConversationDiffResponse> {
     const resp = await fetch(`/api/conversations/${conversationId}/active-pr/diff`);
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to fetch PR diff'); }
+    return resp.json();
+  },
+
+  /** POST /api/conversations/:id/diff/expansion — full file contents for the
+   *  files in a diff, so the viewer can reveal unmodified lines around each
+   *  hunk (GitHub-style "show more context").
+   *
+   *  Files are identified by the blob object ids the diff recorded, not by
+   *  path alone: the server resolves content by that id so context lines can
+   *  never come from a version of the file the diff wasn't computed against. */
+  async getDiffExpansion(
+    conversationId: string,
+    files: readonly DiffExpansionFileRequest[],
+    signal?: AbortSignal,
+  ): Promise<DiffExpansionResponse> {
+    const resp = await fetch(`/api/conversations/${conversationId}/diff/expansion`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ files }),
+      ...(signal ? { signal } : {}),
+    });
+    if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err.error || 'Failed to fetch diff expansion'); }
     return resp.json();
   },
 

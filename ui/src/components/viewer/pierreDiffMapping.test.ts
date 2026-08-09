@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   annotationsForFile,
   buildSectionItems,
+  hydrateItem,
   fileNotesFor,
   itemId,
   itemRenderSignature,
@@ -56,9 +57,9 @@ describe('itemId / sectionFromItemId', () => {
 
 describe('buildSectionItems', () => {
   it('returns empty (no error) for blank or missing diff', () => {
-    expect(buildSectionItems('committed', '')).toEqual({ items: [], error: null });
-    expect(buildSectionItems('committed', '   \n')).toEqual({ items: [], error: null });
-    expect(buildSectionItems('committed', undefined)).toEqual({ items: [], error: null });
+    expect(buildSectionItems('committed', '')).toEqual({ items: [], sources: [], error: null });
+    expect(buildSectionItems('committed', '   \n')).toEqual({ items: [], sources: [], error: null });
+    expect(buildSectionItems('committed', undefined)).toEqual({ items: [], sources: [], error: null });
   });
 
   it('parses multiple files into section-prefixed diff items', () => {
@@ -403,5 +404,126 @@ describe('scrollTargetForNote', () => {
 
   it('returns null for a file-viewer note', () => {
     expect(scrollTargetForNote(note({ kind: 'file', filePath: '/x', lineNumber: 1 }))).toBeNull();
+  });
+});
+
+// A file whose diff carries only 3 lines of context, plus the real content of
+// both sides. Hydration should turn this into a whole-file item that Pierre can
+// expand, while leaving the hunk's own line numbers untouched.
+const CONTEXT_OLD = Array.from({ length: 40 }, (_, i) => `line ${i + 1}`).join('\n') + '\n';
+const CONTEXT_NEW = CONTEXT_OLD.replace('line 20\n', 'line 20 CHANGED\n');
+const CONTEXT_PATCH = [
+  'diff --git a/src/ctx.ts b/src/ctx.ts',
+  'index aaaaaaa..bbbbbbb 100644',
+  '--- a/src/ctx.ts',
+  '+++ b/src/ctx.ts',
+  '@@ -17,7 +17,7 @@',
+  ' line 17',
+  ' line 18',
+  ' line 19',
+  '-line 20',
+  '+line 20 CHANGED',
+  ' line 21',
+  ' line 22',
+  ' line 23',
+  '',
+].join('\n');
+
+function contextSource() {
+  const built = buildSectionItems('committed', CONTEXT_PATCH);
+  const source = built.sources[0];
+  if (!source) throw new Error('expected a hydratable source');
+  return source;
+}
+
+describe('buildSectionItems — expansion sources', () => {
+  it('retains each file\u2019s patch text and blob ids for later hydration', () => {
+    const built = buildSectionItems('committed', CONTEXT_PATCH);
+    expect(built.sources).toHaveLength(1);
+    expect(built.sources[0]).toMatchObject({
+      itemId: itemId('committed', 'src/ctx.ts'),
+      section: 'committed',
+      filePath: 'src/ctx.ts',
+      prevObjectId: 'aaaaaaa',
+      newObjectId: 'bbbbbbb',
+    });
+    expect(built.sources[0]!.patchText).toContain('@@ -17,7 +17,7 @@');
+  });
+
+  it('pairs each file with its own patch slice in a multi-file diff', () => {
+    const built = buildSectionItems('committed', `${ADD_FILE}\n${CONTEXT_PATCH}`);
+    const ctx = built.sources.find((s) => s.filePath === 'src/ctx.ts');
+    expect(ctx?.patchText).toContain('src/ctx.ts');
+    expect(ctx?.patchText).not.toContain('src/foo.ts');
+  });
+
+  // Without an index line there is no object id, so there is no way to fetch
+  // content that is provably the right version — the file must not be offered
+  // for expansion at all.
+  it('omits files whose patch carries no blob ids', () => {
+    const built = buildSectionItems('committed', SECOND_FILE);
+    expect(built.items).toHaveLength(1);
+    expect(built.sources).toHaveLength(0);
+  });
+});
+
+describe('hydrateItem', () => {
+  it('produces a non-partial item carrying the whole file', () => {
+    const hydrated = hydrateItem(contextSource(), CONTEXT_OLD, CONTEXT_NEW);
+    expect(hydrated).not.toBeNull();
+    expect(hydrated!.fileDiff.isPartial).toBe(false);
+    // The partial parse only ever held the 7 patched lines.
+    expect(hydrated!.fileDiff.additionLines).toHaveLength(40);
+    expect(hydrated!.fileDiff.deletionLines).toHaveLength(40);
+  });
+
+  it('keeps the item id and line numbering the notes are anchored to', () => {
+    const source = contextSource();
+    const partial = buildSectionItems('committed', CONTEXT_PATCH).items[0]!;
+    const hydrated = hydrateItem(source, CONTEXT_OLD, CONTEXT_NEW)!;
+
+    expect(hydrated.id).toBe(partial.id);
+    // Anchoring is what must not move: the same line number resolves to the
+    // same text before and after hydration.
+    expect(lineTextAt(hydrated.fileDiff, 'additions', 20)).toBe('line 20 CHANGED');
+    expect(lineTextAt(partial.fileDiff, 'additions', 20)).toBe('line 20 CHANGED');
+    // And a line only reachable once expanded now resolves correctly.
+    expect(lineTextAt(hydrated.fileDiff, 'additions', 3)).toBe('line 3');
+  });
+
+  // The failure this guards against: Pierre accepts mismatched contents without
+  // complaint and renders context lines that silently disagree with the diff.
+  it('refuses contents that do not match the patch', () => {
+    const shifted = `x\nx\nx\nx\nx\n${CONTEXT_OLD}`;
+    expect(hydrateItem(contextSource(), shifted, shifted)).toBeNull();
+  });
+
+  it('refuses contents from an unrelated file', () => {
+    const unrelated = 'totally\ndifferent\nfile\n';
+    expect(hydrateItem(contextSource(), unrelated, unrelated)).toBeNull();
+  });
+});
+
+describe('lineTextAt — expanded context lines', () => {
+  it('resolves a line outside every hunk once the file is hydrated', () => {
+    const hydrated = hydrateItem(contextSource(), CONTEXT_OLD, CONTEXT_NEW)!;
+    // Line 3 is nowhere near the single hunk (which starts at 17), so it is
+    // only reachable after the reviewer expands context. Annotating it must
+    // still quote the right source text.
+    expect(lineTextAt(hydrated.fileDiff, 'additions', 3)).toBe('line 3');
+    expect(lineTextAt(hydrated.fileDiff, 'deletions', 3)).toBe('line 3');
+    expect(lineTextAt(hydrated.fileDiff, 'additions', 40)).toBe('line 40');
+  });
+
+  it('still reports nothing for an out-of-range line in a hydrated file', () => {
+    const hydrated = hydrateItem(contextSource(), CONTEXT_OLD, CONTEXT_NEW)!;
+    expect(lineTextAt(hydrated.fileDiff, 'additions', 999)).toBeUndefined();
+  });
+
+  // A partial file's line arrays hold only the patched lines, so indexing them
+  // by file line number would return an unrelated line. Absence is correct.
+  it('reports nothing for a non-hunk line while the file is still partial', () => {
+    const partial = buildSectionItems('committed', CONTEXT_PATCH).items[0]!;
+    expect(lineTextAt(partial.fileDiff, 'additions', 3)).toBeUndefined();
   });
 });

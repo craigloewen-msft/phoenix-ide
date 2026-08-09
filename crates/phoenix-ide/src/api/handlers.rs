@@ -10,10 +10,9 @@ use super::chains::{
 };
 use super::git_handlers::{
     create_pr_auto_fix_context, get_active_pr_diff, get_conversation_diff,
-    get_conversation_diff_expansion,
-    get_conversation_git_status, get_conversation_pr_status, get_review_file_diff,
-    get_review_files, list_git_branches, mark_file_reviewed, pin_associated_pr,
-    resume_associated_pr_inference, unmark_file_reviewed,
+    get_conversation_diff_expansion, get_conversation_git_status, get_conversation_pr_status,
+    get_review_file_diff, get_review_files, list_git_branches, mark_file_reviewed,
+    pin_associated_pr, resume_associated_pr_inference, unmark_file_reviewed,
 };
 use super::global_read;
 use super::lifecycle_handlers::{
