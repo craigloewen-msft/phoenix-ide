@@ -26,13 +26,15 @@
   text-align: center;
 }
 
-/* Dim what did not change so the eye lands on what did. */
-.task-approval-content--diffing .viewer-markdown-block:not([class*='plan-diff-block--']) {
+/* Dim what did not change so the eye lands on what did. Keyed on the explicit
+   unchanged class: every block carries a plan-diff-block--* class while the
+   diff is on, so a :not() on the prefix would match nothing. */
+.task-approval-content--diffing .plan-diff-block--unchanged {
   opacity: 0.55;
   transition: opacity 150ms ease;
 }
 
-.task-approval-content--diffing .viewer-markdown-block:not([class*='plan-diff-block--']):hover {
+.task-approval-content--diffing .plan-diff-block--unchanged:hover {
   opacity: 1;
 }
 

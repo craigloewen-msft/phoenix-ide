@@ -518,6 +518,24 @@ describe('TaskApprovalReader plan diff (REQ-PF-018)', () => {
     );
   });
 
+  it('tags unchanged blocks so they can be de-emphasised', async () => {
+    stubBaseline({ ordinal: 1, plan: '# Plan\n\nUntouched line.\n\nUse SQLite.', notes: [] });
+    const { container } = renderTaskApprovalReader(
+      '# Plan\n\nUntouched line.\n\nUse Postgres.',
+      vi.fn(),
+      { conversationId: 'conv-1' },
+    );
+
+    await waitFor(() =>
+      expect(container.querySelector('.plan-diff-block--changed')).not.toBeNull(),
+    );
+    // The de-emphasis rule keys on this class. Without it the dimming silently
+    // does nothing and the diff loses half its signal.
+    const unchanged = [...container.querySelectorAll('.plan-diff-block--unchanged')];
+    expect(unchanged.length).toBeGreaterThan(0);
+    expect(unchanged.map((e) => e.textContent)).toContain('Untouched line.');
+  });
+
   it('sends structured notes rather than pre-rendered prose', () => {
     stubBaseline(null);
     const onSendFeedback = vi.fn();
