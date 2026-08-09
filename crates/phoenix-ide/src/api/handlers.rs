@@ -10,6 +10,7 @@ use super::chains::{
 };
 use super::git_handlers::{
     create_pr_auto_fix_context, get_active_pr_diff, get_conversation_diff,
+    get_conversation_diff_expansion,
     get_conversation_git_status, get_conversation_pr_status, get_review_file_diff,
     get_review_files, list_git_branches, mark_file_reviewed, pin_associated_pr,
     resume_associated_pr_inference, unmark_file_reviewed,
@@ -371,6 +372,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         // Per-conversation worktree diff and PR state
         .route("/api/conversations/:id/diff", get(get_conversation_diff))
+        .route(
+            "/api/conversations/:id/diff/expansion",
+            post(get_conversation_diff_expansion),
+        )
         // Iterative review: per-file manifest, per-file diffs, review marks
         .route("/api/conversations/:id/review/files", get(get_review_files))
         .route(

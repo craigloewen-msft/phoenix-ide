@@ -396,6 +396,125 @@ pub(crate) fn effective_base_ref(cwd: &Path, base_branch: &str) -> String {
     crate::git_start::effective_base_ref(cwd, base_branch)
 }
 
+/// Maximum size of a single file side handed to the diff viewer for context
+/// expansion. Expansion is a convenience for reading around a hunk; beyond this
+/// the payload cost outweighs the benefit and the file is reported as
+/// non-expandable instead.
+pub(crate) const MAX_EXPANDABLE_FILE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Why one side of a file could not be supplied for context expansion.
+///
+/// Every variant is a *legitimate* outcome, not a failure: the viewer renders
+/// the file without expansion affordances and can say why. Modelled as an enum
+/// so "no content" always carries its reason — a bare `None` would be
+/// indistinguishable from "we forgot to fetch it".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExpansionUnavailable {
+    /// The side does not exist: an added file has no old side, a deleted file
+    /// has no new side. Git spells this as the all-zero object id.
+    SideAbsent,
+    /// Content is not text, so there are no lines to reveal.
+    Binary,
+    /// Larger than [`MAX_EXPANDABLE_FILE_BYTES`].
+    TooLarge,
+    /// The blob named by the diff is not in the object database.
+    ObjectMissing,
+    /// The requested path escapes the worktree. Expansion only ever reads files
+    /// belonging to the diff being reviewed.
+    OutsideWorktree,
+    /// Working-tree content no longer hashes to the object id recorded in the
+    /// diff — the file changed after the diff was captured. Serving it would
+    /// render context lines that silently disagree with the diff, so it is
+    /// refused instead.
+    ContentMoved,
+}
+
+/// One side's content for expansion, or the reason there isn't any.
+pub(crate) type ExpansionSide = Result<String, ExpansionUnavailable>;
+
+/// Git's all-zero object id, which an `index` line uses for an absent side.
+fn is_null_oid(oid: &str) -> bool {
+    !oid.is_empty() && oid.bytes().all(|b| b == b'0')
+}
+
+fn classify_bytes(bytes: Vec<u8>) -> ExpansionSide {
+    if bytes.len() > MAX_EXPANDABLE_FILE_BYTES {
+        return Err(ExpansionUnavailable::TooLarge);
+    }
+    // A NUL byte is git's own binary heuristic; reusing it keeps our notion of
+    // "binary" aligned with the one that produced the diff.
+    if bytes.contains(&0) {
+        return Err(ExpansionUnavailable::Binary);
+    }
+    String::from_utf8(bytes).map_err(|_| ExpansionUnavailable::Binary)
+}
+
+/// Read a blob out of the object database **by object id**.
+///
+/// Resolving by object id rather than by `<rev>:<path>` is what makes stale
+/// content unrepresentable: the id is a hash of the bytes, so a successful
+/// lookup cannot return content that disagrees with the diff that named it.
+pub(crate) fn read_blob_by_oid(worktree: &Path, oid: &str) -> ExpansionSide {
+    if is_null_oid(oid) {
+        return Err(ExpansionUnavailable::SideAbsent);
+    }
+    match run_git_bytes(worktree, &["cat-file", "blob", oid]) {
+        Ok(bytes) => classify_bytes(bytes),
+        Err(_) => Err(ExpansionUnavailable::ObjectMissing),
+    }
+}
+
+/// Read the working-tree file for the *new* side of an uncommitted diff.
+///
+/// Working-tree content generally has no blob in the object database, so it
+/// cannot be fetched by object id like the other sides. Instead the bytes are
+/// read and hashed, and that hash must match the object id the diff recorded.
+/// This restores the same guarantee by another route: content that moved on
+/// after the diff was captured is refused ([`ExpansionUnavailable::ContentMoved`])
+/// rather than served as misleading context.
+pub(crate) fn read_worktree_file_verified(
+    worktree: &Path,
+    rel_path: &str,
+    expected_oid: &str,
+) -> ExpansionSide {
+    if is_null_oid(expected_oid) {
+        return Err(ExpansionUnavailable::SideAbsent);
+    }
+    let full = worktree.join(rel_path);
+    // Containment is checked on the resolved path, so neither `..` segments nor
+    // a symlink pointing out of the tree can turn expansion into an arbitrary
+    // file read. Both the base and the target are canonicalised because a
+    // textual prefix check would be defeated by either.
+    let (Ok(canonical_root), Ok(canonical_full)) = (worktree.canonicalize(), full.canonicalize())
+    else {
+        return Err(ExpansionUnavailable::ObjectMissing);
+    };
+    if !canonical_full.starts_with(&canonical_root) {
+        return Err(ExpansionUnavailable::OutsideWorktree);
+    }
+    let full = canonical_full;
+    let Ok(bytes) = std::fs::read(&full) else {
+        return Err(ExpansionUnavailable::ObjectMissing);
+    };
+    if bytes.len() > MAX_EXPANDABLE_FILE_BYTES {
+        return Err(ExpansionUnavailable::TooLarge);
+    }
+    // `hash-object` without `-w` hashes without writing, applying the same
+    // filters git used when producing the diff's index line.
+    let Ok(actual) = run_git(
+        worktree,
+        &["hash-object", "--", full.to_string_lossy().as_ref()],
+    ) else {
+        return Err(ExpansionUnavailable::ObjectMissing);
+    };
+    // Diff index lines abbreviate the object id, so compare on that prefix.
+    let actual = actual.trim();
+    if actual.get(..expected_oid.len()) != Some(expected_oid) {
+        return Err(ExpansionUnavailable::ContentMoved);
+    }
+    classify_bytes(bytes)
+}
+
 /// Capture of "what this branch has done relative to its base."
 ///
 /// Used by both the abandon snapshot and the conversation diff endpoint.
@@ -1283,6 +1402,172 @@ mod tests {
         std::fs::write(dir.join(name), content).unwrap();
         run_git(dir, &["add", name]).unwrap();
         run_git(dir, &["commit", "-q", "-m", message]).unwrap();
+    }
+
+    /// Expansion resolves the old side out of the object database by the id the
+    /// diff recorded, so what the viewer shows as context is exactly what the
+    /// diff was computed against.
+    #[test]
+    fn read_blob_by_oid_returns_committed_content() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_file(tmp.path(), "f.txt", "one\ntwo\nthree\n", "add");
+        let oid = run_git(tmp.path(), &["rev-parse", "HEAD:f.txt"]).unwrap();
+
+        assert_eq!(
+            read_blob_by_oid(tmp.path(), oid.trim()),
+            Ok("one\ntwo\nthree\n".to_string())
+        );
+    }
+
+    /// An added file has no old side. That is a normal outcome with its own
+    /// reason, not an error the viewer has to interpret.
+    #[test]
+    fn read_blob_by_oid_reports_absent_side_for_null_oid() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        assert_eq!(
+            read_blob_by_oid(tmp.path(), "0000000000000000000000000000000000000000"),
+            Err(ExpansionUnavailable::SideAbsent)
+        );
+    }
+
+    #[test]
+    fn read_blob_by_oid_reports_missing_object() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        assert_eq!(
+            read_blob_by_oid(tmp.path(), "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+            Err(ExpansionUnavailable::ObjectMissing)
+        );
+    }
+
+    /// A binary file has no lines to reveal, so expansion reports why rather
+    /// than shipping bytes the viewer would have to guess about.
+    #[test]
+    fn read_blob_by_oid_reports_binary() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        std::fs::write(tmp.path().join("b.bin"), [0x00, 0x01, 0x02]).unwrap();
+        run_git(tmp.path(), &["add", "b.bin"]).unwrap();
+        run_git(tmp.path(), &["commit", "-q", "-m", "bin"]).unwrap();
+        let oid = run_git(tmp.path(), &["rev-parse", "HEAD:b.bin"]).unwrap();
+
+        assert_eq!(
+            read_blob_by_oid(tmp.path(), oid.trim()),
+            Err(ExpansionUnavailable::Binary)
+        );
+    }
+
+    /// The working-tree side has no stored blob, so it is verified by hash
+    /// instead. Matching content is served.
+    #[test]
+    fn read_worktree_file_verified_returns_content_when_hash_matches() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_file(tmp.path(), "f.txt", "a\nb\n", "add");
+        std::fs::write(tmp.path().join("f.txt"), "a\nB\n").unwrap();
+        let oid = run_git(tmp.path(), &["hash-object", "--", "f.txt"]).unwrap();
+
+        assert_eq!(
+            read_worktree_file_verified(tmp.path(), "f.txt", oid.trim()),
+            Ok("a\nB\n".to_string())
+        );
+    }
+
+    /// The load-bearing case: if the file changed after the diff was captured,
+    /// serving it would render context lines that silently disagree with the
+    /// diff. Refusing is the only correct answer.
+    #[test]
+    fn read_worktree_file_verified_refuses_content_that_moved_on() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_file(tmp.path(), "f.txt", "a\nb\n", "add");
+        std::fs::write(tmp.path().join("f.txt"), "a\nB\n").unwrap();
+        let captured_oid = run_git(tmp.path(), &["hash-object", "--", "f.txt"]).unwrap();
+        // The reviewer keeps editing after the diff snapshot was taken.
+        std::fs::write(tmp.path().join("f.txt"), "a\nB\nc\nd\n").unwrap();
+
+        assert_eq!(
+            read_worktree_file_verified(tmp.path(), "f.txt", captured_oid.trim()),
+            Err(ExpansionUnavailable::ContentMoved)
+        );
+    }
+
+    /// Abbreviated ids are what actually appear in a diff's `index` line, so the
+    /// comparison must accept them.
+    #[test]
+    fn read_worktree_file_verified_accepts_abbreviated_oid() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_file(tmp.path(), "f.txt", "a\nb\n", "add");
+        std::fs::write(tmp.path().join("f.txt"), "a\nB\n").unwrap();
+        let full_oid = run_git(tmp.path(), &["hash-object", "--", "f.txt"]).unwrap();
+        let abbreviated = &full_oid.trim()[..7];
+
+        assert_eq!(
+            read_worktree_file_verified(tmp.path(), "f.txt", abbreviated),
+            Ok("a\nB\n".to_string())
+        );
+    }
+
+    /// Expansion must only ever read files belonging to the diff under review.
+    #[test]
+    fn read_worktree_file_verified_rejects_path_escaping_the_worktree() {
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret\n").unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let oid = run_git(
+            tmp.path(),
+            &[
+                "hash-object",
+                "--",
+                outside.path().join("secret.txt").to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let escaping = format!("../{}/secret.txt", outside.path().file_name().unwrap().to_str().unwrap());
+        assert_eq!(
+            read_worktree_file_verified(tmp.path(), &escaping, oid.trim()),
+            Err(ExpansionUnavailable::OutsideWorktree)
+        );
+    }
+
+    /// A symlink is the other way out of the worktree, and a textual path check
+    /// would not catch it — containment is therefore checked after resolution.
+    #[test]
+    #[cfg(unix)]
+    fn read_worktree_file_verified_rejects_symlink_escaping_the_worktree() {
+        let outside = TempDir::new().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "secret\n").unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        std::os::unix::fs::symlink(&secret, tmp.path().join("link.txt")).unwrap();
+        let oid = run_git(tmp.path(), &["hash-object", "--", secret.to_str().unwrap()]).unwrap();
+
+        assert_eq!(
+            read_worktree_file_verified(tmp.path(), "link.txt", oid.trim()),
+            Err(ExpansionUnavailable::OutsideWorktree)
+        );
+    }
+
+    #[test]
+    fn read_worktree_file_verified_reports_absent_side_for_null_oid() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        assert_eq!(
+            read_worktree_file_verified(
+                tmp.path(),
+                "gone.txt",
+                "0000000000000000000000000000000000000000"
+            ),
+            Err(ExpansionUnavailable::SideAbsent)
+        );
     }
 
     fn clone_repo(source: &Path, dest: &Path) {

@@ -7,7 +7,9 @@ use super::types::{
     ActivePrIdentityResponse, ActivePrSelectionMutationResponse,
     ActivePrSelectionProvenanceResponse, ActivePrSelectionResponse, AssociatedPrStatusEnvelope,
     AssociatedPrSummaryResponse, BranchRemoteStatus, CheckoutStatus, ConflictErrorResponse,
-    ConversationDiffResponse, ConversationGitStatusResponse, FileReviewState, GitBranchEntry,
+    ConversationDiffResponse, ConversationGitStatusResponse, DiffExpansionFile,
+    DiffExpansionRequest, DiffExpansionResponse, DiffExpansionSection, DiffExpansionSide,
+    DiffExpansionUnavailableReason, FileReviewState, GitBranchEntry,
     GitBranchesQuery, GitBranchesResponse, GitChangedPath, GitFileStatus, GitStatusCounts,
     MarkReviewedRequest, ObservedBranchSummaryResponse, PinAssociatedPrRequest,
     PrAutoFixContextResponse, PrFeedbackStatus, PrStatusResponse, PrUnavailableReason,
@@ -2135,6 +2137,112 @@ pub(crate) async fn get_active_pr_diff(
             Some(pr_number),
             checkout_status,
         ))
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?
+    .map(Json)
+}
+
+/// Cap on how many files one expansion request may resolve. The viewer asks
+/// only for files it has actually parsed, so this is a guard against a
+/// hand-crafted request, not a limit the UI is expected to reach.
+const MAX_EXPANSION_FILES: usize = 500;
+
+fn expansion_side_response(side: crate::git_ops::ExpansionSide) -> DiffExpansionSide {
+    use crate::git_ops::ExpansionUnavailable as U;
+    match side {
+        Ok(contents) => DiffExpansionSide::Available { contents },
+        Err(reason) => DiffExpansionSide::Unavailable {
+            reason: match reason {
+                U::SideAbsent => DiffExpansionUnavailableReason::SideAbsent,
+                U::Binary => DiffExpansionUnavailableReason::Binary,
+                U::TooLarge => DiffExpansionUnavailableReason::TooLarge,
+                U::ObjectMissing => DiffExpansionUnavailableReason::ObjectMissing,
+                U::OutsideWorktree => DiffExpansionUnavailableReason::OutsideWorktree,
+                U::ContentMoved => DiffExpansionUnavailableReason::ContentMoved,
+            },
+        },
+    }
+}
+
+/// `POST /api/conversations/:id/diff/expansion` — full file contents for the
+/// files in a diff, so the viewer can offer GitHub-style "show more context"
+/// around each hunk.
+///
+/// Read-only. Content is addressed by the object ids the diff recorded rather
+/// than by path, which is what prevents a file edited since the diff was
+/// captured from being rendered as though it were the diff's context. The one
+/// side without a stored blob — the working tree, for the uncommitted section
+/// — is hash-verified against the recorded id instead.
+pub(crate) async fn get_conversation_diff_expansion(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<DiffExpansionRequest>,
+) -> Result<Json<DiffExpansionResponse>, AppError> {
+    if request.files.len() > MAX_EXPANSION_FILES {
+        return Err(AppError::BadRequest(format!(
+            "Too many files in one expansion request ({} > {MAX_EXPANSION_FILES})",
+            request.files.len()
+        )));
+    }
+
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let worktree_path = match &conv.conv_mode {
+        ConvMode::Work { worktree_path, .. } | ConvMode::Branch { worktree_path, .. } => {
+            worktree_path.to_string()
+        }
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation is not in Work or Branch mode (no worktree to diff)".to_string(),
+            ));
+        }
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let wt = PathBuf::from(&worktree_path);
+        if !wt.exists() {
+            return Err(AppError::NotFound(format!(
+                "Worktree no longer exists: {worktree_path}"
+            )));
+        }
+
+        let files = request
+            .files
+            .into_iter()
+            .map(|file| {
+                let old_side = crate::git_ops::read_blob_by_oid(&wt, &file.prev_object_id);
+                // Committed diffs compare two commits, so both sides are stored
+                // blobs. The uncommitted section's new side is the working tree,
+                // whose content is generally not in the object database.
+                let new_side = match file.section {
+                    DiffExpansionSection::Committed => {
+                        crate::git_ops::read_blob_by_oid(&wt, &file.new_object_id)
+                    }
+                    DiffExpansionSection::Uncommitted => {
+                        crate::git_ops::read_worktree_file_verified(
+                            &wt,
+                            &file.path,
+                            &file.new_object_id,
+                        )
+                    }
+                };
+                DiffExpansionFile {
+                    path: file.path,
+                    prev_object_id: file.prev_object_id,
+                    new_object_id: file.new_object_id,
+                    old_side: expansion_side_response(old_side),
+                    new_side: expansion_side_response(new_side),
+                }
+            })
+            .collect();
+
+        Ok(DiffExpansionResponse { files })
     })
     .await
     .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?

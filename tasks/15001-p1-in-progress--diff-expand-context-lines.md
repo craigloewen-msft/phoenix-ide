@@ -69,7 +69,75 @@ file.
   consistent with `useReviewKeyboard`.
 - Expansion state resets on refresh/refetch (the underlying diff may have moved).
 
-### 4. Renderer-slot spike (do this first — it gates step 3's shape)
+### SPIKE RESULT (completed) — steps 1-3 above are SUPERSEDED
+
+`@pierre/diffs@1.2.0` **already implements hunk expansion natively.** Verified by
+running the real package:
+
+- `FileDiffMetadata.isPartial` is `false` exactly when `processFile` is given both
+  `oldFile` and `newFile` full contents. Then `additionLines`/`deletionLines` hold
+  the *entire* file, and `DiffHunksRenderer` sets `isExpandable: !fileDiff.isPartial`.
+- With that, Pierre renders clickable expanders in its hunk separators
+  (`hunkSeparators: 'line-info'`, the default Phoenix already uses) and wires
+  `onHunkExpand` → `expandHunk(hunkIndex, direction, count)` internally.
+  Shift-click expands the whole gap. `expansionLineCount` (default 100) tunes the
+  per-click chunk.
+- Confirmed empirically: the same patch parsed partial → `additionLines.length === 7`,
+  `isPartial: true`; parsed with contents → `additionLines.length === 40`,
+  `isPartial: false`, and hunk offsets (`additionLineIndex: 16` for
+  `additionStart: 17`) line up exactly with the real file.
+
+So **the hand-rolled splice layer in step 2 is unnecessary** — writing it would
+duplicate, less well, logic the pinned dependency already ships. Dropped.
+
+The real work is only: *give Pierre the full file contents*, safely.
+
+#### The correctness hazard this exposes (and how it is closed)
+
+Pierre trusts supplied contents blindly. Verified empirically: feeding contents
+that do not match the diff's base makes Pierre report `deletionStart: 17` while the
+line actually at that index is `line 12` — **silently wrong context, no error**. A
+naive "read the file from disk" implementation would hit this whenever the file
+changed after the diff was captured.
+
+Git already solves this: the `index <old>..<new>` line in every git diff carries
+blob OIDs, and Pierre parses them into `prevObjectId` / `newObjectId`. Content is
+therefore fetched **by OID, not by path+revision**:
+
+- old side: `git cat-file blob <prevObjectId>` — the OID *is* the content identity,
+  so a stale read is not representable.
+- new side: committed diffs resolve by OID the same way. For the uncommitted
+  section the new side is the working-tree file, whose blob may not be in the
+  object database, so the server reads the file and verifies `git hash-object`
+  equals `newObjectId`; a mismatch returns a typed not-expandable outcome instead
+  of wrong content.
+
+That makes "expanded context that doesn't match the diff" structurally impossible
+rather than something a reviewer must notice.
+
+(Checked and cleared: Phoenix's `git_command()` already pins `diff.mnemonicPrefix=false`
+and `a/`+`b/` prefixes, so the `c/`..`w/` prefixes a user's global
+`diff.mnemonicPrefix=true` would otherwise produce — which crash Pierre's parser —
+cannot reach the viewer.)
+
+### Revised implementation
+
+1. **Backend**: one read-only conversation-scoped endpoint resolving a batch of
+   `(path, prevObjectId, newObjectId)` to old/new file contents by OID, with the
+   working-tree hash verification above. Binary, oversized, added/deleted, and
+   hash-mismatch cases each return a typed non-expandable reason.
+2. **Frontend**: `pierreDiffMapping` gains a pure hydration step that re-parses a
+   file's diff chunk through `processFile` with fetched contents, yielding a
+   non-partial item. Pierre then renders and drives expansion itself.
+3. **Wiring**: `PhoenixDiffCodeView` stays the only Pierre boundary; hydration is
+   fetched once per diff load, skipped for truncated sections (expansion there
+   would lie), and the item `version` bump carries hydrated content through
+   Pierre's controlled reconciler.
+
+No DOM scraping, no bespoke diff splicing, and note/find/keyboard anchoring is
+untouched because line numbers come from the same parse as before.
+
+### 4. Original renderer-slot spike plan (superseded by the result above)
 
 `@pierre/diffs@1.2.0` is pinned and its render slots in use are
 `renderAnnotation` / `renderHeaderPrefix` / `renderHeaderMetadata` /

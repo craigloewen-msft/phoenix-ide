@@ -1148,6 +1148,73 @@ pub struct ConversationDiffResponse {
     pub uncommitted_saturated: bool,
 }
 
+/// One file's content for diff context expansion, keyed by the object ids the
+/// diff itself recorded. The viewer matches these back to its parsed files by
+/// `(path, prev_object_id, new_object_id)`, so a response can never be applied
+/// to a file it wasn't fetched for.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct DiffExpansionFile {
+    pub path: String,
+    pub prev_object_id: String,
+    pub new_object_id: String,
+    /// Old-side content, or the reason it is unavailable.
+    pub old_side: DiffExpansionSide,
+    /// New-side content, or the reason it is unavailable.
+    pub new_side: DiffExpansionSide,
+}
+
+/// Either a file side's full text, or a typed reason there isn't one.
+///
+/// A reason is a normal outcome (binary file, added/deleted side, content moved
+/// on), not an error — the viewer renders the diff without expansion for that
+/// file. Encoding it as a tagged union keeps "absent" from being confusable
+/// with "empty file".
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DiffExpansionSide {
+    Available { contents: String },
+    Unavailable { reason: DiffExpansionUnavailableReason },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffExpansionUnavailableReason {
+    SideAbsent,
+    Binary,
+    TooLarge,
+    ObjectMissing,
+    OutsideWorktree,
+    ContentMoved,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiffExpansionRequest {
+    pub files: Vec<DiffExpansionFileRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiffExpansionFileRequest {
+    pub path: String,
+    pub prev_object_id: String,
+    pub new_object_id: String,
+    /// Which diff section the file came from. The uncommitted section's new
+    /// side is the working tree rather than a stored blob, so the resolution
+    /// route differs and the caller must say which one it means.
+    pub section: DiffExpansionSection,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffExpansionSection {
+    Committed,
+    Uncommitted,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiffExpansionResponse {
+    pub files: Vec<DiffExpansionFile>,
+}
+
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PrUnavailableReason {
