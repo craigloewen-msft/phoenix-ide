@@ -226,7 +226,7 @@ describe('DiffView keyboard review', () => {
     );
   });
 
-  it('shows the pending count while it is being typed', async () => {
+  it('keeps a typed count out of the UI entirely', async () => {
     const { value } = harness([entry('a.ts', { kind: 'unreviewed' })]);
     renderDiff(value);
     await screen.findByTestId('codeview-mock');
@@ -234,7 +234,13 @@ describe('DiffView keyboard review', () => {
     press('4');
     press('2');
 
-    expect(await screen.findByRole('status')).toHaveTextContent('42');
+    // The count is armed but never painted: no banner, no status region.
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+
+    // ...and it still drives the next annotate command.
+    press('c');
+    await screen.findByPlaceholderText(/Add your note/);
+    expect(screen.getByText('a.ts:42')).toBeInTheDocument();
   });
 
   it('explains rather than silently ignoring a line that is not in the diff', async () => {

@@ -40,7 +40,7 @@ import { useRefreshOnWindowFocus } from './useRefreshOnWindowFocus';
 import type { ReviewCommand } from './reviewKeymap';
 import { useDiffStyle } from './useDiffStyle';
 import { DiffStyleToggleButton, ReviewFocusToggleButton } from './DiffHeaderControls';
-import { ReviewCountIndicator, ReviewKeyboardNotice } from './ReviewCountIndicator';
+import { ReviewKeyboardNotice } from './ReviewKeyboardNotice';
 import './DiffView.css';
 
 export interface DiffViewProps {
@@ -345,7 +345,7 @@ export function DiffView({
     [cursorFile, cursorIndex, files, manifestEntryFor, moveCursorTo, notes, onClose, refresh, toggleReviewed],
   );
 
-  const { pendingCount } = useReviewKeyboard({
+  useReviewKeyboard({
     scopeId: 'diff-viewer',
     id: 'diff-view',
     onCommand: runCommand,
@@ -416,10 +416,6 @@ export function DiffView({
           onClose={closeFind}
           autoFocus
         />
-      ) : pendingCount !== null ? (
-        // The live count outranks a notice from an earlier key: it is what the
-        // reviewer is typing right now.
-        <ReviewCountIndicator count={pendingCount} />
       ) : keyboardNotice ? (
         <ReviewKeyboardNotice notice={keyboardNotice} />
       ) : undefined}

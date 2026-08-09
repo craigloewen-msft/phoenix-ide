@@ -135,10 +135,22 @@ THE SYSTEM SHALL offer a diff restricted to the changes made after that checkpoi
 AND SHALL report an error, rather than substituting the full diff, when a
   since-review diff is requested for a file with no checkpoint
 
+WHEN the user chooses the since-review diff
+THE SYSTEM SHALL treat that choice as a standing preference across the files
+  they subsequently open
+AND SHALL render the full diff for a file with no checkpoint without discarding
+  that preference
+
 **Design:** This is the requirement the whole loop exists to serve: after asking
 for fixes, the user reads the delta, not the file again. Silently widening the
 scope to the full diff would answer a different question than the one asked, and
 the user would have no way to tell that had happened.
+
+"Show me only what is new" is an intent for a whole review pass, not for one
+file: a reviewer walking the changed-files list is asking the same question of
+every file. Resetting per file would make them re-state it at each step. A file
+with no checkpoint cannot answer that question, so it shows the full diff — but
+it answers for itself only, and does not speak for the next file.
 
 ---
 
@@ -191,8 +203,12 @@ AND SHALL apply those commands to the whole-branch diff and the per-file review
   diff alike
 
 WHILE the user types digits on a review surface
-THE SYSTEM SHALL accumulate them into a count, display the count on that
-  surface, and apply it to the next command that takes one
+THE SYSTEM SHALL accumulate them into a count and apply it to the next command
+  that takes one
+
+WHEN a pending count or held prefix is not completed within the review prefix
+  timeout
+THE SYSTEM SHALL discard it
 
 WHEN a key that takes no count is pressed
 THE SYSTEM SHALL discard the count
@@ -226,10 +242,12 @@ screen with its number printed beside it; typing that number is a shorter path
 than hunting for the line's gutter affordance. Borrowing vim's count semantics
 means the behaviour is already known to the audience that wants it.
 
-A count is displayed because it changes what the next key does. A held multi-key
-prefix expires on its own so a forgotten `g` cannot swallow a later key, but a
-count does not: it is on screen, so the reviewer knows it is armed, and having it
-evaporate mid-type would be the surprise.
+A count is not displayed. The line number is already printed in the gutter
+beside the line the reviewer is looking at, so echoing the digits back adds a
+banner that shifts the diff while they type without telling them anything the
+screen does not already show. Because the count is therefore invisible, it
+expires on the same timeout a held multi-key prefix does: unseen modal state
+that never lapses would silently change what a key pressed much later means.
 
 Marking advances because it is the act that completes a file; un-marking is a
 correction to the file in front of the user, so moving away from it would discard

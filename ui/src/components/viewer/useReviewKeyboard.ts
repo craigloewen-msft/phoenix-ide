@@ -2,16 +2,17 @@
  * useReviewKeyboard - the React shell around the pure review keymap.
  *
  * Owns only what the resolver cannot: the pending state (a held multi-key
- * prefix or a typed count) and the prefix's expiry timer. Everything about
- * *meaning* lives in `reviewKeymap.ts`; this hook routes the resolved command
- * to the surface's handlers.
+ * prefix or a typed count) and its expiry timer. Everything about *meaning*
+ * lives in `reviewKeymap.ts`; this hook routes the resolved command to the
+ * surface's handlers. The pending state never renders, so it is a ref and the
+ * hook returns nothing.
  *
  * Registration goes through the shared keyboard router rather than a raw
  * window listener, so a review surface only owns these keys while it is the
  * topmost scope and no text field has focus.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { useKeyboardRouterShortcut } from '../../hooks/useFocusScope';
 import {
   REVIEW_PENDING_NONE,
@@ -33,30 +34,22 @@ export interface UseReviewKeyboardOptions {
   dialogOpen?: boolean;
 }
 
-export interface UseReviewKeyboardResult {
-  /** The count typed so far, for the surface to display. A count is modal
-   *  state, and modal state the user cannot see is a trap. */
-  pendingCount: number | null;
-}
-
 export function useReviewKeyboard({
   scopeId,
   id,
   onCommand,
   enabled = true,
   dialogOpen = false,
-}: UseReviewKeyboardOptions): UseReviewKeyboardResult {
-  // The ref is what the (non-reactive) key handler reads; the state exists only
-  // to render the count. Both are written together in `setPending`.
+}: UseReviewKeyboardOptions): void {
+  // The key handler is non-reactive, so the pending prefix/count lives in a ref
+  // rather than state: nothing renders from it.
   const pendingRef = useRef<ReviewPending>(REVIEW_PENDING_NONE);
-  const [pendingCount, setPendingCount] = useState<number | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const setPending = useCallback((next: ReviewPending) => {
     if (timerRef.current) clearTimeout(timerRef.current);
     timerRef.current = undefined;
     pendingRef.current = next;
-    setPendingCount(next.count);
   }, []);
 
   const clearPending = useCallback(() => setPending(REVIEW_PENDING_NONE), [setPending]);
@@ -76,12 +69,10 @@ export function useReviewKeyboard({
 
       if (resolution.kind === 'pending') {
         setPending(resolution.pending);
-        // A held prefix expires so a forgotten `g` doesn't swallow the next key
-        // minutes later. A count does not: it is visible on screen, so it
-        // vanishing under the reviewer mid-type would be the surprise.
-        if (resolution.pending.prefix !== null) {
-          timerRef.current = setTimeout(clearPending, REVIEW_PREFIX_TIMEOUT_MS);
-        }
+        // Neither a held prefix nor a typed count is visible on screen, so both
+        // expire: a forgotten `g` or a half-typed line number must not silently
+        // change what a key pressed minutes later does.
+        timerRef.current = setTimeout(clearPending, REVIEW_PREFIX_TIMEOUT_MS);
         return;
       }
       onCommand(resolution.command);
@@ -109,6 +100,4 @@ export function useReviewKeyboard({
   useEffect(() => {
     if (dialogOpen || !enabled) clearPending();
   }, [clearPending, dialogOpen, enabled]);
-
-  return { pendingCount };
 }

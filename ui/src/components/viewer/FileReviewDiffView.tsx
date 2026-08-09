@@ -22,8 +22,9 @@ import type { ReviewCommand } from './reviewKeymap';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
 import { useDiffStyle } from './useDiffStyle';
 import { DiffStyleToggleButton, ReviewFocusToggleButton } from './DiffHeaderControls';
-import { ReviewCountIndicator, ReviewKeyboardNotice } from './ReviewCountIndicator';
-import { api, type FileReviewState, type ReviewDiffScope, type ReviewFileDiffResponse } from '../../api';
+import { ReviewKeyboardNotice } from './ReviewKeyboardNotice';
+import { useReviewDiffScope } from './useReviewDiffScope';
+import { api, type FileReviewState, type ReviewFileDiffResponse } from '../../api';
 import './FileReviewDiffView.css';
 
 export interface FileReviewDiffViewProps {
@@ -94,7 +95,12 @@ export function FileReviewDiffView({
   const { diffNotes } = notes;
   const codeViewRef = useRef<React.ComponentRef<typeof PhoenixDiffCodeView>>(null);
 
-  const [scope, setScope] = useState<ReviewDiffScope>('full');
+  const { scopePreference, toggleScopePreference } = useReviewDiffScope();
+  // A file with no checkpoint has no "since review" to show. Deriving the
+  // effective scope rather than writing the preference back means such a file
+  // renders the full diff without discarding the reviewer's standing choice.
+  const hasCheckpoint = review.kind !== 'unreviewed';
+  const scope = scopePreference === 'since_review' && hasCheckpoint ? 'since_review' : 'full';
   // The single rendered file's structural item id, published by the wrapper's
   // parse. Reconstructing it from `path` would duplicate the id scheme; a
   // renamed file would then silently miss.
@@ -129,13 +135,6 @@ export function FileReviewDiffView({
       });
     return () => controller.abort();
   }, [conversationId, path, scope, reviewedBlob, reloadToken]);
-
-  // A file with no checkpoint has no "since review" to show; fall back rather
-  // than leave the user on a scope the server will reject.
-  const hasCheckpoint = review.kind !== 'unreviewed';
-  useEffect(() => {
-    if (scope === 'since_review' && !hasCheckpoint) setScope('full');
-  }, [scope, hasCheckpoint]);
 
   const handleMark = useCallback(async () => {
     if (!data) return;
@@ -211,7 +210,7 @@ export function FileReviewDiffView({
     [itemId, notes, onClose, onNextFile, onNextUnreviewed, onPreviousFile, path, refresh, toggleReviewed],
   );
 
-  const { pendingCount } = useReviewKeyboard({
+  useReviewKeyboard({
     scopeId: FILE_REVIEW_SCOPE,
     id: 'file-review-diff',
     onCommand: runCommand,
@@ -232,13 +231,7 @@ export function FileReviewDiffView({
         </span>
       }
       titleTooltip={absolutePath}
-      banner={pendingCount !== null ? (
-        // The live count outranks a notice from an earlier key: it is what the
-        // reviewer is typing right now.
-        <ReviewCountIndicator count={pendingCount} />
-      ) : keyboardNotice ? (
-        <ReviewKeyboardNotice notice={keyboardNotice} />
-      ) : undefined}
+      banner={keyboardNotice ? <ReviewKeyboardNotice notice={keyboardNotice} /> : undefined}
       headerExtras={
         <>
           <div className="frd-modes" role="group" aria-label="File view mode">
@@ -255,7 +248,7 @@ export function FileReviewDiffView({
             <button
               type="button"
               className="viewer-shell-btn"
-              onClick={() => setScope((s) => (s === 'full' ? 'since_review' : 'full'))}
+              onClick={toggleScopePreference}
               title={scope === 'full' ? 'Show only what changed since you reviewed' : 'Show the full diff'}
             >
               {scope === 'full' ? 'Since review' : 'Full diff'}
