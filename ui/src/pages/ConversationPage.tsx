@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, MessageSliceAlignmentError, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, MessageSliceAlignmentError, type Conversation, type FileAttachment, type ImageData, type Message, type TaskFeedbackNote } from '../api';
 import { refreshModels } from '../modelsPoller';
 import {
   canCancelConversationState,
@@ -1720,10 +1720,10 @@ function ConversationPageContent({
     }
   };
 
-  const handleTaskFeedback = async (annotations: string) => {
+  const handleTaskFeedback = async (notes: readonly TaskFeedbackNote[]) => {
     if (!conversationId || isArchived) return;
     try {
-      await api.sendTaskFeedback(conversationId, annotations);
+      await api.sendTaskFeedback(conversationId, notes);
     } catch (err) {
       console.error('Failed to send task feedback:', err);
     }
@@ -2844,6 +2844,7 @@ function ConversationPageContent({
             title={atom.phase.title}
             priority={atom.phase.priority}
             plan={atom.phase.plan}
+            conversationId={conversationId ?? undefined}
             contextWindowUsed={approvalContextWindowUsed ?? undefined}
             modelContextWindow={actualModelContextWindow ?? undefined}
             approvalError={taskApprovalError}

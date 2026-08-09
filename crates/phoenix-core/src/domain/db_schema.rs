@@ -651,6 +651,45 @@ pub struct ForkProposal {
     pub resolved_at: Option<DateTime<Utc>>,
 }
 
+/// One version of a task plan submitted for human review (REQ-PF-018).
+///
+/// A row is written each time a conversation enters `AwaitingTaskApproval`, so
+/// the sequence of rows for a conversation is the review history of that
+/// conversation's plan. `ordinal` is the 1-based proposal number within the
+/// conversation and gives the revisions a total order independent of clock skew.
+///
+/// The plan approval reader diffs the current proposal against the previous
+/// revision; `notes` are the annotations the reviewer sent on *this* revision,
+/// which the reader replays against the next revision to show which comments a
+/// change addressed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskPlanRevision {
+    pub id: String,
+    pub conversation_id: String,
+    /// 1-based proposal number within the conversation.
+    pub ordinal: i64,
+    pub task_file: String,
+    pub title: String,
+    pub priority: String,
+    /// The plan body exactly as the reviewer saw it.
+    pub plan: String,
+    pub proposed_at: DateTime<Utc>,
+    /// Annotations the reviewer sent as feedback on this revision, in the order
+    /// they were added. Empty until (and unless) the reviewer requests changes.
+    pub notes: Vec<TaskPlanRevisionNote>,
+}
+
+/// A single reviewer annotation anchored to a line of a [`TaskPlanRevision`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskPlanRevisionNote {
+    /// 1-based line number within the revision's plan text.
+    pub line_number: i64,
+    /// The plan line the note was anchored to, captured at annotation time.
+    pub line_content: String,
+    /// The reviewer's comment.
+    pub note: String,
+}
+
 /// Error classification for UI display.
 ///
 /// No `Unknown` variant. Every error gets an explicit, intentional classification.

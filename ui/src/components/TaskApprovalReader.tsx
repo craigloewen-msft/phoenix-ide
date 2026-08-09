@@ -19,7 +19,10 @@ import remarkGfm from 'remark-gfm';
 import { SyntaxHighlighter, oneDark } from '../utils/syntaxHighlighter';
 import { MermaidDiagram } from './MermaidDiagram';
 import { generateUUID } from '../utils/uuid';
-import type { TaskApprovalHandoff } from '../api';
+import type { TaskApprovalHandoff, TaskFeedbackNote, PlanDiffBaseline } from '../api';
+import { api } from '../api';
+import { computePlanDiff, type PlanDiff } from './taskApproval/planDiff';
+import './taskApproval/planDiff.css';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import {
   FindBar,
@@ -40,9 +43,37 @@ import {
   Trash2,
   Send,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Check,
   Loader2,
+  GitCompare,
 } from 'lucide-react';
+
+/**
+ * Remembered `Plan diff` toggle choice. Persisted per-browser so a reviewer who
+ * has turned the diff off stays off across revisions within a review session.
+ */
+const PLAN_DIFF_PREF_KEY = 'phoenix.planDiff.enabled';
+
+function readPlanDiffPreference(): boolean | null {
+  try {
+    const raw = window.localStorage.getItem(PLAN_DIFF_PREF_KEY);
+    if (raw === 'true') return true;
+    if (raw === 'false') return false;
+  } catch {
+    // Private-mode or blocked storage: fall back to the computed default.
+  }
+  return null;
+}
+
+function writePlanDiffPreference(enabled: boolean): void {
+  try {
+    window.localStorage.setItem(PLAN_DIFF_PREF_KEY, String(enabled));
+  } catch {
+    // Preference is a convenience; failing to persist it must not break review.
+  }
+}
 
 // Reuse ReviewNote type shape
 interface ReviewNote {
@@ -75,12 +106,18 @@ export interface TaskApprovalReaderProps {
   title: string;
   priority: string;
   plan: string;
+  /**
+   * Conversation whose plan revision history supplies the diff baseline
+   * (REQ-PF-018). Omitted in fixtures/stories that render the reader without a
+   * live conversation — the diff affordance is then simply absent.
+   */
+  conversationId?: string | undefined;
   contextWindowUsed?: number | undefined;
   modelContextWindow?: number | undefined;
   approvalError?: string | null | undefined;
   onApprove: (handoff: TaskApprovalHandoff) => void;
   onReject: () => void;
-  onSendFeedback: (annotations: string) => void;
+  onSendFeedback: (notes: readonly TaskFeedbackNote[]) => void;
 }
 
 // Long-press hook (same as ProseReader)
@@ -306,10 +343,58 @@ function decorateFindChildren(
   return decorate(children);
 }
 
+/**
+ * Wrap the inserted ranges of a changed block in change marks, reusing the
+ * find-decoration walk so marks land on text nodes inside inline markup rather
+ * than replacing the rendered children wholesale.
+ */
+function decorateDiffChildren(
+  children: React.ReactNode,
+  insertions: readonly { start: number; end: number }[],
+): React.ReactNode {
+  if (insertions.length === 0) return children;
+  let cursor = 0;
+  const decorate = (node: React.ReactNode): React.ReactNode => Children.map(node, (child) => {
+    if (typeof child === 'string' || typeof child === 'number') {
+      const text = String(child);
+      const start = cursor;
+      cursor += text.length;
+      const local = insertions
+        .filter((range) => range.start < cursor && range.end > start)
+        .map((range) => ({
+          start: Math.max(0, range.start - start),
+          end: Math.min(text.length, range.end - start),
+        }));
+      if (local.length === 0) return child;
+      const fragments: React.ReactNode[] = [];
+      let offset = 0;
+      local.forEach((range) => {
+        if (range.start > offset) fragments.push(text.slice(offset, range.start));
+        fragments.push(
+          <ins key={`${range.start}-${range.end}`} className="plan-diff-ins">
+            {text.slice(range.start, range.end)}
+          </ins>,
+        );
+        offset = range.end;
+      });
+      if (offset < text.length) fragments.push(text.slice(offset));
+      return fragments;
+    }
+    if (!isValidElement<{ children?: React.ReactNode; node?: { tagName?: string; type?: string } }>(child)) return child;
+    if (!isDecoratableInlineElement(child)) {
+      cursor += renderedInlineTextLength(child.props.children);
+      return child;
+    }
+    return cloneElement(child, {}, decorate(child.props.children));
+  });
+  return decorate(children);
+}
+
 export function TaskApprovalReader({
   title,
   priority,
   plan,
+  conversationId,
   contextWindowUsed,
   modelContextWindow,
   approvalError,
@@ -329,6 +414,9 @@ export function TaskApprovalReader({
   const [showNotesPanel, setShowNotesPanel] = useState(false);
   const [highlightedLine, setHighlightedLine] = useState<number | null>(null);
   const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false);
+  const [baseline, setBaseline] = useState<PlanDiffBaseline | null>(null);
+  const [diffEnabled, setDiffEnabled] = useState<boolean | null>(readPlanDiffPreference);
+  const [activeChangeIndex, setActiveChangeIndex] = useState(0);
   const hasUnsentNotes = notes.length > 0;
   const noteCountLabel = `${notes.length} note${notes.length !== 1 ? 's' : ''}`;
 
@@ -343,7 +431,92 @@ export function TaskApprovalReader({
     ? getTaskApprovalContextRecommendation(contextUsage)
     : null;
 
+  const toggleDiff = useCallback(() => {
+    setDiffEnabled((prev) => {
+      const next = !(prev ?? true);
+      writePlanDiffPreference(next);
+      return next;
+    });
+  }, []);
+
   const markdownDisplayBlocks = useMemo(() => buildMarkdownDisplayBlocks(plan), [plan]);
+
+  // Fetch the plan the reviewer last saw. A 204 (first proposal) leaves
+  // `baseline` null, which is what withholds the diff affordance entirely.
+  useEffect(() => {
+    if (!conversationId) return undefined;
+    let cancelled = false;
+    void api
+      .getPlanDiffBaseline(conversationId)
+      .then((result) => {
+        if (!cancelled) setBaseline(result);
+      })
+      .catch((err: unknown) => {
+        // A missing baseline degrades to today's plain reader; it must never
+        // block the approval decision.
+        console.warn('Failed to load plan diff baseline:', err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationId, plan]);
+
+  const planDiff: PlanDiff | null = useMemo(
+    () => (baseline ? computePlanDiff(baseline.plan, plan, baseline.notes.map((n) => ({
+      lineNumber: n.line_number,
+      lineContent: n.line_content,
+      note: n.note,
+    }))) : null),
+    [baseline, plan],
+  );
+
+  // Default on when there is something to see: the value of the diff is lost if
+  // the reviewer has to go looking for it. An explicit prior choice wins.
+  const hasDiff = planDiff !== null && planDiff.changeCount > 0;
+  const showDiff = hasDiff && (diffEnabled ?? true);
+
+  const diffBlocksById = useMemo(() => {
+    const map = new Map<string, PlanDiff['blocks'][number]>();
+    if (showDiff && planDiff) {
+      for (const block of planDiff.blocks) map.set(block.blockId, block);
+    }
+    return map;
+  }, [planDiff, showDiff]);
+
+  const diffNotesByBlockId = useMemo(() => {
+    const map = new Map<string, PlanDiff['notes']>();
+    if (showDiff && planDiff) {
+      for (const note of planDiff.notes) {
+        if (!note.blockId) continue;
+        const bucket = map.get(note.blockId);
+        if (bucket) bucket.push(note);
+        else map.set(note.blockId, [note]);
+      }
+    }
+    return map;
+  }, [planDiff, showDiff]);
+
+  const removalsByBlockId = useMemo(() => {
+    const map = new Map<string, PlanDiff['removals']>();
+    if (showDiff && planDiff) {
+      for (const removal of planDiff.removals) {
+        if (!removal.beforeBlockId) continue;
+        const bucket = map.get(removal.beforeBlockId);
+        if (bucket) bucket.push(removal);
+        else map.set(removal.beforeBlockId, [removal]);
+      }
+    }
+    return map;
+  }, [planDiff, showDiff]);
+
+  /** Changed blocks in document order — the jump-to-next-change itinerary. */
+  const changedBlockIds = useMemo(
+    () =>
+      showDiff && planDiff
+        ? planDiff.blocks.filter((b) => b.status !== 'unchanged').map((b) => b.blockId)
+        : [],
+    [planDiff, showDiff],
+  );
   const findablePlanBlocks = useMemo(
     () => markdownDisplayBlocks.map((block) => ({ id: block.id, lineNumber: block.lineNumber, text: block.searchableText })),
     [markdownDisplayBlocks],
@@ -488,12 +661,24 @@ export function TaskApprovalReader({
       }
       if (annotatingLine && (e.ctrlKey || e.metaKey) && e.key === 'Enter') {
         handleAddNote();
+        return;
+      }
+      // `d` toggles the diff, but only when no text-entry surface owns the key.
+      if (
+        e.key === 'd'
+        && !e.ctrlKey && !e.metaKey && !e.altKey
+        && !annotatingLine && !discardConfirmOpen && !findOpen
+        && !(document.activeElement instanceof HTMLInputElement)
+        && !(document.activeElement instanceof HTMLTextAreaElement)
+      ) {
+        e.preventDefault();
+        toggleDiff();
       }
     };
 
     window.addEventListener('keydown', handleKeyDown, true);
     return () => window.removeEventListener('keydown', handleKeyDown, true);
-  }, [annotatingLine, closeFind, discardConfirmOpen, findOpen, handleAddNote]);
+  }, [annotatingLine, closeFind, discardConfirmOpen, findOpen, handleAddNote, toggleDiff]);
 
   useViewerFindKeyboardShortcut({
     scopeId: 'task-approval',
@@ -512,20 +697,35 @@ export function TaskApprovalReader({
   const handleFindNext = useCallback(() => sendFind({ type: 'next' }), [sendFind]);
   const handleFindPrevious = useCallback(() => sendFind({ type: 'previous' }), [sendFind]);
 
-  // Format and send notes (REQ-PF-009 format)
+  // Send the annotations structurally; the LLM-facing prose is rendered
+  // server-side so the agent's message and the persisted review record (which
+  // the next revision's diff replays) cannot drift apart.
   const handleSendFeedback = useCallback(() => {
     if (notes.length === 0) return;
 
-    const formatted =
-      `Review notes for \`task\`:\n\n` +
-      notes
-        .map((n) => `> Line ${n.lineNumber}: \`${n.lineContent}\`\n${n.note}`)
-        .join('\n\n');
-
-    onSendFeedback(formatted);
+    onSendFeedback(
+      notes.map((n) => ({
+        line_number: n.lineNumber,
+        line_content: n.lineContent,
+        note: n.note,
+      })),
+    );
     setNotes([]);
     setShowNotesPanel(false);
   }, [notes, onSendFeedback]);
+
+  /** Scroll the nth changed block into view and flash it. */
+  const jumpToChange = useCallback(
+    (delta: number) => {
+      if (changedBlockIds.length === 0) return;
+      const next =
+        (activeChangeIndex + delta + changedBlockIds.length) % changedBlockIds.length;
+      setActiveChangeIndex(next);
+      const element = blockRefs.current.get(changedBlockIds[next]!);
+      element?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    },
+    [activeChangeIndex, changedBlockIds],
+  );
 
   const handleDiscard = useCallback(() => {
     setDiscardConfirmOpen(true);
@@ -597,13 +797,32 @@ export function TaskApprovalReader({
         const blockId = claimDisplayBlock(ln, node?.position?.start?.offset, kind);
         const blockMatches = matchesByBlockId.get(blockId) ?? [];
         const shouldDecorateChildren = decorateChildren && blockMatches.length > 0;
-        return (
+        const diffBlock = diffBlocksById.get(blockId);
+        const blockRemovals = removalsByBlockId.get(blockId) ?? [];
+        const blockNotes = diffNotesByBlockId.get(blockId) ?? [];
+        const isActiveChange =
+          changedBlockIds[activeChangeIndex] === blockId && changedBlockIds.length > 0;
+        // Find highlighting wins over change marks when both apply: the reviewer
+        // asked for the search, so it is the more specific intent.
+        const body = shouldDecorateChildren
+          ? decorateFindChildren(children, blockMatches, activeFindIndex)
+          : diffBlock && decorateChildren
+            ? decorateDiffChildren(children, diffBlock.insertions)
+            : children;
+        const rendered = (
           <AnnotatableBlock
             as={Tag}
             lineNumber={ln}
             lineContent={rawLineContent}
             onAnnotate={handleLongPress}
-            className="viewer-markdown-block"
+            className={[
+              'viewer-markdown-block',
+              showDiff && 'plan-diff-active',
+              diffBlock && `plan-diff-block--${diffBlock.status}`,
+              isActiveChange && 'plan-diff-block--current',
+            ]
+              .filter(Boolean)
+              .join(' ')}
             isHighlighted={highlightedLine === ln}
             lineRef={(el) => {
               if (el) {
@@ -616,10 +835,40 @@ export function TaskApprovalReader({
             }}
             {...props}
           >
-            {shouldDecorateChildren
-              ? decorateFindChildren(children, blockMatches, activeFindIndex)
-              : children}
+            {body}
+            {diffBlock && diffBlock.deletions.length > 0 && (
+              <span className="plan-diff-deletions">
+                {diffBlock.deletions.map((text, index) => (
+                  <del key={index} className="plan-diff-del">{text}</del>
+                ))}
+              </span>
+            )}
+            {blockNotes.length > 0 && (
+              <span className="plan-diff-notes">
+                {blockNotes.map((note, index) => (
+                  <span
+                    key={index}
+                    className={`plan-diff-note plan-diff-note--${note.status}`}
+                    title={`Your note: ${note.note}`}
+                  >
+                    <MessageSquare size={12} />
+                    {note.status === 'touched' ? 'addressed here' : 'not changed'}
+                  </span>
+                ))}
+              </span>
+            )}
           </AnnotatableBlock>
+        );
+        if (blockRemovals.length === 0) return rendered;
+        return (
+          <>
+            {blockRemovals.map((removal, index) => (
+              <div key={index} className="plan-diff-removed-block">
+                <del>{removal.text}</del>
+              </div>
+            ))}
+            {rendered}
+          </>
         );
       };
 
@@ -712,7 +961,7 @@ export function TaskApprovalReader({
         {plan}
       </ReactMarkdown>
     );
-  }, [plan, highlightedLine, handleLongPress, findProjection.matches, activeFindIndex, markdownDisplayBlocks, registerBlockRef]);
+  }, [plan, highlightedLine, handleLongPress, findProjection.matches, activeFindIndex, markdownDisplayBlocks, registerBlockRef, diffBlocksById, removalsByBlockId, diffNotesByBlockId, changedBlockIds, activeChangeIndex, showDiff]);
 
   return (
     <div className="task-approval-reader">
@@ -723,6 +972,49 @@ export function TaskApprovalReader({
           <span className="task-approval-priority">{priority}</span>
         </div>
         <div className="task-approval-header-actions">
+          {hasDiff && (
+            <>
+              <button
+                className={`task-approval-badge plan-diff-toggle${showDiff ? ' plan-diff-toggle--on' : ''}`}
+                onClick={toggleDiff}
+                aria-pressed={showDiff}
+                aria-label={showDiff ? 'Hide plan diff' : 'Show plan diff'}
+                title={
+                  showDiff
+                    ? 'Hide what changed since your last review'
+                    : 'Show what changed since your last review'
+                }
+              >
+                <GitCompare size={16} />
+                <span>
+                  {planDiff!.changeCount} change{planDiff!.changeCount === 1 ? '' : 's'}
+                </span>
+              </button>
+              {showDiff && changedBlockIds.length > 0 && (
+                <span className="plan-diff-nav">
+                  <button
+                    className="task-approval-badge"
+                    onClick={() => jumpToChange(-1)}
+                    aria-label="Previous change"
+                    title="Previous change"
+                  >
+                    <ChevronLeft size={16} />
+                  </button>
+                  <span className="plan-diff-nav__position">
+                    {activeChangeIndex + 1}/{changedBlockIds.length}
+                  </span>
+                  <button
+                    className="task-approval-badge"
+                    onClick={() => jumpToChange(1)}
+                    aria-label="Next change"
+                    title="Next change"
+                  >
+                    <ChevronRight size={16} />
+                  </button>
+                </span>
+              )}
+            </>
+          )}
           {notes.length > 0 && (
             <button
               className="task-approval-badge"
@@ -768,7 +1060,7 @@ export function TaskApprovalReader({
       )}
 
       {/* Plan content */}
-      <div className="task-approval-content">
+      <div className={`task-approval-content${showDiff ? ' task-approval-content--diffing' : ''}`}>
         <div className="viewer-markdown">{renderPlanMarkdown}</div>
       </div>
 

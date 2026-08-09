@@ -718,10 +718,45 @@ pub struct TaskApprovalRequest {
     pub handoff: crate::state_machine::state::TaskApprovalHandoff,
 }
 
-/// Request to provide feedback on a proposed task plan
+/// Request to provide feedback on a proposed task plan.
+///
+/// Carries the reviewer's annotations structurally. The LLM-bound prose is
+/// rendered from these server-side (see `format_task_feedback`) rather than
+/// being sent alongside them: one value, one representation, no way for the
+/// prose and the persisted review record to disagree.
 #[derive(Debug, Deserialize)]
 pub struct TaskFeedbackRequest {
-    pub annotations: String,
+    pub notes: Vec<TaskFeedbackNote>,
+}
+
+/// One reviewer annotation anchored to a line of the plan under review.
+#[derive(Debug, Deserialize)]
+pub struct TaskFeedbackNote {
+    pub line_number: i64,
+    pub line_content: String,
+    pub note: String,
+}
+
+/// The plan revision the reviewer saw before the current proposal — the diff
+/// baseline for the plan approval reader (REQ-PF-018).
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct PlanDiffBaseline {
+    /// 1-based proposal number of the baseline revision within the conversation.
+    pub ordinal: i64,
+    /// The plan text as the reviewer saw it.
+    pub plan: String,
+    /// The annotations the reviewer sent on that revision.
+    pub notes: Vec<PlanDiffBaselineNote>,
+}
+
+/// One reviewer annotation from the baseline revision.
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct PlanDiffBaselineNote {
+    pub line_number: i64,
+    pub line_content: String,
+    pub note: String,
 }
 
 /// Response for task approval actions

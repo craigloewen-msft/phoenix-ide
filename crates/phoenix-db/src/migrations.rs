@@ -321,7 +321,37 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_work_scope_review_checkpoints",
         sql: MIGRATION_061,
     },
+    Migration {
+        version: 62,
+        name: "create_task_plan_revisions",
+        sql: MIGRATION_062,
+    },
 ];
+
+const MIGRATION_062: &str = r"
+CREATE TABLE IF NOT EXISTS task_plan_revisions (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 1),
+    task_file TEXT NOT NULL,
+    title TEXT NOT NULL,
+    priority TEXT NOT NULL,
+    plan TEXT NOT NULL,
+    proposed_at TEXT NOT NULL,
+    UNIQUE (conversation_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_task_plan_revisions_conversation
+    ON task_plan_revisions(conversation_id, ordinal);
+
+CREATE TABLE IF NOT EXISTS task_plan_revision_notes (
+    revision_id TEXT NOT NULL REFERENCES task_plan_revisions(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    line_number INTEGER NOT NULL,
+    line_content TEXT NOT NULL,
+    note TEXT NOT NULL CHECK (note <> ''),
+    PRIMARY KEY (revision_id, ordinal)
+);
+";
 
 const MIGRATION_061: &str = r"
 CREATE TABLE IF NOT EXISTS work_scope_review_checkpoints (

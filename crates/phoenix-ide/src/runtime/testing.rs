@@ -524,6 +524,7 @@ pub struct InMemoryStorage {
     next_msg_id: Mutex<u64>,
     steering_queues: Mutex<HashMap<String, Vec<crate::state_machine::event::SteerEntry>>>,
     fork_proposals: Mutex<Vec<crate::db::ForkProposal>>,
+    task_plan_revisions: Mutex<Vec<crate::db::TaskPlanRevision>>,
     clear_watermarks: Mutex<HashMap<String, i64>>,
     last_prompt_tokens: Mutex<HashMap<String, i64>>,
     preflight_authoritative_user_message_results:
@@ -562,6 +563,7 @@ impl InMemoryStorage {
             next_msg_id: Mutex::new(1),
             steering_queues: Mutex::new(HashMap::new()),
             fork_proposals: Mutex::new(Vec::new()),
+            task_plan_revisions: Mutex::new(Vec::new()),
             clear_watermarks: Mutex::new(HashMap::new()),
             last_prompt_tokens: Mutex::new(HashMap::new()),
             preflight_authoritative_user_message_results: Mutex::new(VecDeque::new()),
@@ -635,6 +637,11 @@ impl InMemoryStorage {
     /// Read back the persisted fork proposals (test-only).
     pub fn get_fork_proposals(&self) -> Vec<crate::db::ForkProposal> {
         self.fork_proposals.lock().unwrap().clone()
+    }
+
+    /// Read back the recorded task plan revisions (test-only).
+    pub fn get_task_plan_revisions(&self) -> Vec<crate::db::TaskPlanRevision> {
+        self.task_plan_revisions.lock().unwrap().clone()
     }
 
     /// Read back the persisted steering queue for a conversation (test-only).
@@ -1120,6 +1127,39 @@ impl MessageStore for InMemoryStorage {
             }
         }
         Err(format!("Message not found: {message_id}"))
+    }
+
+    async fn record_task_plan_revision(
+        &self,
+        conversation_id: &str,
+        task_file: &str,
+        title: &str,
+        priority: &str,
+        plan: &str,
+    ) -> Result<(), String> {
+        let mut revisions = self.task_plan_revisions.lock().unwrap();
+        let latest = revisions
+            .iter()
+            .filter(|r| r.conversation_id == conversation_id)
+            .max_by_key(|r| r.ordinal);
+        if let Some(existing) = latest {
+            if existing.plan == plan && existing.task_file == task_file {
+                return Ok(());
+            }
+        }
+        let ordinal = latest.map_or(1, |r| r.ordinal + 1);
+        revisions.push(crate::db::TaskPlanRevision {
+            id: format!("rev-{conversation_id}-{ordinal}"),
+            conversation_id: conversation_id.to_string(),
+            ordinal,
+            task_file: task_file.to_string(),
+            title: title.to_string(),
+            priority: priority.to_string(),
+            plan: plan.to_string(),
+            proposed_at: chrono::Utc::now(),
+            notes: Vec::new(),
+        });
+        Ok(())
     }
 
     async fn persist_fork_proposal_with_tool_round(

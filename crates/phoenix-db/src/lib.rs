@@ -6595,6 +6595,206 @@ impl Database {
         Ok(())
     }
 
+    // ==================== Task Plan Revision Operations ====================
+
+    /// Record a task plan revision (REQ-PF-018), allocating the next `ordinal`
+    /// for this conversation.
+    ///
+    /// Called each time the conversation enters `AwaitingTaskApproval`. The
+    /// ordinal allocation and the insert share one transaction so two proposals
+    /// racing on the same conversation cannot collide on
+    /// `UNIQUE (conversation_id, ordinal)`.
+    ///
+    /// Re-recording an identical plan for the conversation's current highest
+    /// ordinal is a no-op: a crash-retry of the same proposal must not manufacture
+    /// a phantom revision that the reader would then diff against itself.
+    ///
+    /// Returns the recorded revision, or the pre-existing one on a retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn record_task_plan_revision(
+        &self,
+        conversation_id: &str,
+        task_file: &str,
+        title: &str,
+        priority: &str,
+        plan: &str,
+    ) -> DbResult<TaskPlanRevision> {
+        let mut tx = self.pool.begin().await?;
+
+        let latest = sqlx::query(
+            "SELECT id, conversation_id, ordinal, task_file, title, priority, plan, proposed_at
+             FROM task_plan_revisions
+             WHERE conversation_id = ?1
+             ORDER BY ordinal DESC
+             LIMIT 1",
+        )
+        .bind(conversation_id)
+        .try_map(parse_task_plan_revision_row)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some(existing) = latest.as_ref() {
+            if existing.plan == plan && existing.task_file == task_file {
+                tx.commit().await?;
+                let notes = self.list_task_plan_revision_notes(&existing.id).await?;
+                return Ok(TaskPlanRevision {
+                    notes,
+                    ..existing.clone()
+                });
+            }
+        }
+
+        let revision = TaskPlanRevision {
+            id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: conversation_id.to_string(),
+            ordinal: latest.map_or(1, |r| r.ordinal + 1),
+            task_file: task_file.to_string(),
+            title: title.to_string(),
+            priority: priority.to_string(),
+            plan: plan.to_string(),
+            proposed_at: Utc::now(),
+            notes: Vec::new(),
+        };
+
+        sqlx::query(
+            "INSERT INTO task_plan_revisions (
+                id, conversation_id, ordinal, task_file, title, priority, plan, proposed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(&revision.id)
+        .bind(&revision.conversation_id)
+        .bind(revision.ordinal)
+        .bind(&revision.task_file)
+        .bind(&revision.title)
+        .bind(&revision.priority)
+        .bind(&revision.plan)
+        .bind(revision.proposed_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(revision)
+    }
+
+    /// Fetch the conversation's most recent task plan revision, with its notes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn latest_task_plan_revision(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<TaskPlanRevision>> {
+        self.task_plan_revision_at_offset(conversation_id, 0).await
+    }
+
+    /// Fetch the revision the reviewer saw *before* the current proposal — the
+    /// diff baseline (REQ-PF-018). `None` when the current proposal is the first,
+    /// which is exactly the case where no diff can be offered.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn baseline_task_plan_revision(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<TaskPlanRevision>> {
+        self.task_plan_revision_at_offset(conversation_id, 1).await
+    }
+
+    /// Fetch the revision `offset` positions back from the newest one.
+    async fn task_plan_revision_at_offset(
+        &self,
+        conversation_id: &str,
+        offset: i64,
+    ) -> DbResult<Option<TaskPlanRevision>> {
+        let Some(revision) = sqlx::query(
+            "SELECT id, conversation_id, ordinal, task_file, title, priority, plan, proposed_at
+             FROM task_plan_revisions
+             WHERE conversation_id = ?1
+             ORDER BY ordinal DESC
+             LIMIT 1 OFFSET ?2",
+        )
+        .bind(conversation_id)
+        .bind(offset)
+        .try_map(parse_task_plan_revision_row)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+
+        let notes = self.list_task_plan_revision_notes(&revision.id).await?;
+        Ok(Some(TaskPlanRevision { notes, ..revision }))
+    }
+
+    async fn list_task_plan_revision_notes(
+        &self,
+        revision_id: &str,
+    ) -> DbResult<Vec<TaskPlanRevisionNote>> {
+        let notes = sqlx::query(
+            "SELECT line_number, line_content, note
+             FROM task_plan_revision_notes
+             WHERE revision_id = ?1
+             ORDER BY ordinal ASC",
+        )
+        .bind(revision_id)
+        .try_map(|row: SqliteRow| {
+            Ok(TaskPlanRevisionNote {
+                line_number: row.try_get("line_number")?,
+                line_content: row.try_get("line_content")?,
+                note: row.try_get("note")?,
+            })
+        })
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(notes)
+    }
+
+    /// Attach the reviewer's annotations to a plan revision (REQ-PF-018).
+    ///
+    /// Written when the reviewer requests changes, so the *next* revision's diff
+    /// can show which comments the agent's edits touched. Replaces any notes
+    /// already attached to the revision, making a retried feedback submission
+    /// idempotent rather than duplicating the pile.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn set_task_plan_revision_notes(
+        &self,
+        revision_id: &str,
+        notes: &[TaskPlanRevisionNote],
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM task_plan_revision_notes WHERE revision_id = ?1")
+            .bind(revision_id)
+            .execute(&mut *tx)
+            .await?;
+
+        for (ordinal, note) in notes.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO task_plan_revision_notes (
+                    revision_id, ordinal, line_number, line_content, note
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .bind(revision_id)
+            .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
+            .bind(note.line_number)
+            .bind(&note.line_content)
+            .bind(&note.note)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Fetch a fork proposal by id.
     ///
     /// # Errors
@@ -9202,6 +9402,25 @@ fn resolution_child_id(p: &ForkProposal) -> Option<&str> {
         ForkProposalStatus::Promoted => p.refinement_conversation_id.as_deref(),
         ForkProposalStatus::Pending | ForkProposalStatus::Dismissed => None,
     }
+}
+
+/// Parse a task-plan-revision row. `notes` is a child collection the caller
+/// loads separately — a `try_map` closure cannot await.
+#[allow(clippy::needless_pass_by_value)] // sqlx try_map passes rows by value
+fn parse_task_plan_revision_row(row: SqliteRow) -> Result<TaskPlanRevision, sqlx::Error> {
+    Ok(TaskPlanRevision {
+        id: row.try_get("id")?,
+        conversation_id: row.try_get("conversation_id")?,
+        ordinal: row.try_get("ordinal")?,
+        task_file: row.try_get("task_file")?,
+        title: row.try_get("title")?,
+        priority: row.try_get("priority")?,
+        plan: row.try_get("plan")?,
+        proposed_at: parse_datetime(&row.try_get::<String, _>("proposed_at")?),
+        // Notes are a child collection loaded by the caller; a row parse cannot
+        // await. Callers that surface a revision must fill this in.
+        notes: Vec::new(),
+    })
 }
 
 /// Parse a fork-proposal row. Unknown `status` values surface as a typed
@@ -16836,6 +17055,167 @@ mod tests {
             usage_data: None,
             created_at: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn task_plan_revisions_allocate_sequential_ordinals() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-1", "c1", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let first = db
+            .record_task_plan_revision("conv-1", "tasks/1.md", "T", "p2", "plan v1")
+            .await
+            .unwrap();
+        assert_eq!(first.ordinal, 1);
+
+        let second = db
+            .record_task_plan_revision("conv-1", "tasks/1.md", "T", "p2", "plan v2")
+            .await
+            .unwrap();
+        assert_eq!(second.ordinal, 2);
+
+        // The baseline is the revision *before* the newest one.
+        let baseline = db
+            .baseline_task_plan_revision("conv-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(baseline.plan, "plan v1");
+        let latest = db
+            .latest_task_plan_revision("conv-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.plan, "plan v2");
+    }
+
+    #[tokio::test]
+    async fn re_recording_the_same_plan_does_not_create_a_phantom_revision() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-1", "c1", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        db.record_task_plan_revision("conv-1", "tasks/1.md", "T", "p2", "plan v1")
+            .await
+            .unwrap();
+        let retry = db
+            .record_task_plan_revision("conv-1", "tasks/1.md", "T", "p2", "plan v1")
+            .await
+            .unwrap();
+
+        assert_eq!(retry.ordinal, 1, "a retry must not advance the ordinal");
+        // A phantom second revision would make the reader diff v1 against itself.
+        assert!(db
+            .baseline_task_plan_revision("conv-1")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn first_proposal_has_no_baseline() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-1", "c1", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.record_task_plan_revision("conv-1", "tasks/1.md", "T", "p2", "only plan")
+            .await
+            .unwrap();
+
+        assert!(db
+            .baseline_task_plan_revision("conv-1")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn revision_notes_round_trip_and_replace_on_resubmit() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-1", "c1", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let rev = db
+            .record_task_plan_revision("conv-1", "tasks/1.md", "T", "p2", "plan v1")
+            .await
+            .unwrap();
+
+        db.set_task_plan_revision_notes(
+            &rev.id,
+            &[
+                TaskPlanRevisionNote {
+                    line_number: 3,
+                    line_content: "Use SQLite.".into(),
+                    note: "why?".into(),
+                },
+                TaskPlanRevisionNote {
+                    line_number: 5,
+                    line_content: "Ship it.".into(),
+                    note: "when?".into(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        db.record_task_plan_revision("conv-1", "tasks/1.md", "T", "p2", "plan v2")
+            .await
+            .unwrap();
+        let baseline = db
+            .baseline_task_plan_revision("conv-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(baseline.notes.len(), 2);
+        assert_eq!(baseline.notes[0].note, "why?");
+        assert_eq!(baseline.notes[1].line_number, 5);
+
+        // A resubmit replaces rather than appends.
+        db.set_task_plan_revision_notes(
+            &rev.id,
+            &[TaskPlanRevisionNote {
+                line_number: 3,
+                line_content: "Use SQLite.".into(),
+                note: "revised question".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        let baseline = db
+            .baseline_task_plan_revision("conv-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(baseline.notes.len(), 1);
+        assert_eq!(baseline.notes[0].note, "revised question");
+    }
+
+    #[tokio::test]
+    async fn task_plan_revisions_are_scoped_per_conversation() {
+        let db = Database::open_in_memory().await.unwrap();
+        for id in ["conv-a", "conv-b"] {
+            db.create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+        }
+
+        db.record_task_plan_revision("conv-a", "tasks/a.md", "A", "p2", "a1")
+            .await
+            .unwrap();
+        let b_first = db
+            .record_task_plan_revision("conv-b", "tasks/b.md", "B", "p2", "b1")
+            .await
+            .unwrap();
+
+        assert_eq!(b_first.ordinal, 1, "ordinals restart per conversation");
+        assert!(db
+            .baseline_task_plan_revision("conv-b")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
