@@ -79,6 +79,16 @@ export interface PhoenixDiffCodeViewHandle {
   scrollToEdge: (edge: 'top' | 'bottom') => void;
   /** Bring one parsed file item into view by its structural item id. */
   scrollToItem: (itemId: string) => void;
+  /**
+   * Start a line note on a line named by number (the keyboard `{n}c` route),
+   * scrolling it into view. Returns false when that line is not in any of the
+   * item's hunks, so the caller can say so instead of appearing to do nothing.
+   *
+   * Lives here rather than in the caller because this wrapper owns the parse:
+   * resolving a number to a side, an anchor, and the quoted source text is the
+   * same typed hunk walk a gutter click already takes.
+   */
+  annotateLineNumber: (itemId: string, lineNumber: number) => boolean;
 }
 
 /** Approximate row height used to translate `j`/`k` into a scroll delta.
@@ -163,6 +173,12 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
       onFilesChange?.(files);
     }, [files, onFilesChange]);
 
+    // The imperative handle is built once (stable identity for callers), but
+    // `{n}c` has to resolve against whatever is parsed *now* — hence a ref
+    // rather than a dependency that would churn the handle on every reparse.
+    const itemsRef = useRef<PhoenixDiffItem[]>(items);
+    itemsRef.current = items;
+
     const findLineDecorationCss = useMemo(() => diffFindDecorationCSS(findMatches, activeFindMatch), [findMatches, activeFindMatch]);
 
     const annotateLine = useCallback(
@@ -176,6 +192,11 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
       },
       [onAnnotateLine],
     );
+
+    // Same reason as `itemsRef`: the handle is built once, so it reads the
+    // current callback through a ref.
+    const annotateLineRef = useRef(annotateLine);
+    annotateLineRef.current = annotateLine;
 
     const options = useMemo<CodeViewOptions<Meta>>(
       () => ({
@@ -418,6 +439,25 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
           },
           scrollToItem: (itemId: string) => {
             scrollCodeViewToTarget(codeViewRef.current, { id: itemId });
+          },
+          annotateLineNumber: (itemId: string, lineNumber: number) => {
+            const item = itemsRef.current.find((candidate) => candidate.id === itemId);
+            const section = sectionFromItemId(itemId);
+            if (!item || !section) return false;
+            // The gutter number a reviewer reads off an added or context line is
+            // the new-file number, so the additions side is tried first; only a
+            // number that exists solely on the left (a removed line) falls
+            // through to deletions.
+            const side: AnnotationSide | null =
+              lineTextAt(item.fileDiff, 'additions', lineNumber) !== undefined
+                ? 'additions'
+                : lineTextAt(item.fileDiff, 'deletions', lineNumber) !== undefined
+                  ? 'deletions'
+                  : null;
+            if (side === null) return false;
+            annotateLineRef.current(section, item.fileDiff, side, lineNumber);
+            scrollCodeViewToTarget(codeViewRef.current, { id: itemId, line: { lineNumber, side } });
+            return true;
           },
         };
       },

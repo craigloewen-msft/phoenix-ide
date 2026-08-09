@@ -22,6 +22,7 @@ import type { ReviewCommand } from './reviewKeymap';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
 import { useDiffStyle } from './useDiffStyle';
 import { DiffStyleToggleButton, ReviewFocusToggleButton } from './DiffHeaderControls';
+import { ReviewCountIndicator, ReviewKeyboardNotice } from './ReviewCountIndicator';
 import { api, type FileReviewState, type ReviewDiffScope, type ReviewFileDiffResponse } from '../../api';
 import './FileReviewDiffView.css';
 
@@ -94,6 +95,13 @@ export function FileReviewDiffView({
   const codeViewRef = useRef<React.ComponentRef<typeof PhoenixDiffCodeView>>(null);
 
   const [scope, setScope] = useState<ReviewDiffScope>('full');
+  // The single rendered file's structural item id, published by the wrapper's
+  // parse. Reconstructing it from `path` would duplicate the id scheme; a
+  // renamed file would then silently miss.
+  const [itemId, setItemId] = useState<string | null>(null);
+  // Why a keyboard action did nothing. A silently ignored key is
+  // indistinguishable from a broken one.
+  const [keyboardNotice, setKeyboardNotice] = useState<string | null>(null);
   const [data, setData] = useState<ReviewFileDiffResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -183,6 +191,12 @@ export function FileReviewDiffView({
         case 'annotate-file':
           notes.startAnnotateFile('committed', path);
           return;
+        case 'annotate-line': {
+          if (itemId === null) return;
+          const found = codeView?.annotateLineNumber(itemId, command.lineNumber) ?? false;
+          setKeyboardNotice(found ? null : `Line ${command.lineNumber} is not in this diff.`);
+          return;
+        }
         case 'refresh':
           refresh();
           return;
@@ -194,15 +208,19 @@ export function FileReviewDiffView({
           return;
       }
     },
-    [notes, onClose, onNextFile, onNextUnreviewed, onPreviousFile, path, refresh, toggleReviewed],
+    [itemId, notes, onClose, onNextFile, onNextUnreviewed, onPreviousFile, path, refresh, toggleReviewed],
   );
 
-  useReviewKeyboard({
+  const { pendingCount } = useReviewKeyboard({
     scopeId: FILE_REVIEW_SCOPE,
     id: 'file-review-diff',
     onCommand: runCommand,
     dialogOpen: notes.annotating !== null,
   });
+
+  const handleFilesChange = useCallback((files: readonly { itemId: string }[]) => {
+    setItemId(files[0]?.itemId ?? null);
+  }, []);
 
   return (
     <ViewerShell
@@ -214,6 +232,13 @@ export function FileReviewDiffView({
         </span>
       }
       titleTooltip={absolutePath}
+      banner={pendingCount !== null ? (
+        // The live count outranks a notice from an earlier key: it is what the
+        // reviewer is typing right now.
+        <ReviewCountIndicator count={pendingCount} />
+      ) : keyboardNotice ? (
+        <ReviewKeyboardNotice notice={keyboardNotice} />
+      ) : undefined}
       headerExtras={
         <>
           <div className="frd-modes" role="group" aria-label="File view mode">
@@ -333,6 +358,7 @@ export function FileReviewDiffView({
             highlightedNoteId={notes.highlightedNoteId}
             onAnnotateLine={notes.startAnnotateLine}
             onAnnotateFile={notes.startAnnotateFile}
+            onFilesChange={handleFilesChange}
           />
         )}
       </div>

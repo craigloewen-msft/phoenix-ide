@@ -40,6 +40,7 @@ import { useRefreshOnWindowFocus } from './useRefreshOnWindowFocus';
 import type { ReviewCommand } from './reviewKeymap';
 import { useDiffStyle } from './useDiffStyle';
 import { DiffStyleToggleButton, ReviewFocusToggleButton } from './DiffHeaderControls';
+import { ReviewCountIndicator, ReviewKeyboardNotice } from './ReviewCountIndicator';
 import './DiffView.css';
 
 export interface DiffViewProps {
@@ -322,6 +323,14 @@ export function DiffView({
         case 'annotate-file':
           if (cursorFile) notes.startAnnotateFile(cursorFile.section, cursorFile.filePath);
           return;
+        case 'annotate-line': {
+          if (!cursorFile) return;
+          const found = codeView?.annotateLineNumber(cursorFile.itemId, command.lineNumber) ?? false;
+          setKeyboardNotice(
+            found ? null : `Line ${command.lineNumber} is not in the diff for ${cursorFile.filePath}.`,
+          );
+          return;
+        }
         case 'refresh':
           refresh();
           return;
@@ -336,7 +345,7 @@ export function DiffView({
     [cursorFile, cursorIndex, files, manifestEntryFor, moveCursorTo, notes, onClose, refresh, toggleReviewed],
   );
 
-  useReviewKeyboard({
+  const { pendingCount } = useReviewKeyboard({
     scopeId: 'diff-viewer',
     id: 'diff-view',
     onCommand: runCommand,
@@ -407,8 +416,12 @@ export function DiffView({
           onClose={closeFind}
           autoFocus
         />
+      ) : pendingCount !== null ? (
+        // The live count outranks a notice from an earlier key: it is what the
+        // reviewer is typing right now.
+        <ReviewCountIndicator count={pendingCount} />
       ) : keyboardNotice ? (
-        <div className="diff-keyboard-notice" role="status">{keyboardNotice}</div>
+        <ReviewKeyboardNotice notice={keyboardNotice} />
       ) : undefined}
       noteCount={diffNotes.length}
       onToggleNotes={notes.togglePanel}
