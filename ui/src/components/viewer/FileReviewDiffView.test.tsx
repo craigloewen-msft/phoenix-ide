@@ -28,6 +28,7 @@ function renderView(extra: Partial<React.ComponentProps<typeof FileReviewDiffVie
         fileName="foo.txt"
         absolutePath="/repo/foo.txt"
         review={{ kind: 'unreviewed' }}
+        currentBlobSha="abc123"
         onClose={() => undefined}
         onSendNotes={() => undefined}
         onShowSource={() => undefined}
@@ -44,13 +45,15 @@ describe('FileReviewDiffView', () => {
     resetCodeViewMock();
     localStorage.removeItem('phoenix-diff-style');
     localStorage.removeItem('phoenix-review-diff-scope');
-    vi.spyOn(api, 'getReviewFileDiff').mockResolvedValue({
-      path: 'foo.txt',
+    // The real endpoint echoes the path and scope it answered; the view relies
+    // on that to tell its own response from the previous request's.
+    vi.spyOn(api, 'getReviewFileDiff').mockImplementation(async (_conv, path, scope) => ({
+      path,
       comparator: 'origin/main',
-      scope: 'full',
+      scope,
       diff: DIFF,
       current_blob_sha: 'abc123',
-    });
+    }));
     // The spy persists across tests in this file; clear the call log so a test
     // asserting on "every call" sees only its own.
     vi.mocked(api.getReviewFileDiff).mockClear();
@@ -131,5 +134,69 @@ describe('FileReviewDiffView', () => {
     renderView({ path: 'bar.txt', fileName: 'bar.txt', review: REVIEWED });
     await waitFor(() => expect(vi.mocked(api.getReviewFileDiff)).toHaveBeenCalled());
     expect(vi.mocked(api.getReviewFileDiff).mock.calls.every((c) => c[2] === 'since_review')).toBe(true);
+  });
+
+  it('refetches when the agent edits the open file, even though the checkpoint is unmoved', async () => {
+    // Reviewed and up to date, so the since-review diff is empty.
+    vi.mocked(api.getReviewFileDiff).mockImplementation(async (_conv, path, scope) => ({
+      path,
+      comparator: 'origin/main',
+      scope,
+      diff: scope === 'since_review' ? '' : DIFF,
+      current_blob_sha: 'abc123',
+    }));
+
+    const view = renderView({ review: REVIEWED, currentBlobSha: 'abc123' });
+    fireEvent.click(await screen.findByRole('button', { name: /Since review/ }));
+    await waitFor(() =>
+      expect(screen.getByText('Nothing changed since you reviewed this file.')).toBeInTheDocument(),
+    );
+    vi.mocked(api.getReviewFileDiff).mockClear();
+
+    // The agent edits the file. Only the *current* side moves — the checkpoint
+    // the user reviewed at is by definition unchanged.
+    view.rerender(
+      <ReviewNotesProvider>
+        <FileReviewDiffView
+          conversationId="conv-1"
+          path="foo.txt"
+          fileName="foo.txt"
+          absolutePath="/repo/foo.txt"
+          review={{ kind: 'reviewed_stale', at_blob: 'abc123', current_blob: 'def456' }}
+          currentBlobSha="def456"
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+          onShowSource={() => undefined}
+          onMarkReviewed={() => undefined}
+          onUnmarkReviewed={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    await waitFor(() =>
+      expect(vi.mocked(api.getReviewFileDiff).mock.calls.filter((c) => c[2] === 'since_review')).toHaveLength(1),
+    );
+  });
+
+  it('does not render the previous scope while the new scope is still loading', async () => {
+    // Distinguishable payloads, and a since-review fetch that never settles, so
+    // the in-flight window is observable rather than a race to catch.
+    vi.mocked(api.getReviewFileDiff).mockImplementation(async (_conv, path, scope) => {
+      if (scope === 'since_review') return new Promise(() => {});
+      return { path, comparator: 'origin/main', scope, diff: DIFF, current_blob_sha: 'abc123' };
+    });
+
+    renderView({ review: REVIEWED });
+    await screen.findByTestId('codeview-mock');
+
+    fireEvent.click(screen.getByRole('button', { name: /Since review/ }));
+
+    // The control already reports since-review; the full diff underneath it
+    // would be an answer to a question the user is no longer asking.
+    expect(await screen.findByRole('button', { name: /Full diff/ })).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByTestId('codeview-mock')).toBeNull());
+    expect(screen.getByText('Loading diff…')).toBeInTheDocument();
+    // And it must not read as "nothing changed" before its own answer arrives.
+    expect(screen.queryByText('Nothing changed since you reviewed this file.')).toBeNull();
   });
 });

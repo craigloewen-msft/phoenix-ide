@@ -287,12 +287,29 @@ pub(crate) fn file_diff_since_review(
 /// `git diff <sha> <sha>` emits `--- a/<sha>` / `+++ b/<sha>`, which carries no
 /// path. The UI parser keys hunks by path, so without this the since-review
 /// diff would render against a meaningless header.
+///
+/// Rewriting stops at the first hunk header. Past it every line is body, and a
+/// removed line is its source text behind a `-` — so source beginning `-- `
+/// (SQL, Lua, Haskell, Allium comments) reaches here as `--- ` and is
+/// indistinguishable from a header by prefix alone. Only position separates the
+/// two, so only position is trusted.
 fn relabel_blob_diff(captured: &CappedStdout, path: &str) -> CappedStdout {
     use std::fmt::Write as _;
 
     let mut out = String::with_capacity(captured.stdout.len() + 2 * path.len());
-    for line in captured.stdout.lines() {
-        if line.starts_with("--- ") {
+    let mut in_body = false;
+    // Splitting on '\n' rather than `lines()` keeps a CRLF file's '\r' and makes
+    // the presence of a final newline observable, so every line the rewrite does
+    // not touch survives byte-for-byte.
+    let mut lines = captured.stdout.split('\n').peekable();
+    while let Some(line) = lines.next() {
+        let is_last = lines.peek().is_none();
+        if in_body {
+            out.push_str(line);
+        } else if line.starts_with("@@ ") {
+            in_body = true;
+            out.push_str(line);
+        } else if line.starts_with("--- ") {
             let _ = write!(out, "--- a/{path}");
         } else if line.starts_with("+++ ") {
             let _ = write!(out, "+++ b/{path}");
@@ -301,7 +318,9 @@ fn relabel_blob_diff(captured: &CappedStdout, path: &str) -> CappedStdout {
         } else {
             out.push_str(line);
         }
-        out.push('\n');
+        if !is_last {
+            out.push('\n');
+        }
     }
     // Rewriting changes the rendered length, so shift the byte total by the
     // same delta. Otherwise `total_bytes > stdout.len()` would read as
@@ -464,6 +483,75 @@ mod tests {
         let reviewed = current_blob_sha(p, "kept.txt");
         let diff = file_diff_since_review(p, "kept.txt", &reviewed, 64 * 1024, 512 * 1024);
         assert!(diff.stdout.is_empty());
+    }
+
+    #[test]
+    fn since_review_diff_preserves_body_lines_that_look_like_headers() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo(p);
+        // Source whose comment syntax collides with a diff header prefix.
+        write(
+            p,
+            "schema.sql",
+            "-- volunteers own their agreement\nSELECT 1;\n",
+        );
+        commit_all(p, "base");
+        let reviewed = current_blob_sha(p, "schema.sql");
+
+        // After the user reviewed, the agent removes the `-- ` comment (which
+        // renders as `--- `) and adds a `++ ` line (which renders as `+++ `).
+        write(p, "schema.sql", "SELECT 1;\n++ still not a header\n");
+
+        let diff = file_diff_since_review(p, "schema.sql", &reviewed, 64 * 1024, 512 * 1024);
+        assert!(
+            diff.stdout.contains("--- volunteers own their agreement"),
+            "a removed `-- ` comment must survive header relabelling: {}",
+            diff.stdout
+        );
+        assert!(
+            diff.stdout.contains("+++ still not a header"),
+            "an added `++ ` line must survive header relabelling: {}",
+            diff.stdout
+        );
+        assert_eq!(
+            diff.stdout
+                .lines()
+                .filter(|l| *l == "--- a/schema.sql")
+                .count(),
+            1,
+            "exactly one old-file header: {}",
+            diff.stdout
+        );
+        assert_eq!(
+            diff.stdout
+                .lines()
+                .filter(|l| *l == "+++ b/schema.sql")
+                .count(),
+            1,
+            "exactly one new-file header: {}",
+            diff.stdout
+        );
+    }
+
+    #[test]
+    fn since_review_diff_keeps_crlf_line_endings() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo(p);
+        // core.autocrlf off by default in a fresh repo, so the bytes round-trip.
+        write(p, "win.txt", "first\r\nsecond\r\n");
+        commit_all(p, "base");
+        let reviewed = current_blob_sha(p, "win.txt");
+
+        write(p, "win.txt", "first\r\nsecond\r\nthird\r\n");
+
+        let diff = file_diff_since_review(p, "win.txt", &reviewed, 64 * 1024, 512 * 1024);
+        assert!(
+            diff.stdout.contains("+third\r\n"),
+            "CRLF endings must survive relabelling: {:?}",
+            diff.stdout
+        );
     }
 
     #[test]

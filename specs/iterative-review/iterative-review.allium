@@ -213,6 +213,25 @@ rule SinceReviewDiffRefusedWithoutCheckpoint {
     ensures: not diff_returned
 }
 
+-- A diff is an answer to one (path, scope) question. Presenting the answer to
+-- the previous question under the new question's label is the same silent
+-- substitution as widening the scope, arriving a moment earlier.
+rule RenderedDiffAnswersTheRequestedScope {
+    when: UserRequestsFileDiff(scope, path, requested)
+    ensures: rendered_diff_scope(scope, path) = requested
+             or not diff_rendered(scope, path)
+}
+
+-- The current side of the comparison moves whenever the agent edits, which is
+-- exactly the event the loop exists to surface. A rendered diff that tracked
+-- only the checkpoint would keep asserting the previous turn's answer while
+-- the manifest beside it already reported the file stale.
+rule OpenDiffFollowsCurrentContent {
+    when: CurrentBlobChanges(scope, path)
+    requires: diff_open_for(scope, path)
+    ensures: diff_reread(scope, path)
+}
+
 ------------------------------------------------------------
 -- IR 3. CHECKPOINT LIFETIME (REQ-RV-008)
 ------------------------------------------------------------

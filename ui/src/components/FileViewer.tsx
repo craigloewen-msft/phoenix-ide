@@ -181,6 +181,7 @@ export function FileViewer({
         fileName={fileName}
         absolutePath={absolutePath}
         review={reviewDiffResolved.entry.review}
+        currentBlobSha={reviewDiffResolved.entry.current_blob_sha}
         onClose={onClose}
         onSendNotes={(notes) => void onSendNotes(notes)}
         onShowSource={showSource}
