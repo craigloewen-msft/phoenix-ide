@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AlertCircle, Loader2 } from 'lucide-react';
 import { ViewerShell } from './viewer/ViewerShell';
+import { ReviewFocusToggleButton } from './viewer/DiffHeaderControls';
 import { MetaViewer } from './viewer/MetaViewer';
 import { classifyViewerFile } from './viewer/viewerFileTypes';
 import type { MetaViewerPayload, PatchContext, TextRenderMode, ViewerFocus } from './viewer/metaViewerTypes';
@@ -159,23 +160,36 @@ export function FileViewer({
 
   // Only a file that is actually part of the change set has a review diff.
   // Placed after all hooks so the hook order is identical in both modes.
-  if (diffModeRequested && review?.conversationId && repoRelativePath && reviewEntry) {
+  const reviewDiffResolved = diffModeRequested && review?.conversationId && repoRelativePath !== null && reviewEntry !== undefined
+    ? { review, conversationId: review.conversationId, path: repoRelativePath, entry: reviewEntry }
+    : null;
+  if (diffModeRequested && reviewDiffResolved === null) {
+    // Falling back to source rendering: the open file is not (or no longer) in
+    // the review manifest. Visible because a silent fallback is indistinguishable
+    // from a broken DIFF toggle.
+    console.debug('[FileViewer] diff mode requested but unresolvable; rendering source', {
+      absolutePath,
+      repoRelativePath,
+      inManifest: reviewEntry !== undefined,
+    });
+  }
+  if (reviewDiffResolved) {
     return (
       <FileReviewDiffView
-        conversationId={review.conversationId}
-        path={repoRelativePath}
+        conversationId={reviewDiffResolved.conversationId}
+        path={reviewDiffResolved.path}
         fileName={fileName}
         absolutePath={absolutePath}
-        review={reviewEntry.review}
+        review={reviewDiffResolved.entry.review}
         onClose={onClose}
         onSendNotes={(notes) => void onSendNotes(notes)}
         onShowSource={showSource}
-        onMarkReviewed={review.markReviewed}
-        onUnmarkReviewed={review.unmarkReviewed}
+        onMarkReviewed={reviewDiffResolved.review.markReviewed}
+        onUnmarkReviewed={reviewDiffResolved.review.unmarkReviewed}
         onNextUnreviewed={goToNextUnreviewed}
         onNextFile={goToNextFile}
         onPreviousFile={goToPreviousFile}
-        onRefreshManifest={review.refresh}
+        onRefreshManifest={reviewDiffResolved.review.refresh}
         {...(inline !== undefined ? { inline } : {})}
         {...(reviewFocus !== undefined ? { reviewFocus } : {})}
         {...(onToggleReviewFocus !== undefined ? { onToggleReviewFocus } : {})}
@@ -201,12 +215,18 @@ export function FileViewer({
     return <MetaViewer payload={payload} />;
   }
 
+  // Every terminal state keeps the shell header, so a review-focused reviewer
+  // (conversation column hidden) always has a close control and a way back to
+  // the conversation rather than a bare background.
   return (
     <ViewerShell
       mode={inline ? 'inline' : 'overlay'}
       ariaLabel={`File viewer: ${fileName}`}
       title={fileName}
       titleTooltip={absolutePath}
+      headerExtras={onToggleReviewFocus
+        ? <ReviewFocusToggleButton reviewFocus={reviewFocus ?? false} onToggle={onToggleReviewFocus} />
+        : undefined}
       noteCount={0}
       onToggleNotes={() => undefined}
       onSend={() => undefined}

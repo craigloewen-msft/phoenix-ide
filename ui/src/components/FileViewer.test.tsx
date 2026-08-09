@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { FileViewer } from './FileViewer';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
@@ -72,5 +72,61 @@ describe('FileViewer typed file responses', () => {
 
     expect(await screen.findByTestId('codeview-mock')).toBeInTheDocument();
     expect(screen.queryByTestId('viewer-large-text-fallback')).not.toBeInTheDocument();
+  });
+});
+
+describe('FileViewer chrome under review focus', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function renderFocused(extra: Partial<React.ComponentProps<typeof FileViewer>> = {}) {
+    return render(
+      <ReviewNotesProvider>
+        <FileViewer
+          filePath="gone.ts"
+          rootDir="/tmp/project"
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+          reviewFocus
+          onToggleReviewFocus={() => undefined}
+          inline
+          {...extra}
+        />
+      </ReviewNotesProvider>,
+    );
+  }
+
+  /**
+   * Review focus hides the conversation column, so every terminal state of the
+   * viewer must still offer a way back — otherwise an unresolvable file leaves
+   * the reviewer looking at a bare background.
+   */
+  it('keeps a close control and the review-focus toggle reachable while loading', () => {
+    vi.mocked(fetch).mockReturnValue(new Promise(() => undefined));
+    const onToggleReviewFocus = vi.fn();
+
+    renderFocused({ onToggleReviewFocus });
+
+    expect(screen.getByRole('button', { name: 'Close viewer' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Show conversation' }));
+    expect(onToggleReviewFocus).toHaveBeenCalledOnce();
+  });
+
+  it('keeps them reachable when the file fails to load', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(
+      JSON.stringify({ error: 'No such file' }),
+      { status: 404, headers: { 'Content-Type': 'application/json' } },
+    ));
+
+    renderFocused();
+
+    expect(await screen.findByText('No such file')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Close viewer' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Show conversation' })).toBeInTheDocument();
   });
 });
