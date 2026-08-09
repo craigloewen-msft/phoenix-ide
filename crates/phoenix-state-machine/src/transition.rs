@@ -1732,6 +1732,7 @@ fn creation_provisioned_transition(
             | Effect::BeginContinuation { .. }
             | Effect::ContinuationCommit { .. }
             | Effect::NotifyContextExhausted { .. }
+            | Effect::RecordPlanRevision { .. }
             | Effect::ApproveTask { .. }
             | Effect::ApproveTaskFreshHandoff { .. }
             | Effect::PersistForkProposal { .. }
@@ -2435,6 +2436,12 @@ pub fn transition_parent(
                             plan: snapshot.plan.clone(),
                         })
                         .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                        .with_effect(Effect::RecordPlanRevision {
+                            task_file: snapshot.task_file.clone(),
+                            title: snapshot.title.clone(),
+                            priority: snapshot.priority,
+                            plan: snapshot.plan.clone(),
+                        })
                         .with_effect(Effect::PersistState)
                         .with_effect(Effect::notify_state_change()),
                     );
@@ -7210,6 +7217,7 @@ mod tests {
                 | Effect::BeginContinuation { .. }
                 | Effect::ContinuationCommit { .. }
                 | Effect::NotifyContextExhausted { .. }
+                | Effect::RecordPlanRevision { .. }
                 | Effect::ApproveTask { .. }
                 | Effect::ApproveTaskFreshHandoff { .. }
                 | Effect::PersistForkProposal { .. }

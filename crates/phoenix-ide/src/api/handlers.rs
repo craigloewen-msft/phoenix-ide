@@ -18,7 +18,8 @@ use super::global_read;
 use super::lifecycle_handlers::{
     abandon_task, approve_commission_review, approve_fork_proposal, approve_task,
     dismiss_fork_proposal, list_fork_proposals, mark_merged, merge_to_local_base,
-    reject_commission_review, reject_task, request_changes_on_fork_proposal, task_feedback,
+    plan_diff_baseline, reject_commission_review, reject_task, request_changes_on_fork_proposal,
+    task_feedback,
 };
 use super::sse::{sse_stream, SseInitTrace};
 use super::types::{
@@ -220,6 +221,11 @@ pub fn create_router(state: AppState) -> Router {
             post(reject_commission_review),
         )
         .route("/api/conversations/:id/task-feedback", post(task_feedback))
+        // Plan diff baseline for the approval reader (REQ-PF-018)
+        .route(
+            "/api/conversations/:id/plan-revisions/baseline",
+            get(plan_diff_baseline),
+        )
         // Fork proposal resolution (REQ-PROJ-034 / 037)
         .route("/api/conversations/:id/proposals", get(list_fork_proposals))
         .route(

@@ -4994,6 +4994,35 @@ where
                 Ok(None)
             }
 
+            Effect::RecordPlanRevision {
+                task_file,
+                title,
+                priority,
+                plan,
+            } => {
+                // A failed revision record costs the reviewer their diff, not
+                // their plan — the proposal itself is already durable via
+                // PersistState. Log and continue rather than fail the turn.
+                if let Err(e) = self
+                    .storage
+                    .record_task_plan_revision(
+                        &self.context.conversation_id,
+                        &task_file,
+                        &title,
+                        priority.as_str(),
+                        &plan,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        conversation_id = %self.context.conversation_id,
+                        error = %e,
+                        "failed to record task plan revision; plan diff baseline unavailable"
+                    );
+                }
+                Ok(None)
+            }
+
             Effect::ApproveTask {
                 task_file,
                 title,

@@ -1,5 +1,6 @@
 import type { ErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
+import type { PlanDiffBaseline } from './generated/PlanDiffBaseline';
 import type { DeploymentInfo } from './generated/DeploymentInfo';
 import type { DeploymentDiskInfo } from './generated/DeploymentDiskInfo';
 import type { AboutResourcesSnapshot } from './generated/AboutResourcesSnapshot';
@@ -12,6 +13,21 @@ import type { UsageOverview } from './generated/UsageOverview';
 import type { ConversationUsageDetail } from './generated/ConversationUsageDetail';
 import type { QuotaDetails } from './generated/QuotaDetails';
 // Phoenix API Client
+
+export type { PlanDiffBaseline };
+export type { PlanDiffBaselineNote } from './generated/PlanDiffBaselineNote';
+
+/**
+ * One reviewer annotation submitted with a request-changes action.
+ *
+ * The request carries only these; the LLM-facing prose is rendered server-side
+ * so the message the agent reads and the persisted review record cannot drift.
+ */
+export interface TaskFeedbackNote {
+  line_number: number;
+  line_content: string;
+  note: string;
+}
 
 export class ApiResponseError extends Error {
   constructor(message: string, readonly status: number, readonly code?: string) {
@@ -2362,13 +2378,29 @@ export const api = {
     return resp.json();
   },
 
-  async sendTaskFeedback(convId: string, annotations: string): Promise<{ success: boolean }> {
+  async sendTaskFeedback(
+    convId: string,
+    notes: readonly TaskFeedbackNote[],
+  ): Promise<{ success: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/task-feedback`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ annotations }),
+      body: JSON.stringify({ notes }),
     });
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to send feedback'); }
+    return resp.json();
+  },
+
+  /**
+   * Fetch the plan revision the reviewer last saw (REQ-PF-018).
+   *
+   * Resolves to `null` when the current proposal is the conversation's first
+   * (204): there is no baseline, so the reader offers no diff.
+   */
+  async getPlanDiffBaseline(convId: string): Promise<PlanDiffBaseline | null> {
+    const resp = await fetch(`/api/conversations/${convId}/plan-revisions/baseline`);
+    if (resp.status === 204) return null;
+    if (!resp.ok) throw new Error('Failed to load plan diff baseline');
     return resp.json();
   },
 

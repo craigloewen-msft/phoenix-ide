@@ -6,8 +6,9 @@ use super::handlers::{
 };
 use super::types::{
     ConflictErrorResponse, ForkDismissResponse, ForkPromoteResponse, ForkProposalListResponse,
-    ForkProposalSummary, ForkSpawnResponse, RequestChangesRequest, SuccessResponse,
-    TaskApprovalRequest, TaskApprovalResponse, TaskFeedbackRequest,
+    ForkProposalSummary, ForkSpawnResponse, PlanDiffBaseline, PlanDiffBaselineNote,
+    RequestChangesRequest, SuccessResponse, TaskApprovalRequest, TaskApprovalResponse,
+    TaskFeedbackNote, TaskFeedbackRequest,
 };
 use super::AppState;
 use crate::db::{ConvMode, Conversation, MessageContent};
@@ -149,6 +150,61 @@ pub(crate) async fn reject_task(
     Ok(Json(SuccessResponse { success: true }))
 }
 
+/// Fetch the diff baseline for the plan under review (REQ-PF-018).
+///
+/// Returns 204 when the current proposal is the conversation's first: there is
+/// nothing to diff against, which is exactly when the reader must not offer the
+/// toggle.
+pub(crate) async fn plan_diff_baseline(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, AppError> {
+    use axum::response::IntoResponse as _;
+
+    let baseline = state
+        .runtime
+        .db()
+        .baseline_task_plan_revision(&id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let Some(revision) = baseline else {
+        return Ok(axum::http::StatusCode::NO_CONTENT.into_response());
+    };
+
+    Ok(Json(PlanDiffBaseline {
+        ordinal: revision.ordinal,
+        plan: revision.plan,
+        notes: revision
+            .notes
+            .into_iter()
+            .map(|n| PlanDiffBaselineNote {
+                line_number: n.line_number,
+                line_content: n.line_content,
+                note: n.note,
+            })
+            .collect(),
+    })
+    .into_response())
+}
+
+/// Render the reviewer's annotations into the prose the agent receives.
+///
+/// The wire carries only the structured notes; this is the single place the
+/// LLM-facing text is derived from them, so the message the agent reads and the
+/// review record the plan diff replays can never drift apart.
+fn format_task_feedback(notes: &[TaskFeedbackNote]) -> String {
+    let mut out = String::from("Review notes for `task`:\n");
+    for note in notes {
+        let _ = write!(
+            out,
+            "\n> Line {}: `{}`\n{}\n",
+            note.line_number, note.line_content, note.note
+        );
+    }
+    out
+}
+
 pub(crate) async fn task_feedback(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -168,13 +224,57 @@ pub(crate) async fn task_feedback(
         ));
     }
 
+    // Attach the annotations to the revision under review (REQ-PF-018) before
+    // dispatching, so the next proposal's diff can show which comments the
+    // agent's edits addressed. The reviewer's feedback must reach the agent
+    // even if this bookkeeping write fails — losing the diff is a degraded
+    // review, losing the feedback is lost work.
+    match state.runtime.db().latest_task_plan_revision(&id).await {
+        Ok(Some(revision)) => {
+            let notes: Vec<crate::db::TaskPlanRevisionNote> = req
+                .notes
+                .iter()
+                .map(|n| crate::db::TaskPlanRevisionNote {
+                    line_number: n.line_number,
+                    line_content: n.line_content.clone(),
+                    note: n.note.clone(),
+                })
+                .collect();
+            if let Err(e) = state
+                .runtime
+                .db()
+                .set_task_plan_revision_notes(&revision.id, &notes)
+                .await
+            {
+                tracing::warn!(
+                    conversation_id = %id,
+                    error = %e,
+                    "failed to attach review notes to plan revision; plan diff will not show them"
+                );
+            }
+        }
+        Ok(None) => {
+            tracing::debug!(
+                conversation_id = %id,
+                "no plan revision recorded for this conversation; review notes not retained"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                conversation_id = %id,
+                error = %e,
+                "failed to read latest plan revision; review notes not retained"
+            );
+        }
+    }
+
     state
         .runtime
         .send_event(
             &id,
             Event::TaskApprovalDecided {
                 outcome: TaskApprovalOutcome::FeedbackProvided {
-                    annotations: req.annotations,
+                    annotations: format_task_feedback(&req.notes),
                 },
             },
         )

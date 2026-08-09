@@ -646,6 +646,11 @@ THE AwaitingTaskApproval state SHALL carry: `task_file` (the path), plus a displ
   as a rollout shim; a row with an empty `task_file` is surfaced as a "reject and
   re-propose" error rather than silently resetting to Idle.)
 
+WHEN the conversation enters AwaitingTaskApproval
+THE SYSTEM SHALL also record the reviewed plan as a task plan revision (REQ-PF-018).
+  This is review history, not state-machine state: AwaitingTaskApproval remains the
+  authority over the *current* proposal and does not accumulate prior versions.
+
 THE HandedOff state SHALL carry `successor_conv_id` and reject further user messages;
   it represents a read-only predecessor whose live work belongs to the successor
   linked by `continued_in_conv_id`.

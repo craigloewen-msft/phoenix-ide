@@ -33,8 +33,9 @@ Task approval is a separate component, `TaskApprovalReader`, not part of the Met
 | **REQ-PF-015:** System-Triggered Prose Reader for Task Approval | ❌ Not Started | Auto-opens on AwaitingTaskApproval state entry |
 | **REQ-PF-016:** Approve, Discard, and Feedback Actions for Task Approval | ❌ Not Started | Three-action toolbar; iterative feedback loop |
 | **REQ-PF-017:** Focused Markdown Review | ✅ Complete | Wide-desktop prose/message/review takeover; bounded send/discard/keep feedback resolution |
+| **REQ-PF-018:** See What Changed Since I Last Reviewed a Plan | ✅ Complete | `task_plan_revisions`/`task_plan_revision_notes` tables; `Effect::RecordPlanRevision`; `GET /api/conversations/:id/plan-revisions/baseline`; `computePlanDiff` inline block/word marks in `TaskApprovalReader` |
 
-**Progress:** 15 of 17 complete
+**Progress:** 16 of 18 complete
 
 ## Prerequisites
 

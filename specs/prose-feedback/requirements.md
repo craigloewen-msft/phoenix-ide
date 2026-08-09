@@ -347,7 +347,7 @@ finding-and-opening friction and makes the required action obvious. Preventing c
 close (without an explicit choice) ensures the user makes a deliberate decision rather
 than accidentally dismissing the review.
 
-**Cross-references:** REQ-PROJ-003, REQ-PROJ-004, REQ-BED-028
+**Cross-references:** REQ-PROJ-003, REQ-PROJ-004, REQ-BED-028, REQ-PF-018
 
 ---
 
@@ -382,7 +382,8 @@ AND clear annotations after sending
 The agent may revise the plan and call `propose_task` again, which re-enters
 AwaitingTaskApproval and opens a fresh prose reader with the updated plan content.
 No content reload or keep-open behavior is needed — each feedback cycle is a clean
-mount/unmount of the prose reader.
+mount/unmount of the prose reader. The reader compares the fresh plan against the
+version the reviewer last saw (REQ-PF-018).
 
 **Rationale:** The user's choices remain explicit even when the destructive terminal
 decision is framed as a close/dismiss affordance. Approval and discard/reject are
@@ -390,7 +391,7 @@ terminal decisions; feedback/request changes is iterative but each round is a cl
 cycle (close, agent revises, reopen). The discard confirmation prevents accidental loss
 of task proposals that the agent may have worked to produce.
 
-**Cross-references:** REQ-PROJ-003, REQ-PROJ-004, REQ-BED-028
+**Cross-references:** REQ-PROJ-003, REQ-PROJ-004, REQ-BED-028, REQ-PF-018
 
 
 ---
@@ -430,3 +431,54 @@ AND SHALL NOT show a pane/fullscreen presentation control
 Finalized conversation-message Markdown SHALL provide the same focused-review and bounded-feedback behavior with message-scoped annotation anchors.
 Commission-review results SHALL provide the same pane/fullscreen presentation without annotation support.
 Task approval and fork-proposal review SHALL remain purpose-built decision surfaces outside this viewer-slot presentation flow.
+
+---
+
+### REQ-PF-018: See What Changed Since I Last Reviewed a Plan
+
+WHEN a conversation enters AwaitingTaskApproval
+THE SYSTEM SHALL record the reviewed plan as a task plan revision, ordered within
+  the conversation, so the review history survives reload, reconnect, and a
+  different browser
+
+WHEN the reviewer sends feedback on a plan
+THE SYSTEM SHALL retain their annotations against the revision under review
+AND SHALL derive the agent-facing feedback prose from those same annotations,
+  so the message the agent reads and the retained review record cannot diverge
+
+WHEN the plan approval reader opens on a proposal that has a preceding revision
+THE SYSTEM SHALL offer an affordance to show the difference between the plan the
+  reviewer last saw and the plan now under review
+AND SHALL report how many blocks changed
+AND SHALL allow the reviewer to step between changes in document order
+
+WHEN the plan approval reader opens on a conversation's first proposal
+THE SYSTEM SHALL NOT offer the difference affordance, there being no prior
+  version to compare against
+
+WHILE the difference is shown
+THE SYSTEM SHALL keep the plan rendered as a document rather than as a patch
+AND SHALL mark inserted text, removed text, and the blocks containing them
+AND SHALL de-emphasise unchanged blocks
+AND SHALL indicate, for each annotation the reviewer left on the previous
+  revision, whether the revision changed the text it was anchored to
+
+WHEN the reviewer switches the difference off
+THE SYSTEM SHALL restore the plan to its undecorated reading presentation
+AND SHALL retain the affordance to switch it back on
+
+IF recording a revision or retaining annotations fails
+THEN THE SYSTEM SHALL still deliver the reviewer's decision and feedback to the
+  agent, degrading to a plan-only reader rather than blocking the review
+
+**Rationale:** A revised plan arriving as an undifferentiated wall of markdown
+forces the reviewer to re-read the whole document to find the agent's edits, and
+gives them no way to confirm a specific comment was addressed. Anchoring the
+comparison to the version the reviewer personally last saw — not to an arbitrary
+prior version — is what makes "what changed since I looked" answerable. The
+difference is presented inside the rendered document because the reviewer's task
+is still to judge a plan, not to audit a patch; a source diff would trade the
+reading experience for precision that plan review does not need.
+
+**Cross-references:** REQ-PF-015, REQ-PF-016, REQ-BED-028
+

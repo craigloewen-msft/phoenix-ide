@@ -210,6 +210,18 @@ pub trait MessageStore: Send + Sync {
         content: &str,
     ) -> Result<i64, String>;
 
+    /// Record the reviewed plan as a task plan revision (REQ-PF-018),
+    /// allocating the next ordinal for the conversation. Idempotent when the
+    /// conversation's newest revision already holds this exact plan.
+    async fn record_task_plan_revision(
+        &self,
+        conversation_id: &str,
+        task_file: &str,
+        title: &str,
+        priority: &str,
+        plan: &str,
+    ) -> Result<(), String>;
+
     /// Atomically persist a fork proposal together with the originating turn's
     /// tool round (REQ-PROJ-033): the assistant message, each synthetic
     /// tool-result message, and the `fork_proposals` row commit in a single
@@ -580,6 +592,19 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
     ) -> Result<i64, String> {
         (**self)
             .update_tool_message_content(message_id, content)
+            .await
+    }
+
+    async fn record_task_plan_revision(
+        &self,
+        conversation_id: &str,
+        task_file: &str,
+        title: &str,
+        priority: &str,
+        plan: &str,
+    ) -> Result<(), String> {
+        (**self)
+            .record_task_plan_revision(conversation_id, task_file, title, priority, plan)
             .await
     }
 
@@ -1107,6 +1132,21 @@ impl MessageStore for DatabaseStorage {
         self.db
             .update_tool_message_content(message_id, content)
             .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn record_task_plan_revision(
+        &self,
+        conversation_id: &str,
+        task_file: &str,
+        title: &str,
+        priority: &str,
+        plan: &str,
+    ) -> Result<(), String> {
+        self.db
+            .record_task_plan_revision(conversation_id, task_file, title, priority, plan)
+            .await
+            .map(|_| ())
             .map_err(|e| e.to_string())
     }
 

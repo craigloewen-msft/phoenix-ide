@@ -222,6 +222,21 @@ pub enum Effect {
     /// Notify client of context exhaustion - REQ-BED-021
     NotifyContextExhausted { summary: String },
 
+    /// Record the plan the user is about to review as a task plan revision
+    /// (REQ-PF-018).
+    ///
+    /// Emitted alongside the state persist whenever the conversation enters
+    /// `AwaitingTaskApproval`. The revision history is what the approval reader
+    /// diffs the current proposal against, so it must be written on the same
+    /// path that makes the proposal visible — not on approval, which most
+    /// revisions never reach.
+    RecordPlanRevision {
+        task_file: String,
+        title: String,
+        priority: phoenix_core::task_source::Priority,
+        plan: String,
+    },
+
     /// Execute git operations for task approval (REQ-BED-028).
     ///
     /// `task_file` (relative to the conversation cwd) is the canonical

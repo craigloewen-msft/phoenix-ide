@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, afterEach } from 'vitest';
 import { TaskApprovalReader } from './TaskApprovalReader';
 import type { TaskApprovalReaderProps } from './TaskApprovalReader';
 
@@ -419,5 +419,119 @@ describe('TaskApprovalReader shared find integration', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Add Note' }));
 
     expect(screen.getAllByRole('button', { name: '1 notes' })).toHaveLength(1);
+  });
+});
+
+describe('TaskApprovalReader plan diff (REQ-PF-018)', () => {
+  const originalFetch = global.fetch;
+
+  /** Stub the baseline endpoint: `null` stands for the 204 no-baseline case. */
+  function stubBaseline(baseline: unknown | null) {
+    global.fetch = vi.fn(async (input: unknown) => {
+      if (String(input).includes('/plan-revisions/baseline')) {
+        return baseline === null
+          ? ({ status: 204, ok: true } as unknown as Response)
+          : ({ status: 200, ok: true, json: async () => baseline } as unknown as Response);
+      }
+      throw new Error(`unexpected fetch: ${String(input)}`);
+    }) as unknown as typeof global.fetch;
+  }
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    window.localStorage.clear();
+    vi.restoreAllMocks();
+  });
+
+  it('offers no diff affordance on a first proposal', async () => {
+    stubBaseline(null);
+    renderTaskApprovalReader('# Plan\n\nDo the thing.', vi.fn(), { conversationId: 'conv-1' });
+
+    await waitFor(() => expect(global.fetch).toHaveBeenCalled());
+    expect(screen.queryByRole('button', { name: /plan diff/i })).not.toBeInTheDocument();
+  });
+
+  it('offers no diff affordance without a conversation to fetch a baseline for', () => {
+    stubBaseline({ ordinal: 1, plan: '# Plan\n\nOld.', notes: [] });
+    renderTaskApprovalReader('# Plan\n\nNew.');
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: /plan diff/i })).not.toBeInTheDocument();
+  });
+
+  it('shows the change count and marks inserted words when a baseline exists', async () => {
+    stubBaseline({ ordinal: 1, plan: '# Plan\n\nUse SQLite for storage.', notes: [] });
+    const { container } = renderTaskApprovalReader(
+      '# Plan\n\nUse Postgres for storage.',
+      vi.fn(),
+      { conversationId: 'conv-1' },
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Hide plan diff' })).toBeInTheDocument(),
+    );
+    expect(screen.getByText('1 change')).toBeInTheDocument();
+    expect(container.querySelector('.plan-diff-ins')?.textContent).toBe('Postgres');
+    expect(container.querySelector('.plan-diff-del')?.textContent).toBe('SQLite');
+  });
+
+  it('restores the undecorated reading surface when toggled off', async () => {
+    stubBaseline({ ordinal: 1, plan: '# Plan\n\nUse SQLite for storage.', notes: [] });
+    const { container } = renderTaskApprovalReader(
+      '# Plan\n\nUse Postgres for storage.',
+      vi.fn(),
+      { conversationId: 'conv-1' },
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Hide plan diff' })).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Hide plan diff' }));
+
+    expect(container.querySelector('.plan-diff-ins')).toBeNull();
+    expect(container.querySelector('.plan-diff-del')).toBeNull();
+    expect(container.querySelector('.plan-diff-block--changed')).toBeNull();
+    expect(container.querySelector('.task-approval-content--diffing')).toBeNull();
+    // The plan itself still reads normally.
+    expect(screen.getByText('Use Postgres for storage.')).toBeInTheDocument();
+    // The affordance stays available to switch back on.
+    expect(screen.getByRole('button', { name: 'Show plan diff' })).toBeInTheDocument();
+  });
+
+  it('marks a prior note as addressed when the revision touched its block', async () => {
+    stubBaseline({
+      ordinal: 1,
+      plan: '# Plan\n\nUse SQLite for storage.',
+      notes: [{ line_number: 3, line_content: 'Use SQLite for storage.', note: 'why sqlite?' }],
+    });
+    const { container } = renderTaskApprovalReader(
+      '# Plan\n\nUse Postgres for storage.',
+      vi.fn(),
+      { conversationId: 'conv-1' },
+    );
+
+    await waitFor(() =>
+      expect(container.querySelector('.plan-diff-note--touched')).not.toBeNull(),
+    );
+    expect(container.querySelector('.plan-diff-note--touched')?.textContent).toContain(
+      'addressed here',
+    );
+  });
+
+  it('sends structured notes rather than pre-rendered prose', () => {
+    stubBaseline(null);
+    const onSendFeedback = vi.fn();
+    renderTaskApprovalReader('# Plan\n\nAdd the thing.', vi.fn(), { onSendFeedback });
+
+    fireEvent.click(screen.getByRole('button', { name: /add note to line 1/i }));
+    fireEvent.change(screen.getByPlaceholderText('Add your note...'), {
+      target: { value: 'Please adjust this plan.' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Add Note' }));
+    fireEvent.click(screen.getByRole('button', { name: /request changes/i }));
+
+    expect(onSendFeedback).toHaveBeenCalledWith([
+      { line_number: 1, line_content: '# Plan', note: 'Please adjust this plan.' },
+    ]);
   });
 });
