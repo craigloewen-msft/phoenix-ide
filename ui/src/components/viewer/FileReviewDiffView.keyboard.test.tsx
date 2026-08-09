@@ -32,7 +32,7 @@ function press(key: string, init: KeyboardEventInit = {}) {
   fireEvent.keyDown(document.body, { key, ...init });
 }
 
-function renderView(review: FileReviewState) {
+function renderView(review: FileReviewState, onToggleReviewFocus?: () => void) {
   const handlers = {
     onClose: vi.fn(),
     onMarkReviewed: vi.fn(async () => undefined),
@@ -53,6 +53,7 @@ function renderView(review: FileReviewState) {
           review={review}
           onSendNotes={() => undefined}
           onShowSource={() => undefined}
+          {...(onToggleReviewFocus ? { onToggleReviewFocus } : {})}
           {...handlers}
         />
       </ReviewNotesProvider>
@@ -125,6 +126,35 @@ describe('FileReviewDiffView keyboard review', () => {
     press('q');
 
     await waitFor(() => expect(handlers.onClose).toHaveBeenCalled());
+  });
+
+  it('toggles review focus on F when the host supplies the handler', async () => {
+    const onToggleReviewFocus = vi.fn();
+    renderView({ kind: 'unreviewed' }, onToggleReviewFocus);
+    await screen.findByTestId('codeview-mock');
+
+    press('F');
+    await waitFor(() => expect(onToggleReviewFocus).toHaveBeenCalledTimes(1));
+
+    // The collapse is a toggle, so the same key restores the conversation.
+    press('F');
+    await waitFor(() => expect(onToggleReviewFocus).toHaveBeenCalledTimes(2));
+  });
+
+  /**
+   * Only the wide-desktop split-pane host owns a conversation column to
+   * collapse. Elsewhere the key must be inert rather than throwing, and must not
+   * disturb the surface it was pressed on.
+   */
+  it('is inert on a surface with no collapse target', async () => {
+    const handlers = renderView({ kind: 'unreviewed' });
+    await screen.findByTestId('codeview-mock');
+
+    press('F');
+
+    expect(handlers.onClose).not.toHaveBeenCalled();
+    expect(handlers.onMarkReviewed).not.toHaveBeenCalled();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
   it('comments on the line named by a typed count', async () => {

@@ -303,6 +303,7 @@ AND SHALL apply that choice to every diff surface and remember it across session
 WHERE a diff is presented beside the conversation
 THE SYSTEM SHALL offer an explicit control that collapses the conversation so the
   review occupies the full window, and restores it on demand
+AND that control SHALL be operable from both the pointer and the keyboard
 AND SHALL restore the conversation when the diff is no longer presented beside it
 
 **Design:** Rendering style is a property of the reader, not of a particular
@@ -310,7 +311,10 @@ diff — a user who reads side-by-side reads side-by-side everywhere, so one
 remembered choice governs both the whole-branch diff and the per-file review
 diff. Collapsing is an explicit act rather than a side effect of clicking into
 the diff: reviewing involves clicking constantly (lines, notes, files), and a
-layout that moved under those clicks would be unpredictable. Because collapsing
-is a transient reading posture rather than an addressable place, it is not part
-of the viewer's addressable state, and it lapses when the surface it belongs to
-goes away.
+layout that moved under those clicks would be unpredictable. It is nonetheless
+reachable from the keyboard, because widening the reading area is part of the
+reading rhythm REQ-RV-010 protects, and a control that forces a reach for the
+mouse breaks that rhythm exactly as moving between files would. Because
+collapsing is a transient reading posture rather than an addressable place, it is
+not part of the viewer's addressable state, and it lapses when the surface it
+belongs to goes away.

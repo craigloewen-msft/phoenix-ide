@@ -79,7 +79,12 @@ function harness(files: ReviewFileEntry[]) {
   return { value, markReviewed, unmarkReviewed, refresh };
 }
 
-function renderDiff(review: ReviewContextValue | null, onClose = vi.fn(), onRefresh = vi.fn()) {
+function renderDiff(
+  review: ReviewContextValue | null,
+  onClose = vi.fn(),
+  onRefresh = vi.fn(),
+  onToggleReviewFocus?: () => void,
+) {
   render(
     <FocusScopeProvider>
       <ReviewContext.Provider value={review}>
@@ -94,6 +99,7 @@ function renderDiff(review: ReviewContextValue | null, onClose = vi.fn(), onRefr
             onClose={onClose}
             onSendNotes={() => undefined}
             onRefresh={onRefresh}
+            {...(onToggleReviewFocus ? { onToggleReviewFocus } : {})}
           />
         </ReviewNotesProvider>
       </ReviewContext.Provider>
@@ -269,6 +275,38 @@ describe('DiffView keyboard review', () => {
     // The count went to the scroll, so `c` falls back to a file-level note.
     await screen.findByPlaceholderText(/Add your note/);
     expect(screen.getByText('a.ts (file-level)')).toBeInTheDocument();
+  });
+
+  it('toggles review focus on F when the host supplies the handler', async () => {
+    const { value } = harness([entry('a.ts', { kind: 'unreviewed' })]);
+    const onToggleReviewFocus = vi.fn();
+    renderDiff(value, vi.fn(), vi.fn(), onToggleReviewFocus);
+    await screen.findByTestId('codeview-mock');
+
+    press('F');
+    await waitFor(() => expect(onToggleReviewFocus).toHaveBeenCalledTimes(1));
+
+    // The collapse is a toggle, so the same key restores the conversation.
+    press('F');
+    await waitFor(() => expect(onToggleReviewFocus).toHaveBeenCalledTimes(2));
+  });
+
+  /**
+   * Only the wide-desktop split-pane host owns a conversation column to
+   * collapse. Elsewhere the key must be inert rather than throwing, and must not
+   * disturb the surface it was pressed on.
+   */
+  it('is inert on a surface with no collapse target', async () => {
+    const { value, markReviewed } = harness([entry('a.ts', { kind: 'unreviewed' })]);
+    const onClose = vi.fn();
+    renderDiff(value, onClose);
+    await screen.findByTestId('codeview-mock');
+
+    press('F');
+
+    expect(onClose).not.toHaveBeenCalled();
+    expect(markReviewed).not.toHaveBeenCalled();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
   it('does not act on review keys while the annotation dialog is open', async () => {

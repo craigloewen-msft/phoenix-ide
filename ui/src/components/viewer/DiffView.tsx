@@ -340,9 +340,19 @@ export function DiffView({
         case 'help':
           openShortcutHelp();
           return;
+        case 'toggle-review-focus':
+          if (!onToggleReviewFocus) {
+            console.debug('[review] F pressed with no collapse target on this surface');
+            return;
+          }
+          onToggleReviewFocus();
+          return;
+        default:
+          command satisfies never;
+          return;
       }
     },
-    [cursorFile, cursorIndex, files, manifestEntryFor, moveCursorTo, notes, onClose, refresh, toggleReviewed],
+    [cursorFile, cursorIndex, files, manifestEntryFor, moveCursorTo, notes, onClose, onToggleReviewFocus, refresh, toggleReviewed],
   );
 
   useReviewKeyboard({

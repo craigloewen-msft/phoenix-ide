@@ -205,9 +205,19 @@ export function FileReviewDiffView({
         case 'help':
           openShortcutHelp();
           return;
+        case 'toggle-review-focus':
+          if (!onToggleReviewFocus) {
+            console.debug('[review] F pressed with no collapse target on this surface');
+            return;
+          }
+          onToggleReviewFocus();
+          return;
+        default:
+          command satisfies never;
+          return;
       }
     },
-    [itemId, notes, onClose, onNextFile, onNextUnreviewed, onPreviousFile, path, refresh, toggleReviewed],
+    [itemId, notes, onClose, onNextFile, onNextUnreviewed, onPreviousFile, onToggleReviewFocus, path, refresh, toggleReviewed],
   );
 
   useReviewKeyboard({

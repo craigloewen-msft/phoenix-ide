@@ -22,6 +22,7 @@ export type ReviewCommand =
   | { kind: 'next-unreviewed' }
   | { kind: 'annotate-file' }
   | { kind: 'annotate-line'; lineNumber: number }
+  | { kind: 'toggle-review-focus' }
   | { kind: 'refresh' }
   | { kind: 'close' }
   | { kind: 'help' };
@@ -88,6 +89,7 @@ export const REVIEW_BINDINGS: readonly ReviewBinding[] = [
   { keys: 'm', description: 'Toggle reviewed, then advance to the next unreviewed file' },
   { keys: 'c', description: 'Add a note on the current file' },
   { keys: '{n}c', description: 'Add a note on line n of the current file' },
+  { keys: 'F', description: 'Collapse the conversation for a full-width review, and restore it' },
   { keys: 'R', description: 'Refresh the diff and review state from disk' },
   { keys: 'q', description: 'Close the review surface' },
   { keys: '?', description: 'Show this guide' },
@@ -176,6 +178,8 @@ export function resolveReviewKey(
       return count === null
         ? resolved({ kind: 'annotate-file' })
         : resolved({ kind: 'annotate-line', lineNumber: count });
+    case 'F':
+      return resolved({ kind: 'toggle-review-focus' });
     case 'R':
       return resolved({ kind: 'refresh' });
     case 'q':

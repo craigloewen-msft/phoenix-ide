@@ -56,6 +56,7 @@ describe('resolveReviewKey', () => {
   it('maps the review actions', () => {
     expect(commandFor('m')).toEqual({ kind: 'toggle-reviewed' });
     expect(commandFor('c')).toEqual({ kind: 'annotate-file' });
+    expect(commandFor('F')).toEqual({ kind: 'toggle-review-focus' });
     expect(commandFor('R')).toEqual({ kind: 'refresh' });
     expect(commandFor('q')).toEqual({ kind: 'close' });
     expect(commandFor('?')).toEqual({ kind: 'help' });
@@ -88,10 +89,17 @@ describe('resolveReviewKey', () => {
     expect(resolveReviewKey(REVIEW_PENDING_NONE, key('m', { ctrlKey: true }))).toEqual({ kind: 'none' });
     // Ctrl+F belongs to viewer find, not to the review keymap.
     expect(resolveReviewKey(REVIEW_PENDING_NONE, key('f', { ctrlKey: true }))).toEqual({ kind: 'none' });
+    // ...and neither modifier form of the collapse key is ours either, so the
+    // find shortcut survives a held Shift.
+    expect(resolveReviewKey(REVIEW_PENDING_NONE, key('F', { ctrlKey: true }))).toEqual({ kind: 'none' });
+    expect(resolveReviewKey(REVIEW_PENDING_NONE, key('F', { metaKey: true }))).toEqual({ kind: 'none' });
+    expect(resolveReviewKey(REVIEW_PENDING_NONE, key('F', { altKey: true }))).toEqual({ kind: 'none' });
   });
 
   it('leaves unknown keys alone', () => {
-    for (const unknown of ['a', 'z', 'Enter', 'Escape', 'ArrowDown']) {
+    // `f` is listed deliberately: it is the second key of `]f` / `[f` and has no
+    // unprefixed meaning, so a mis-tapped prefix must not reach a command.
+    for (const unknown of ['a', 'z', 'f', 'Enter', 'Escape', 'ArrowDown']) {
       expect(resolveReviewKey(REVIEW_PENDING_NONE, key(unknown))).toEqual({ kind: 'none' });
     }
   });
@@ -123,6 +131,10 @@ describe('resolveReviewKey - count prefix', () => {
     expect(commandFor('m', count(9))).toEqual({ kind: 'toggle-reviewed' });
     expect(commandFor('G', count(9))).toEqual({ kind: 'scroll-edge', edge: 'bottom' });
     expect(type(['9', 'q']).commands).toEqual([{ kind: 'close' }]);
+
+    const focus = type(['9', 'F']);
+    expect(focus.commands).toEqual([{ kind: 'toggle-review-focus' }]);
+    expect(focus.pending).toEqual(REVIEW_PENDING_NONE);
   });
 
   it('drops the count when a multi-key prefix starts, rather than composing', () => {
@@ -143,7 +155,7 @@ describe('resolveReviewKey - count prefix', () => {
 
 describe('isReviewKeyCandidate', () => {
   it('accepts keys the surface owns under some pending state', () => {
-    for (const owned of ['j', 'k', 'm', 'q', 'g', ']', '[', 'f', 'u', '?', '1', '9']) {
+    for (const owned of ['j', 'k', 'm', 'q', 'g', ']', '[', 'f', 'u', 'F', '?', '1', '9']) {
       expect(isReviewKeyCandidate(key(owned))).toBe(true);
     }
     // `0` is only meaningful once a count is accumulating — but the router has

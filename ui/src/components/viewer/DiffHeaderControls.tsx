@@ -44,7 +44,7 @@ export function ReviewFocusToggleButton({
       onClick={onToggle}
       aria-label={label}
       aria-pressed={reviewFocus}
-      title={label}
+      title={`${label} (F)`}
     >
       {reviewFocus ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
     </button>

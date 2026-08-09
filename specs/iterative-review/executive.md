@@ -28,7 +28,7 @@ and commit with.
 | **REQ-RV-010:** Keyboard-complete review pass | ✅ Complete | `reviewKeymap.ts` (binding table + `ReviewPending` resolver, incl. the vim-style count); `useReviewKeyboard` (pending state is a ref, expires on `REVIEW_PREFIX_TIMEOUT_MS`, never rendered); `PhoenixDiffCodeView.annotateLineNumber`; `DiffView` file cursor; `FileReviewDiffView` |
 | **REQ-RV-011:** Reconciles with edits made outside Phoenix | ✅ Complete | `R` command and header button on both surfaces; `useRefreshOnWindowFocus` |
 | **REQ-RV-012:** Keyboard commands are discoverable | ✅ Complete | `REVIEW_BINDINGS` → `ShortcutHelpPanel` "Diff Review" group; keyboard button in both viewer headers |
-| **REQ-RV-013:** Reader controls the review's screen | ✅ Complete | `useDiffStyle` + `DiffStyleToggleButton` shared by `DiffView` and `FileReviewDiffView`; `ConversationPage` review-focus state → `.app-split-pane--review-focus` |
+| **REQ-RV-013:** Reader controls the review's screen | ✅ Complete | `useDiffStyle` + `DiffStyleToggleButton` shared by `DiffView` and `FileReviewDiffView`; `ConversationPage` review-focus state → `.app-split-pane--review-focus`; `F` in `reviewKeymap.ts` reaches the same toggle |
 
 ## Current reality
 
@@ -52,12 +52,19 @@ comments are not implemented.
 
 **Keyboard.** Bindings are vim-flavoured: `j`/`k` and `Ctrl+d`/`Ctrl+u` for the
 viewport, `gg`/`G` for the edges, `]f`/`[f` (aliased `n`/`N`) between files, `]u`
-for the next outstanding file, `m` to toggle reviewed, `c` to annotate, `R` to
-refresh, `q` to close. `reviewKeymap.ts` holds the resolver and the binding table;
-`useReviewKeyboard` adds only the pending-prefix state for the two-key sequences.
+for the next outstanding file, `m` to toggle reviewed, `c` to annotate, `F` to
+collapse the conversation for a full-width read, `R` to refresh, `q` to close.
+`reviewKeymap.ts` holds the resolver and the binding table; `useReviewKeyboard`
+adds only the pending-prefix state for the two-key sequences.
 Registration goes through the shared keyboard router
 (`specs/keyboard-interaction/`) on the `viewer` layer, so bare letters reach a
 review surface only while it is topmost and no field has focus.
+
+Uppercase `F` rather than bare `f`, which is reserved as the second key of `]f` /
+`[f`: a mis-tapped prefix must not reshape the layout. Only the wide-desktop
+split-pane host supplies a collapse handler, so on a fullscreen or overlay diff
+the key resolves to a command that finds no target and logs at debug — the
+header control is absent there too, so there is nothing the reviewer is denied.
 
 In the whole-branch diff, the "current file" is an explicit cursor over the parsed
 item list, marked in the file header; `PhoenixDiffCodeView` publishes that list and
@@ -73,7 +80,8 @@ changing the requirement.
 by `useDiffStyle` on every diff surface. Review focus lives in `ConversationPage`
 component state and applies `.app-split-pane--review-focus`, which overrides the
 reserved chat width in CSS — `--viewer-pane-width` keeps its two imperative
-writers (the pane layout effect and the divider's live-drag channel).
+writers (the pane layout effect and the divider's live-drag channel). The header
+button and the `F` key are two routes to that one piece of state, not two states.
 
 ## Verification
 
@@ -92,10 +100,12 @@ writers (the pane layout effect and the divider's live-drag channel).
 - UI (`reviewKeymap.test.ts`): every binding, prefix sequences and their
   abandonment, modifier guards, and that unknown keys are left alone.
 - UI (`DiffView.keyboard.test.tsx`): file-cursor motion, mark-and-advance versus
-  unmark-and-stay, the untracked-file report, refresh, close, and that review keys
-  stand down while the annotation dialog is open.
+  unmark-and-stay, the untracked-file report, refresh, close, the review-focus
+  toggle and its inert no-target case, and that review keys stand down while the
+  annotation dialog is open.
 - UI (`FileReviewDiffView.keyboard.test.tsx`): mark at the rendered blob then
-  advance, unmark without advancing, file motion, refresh, close.
+  advance, unmark without advancing, file motion, refresh, close, and the
+  review-focus toggle with and without a collapse target.
 - UI (`ShortcutHelpPanel.test.tsx`): every binding in the table reaches the guide.
 - UI (`DiffView.test.tsx`, `FileReviewDiffView.test.tsx`): the unified/split toggle
   driving Pierre's `diffStyle`, the shared persisted preference across both diff
