@@ -157,6 +157,23 @@ In CI, gating mode must be explicit: full runs set `PHOENIX_CHECK_ALL=1`, gated
 runs set `PHOENIX_CHECK_BASE`; `check` refuses to auto-derive a base under
 `CI=true` (a derived base on a main push would silently skip every lane).
 
+#### Reading `check` output — get the lane summary on the first run
+
+`check` is a multi-minute run whose per-test output buries the one line that
+matters: which *lanes* failed. Piping to `tail` shows only the last lane's
+test log, so a failure in an earlier lane is invisible and you end up running
+the whole thing a second time to find it. Capture the lane summary on the
+first run instead:
+
+```bash
+./dev.py check 2>&1 | tee /tmp/check.log | grep -E "^(\s*[✓✗]|FAILED|error)"
+```
+
+The `grep` gives the per-lane pass/fail table immediately; `/tmp/check.log`
+keeps the full output so you can dig into whichever lane failed
+(`grep -B40 "^  ✗ cargo test" /tmp/check.log`) without re-running. Never run
+`check` twice just to see the summary.
+
 **Workflow:** `./dev.py up` → make changes → `./dev.py restart` (Rust changes) or save (UI auto-reloads via Vite) → `./dev.py check` → commit
 
 In dev mode, Vite serves `ui/` with hot reload. In production, `ui/dist/` is embedded into the Rust binary via RustEmbed.
