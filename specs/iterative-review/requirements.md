@@ -141,10 +141,20 @@ THE SYSTEM SHALL treat that choice as a standing preference across the files
 AND SHALL render the full diff for a file with no checkpoint without discarding
   that preference
 
+WHILE a requested diff scope has no answer yet
+THE SYSTEM SHALL NOT present the previously requested scope's diff as that
+  scope's content
+
 **Design:** This is the requirement the whole loop exists to serve: after asking
 for fixes, the user reads the delta, not the file again. Silently widening the
 scope to the full diff would answer a different question than the one asked, and
 the user would have no way to tell that had happened.
+
+The same is true a moment earlier, while the answer is still in flight: the
+control reports the scope the user picked, so leaving the previous scope's
+content beneath it makes the surface state a falsehood the user cannot detect —
+the full diff and the since-review diff describe the same file and differ only in
+extent. Two renderings of one path are two documents, not one document updating.
 
 "Show me only what is new" is an intent for a whole review pass, not for one
 file: a reviewer walking the changed-files list is asking the same question of
@@ -269,11 +279,22 @@ THE SYSTEM SHALL re-read the rendered diff and the review manifest from the
 WHEN the browser window regains focus while a review surface is open
 THE SYSTEM SHALL perform the same refresh
 
+WHERE a file's content changes while its diff is open for review
+THE SYSTEM SHALL re-read that diff without waiting for the user to ask
+
 **Design:** The working tree is shared with whatever editor the user also has
 open, so a rendered diff is a snapshot that can silently fall behind. Returning to
 the Phoenix window is both the moment the staleness starts to matter and an action
 the user took, which makes it a truthful trigger; polling would spend requests
 while nobody is looking and still lag the edit that prompted the switch.
+
+The agent editing an open file is the same staleness arriving from inside
+Phoenix, and it is the event the whole loop is built around, so it cannot wait
+for a user gesture. A diff compares two contents, and the one that moves here is
+the current side — a surface that watched only the checkpoint would keep
+asserting the previous turn's answer, including the negative "nothing changed
+since you reviewed this file", while the manifest beside it already reported the
+file stale.
 
 Refreshing re-reads rather than patching: the manifest is server-owned
 (REQ-RV-002), so the surface asks again instead of reconciling a local copy.

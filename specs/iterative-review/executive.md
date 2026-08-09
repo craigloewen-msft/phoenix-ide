@@ -22,11 +22,11 @@ and commit with.
 | **REQ-RV-004:** Marking records the content the user saw | ✅ Complete | `POST …/review/files/mark` → `mark_file_reviewed`; `Database::upsert_review_checkpoint` compare-and-set |
 | **REQ-RV-005:** No interference with staging or committing | ✅ Complete | `git_ops::review::temp_index_env` (isolated `GIT_INDEX_FILE`); guarded by `review_plumbing_never_touches_the_index` |
 | **REQ-RV-006:** Reviewing a single file | ✅ Complete | `?mode=diff` slot param; `FileReviewDiffView`; FILE⇄DIFF toggle in `MetaViewer` and the diff header |
-| **REQ-RV-007:** Only what changed since last review | ✅ Complete | `git_ops::review::file_diff_since_review`; `scope=since_review`; 409 when no checkpoint; `useReviewDiffScope` persists the choice across files, with a no-checkpoint file rendering `full` without clearing it |
+| **REQ-RV-007:** Only what changed since last review | ✅ Complete | `git_ops::review::file_diff_since_review` (header relabelling stops at the first hunk, so body lines that begin `-- ` / `++ ` survive); `scope=since_review`; 409 when no checkpoint; `useReviewDiffScope` persists the choice across files, with a no-checkpoint file rendering `full` without clearing it; `FileReviewDiffView` renders a response only when its echoed `path`/`scope` match the open request |
 | **REQ-RV-008:** Checkpoints live and die with the work scope | ✅ Complete | `ON DELETE CASCADE` on scope deletion; re-scope clears in `update_work_scope_environment_tx`; comparator mismatch → unreviewed |
 | **REQ-RV-009:** Completing a pass does not gate merging | ✅ Complete | `ChangedFilesReview` complete action; `WorkActions` untouched |
 | **REQ-RV-010:** Keyboard-complete review pass | ✅ Complete | `reviewKeymap.ts` (binding table + `ReviewPending` resolver, incl. the vim-style count); `useReviewKeyboard` (pending state is a ref, expires on `REVIEW_PREFIX_TIMEOUT_MS`, never rendered); `PhoenixDiffCodeView.annotateLineNumber`; `DiffView` file cursor; `FileReviewDiffView` |
-| **REQ-RV-011:** Reconciles with edits made outside Phoenix | ✅ Complete | `R` command and header button on both surfaces; `useRefreshOnWindowFocus` |
+| **REQ-RV-011:** Reconciles with edits made outside Phoenix | ✅ Complete | `R` command and header button on both surfaces; `useRefreshOnWindowFocus`; `FileReviewDiffView` refetches on either side of the comparison moving (`currentBlobSha` from the manifest, `at_blob` from the checkpoint) |
 | **REQ-RV-012:** Keyboard commands are discoverable | ✅ Complete | `REVIEW_BINDINGS` → `ShortcutHelpPanel` "Diff Review" group; keyboard button in both viewer headers |
 | **REQ-RV-013:** Reader controls the review's screen | ✅ Complete | `useDiffStyle` + `DiffStyleToggleButton` shared by `DiffView` and `FileReviewDiffView`; `ConversationPage` review-focus state → `.app-split-pane--review-focus` |
 
@@ -79,9 +79,10 @@ writers (the pane layout effect and the divider's live-drag channel).
 
 - Rust (`git_ops::review::tests`): checkpoint stability across commit/amend/rebase;
   manifest invariance under the agent committing; since-review scoping;
-  truncation accounting after header relabelling; local-vs-remote comparator
-  selection; and an explicit assertion that the repository index is unchanged
-  across a full manifest-plus-diff pass.
+  truncation accounting after header relabelling; that a removed `-- ` comment
+  and an added `++ ` line survive that relabelling and CRLF endings round-trip;
+  local-vs-remote comparator selection; and an explicit assertion that the
+  repository index is unchanged across a full manifest-plus-diff pass.
 - Rust (`phoenix-db`): checkpoint round-trip, compare-and-set rejection of a stale
   mark, individual and wholesale clearing, and that re-scoping a conversation
   discards its review.
@@ -99,8 +100,10 @@ writers (the pane layout effect and the divider's live-drag channel).
 - UI (`ShortcutHelpPanel.test.tsx`): every binding in the table reaches the guide.
 - UI (`DiffView.test.tsx`, `FileReviewDiffView.test.tsx`): the unified/split toggle
   driving Pierre's `diffStyle`, the shared persisted preference across both diff
-  surfaces, and that the conversation-collapse control appears only on the
-  split-pane surfaces that supply the handler.
+  surfaces, that the conversation-collapse control appears only on the
+  split-pane surfaces that supply the handler, that an agent edit to the open
+  file refetches without a user gesture, and that a scope switch shows the
+  loading state rather than the outgoing scope's diff.
 - Manual: the full loop exercised against the seeded `diff-review-fixture`
   conversation — mark → agent edit → stale marker → since-review delta.
 
