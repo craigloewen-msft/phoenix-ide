@@ -21,14 +21,17 @@ vi.mock('@pierre/diffs/react', async () => {
   return makeCodeViewMock();
 });
 
+// Hunks start at line 41 so a counted-line test names a line the parse must
+// actually resolve, not the trivial first one.
 function fileDiff(name: string): string {
   return [
     `diff --git a/${name} b/${name}`,
     'index 0000000..1111111 100644',
     `--- a/${name}`,
     `+++ b/${name}`,
-    '@@ -0,0 +1,1 @@',
+    '@@ -40,0 +41,2 @@',
     '+hello world',
+    `+line 42 of ${name}`,
   ].join('\n');
 }
 
@@ -203,6 +206,63 @@ describe('DiffView keyboard review', () => {
       behavior: 'instant',
     }));
     expect(scrolledItemIds()).toEqual([]);
+  });
+
+  it('comments on the line named by a typed count, on the cursor file', async () => {
+    const { value } = harness([entry('a.ts', { kind: 'unreviewed' })]);
+    renderDiff(value);
+    await screen.findByTestId('codeview-mock');
+
+    press('4');
+    press('2');
+    press('c');
+
+    await screen.findByPlaceholderText(/Add your note/);
+    expect(screen.getByText('a.ts:42')).toBeInTheDocument();
+    expect(screen.getByText('line 42 of a.ts')).toBeInTheDocument();
+    // The commented line is brought into view, as a gutter click would.
+    expect(codeViewMockState.scrollToCalls).toContainEqual(
+      expect.objectContaining({ type: 'line', id: 'committed:a.ts', lineNumber: 42, side: 'additions' }),
+    );
+  });
+
+  it('shows the pending count while it is being typed', async () => {
+    const { value } = harness([entry('a.ts', { kind: 'unreviewed' })]);
+    renderDiff(value);
+    await screen.findByTestId('codeview-mock');
+
+    press('4');
+    press('2');
+
+    expect(await screen.findByRole('status')).toHaveTextContent('42');
+  });
+
+  it('explains rather than silently ignoring a line that is not in the diff', async () => {
+    const { value } = harness([entry('a.ts', { kind: 'unreviewed' })]);
+    renderDiff(value);
+    await screen.findByTestId('codeview-mock');
+
+    press('9');
+    press('9');
+    press('c');
+
+    expect(await screen.findByRole('status')).toHaveTextContent(/Line 99 is not in the diff for a\.ts/);
+    expect(screen.queryByPlaceholderText(/Add your note/)).not.toBeInTheDocument();
+  });
+
+  it('clears a typed count when another command intervenes', async () => {
+    const { value } = harness([entry('a.ts', { kind: 'unreviewed' })]);
+    renderDiff(value);
+    await screen.findByTestId('codeview-mock');
+
+    press('4');
+    press('2');
+    press('j');
+    press('c');
+
+    // The count went to the scroll, so `c` falls back to a file-level note.
+    await screen.findByPlaceholderText(/Add your note/);
+    expect(screen.getByText('a.ts (file-level)')).toBeInTheDocument();
   });
 
   it('does not act on review keys while the annotation dialog is open', async () => {

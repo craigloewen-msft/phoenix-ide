@@ -25,7 +25,7 @@ and commit with.
 | **REQ-RV-007:** Only what changed since last review | ✅ Complete | `git_ops::review::file_diff_since_review`; `scope=since_review`; 409 when no checkpoint |
 | **REQ-RV-008:** Checkpoints live and die with the work scope | ✅ Complete | `ON DELETE CASCADE` on scope deletion; re-scope clears in `update_work_scope_environment_tx`; comparator mismatch → unreviewed |
 | **REQ-RV-009:** Completing a pass does not gate merging | ✅ Complete | `ChangedFilesReview` complete action; `WorkActions` untouched |
-| **REQ-RV-010:** Keyboard-complete review pass | ✅ Complete | `reviewKeymap.ts` (binding table + resolver); `useReviewKeyboard`; `DiffView` file cursor; `FileReviewDiffView` |
+| **REQ-RV-010:** Keyboard-complete review pass | ✅ Complete | `reviewKeymap.ts` (binding table + `ReviewPending` resolver, incl. the vim-style count); `useReviewKeyboard`; `PhoenixDiffCodeView.annotateLineNumber`; `ReviewCountIndicator`; `DiffView` file cursor; `FileReviewDiffView` |
 | **REQ-RV-011:** Reconciles with edits made outside Phoenix | ✅ Complete | `R` command and header button on both surfaces; `useRefreshOnWindowFocus` |
 | **REQ-RV-012:** Keyboard commands are discoverable | ✅ Complete | `REVIEW_BINDINGS` → `ShortcutHelpPanel` "Diff Review" group; keyboard button in both viewer headers |
 | **REQ-RV-013:** Reader controls the review's screen | ✅ Complete | `useDiffStyle` + `DiffStyleToggleButton` shared by `DiffView` and `FileReviewDiffView`; `ConversationPage` review-focus state → `.app-split-pane--review-focus` |

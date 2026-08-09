@@ -185,9 +185,26 @@ reports a fact rather than inviting a premature claim.
 WHILE a review surface is the topmost focus scope and no text field has focus
 THE SYSTEM SHALL accept keyboard commands to scroll the viewport, move between
   changed files, toggle a file's reviewed state, annotate the current file,
-  refresh the surface, and dismiss the surface
+  annotate a named line of the current file, refresh the surface, and dismiss
+  the surface
 AND SHALL apply those commands to the whole-branch diff and the per-file review
   diff alike
+
+WHILE the user types digits on a review surface
+THE SYSTEM SHALL accumulate them into a count, display the count on that
+  surface, and apply it to the next command that takes one
+
+WHEN a key that takes no count is pressed
+THE SYSTEM SHALL discard the count
+
+WHERE a count precedes the annotate command
+THE SYSTEM SHALL anchor the note to that line of the current file, bring the
+  line into view, and quote the same source text a pointer-driven note on that
+  line would quote
+
+WHERE a counted annotate command names a line the current file's diff does not
+  contain
+THE SYSTEM SHALL report why the command had no effect
 
 WHEN the user toggles a file that is unreviewed or stale
 THE SYSTEM SHALL mark it reviewed and then move to the next file still needing
@@ -204,13 +221,24 @@ mouse between every file is what breaks its rhythm. The commands are the ones th
 loop already has as buttons, so the keyboard is a second route to the same
 behaviour rather than a parallel one that can diverge.
 
+The count exists because the line a reviewer wants to comment on is already on
+screen with its number printed beside it; typing that number is a shorter path
+than hunting for the line's gutter affordance. Borrowing vim's count semantics
+means the behaviour is already known to the audience that wants it.
+
+A count is displayed because it changes what the next key does. A held multi-key
+prefix expires on its own so a forgotten `g` cannot swallow a later key, but a
+count does not: it is on screen, so the reviewer knows it is armed, and having it
+evaporate mid-type would be the surprise.
+
 Marking advances because it is the act that completes a file; un-marking is a
 correction to the file in front of the user, so moving away from it would discard
 the context that prompted the correction.
 
 The whole-branch diff can render files outside the manifest (a diff taken against
-another branch), so marking there can find no file to mark. Doing nothing is
-indistinguishable from a broken key, hence the explicit report.
+another branch), so marking there can find no file to mark. A named line can
+likewise fall outside the rendered hunks. Doing nothing is indistinguishable from
+a broken key, hence the explicit report in both cases.
 
 ---
 

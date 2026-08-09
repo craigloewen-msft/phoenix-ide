@@ -23,8 +23,9 @@ const DIFF = [
   'index 0000000..1111111 100644',
   '--- a/a.ts',
   '+++ b/a.ts',
-  '@@ -0,0 +1,1 @@',
+  '@@ -40,0 +41,2 @@',
   '+hello world',
+  '+line 42 of a.ts',
 ].join('\n');
 
 function press(key: string, init: KeyboardEventInit = {}) {
@@ -124,5 +125,30 @@ describe('FileReviewDiffView keyboard review', () => {
     press('q');
 
     await waitFor(() => expect(handlers.onClose).toHaveBeenCalled());
+  });
+
+  it('comments on the line named by a typed count', async () => {
+    renderView({ kind: 'unreviewed' });
+    await screen.findByTestId('codeview-mock');
+
+    press('4');
+    press('2');
+    press('c');
+
+    await screen.findByPlaceholderText(/Add your note/);
+    expect(screen.getByText('a.ts:42')).toBeInTheDocument();
+    expect(screen.getByText('line 42 of a.ts')).toBeInTheDocument();
+  });
+
+  it('explains rather than silently ignoring a line that is not in the diff', async () => {
+    renderView({ kind: 'unreviewed' });
+    await screen.findByTestId('codeview-mock');
+
+    press('9');
+    press('9');
+    press('c');
+
+    expect(await screen.findByRole('status')).toHaveTextContent(/Line 99 is not in this diff/);
+    expect(screen.queryByPlaceholderText(/Add your note/)).not.toBeInTheDocument();
   });
 });
