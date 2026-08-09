@@ -44,6 +44,7 @@ VITE_PROXY_FILE = ROOT / ".vite.proxy"
 PHOENIX_PORT_FILE = ROOT / ".phoenix.port"
 VITE_PORT_FILE = ROOT / ".vite.port"
 LOG_FILE = ROOT / "phoenix.log"
+VITE_LOG_FILE = ROOT / "vite.log"
 
 # ANSI/terminal control sequences: CSI escapes (colour, cursor) plus the
 # SO/SI shift bytes rustfmt emits around its diff colours. Used to scrub
@@ -2072,14 +2073,26 @@ def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False) -> bool:
     # resolved above and folded into the restart key — a `0.0.0.0` Vite proxies
     # the unauthenticated backend to the network.
     # pnpm passes args after the script name directly — no `--` separator.
-    proc = subprocess.Popen(
-        ["pnpm", "run", "dev", "--port", str(port), "--strictPort", "--host", vite_host],
-        cwd=UI_DIR,
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
+    # Vite's own output is the only record of why it exited; discarding it makes
+    # a crash (node heap OOM, a plugin throwing, a port conflict) undiagnosable
+    # after the fact, since the process is gone and leaves no other trace.
+    vite_log = open(VITE_LOG_FILE, "a", buffering=1)
+    vite_log.write(
+        f"\n===== vite start {datetime.datetime.now().isoformat(timespec='seconds')} "
+        f"port={port} host={vite_host} =====\n"
     )
+    try:
+        proc = subprocess.Popen(
+            ["pnpm", "run", "dev", "--port", str(port), "--strictPort", "--host", vite_host],
+            cwd=UI_DIR,
+            env=env,
+            stdout=vite_log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        # The child holds its own dup of the fd; the parent's copy is dead weight.
+        vite_log.close()
     VITE_PID_FILE.write_text(str(proc.pid))
     VITE_PORT_FILE.write_text(str(port) + "\n")
     register_dev_process("vite", proc.pid, port)
@@ -2097,6 +2110,7 @@ def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False) -> bool:
             "try './dev.py reap' or './dev.py up --vite-port <free>'.",
             file=sys.stderr,
         )
+        print(f"  Vite output: {VITE_LOG_FILE}", file=sys.stderr)
         # Don't leave the orphan this check exists to detect: the wrapper may
         # still be alive (its child died on EADDRINUSE), so kill the group and
         # clear every record we wrote above before bailing.
@@ -2154,8 +2168,17 @@ def cmd_up(
     # Seed before Phoenix starts so the seeder remains the only database writer.
     # The release binary is already built, so seed can run its canonical
     # migrate-only path without rebuilding.
+    #
+    # A live Phoenix already owns the DB, so seeding is impossible by design
+    # (cmd_seed refuses, and would exit). That must not abort `up`: the common
+    # case is a Phoenix that outlived its Vite, where `up`'s job is to restart
+    # only the servers that are down. A DB with a live runtime is also, by
+    # definition, already initialised — so there is nothing to seed.
     if not no_seed:
-        cmd_seed(quiet_if_populated=True, build=False)
+        if get_pid(PHOENIX_PID_FILE) is not None:
+            print("Phoenix already running — skipping seed (live runtime owns the DB).")
+        else:
+            cmd_seed(quiet_if_populated=True, build=False)
         print()
 
     phoenix_tls = start_phoenix(port=phoenix_port, tls=tls)
