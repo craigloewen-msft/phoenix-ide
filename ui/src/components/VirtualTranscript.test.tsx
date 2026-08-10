@@ -706,4 +706,109 @@ describe('VirtualTranscript', () => {
     const observer = resizeObservers.at(-1)!;
     expect(observer.elements.has(scroller)).toBe(true);
   });
+
+  // A row's extent is discoverable only while it is mounted, so the layout
+  // reaches its fixed point by iterating: measure the mounted rows, relayout,
+  // mount whatever the new layout reveals. Every iteration is a React update
+  // scheduled from the commit phase, and React destroys the tree once 50 of
+  // those nest. A scalar estimate that stays wrong makes the iteration count
+  // scale with the list, because each round only absorbs one viewport's worth of
+  // rows, so a long transcript exceeds the limit and the whole conversation
+  // unmounts mid-read.
+  it('converges within a bounded number of relayout rounds when the estimate is far too large', () => {
+    const items = makeItems(2000, 4);
+
+    expect(() => render(
+      <StrictMode>
+        <VirtualTranscript
+          items={items}
+          getKey={(item) => item.id}
+          estimatedExtent={120}
+          overscan={600}
+          initialTail
+          renderItem={renderRow}
+          header={<div data-height={90}>header</div>}
+        />
+      </StrictMode>,
+    )).not.toThrow();
+
+    // Convergence actually happened: the tail is mounted and the total extent
+    // reflects the measured rows rather than the discarded estimate.
+    const indexes = rowIndexes();
+    expect(indexes.length).toBeGreaterThan(0);
+    expect(indexes.at(-1)).toBe(items.length - 1);
+  });
+
+  // Measurements are the only evidence of real row height, so a scalar estimate
+  // is a seed rather than a standing answer: once rows have been measured, the
+  // rows never measured are predicted from them.
+  it('predicts unmeasured rows from measured ones when the estimate is a scalar', () => {
+    const totals: number[] = [];
+
+    render(
+      <VirtualTranscript
+        items={makeItems(100, 40)}
+        getKey={(item) => item.id}
+        estimatedExtent={200}
+        overscan={0}
+        initialTail={false}
+        renderItem={renderRow}
+        onTotalExtentChange={(total) => totals.push(total)}
+      />,
+    );
+
+    // 100 rows of 40px: the seed would have claimed 20000.
+    expect(totals.at(-1)).toBe(4000);
+  });
+
+  // A caller-supplied function carries per-row knowledge the component cannot
+  // improve on, so measurements of other rows must not override it.
+  it('keeps a per-item estimate authoritative for unmeasured rows', () => {
+    const totals: number[] = [];
+    const items = makeItems(100, 40).map((item, index) => (
+      index < 5 ? { ...item, height: 400 } : item
+    ));
+
+    render(
+      <VirtualTranscript
+        items={items}
+        getKey={(item) => item.id}
+        estimatedExtent={(item) => item.height}
+        overscan={0}
+        initialTail={false}
+        renderItem={renderRow}
+        onTotalExtentChange={(total) => totals.push(total)}
+      />,
+    );
+
+    // 5 rows of 400 plus 95 of 40; a mean over the measured tall rows would not
+    // reproduce this total.
+    expect(totals.at(-1)).toBe(5 * 400 + 95 * 40);
+  });
+
+  // The relayout cap only exists to break nesting, so it must count updates that
+  // nest inside one commit — not updates that merely follow one another. If
+  // successive user interactions accumulated against the cap, a transcript would
+  // stop responding to scrolls after a while and lag a frame behind forever.
+  it('keeps responding synchronously to many successive scrolls', () => {
+    render(
+      <VirtualTranscript
+        items={makeItems(4000, 20)}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={0}
+        initialTail={false}
+        renderItem={renderRow}
+      />,
+    );
+
+    const scroller = document.querySelector<HTMLElement>('.virtual-transcript')!;
+
+    // Well past the cap, so an over-eager cap would have started deferring.
+    for (let step = 1; step <= 40; step += 1) {
+      scroller.scrollTop = step * 100;
+      fireEvent.scroll(scroller);
+      expect(rowIndexes()[0]).toBe((step * 100) / 20);
+    }
+  });
 });

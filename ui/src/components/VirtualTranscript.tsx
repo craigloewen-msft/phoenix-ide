@@ -99,6 +99,15 @@ interface StorePublisher<T> {
 
 const DEFAULT_ESTIMATED_EXTENT = 1;
 const PINNED_EPSILON = 1;
+// A row's extent is discoverable only while it is mounted, so the layout reaches
+// its fixed point by iterating: measure the mounted rows, relayout, mount
+// whatever the new layout reveals. Each iteration is a React update scheduled
+// from the commit phase, and React destroys the tree once 50 of those nest. This
+// caps how many iterations may nest before the remainder is deferred to the next
+// frame, which converges a frame later instead of tearing the transcript down.
+// Ordinary convergence takes a handful of iterations, so the cap is unreachable
+// except for content whose measured height keeps changing.
+const MAX_NESTED_RELAYOUT_ROUNDS = 16;
 
 function clampNonNegative(value: number): number {
   return Number.isFinite(value) && value > 0 ? value : 0;
@@ -185,8 +194,26 @@ function resolvePhysicalKeys<T>(
   return { keys, duplicateKeys: [...duplicateKeys] };
 }
 
+function measuredExtentMean<T>(store: PhysicalStore<T>): number | null {
+  if (store.measuredExtents.size === 0) return null;
+  let total = 0;
+  for (const extent of store.measuredExtents.values()) total += extent;
+  const mean = total / store.measuredExtents.size;
+  return mean > 0 ? mean : null;
+}
+
 function estimatedExtentForKey<T>(store: PhysicalStore<T>) {
+  // A scalar `estimatedExtent` carries no per-row information, so it is only a
+  // seed for rows never yet measured; a caller-supplied function does carry
+  // per-row information and is always authoritative. Refining the seed with the
+  // mean of what has been measured is what bounds convergence: a row is measured
+  // only while mounted, so every correction to the layout costs one nested
+  // React update, and a seed that stays wrong drags the rendered window across
+  // the list a screenful per round. Long transcripts then exceed React's nested
+  // update limit and the whole tree is torn down mid-conversation.
+  const adaptiveExtent = typeof store.estimatedExtent === 'function' ? null : measuredExtentMean(store);
   return (_key: string, index: number) => {
+    if (adaptiveExtent !== null) return adaptiveExtent;
     const item = store.items[index];
     if (item === undefined) return DEFAULT_ESTIMATED_EXTENT;
     return typeof store.estimatedExtent === 'function'
@@ -446,8 +473,43 @@ function VirtualTranscriptInner<T>(
     applyPhysicalChange(store, anchor, wasPinned);
   }
 
+  // Depth of the current measure→relayout chain. The flag is cleared during
+  // render, so only a publish issued from the commit phase of that render — a
+  // row ref reporting a new measurement — is still set when the layout effect
+  // below runs. A commit that measures nothing new ends the chain, which is what
+  // keeps independent publishes (a scroll, then a resize) from accumulating.
+  const chainDepth = useRef(0);
+  const publishedDuringCommit = useRef(false);
+  const deferredPublishHandle = useRef(0);
+  publishedDuringCommit.current = false;
+
   const publish = useCallback(() => {
+    if (chainDepth.current >= MAX_NESTED_RELAYOUT_ROUNDS) {
+      if (deferredPublishHandle.current !== 0) return;
+      deferredPublishHandle.current = requestAnimationFrame(() => {
+        deferredPublishHandle.current = 0;
+        chainDepth.current = 0;
+        publishRevision();
+      });
+      return;
+    }
+    publishedDuringCommit.current = true;
     publishRevision();
+  }, []);
+
+  // Runs after every commit, and after the row refs of that commit have
+  // attached, so it observes whether the commit extended the chain.
+  useLayoutEffect(() => {
+    if (publishedDuringCommit.current) {
+      chainDepth.current += 1;
+      return;
+    }
+    chainDepth.current = 0;
+  });
+
+  useEffect(() => () => {
+    if (deferredPublishHandle.current !== 0) cancelAnimationFrame(deferredPublishHandle.current);
+    deferredPublishHandle.current = 0;
   }, []);
 
   useEffect(() => {
