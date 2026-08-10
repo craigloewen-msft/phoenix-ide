@@ -100,3 +100,5 @@ construction rather than by careful re-derivation.
   verification that a hydrated file agrees with its patch.
 - `@pierre/diffs` `DiffHunksRenderer` (`isExpandable: !fileDiff.isPartial`) and
   `processFile` — the upstream behaviour this decision unlocks.
+- ADR-028 refines how the addressed content is fetched, without changing this
+  addressing decision.

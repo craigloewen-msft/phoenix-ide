@@ -7,7 +7,7 @@
  * anchor the whole-branch diff produces.
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Loader2, AlertCircle, Keyboard, RefreshCw } from 'lucide-react';
 import { ViewerShell } from './ViewerShell';
 import { NotesPanel } from './NotesPanel';
@@ -15,6 +15,8 @@ import { AnnotationDialog } from './AnnotationDialog';
 import { useDiffReviewNotes } from './useDiffReviewNotes';
 import type { AnnotateTarget } from './useDiffReviewNotes';
 import { PhoenixDiffCodeView } from './PhoenixDiffCodeView';
+import type { SectionFileSource } from './pierreDiffMapping';
+import { useDiffExpansion } from './useDiffExpansion';
 import { openShortcutHelp } from './openShortcutHelp';
 import { useReviewKeyboard } from './useReviewKeyboard';
 import { useRefreshOnWindowFocus } from './useRefreshOnWindowFocus';
@@ -150,6 +152,29 @@ export function FileReviewDiffView({
   // state until its own answer arrives. A refetch of the *same* request keeps
   // the current content on screen, so pulling in an edit does not flash.
   const shown = data !== null && data.path === path && data.scope === scope ? data : null;
+
+  // Context expansion. The code view publishes which files carry the blob ids
+  // needed to fetch their contents, and the fetched contents flow back in.
+  const [expandableSources, setExpandableSources] = useState<readonly SectionFileSource[]>([]);
+  // A truncated diff is not the whole patch, so a whole-file parse of it would
+  // disagree with the file. The wrapper is fed this diff in the committed slot,
+  // so that is the section its published sources carry.
+  const truncatedSections = useMemo(() => {
+    const sections = new Set<SectionFileSource['section']>();
+    if (shown?.truncated_kib !== undefined) sections.add('committed');
+    return sections;
+  }, [shown?.truncated_kib]);
+  // The two scopes resolve content by different routes. `full` diffs the merge
+  // base against the working tree, whose new side is generally not in the object
+  // database and must be hash-verified — the `uncommitted` route.
+  // `since_review` diffs two blobs that are both stored, so it is `committed`.
+  const expansionRoute = scope === 'since_review' ? 'committed' : 'uncommitted';
+  const expansionContents = useDiffExpansion({
+    conversationId,
+    sources: expandableSources,
+    truncatedSections,
+    route: expansionRoute,
+  });
 
   const handleMark = useCallback(async () => {
     if (!shown) return;
@@ -377,6 +402,8 @@ export function FileReviewDiffView({
             onAnnotateLine={notes.startAnnotateLine}
             onAnnotateFile={notes.startAnnotateFile}
             onFilesChange={handleFilesChange}
+            expansionContents={expansionContents}
+            onExpandableFilesChange={setExpandableSources}
           />
         )}
       </div>

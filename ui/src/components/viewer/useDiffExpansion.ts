@@ -13,7 +13,7 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
-import { api, type DiffExpansionFileRequest } from '../../api';
+import { api, type DiffExpansionFileRequest, type DiffExpansionSection } from '../../api';
 import type { SectionFileSource } from './pierreDiffMapping';
 
 export interface ExpansionContents {
@@ -30,6 +30,20 @@ export interface UseDiffExpansionArgs {
    *  them: the patch we hold is not the whole patch, so a hydrated parse would
    *  disagree with the file and be rejected anyway. */
   truncatedSections: ReadonlySet<SectionFileSource['section']>;
+  /**
+   * How the server should resolve each side's content.
+   *
+   * This is not the same question as which diff section a file belongs to, even
+   * though the whole-branch diff answers both the same way. `committed` reads
+   * both sides from the object database; `uncommitted` reads the new side from
+   * the working tree and hash-verifies it. A surface whose diff compares a
+   * stored blob against the working tree is therefore `uncommitted` regardless
+   * of which section slot its text arrived in, so the caller states the route
+   * rather than letting it be inferred.
+   *
+   * Defaults to the file's own section.
+   */
+  route?: DiffExpansionSection | undefined;
 }
 
 /** Item id → both file sides, for every file whose contents resolved. */
@@ -37,6 +51,7 @@ export function useDiffExpansion({
   conversationId,
   sources,
   truncatedSections,
+  route,
 }: UseDiffExpansionArgs): ReadonlyMap<string, ExpansionContents> {
   const [contents, setContents] = useState<ReadonlyMap<string, ExpansionContents>>(EMPTY);
 
@@ -49,9 +64,9 @@ export function useDiffExpansion({
   // not refetch, while a genuinely new diff (different blob ids) does.
   const requestKey = useMemo(
     () => requestable
-      .map((s) => `${s.itemId}\u0000${s.prevObjectId}\u0000${s.newObjectId}`)
+      .map((s) => `${s.itemId}\u0000${s.prevObjectId}\u0000${s.newObjectId}\u0000${route ?? s.section}`)
       .join('\u0001'),
-    [requestable],
+    [requestable, route],
   );
 
   useEffect(() => {
@@ -70,7 +85,7 @@ export function useDiffExpansion({
       path: s.filePath,
       prev_object_id: s.prevObjectId,
       new_object_id: s.newObjectId,
-      section: s.section,
+      section: route ?? s.section,
     }));
 
     api.getDiffExpansion(conversationId, files, controller.signal)

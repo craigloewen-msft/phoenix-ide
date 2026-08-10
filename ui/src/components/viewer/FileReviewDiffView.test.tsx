@@ -199,4 +199,81 @@ describe('FileReviewDiffView', () => {
     // And it must not read as "nothing changed" before its own answer arrives.
     expect(screen.queryByText('Nothing changed since you reviewed this file.')).toBeNull();
   });
+
+  describe('context expansion', () => {
+    beforeEach(() => {
+      vi.spyOn(api, 'getDiffExpansion').mockResolvedValue({ files: [] });
+      vi.mocked(api.getDiffExpansion).mockClear();
+    });
+
+    it('requests expansion content for the file so hunk separators can reveal context', async () => {
+      renderView();
+      await screen.findByTestId('codeview-mock');
+
+      await waitFor(() => expect(api.getDiffExpansion).toHaveBeenCalled());
+      const [, files] = vi.mocked(api.getDiffExpansion).mock.calls[0]!;
+      expect(files).toEqual([
+        expect.objectContaining({
+          path: 'foo.txt',
+          prev_object_id: '0000000',
+          new_object_id: '1111111',
+        }),
+      ]);
+    });
+
+    it('resolves the full diff against the working tree, since its new side is not a stored blob', async () => {
+      renderView();
+      await screen.findByTestId('codeview-mock');
+
+      await waitFor(() => expect(api.getDiffExpansion).toHaveBeenCalled());
+      expect(
+        vi.mocked(api.getDiffExpansion).mock.calls.every((call) => call[1].every((f) => f.section === 'uncommitted')),
+      ).toBe(true);
+    });
+
+    it('resolves the since-review diff from the object database, where both its blobs live', async () => {
+      renderView({ review: REVIEWED });
+      await screen.findByTestId('codeview-mock');
+
+      fireEvent.click(screen.getByRole('button', { name: /Since review/ }));
+
+      await waitFor(() =>
+        expect(
+          vi.mocked(api.getDiffExpansion).mock.calls.filter((call) =>
+            call[1].some((f) => f.section === 'committed'),
+          ),
+        ).toHaveLength(1),
+      );
+    });
+
+    it('does not request expansion for a truncated diff', async () => {
+      vi.mocked(api.getReviewFileDiff).mockImplementation(async (_conv, path, scope) => ({
+        path,
+        comparator: 'origin/main',
+        scope,
+        diff: DIFF,
+        truncated_kib: 512,
+        saturated: false,
+        current_blob_sha: 'abc123',
+      }));
+
+      renderView();
+      await screen.findByTestId('codeview-mock');
+
+      // The retained patch is not the whole patch, so revealed context could not
+      // be shown to match the file.
+      await waitFor(() => expect(codeViewMockState.lastDiffStyle).toBe('unified'));
+      expect(api.getDiffExpansion).not.toHaveBeenCalled();
+    });
+
+    it('still renders the diff when expansion content cannot be fetched', async () => {
+      vi.mocked(api.getDiffExpansion).mockRejectedValue(new Error('nope'));
+
+      renderView();
+
+      // Expansion is an enhancement; losing it must not cost the reviewer the diff.
+      expect(await screen.findByTestId('codeview-mock')).toBeInTheDocument();
+      expect(screen.queryByText('nope')).toBeNull();
+    });
+  });
 });
