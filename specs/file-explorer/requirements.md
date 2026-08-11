@@ -36,7 +36,7 @@ AND persist expansion state for the current conversation
 
 WHEN conversation changes
 THE SYSTEM SHALL update the tree root to the new conversation's cwd
-AND restore that conversation's previously saved expansion state (if any)
+AND restore that conversation's saved expansion state (if any)
 
 WHEN user expands or collapses a directory
 THE SYSTEM SHALL persist expansion state per conversation
@@ -91,7 +91,7 @@ AND persist collapse preference to localStorage
 
 WHEN file explorer panel is collapsed
 THE SYSTEM SHALL display a narrow strip (approximately 48px)
-AND show icons for recently opened files (last 3-5 files)
+AND show icons for recent files (last 3-5 files)
 AND show an expand toggle button
 
 WHEN user clicks a recent file icon in collapsed state
@@ -162,7 +162,7 @@ AND return to conversation view
 
 ### REQ-FE-009: Visual Feedback
 
-WHEN a file is currently open in prose reader
+WHEN a file is open in prose reader
 THE SYSTEM SHALL highlight it in the file tree with distinct styling
 
 WHEN a file is in the recent files list
@@ -268,3 +268,130 @@ AND the file tree SHALL register as a focus scope (per `specs/keyboard-interacti
 **Rationale:** A file browser without context menu, drag-and-drop, or keyboard navigation forces users to type `@path` references manually. These affordances reduce friction when referencing files in messages and make the tree usable without a mouse. The focus scope integration prevents key leak per the keyboard interaction model.
 
 **Dependencies:** `specs/keyboard-interaction/` REQ-KB-001 through REQ-KB-008, `specs/inline-references/` REQ-IR-001, REQ-IR-008
+
+---
+
+### REQ-FE-013: Explicit Per-File Edit Mode
+
+WHEN a viewer-openable file opens
+THE SYSTEM SHALL display its content read-only
+AND SHALL keep editing and deletion controls disarmed
+
+WHEN the user enables edit mode for the open file
+THE SYSTEM SHALL arm editing and deletion only for that file-viewer session
+AND SHALL NOT persist the armed state in the viewer URL, browser storage, conversation state, or reconnect state
+
+WHEN the file viewer closes, opens another file, changes conversation, or reloads
+THE SYSTEM SHALL begin the resulting file-viewer session with edit mode disarmed
+
+**Rationale:** Destructive capabilities require fresh, file-specific user intent rather than a preference that can remain active after context changes.
+
+---
+
+### REQ-FE-014: Explicit Text Save
+
+WHEN edit mode is armed for a mutable UTF-8 text file
+THE SYSTEM SHALL display a controlled source editor initialized from the loaded file content
+AND SHALL allow normal text entry and indentation
+AND SHALL expose Save only when the draft differs from the loaded baseline
+
+WHEN the user saves a dirty draft against the loaded file version
+THE SYSTEM SHALL atomically replace the file content
+AND preserve the file's permissions
+AND adopt the saved content and returned version as the clean viewer baseline
+AND SHALL NOT stage, commit, or otherwise mutate Git state beyond the working-tree file change
+
+WHEN edit mode is armed for an image
+THE SYSTEM SHALL NOT expose a text editor or Save action
+
+**Rationale:** Save is an explicit full-content replacement operation; the UI never implies that binary/image content can be edited as text.
+
+---
+
+### REQ-FE-015: Viewer-Only File Deletion
+
+WHEN edit mode is armed for the open file
+THE SYSTEM SHALL expose a Delete action in the file viewer
+AND SHALL require an additional confirmation that names the file and states that deletion cannot be undone
+
+WHEN the user confirms deletion against the loaded file version
+THE SYSTEM SHALL delete exactly that file
+AND close the invalidated viewer
+AND disarm the file-edit session
+
+WHEN the file tree or a directory is displayed
+THE SYSTEM SHALL NOT expose file deletion in the tree context menu
+AND SHALL NOT expose empty or recursive directory deletion
+
+**Rationale:** Keeping deletion behind both an open-file context and a second confirmation minimizes accidental destructive actions.
+
+---
+
+### REQ-FE-016: Conversation-Scoped Mutation Authority
+
+WHEN file content is loaded for an active conversation
+THE SYSTEM SHALL derive the file root from the server-authoritative conversation environment
+AND SHALL classify the result as mutable text, delete-only image, or read-only
+
+WHEN a save or delete request is received
+THE SYSTEM SHALL derive the root again from the conversation id
+AND accept only a non-empty relative path to an existing regular-file descendant of that root
+AND reject absolute paths, traversal components, directories, symbolic-link leaf targets, and targets that resolve outside the root
+AND reject mutation when the conversation environment is read-only, archived, continued, retired, or absent
+
+THE SYSTEM SHALL NOT use the cross-conversation preview/read allowlist or a client-supplied root as mutation authority
+
+**Rationale:** Readability across viewer surfaces does not imply write authority; mutation belongs only to the live conversation environment named by the request.
+
+---
+
+### REQ-FE-017: Optimistic File-Mutation Concurrency
+
+WHEN file content is loaded with mutation capability
+THE SYSTEM SHALL return an opaque version derived from the complete current bytes
+
+WHEN Save or Delete supplies a version that differs from the current file bytes
+THE SYSTEM SHALL reject the mutation as a conflict
+AND preserve the current filesystem content
+AND keep the user's draft available
+AND offer an explicit reload-latest recovery
+AND SHALL NOT offer an implicit or force overwrite
+
+WHEN reload-latest would replace a dirty draft
+THE SYSTEM SHALL require explicit discard confirmation before replacing it
+
+**Rationale:** Agents, terminals, Git operations, and other browser sessions can edit the same worktree; stale viewers must never silently overwrite newer work.
+
+---
+
+### REQ-FE-018: Dirty Draft Exit Protection
+
+WHEN the open file has a dirty edit draft
+AND the user requests viewer close, edit-mode disarm, file replacement, conversation navigation, or page unload
+THE SYSTEM SHALL require an explicit discard decision before completing the transition
+AND SHALL retain the draft when the user keeps editing
+
+WHEN the draft is clean or edit mode is disarmed
+THE SYSTEM SHALL complete the requested transition without a discard prompt
+
+WHEN a save, delete, reload, or validation request fails
+THE SYSTEM SHALL keep the file viewer open
+AND preserve the draft and edit-mode state
+AND expose an accessible error
+
+**Rationale:** The safety gate must protect both filesystem content and unsaved user input.
+
+---
+
+### REQ-FE-019: Immediate Mutation Grounding
+
+WHEN a file save succeeds
+THE SYSTEM SHALL immediately refresh the owning visible file-tree listing, Git grounding, and review manifest
+AND keep the viewer on the saved clean baseline
+
+WHEN a file deletion succeeds
+THE SYSTEM SHALL immediately close the deleted file's viewer
+AND refresh the owning visible file-tree listing, Git grounding, and review manifest
+AND SHALL NOT wait for the periodic file-tree refresh interval
+
+**Rationale:** A successful mutation is user-visible truth; stale file and Git projections must not contradict it.
