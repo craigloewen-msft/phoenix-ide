@@ -1,0 +1,1 @@
+The phoenix-llm test registry::tests::test_no_api_keys_no_models assumes PHOENIX_ENABLE_MOCK_MODEL is unset, but ./dev.py intentionally configures that environment and the test fails deterministically because `mock` is available. Make the test environment-independent using a typed test constructor/config seam instead of ambient process environment.
