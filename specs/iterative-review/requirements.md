@@ -118,13 +118,18 @@ WHEN the user opens a changed file for review
 THE SYSTEM SHALL present that file's diff against the comparator
 AND SHALL allow switching between the file's diff and its current source without
   changing which file is open
+AND SHALL allow reaching the source rendering ready to edit, where the file is
+  editable text
 AND SHALL allow annotating diff lines, anchored to the file, side, and line number
 
 **Design:** Diff and source are two renderings of one open file, not two viewers;
 preserving the open file across the toggle is what makes "read the diff, check the
-surrounding code, mark it, move on" a single continuous act. Annotations carry
-side identity because a comment on a removed line means something different from a
-comment on the line that replaced it.
+surrounding code, mark it, move on" a single continuous act. Reading a diff and
+deciding to fix what it shows is the same continuity, so the source rendering is
+reachable in its editable state directly rather than only through a second
+control once there. Annotations carry side identity because a comment on a
+removed line means something different from a comment on the line that replaced
+it.
 
 ---
 

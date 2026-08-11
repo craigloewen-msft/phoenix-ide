@@ -273,7 +273,7 @@ AND the file tree SHALL register as a focus scope (per `specs/keyboard-interacti
 
 ### REQ-FE-013: Explicit Per-File Edit Mode
 
-WHEN a viewer-openable file opens
+WHEN a viewer-openable file opens by navigation
 THE SYSTEM SHALL display its content read-only
 AND SHALL keep editing and deletion controls disarmed
 
@@ -281,10 +281,16 @@ WHEN the user enables edit mode for the open file
 THE SYSTEM SHALL arm editing and deletion only for that file-viewer session
 AND SHALL NOT persist the armed state in the viewer URL, browser storage, conversation state, or reconnect state
 
+WHERE the user issues an explicit edit request naming the open file from another
+  rendering of that same file
+THE SYSTEM SHALL open the resulting source view already armed
+AND SHALL treat that request as satisfied once armed, so a subsequent disarm is not undone
+AND SHALL offer the request only where the file is editable text
+
 WHEN the file viewer closes, opens another file, changes conversation, or reloads
 THE SYSTEM SHALL begin the resulting file-viewer session with edit mode disarmed
 
-**Rationale:** Destructive capabilities require fresh, file-specific user intent rather than a preference that can remain active after context changes.
+**Rationale:** Destructive capabilities require fresh, file-specific user intent rather than a preference that can remain active after context changes. An explicit edit request *is* that intent, named for one file at the moment it is made, so honouring it on arrival arms no more broadly than the toggle does — it removes a step, not a safeguard.
 
 ---
 

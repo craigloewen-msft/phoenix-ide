@@ -24,7 +24,7 @@ The File Explorer Panel provides persistent browsing and live Git grounding on d
 | **REQ-FE-010:** Mobile File Browser Overlay | ✅ Complete | FileBrowserOverlay hosts FileTree |
 | **REQ-FE-011:** Context Menu, Drag-and-Drop, Keyboard Nav | ✅ Complete | FileTreeContextMenu + custom drag type + focus scope |
 | **REQ-FE-012:** Live Git Status Grounding | ✅ Complete | Typed status snapshot, tree badges, ancestor counts, desktop/mobile summaries |
-| **REQ-FE-013:** Explicit Per-File Edit Mode | ✅ Complete | Off by default; ephemeral to one open-file session |
+| **REQ-FE-013:** Explicit Per-File Edit Mode | ✅ Complete | Off by default; ephemeral to one open-file session; review-diff Edit button arms on arrival via a one-shot, path-scoped request |
 | **REQ-FE-014:** Explicit Text Save | ✅ Complete | Controlled source editor; atomic versioned save preserves permissions |
 | **REQ-FE-015:** Viewer-Only File Deletion | ✅ Complete | Armed viewer action plus named destructive confirmation; no directory/tree deletion |
 | **REQ-FE-016:** Conversation-Scoped Mutation Authority | ✅ Complete | Server-derived root, relative regular-file targets, typed read-only capability |

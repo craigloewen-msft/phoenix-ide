@@ -21,7 +21,7 @@ and commit with.
 | **REQ-RV-003:** Reviewed / stale / unreviewed | ✅ Complete | `FileReviewState` (Rust + TS); `resolve_review_state`; markers in `ChangedFilesReview` |
 | **REQ-RV-004:** Marking records the content the user saw | ✅ Complete | `POST …/review/files/mark` → `mark_file_reviewed`; `Database::upsert_review_checkpoint` compare-and-set |
 | **REQ-RV-005:** No interference with staging or committing | ✅ Complete | `git_ops::review::temp_index_env` (isolated `GIT_INDEX_FILE`); guarded by `review_plumbing_never_touches_the_index` |
-| **REQ-RV-006:** Reviewing a single file | ✅ Complete | `?mode=diff` slot param; `FileReviewDiffView`; FILE⇄DIFF toggle in `MetaViewer` and the diff header |
+| **REQ-RV-006:** Reviewing a single file | ✅ Complete | `?mode=diff` slot param; `FileReviewDiffView`; FILE⇄DIFF toggle in `MetaViewer` and the diff header; Edit button reaches the armed source editor directly |
 | **REQ-RV-007:** Only what changed since last review | ✅ Complete | `git_ops::review::file_diff_since_review` (header relabelling stops at the first hunk, so body lines that begin `-- ` / `++ ` survive); `scope=since_review`; 409 when no checkpoint; `useReviewDiffScope` persists the choice across files, with a no-checkpoint file rendering `full` without clearing it; `FileReviewDiffView` renders a response only when its echoed `path`/`scope` match the open request |
 | **REQ-RV-008:** Checkpoints live and die with the work scope | ✅ Complete | `ON DELETE CASCADE` on scope deletion; re-scope clears in `update_work_scope_environment_tx`; comparator mismatch → unreviewed |
 | **REQ-RV-009:** Completing a pass does not gate merging | ✅ Complete | `ChangedFilesReview` complete action; `WorkActions` untouched |
