@@ -527,3 +527,84 @@ describe('lineTextAt — expanded context lines', () => {
     expect(lineTextAt(partial.fileDiff, 'additions', 3)).toBeUndefined();
   });
 });
+
+// A file changed in two places, where the patch describing it lost its final
+// hunk — the shape produced whenever a diff is abridged upstream. Every hunk
+// that survives still anchors correctly against the real file, so the parse
+// looks healthy right up until the point it is laid out.
+const TWO_HUNK_OLD = Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join('\n') + '\n';
+const TWO_HUNK_NEW = TWO_HUNK_OLD
+  .replace('line 10\n', 'line 10 CHANGED\n')
+  .replace('line 30\n', 'line 30 INSERTED\nline 30\n');
+const TWO_HUNK_PATCH = [
+  'diff --git a/src/two.ts b/src/two.ts',
+  'index aaaaaaa..bbbbbbb 100644',
+  '--- a/src/two.ts',
+  '+++ b/src/two.ts',
+  '@@ -7,7 +7,7 @@',
+  ' line 7',
+  ' line 8',
+  ' line 9',
+  '-line 10',
+  '+line 10 CHANGED',
+  ' line 11',
+  ' line 12',
+  ' line 13',
+  '@@ -27,6 +27,7 @@',
+  ' line 27',
+  ' line 28',
+  ' line 29',
+  '+line 30 INSERTED',
+  ' line 30',
+  ' line 31',
+  ' line 32',
+  '',
+].join('\n');
+
+function sourceFor(patch: string) {
+  const source = buildSectionItems('committed', patch).sources[0];
+  if (!source) throw new Error('expected a hydratable source');
+  return source;
+}
+
+describe('hydrateItem — whole-file accounting', () => {
+  it('hydrates a multi-hunk file whose patch is complete', () => {
+    const hydrated = hydrateItem(sourceFor(TWO_HUNK_PATCH), TWO_HUNK_OLD, TWO_HUNK_NEW);
+    expect(hydrated).not.toBeNull();
+    expect(hydrated!.fileDiff.isPartial).toBe(false);
+    expect(hydrated!.fileDiff.hunks).toHaveLength(2);
+  });
+
+  // Everything past the final hunk is trailing context, so both sides must have
+  // the same number of lines left over. A patch missing hunks under-accounts for
+  // the file's line-count delta and breaks that, and Pierre discovers it while
+  // laying the file out — from inside a layout effect, where React's only
+  // recovery is to unmount the tree and blank the window.
+  it('refuses to hydrate when the patch does not account for the whole file', () => {
+    const abridged = TWO_HUNK_PATCH.split('@@ -27,6 +27,7 @@')[0]!;
+    expect(hydrateItem(sourceFor(abridged), TWO_HUNK_OLD, TWO_HUNK_NEW)).toBeNull();
+  });
+
+  // The rejection has to be specific to the inconsistency, not to "this patch
+  // has one hunk" — a genuinely single-hunk file must still expand.
+  it('still hydrates a single-hunk file that does account for the whole delta', () => {
+    const hydrated = hydrateItem(contextSource(), CONTEXT_OLD, CONTEXT_NEW);
+    expect(hydrated).not.toBeNull();
+  });
+
+  // A pure addition has no deletion side at all; its leftovers are zero on both
+  // sides rather than mismatched, so it must not be caught by the check.
+  it('hydrates a newly added file', () => {
+    const body = Array.from({ length: 5 }, (_, i) => `line ${i + 1}`);
+    const patch = [
+      'diff --git a/src/new.ts b/src/new.ts',
+      'index 0000000..ccccccc 100644',
+      '--- /dev/null',
+      '+++ b/src/new.ts',
+      '@@ -0,0 +1,5 @@',
+      ...body.map((l) => `+${l}`),
+      '',
+    ].join('\n');
+    expect(hydrateItem(sourceFor(patch), '', body.join('\n') + '\n')).not.toBeNull();
+  });
+});

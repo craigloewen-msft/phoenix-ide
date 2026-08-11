@@ -24,6 +24,7 @@ import type { AnnotationSide, CodeViewOptions, FileDiffMetadata } from '@pierre/
 import type { DiffSearchMatchTarget } from '../viewer-find';
 import type { DiffSection, ReviewNote } from '../../contexts/ReviewNotesContext';
 import { useTheme } from '../../hooks/useTheme';
+import { RenderErrorBoundary } from '../RenderErrorBoundary';
 import type { LineAnnotateTarget } from './useDiffReviewNotes';
 import {
   annotationsForFile,
@@ -526,17 +527,27 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
           </div>
         )}
         {items.length > 0 ? (
-          <CodeView<Meta>
-            ref={codeViewRef}
-            containerRef={containerRef}
-            items={items}
-            options={options}
-            className="phoenix-diff-codeview"
-            renderAnnotation={renderAnnotation}
-            renderHeaderPrefix={renderHeaderPrefix}
-            renderHeaderMetadata={renderHeaderMetadata}
-            renderGutterUtility={renderGutterUtility}
-          />
+          <RenderErrorBoundary
+            label="diff viewer"
+            resetKey={items.map((item) => `${item.id}:${item.version ?? 0}`).join('\u0001')}
+            fallback={(error) => (
+              <div className="diff-section-error" role="alert">
+                This diff could not be displayed: {error.message}
+              </div>
+            )}
+          >
+            <CodeView<Meta>
+              ref={codeViewRef}
+              containerRef={containerRef}
+              items={items}
+              options={options}
+              className="phoenix-diff-codeview"
+              renderAnnotation={renderAnnotation}
+              renderHeaderPrefix={renderHeaderPrefix}
+              renderHeaderMetadata={renderHeaderMetadata}
+              renderGutterUtility={renderGutterUtility}
+            />
+          </RenderErrorBoundary>
         ) : (
           !parseError && <div className="diff-viewer-empty">No file changes to display.</div>
         )}

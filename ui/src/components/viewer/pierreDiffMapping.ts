@@ -464,7 +464,9 @@ export interface SectionFileSource {
  * caller keeps the partial item. Verification compares the hydrated file's
  * context lines against the lines the patch itself carried: if the supplied
  * contents belong to a different version of the file, those disagree, and
- * rendering would show context that silently does not match the diff.
+ * rendering would show context that silently does not match the diff. It also
+ * checks that the patch accounts for the file's whole line-count delta, since a
+ * patch missing hunks describes a file that cannot be laid out.
  */
 export function hydrateItem(
   source: SectionFileSource,
@@ -483,6 +485,7 @@ export function hydrateItem(
   }
   if (!hydrated || hydrated.isPartial) return null;
   if (!hydratedMatchesPatch(hydrated, source.patchText)) return null;
+  if (!hydratedAccountsForWholeFile(hydrated)) return null;
   return {
     id: source.itemId,
     type: 'diff',
@@ -514,6 +517,41 @@ function hydratedMatchesPatch(hydrated: FileDiffMetadata, patchText: string): bo
     if (stripEol(actual) !== stripEol(expected)) return false;
   }
   return true;
+}
+
+/**
+ * Check that the patch accounts for the entire difference between the two file
+ * versions it was hydrated against.
+ *
+ * Everything past a diff's final hunk is trailing context — the same lines on
+ * both sides — so both sides must have an equal number of lines left over. That
+ * holds exactly when the hunks account for the whole line-count delta between
+ * the two versions, and fails when the patch is missing hunks: a patch abridged
+ * upstream still anchors correctly at every hunk it kept, so
+ * `hydratedMatchesPatch` cannot see the loss, while the leftover counts can.
+ *
+ * This matters because a partial parse and a whole-file parse fail differently.
+ * A partial parse renders only the lines the patch carried, so missing hunks are
+ * merely missing. A whole-file parse claims to describe the file end to end, and
+ * Pierre lays it out on that basis: it derives the same two leftover counts and
+ * throws when they disagree. That throw happens inside a layout effect, where
+ * React's only recovery is to unmount the tree — so a diff Pierre cannot lay out
+ * must never reach it.
+ *
+ * A file that exists on only one side — added or deleted — has no shared
+ * trailing context for the two counts to describe, and Pierre skips the
+ * comparison for it. The condition is scoped to match, so a one-sided file keeps
+ * expanding rather than being rejected by a rule that does not apply to it.
+ */
+function hydratedAccountsForWholeFile(hydrated: FileDiffMetadata): boolean {
+  const finalHunk = hydrated.hunks.at(-1);
+  if (finalHunk === undefined) return true;
+  if (hydrated.additionLines.length === 0 || hydrated.deletionLines.length === 0) return true;
+  const additionsRemaining = hydrated.additionLines.length
+    - (finalHunk.additionLineIndex + finalHunk.additionCount);
+  const deletionsRemaining = hydrated.deletionLines.length
+    - (finalHunk.deletionLineIndex + finalHunk.deletionCount);
+  return additionsRemaining === deletionsRemaining;
 }
 
 /** The addition-side lines (context + additions) a patch carries, in order —
