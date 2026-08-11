@@ -1,0 +1,235 @@
+-- allium: 3
+-- File Editing Behaviour
+--
+-- Scope: the ephemeral edit lifecycle for one open file-viewer session.
+-- Includes: explicit arming, source editing, versioned save/delete, conflict
+-- recovery, dirty-exit protection, and mutation grounding.
+-- Excludes: viewer URL identity, file-tree navigation, creation, rename, binary
+-- editing, and directory deletion.
+--
+-- Requirement traceability: REQ-FE-013 through REQ-FE-019
+
+use "../bedrock/bedrock.allium" as bedrock
+use "../viewer_slot/viewer_slot.allium" as viewer_slot
+
+-- Helpers
+--   editable_text(file) is true when the server classifies the file as UTF-8
+--     text and grants mutable_text capability.
+--   deletable_file(file) is true when the server grants mutable_text or
+--     delete_only capability.
+--   latest_bytes_match(session) is true when the complete current file bytes
+--     produce session.expected_version.
+
+enum EditState { read_only | armed_clean | armed_dirty | saving | conflict | deleting }
+enum ConflictKind { save | delete }
+
+entity FileEditSession {
+    file: viewer_slot/ProseFile
+    state: EditState
+    draft: String?
+    expected_version: String?
+    conflict_kind: ConflictKind? when state = conflict
+
+    transitions state {
+        read_only -> armed_clean
+        armed_clean -> read_only
+        armed_clean -> armed_dirty
+        armed_clean -> deleting
+        armed_dirty -> read_only
+        armed_dirty -> saving
+        armed_dirty -> deleting
+        saving -> armed_clean
+        saving -> conflict
+        deleting -> read_only
+        deleting -> conflict
+        conflict -> armed_clean
+        conflict -> armed_dirty
+        conflict -> read_only
+    }
+}
+
+rule EditModeEnabled {
+    when: UserEnablesEditMode(session, draft, version)
+    requires: session.state = read_only
+    requires: deletable_file(session.file)
+    ensures: session.state = armed_clean
+    ensures: session.draft = draft
+    ensures: session.expected_version = version
+}
+
+rule TextDraftEdited {
+    when: UserEditsDraft(session, draft)
+    requires: session.state = armed_clean or session.state = armed_dirty
+    requires: editable_text(session.file)
+    ensures: session.state = armed_dirty
+    ensures: session.draft = draft
+}
+
+rule DirtyDraftSaveRequested {
+    when: UserRequestsSave(session)
+    requires: session.state = armed_dirty
+    requires: editable_text(session.file)
+    ensures: session.state = saving
+}
+
+rule CurrentVersionSaveSucceeds {
+    when: SaveCompleted(session, draft, version)
+    requires: session.state = saving
+    requires: latest_bytes_match(session)
+    ensures: session.state = armed_clean
+    ensures: session.draft = draft
+    ensures: session.expected_version = version
+}
+
+rule StaleVersionSaveConflicts {
+    when: SaveConflicted(session)
+    requires: session.state = saving
+    requires: not latest_bytes_match(session)
+    ensures: session.state = conflict
+    ensures: session.conflict_kind = save
+}
+
+rule SaveConflictKeepsDraft {
+    when: UserKeepsEditing(session)
+    requires: session.state = conflict
+    requires: session.conflict_kind = save
+    ensures: session.state = armed_dirty
+}
+
+rule SaveConflictReloadsLatest {
+    when: UserConfirmsReloadLatest(session, draft, version)
+    requires: session.state = conflict
+    requires: session.conflict_kind = save
+    ensures: session.state = armed_clean
+    ensures: session.draft = draft
+    ensures: session.expected_version = version
+}
+
+rule ArmedFileDeleteRequested {
+    when: UserConfirmsDelete(session)
+    requires: session.state = armed_clean or session.state = armed_dirty
+    requires: deletable_file(session.file)
+    ensures: session.state = deleting
+}
+
+rule CurrentVersionDeleteSucceeds {
+    when: DeleteCompleted(session)
+    requires: session.state = deleting
+    requires: latest_bytes_match(session)
+    ensures: session.state = read_only
+    ensures: session.draft = null
+    ensures: session.expected_version = null
+    ensures: FileMutationGroundingRequested(session.file)
+}
+
+rule StaleVersionDeleteConflicts {
+    when: DeleteConflicted(session)
+    requires: session.state = deleting
+    requires: not latest_bytes_match(session)
+    ensures: session.state = conflict
+    ensures: session.conflict_kind = delete
+}
+
+rule DeleteConflictReloadsLatest {
+    when: UserReloadsAfterDeleteConflict(session, draft, version)
+    requires: session.state = conflict
+    requires: session.conflict_kind = delete
+    ensures: session.state = armed_clean
+    ensures: session.draft = draft
+    ensures: session.expected_version = version
+}
+
+rule CleanSessionDisarms {
+    when: UserRequestsSessionExit(session)
+    requires: session.state = armed_clean
+    ensures: session.state = read_only
+    ensures: session.draft = null
+    ensures: session.expected_version = null
+}
+
+rule DirtySessionExitWaitsForDiscard {
+    when: UserRequestsSessionExit(session)
+    requires: session.state = armed_dirty or (session.state = conflict and session.conflict_kind = save)
+    ensures: DiscardDecisionRequested(session)
+    @guidance
+        -- Hold the viewer close, edit-mode disarm, file replacement, or
+        -- conversation navigation until the user confirms discard. Emit the held
+        -- transition only after confirmation; keeping editing preserves the draft.
+}
+
+rule DirtySessionDiscardConfirmed {
+    when: UserConfirmsDiscard(session)
+    requires: session.state = armed_dirty or (session.state = conflict and session.conflict_kind = save)
+    ensures: session.state = read_only
+    ensures: session.draft = null
+    ensures: session.expected_version = null
+}
+
+rule SavedFileRefreshesGrounding {
+    when: SaveCompleted(session, _, _)
+    requires: session.state = saving
+    requires: latest_bytes_match(session)
+    ensures: FileMutationGroundingRequested(session.file)
+}
+
+surface FileEditor {
+    facing user: bedrock/User
+
+    context session: FileEditSession
+
+    exposes:
+        session.file
+        session.state
+        session.draft when session.state != read_only
+        session.expected_version when session.state != read_only
+        session.conflict_kind when session.state = conflict
+
+    provides:
+        UserEnablesEditMode(session, draft, version)
+            when session.state = read_only
+        UserEditsDraft(session, draft)
+            when session.state = armed_clean or session.state = armed_dirty
+        UserRequestsSave(session)
+            when session.state = armed_dirty
+        SaveCompleted(session, draft, version)
+            when session.state = saving
+        SaveConflicted(session)
+            when session.state = saving
+        UserKeepsEditing(session)
+            when session.state = conflict
+        UserConfirmsReloadLatest(session, draft, version)
+            when session.state = conflict
+        UserConfirmsDelete(session)
+            when session.state = armed_clean or session.state = armed_dirty
+        DeleteCompleted(session)
+            when session.state = deleting
+        DeleteConflicted(session)
+            when session.state = deleting
+        UserReloadsAfterDeleteConflict(session, draft, version)
+            when session.state = conflict
+        UserRequestsSessionExit(session)
+            when session.state = armed_clean or session.state = armed_dirty or session.state = conflict
+        UserConfirmsDiscard(session)
+            when session.state = armed_dirty or session.state = conflict
+}
+
+invariant ReadOnlyCarriesNoMutationDraft {
+    for session in FileEditSession:
+        (session.state = read_only) implies
+            (session.draft = null and session.expected_version = null and session.conflict_kind = null)
+}
+
+invariant ArmedStatesCarryVersion {
+    for session in FileEditSession:
+        (session.state != read_only) implies (session.expected_version != null)
+}
+
+invariant SaveConflictRetainsDraft {
+    for session in FileEditSession:
+        (session.state = conflict and session.conflict_kind = save) implies (session.draft != null)
+}
+
+invariant ConflictKindOnlyDuringConflict {
+    for session in FileEditSession:
+        (session.state != conflict) implies (session.conflict_kind = null)
+}

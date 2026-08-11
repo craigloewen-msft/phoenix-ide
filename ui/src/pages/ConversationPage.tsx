@@ -1733,8 +1733,7 @@ function ConversationPageContent({
 
   const handleFileSelect = useCallback(
     (filePath: string, rootDir: string) => {
-      setShowFileBrowser(false);
-      fileExplorer.openFile(filePath, rootDir);
+      fileExplorer.openFile(filePath, rootDir, undefined, () => setShowFileBrowser(false));
     },
     [fileExplorer]
   );
@@ -2124,6 +2123,7 @@ function ConversationPageContent({
             <FileViewer
               filePath={prs.path}
               rootDir={prs.rootDir}
+              conversationId={conversationId}
               onClose={handleCloseFileViewer}
               onSendNotes={handleSendNotes}
               patchContext={prs.patchContext ?? undefined}
@@ -2280,6 +2280,7 @@ function ConversationPageContent({
           <FileViewer
             filePath={content.file.path}
             rootDir={content.file.rootDir}
+            conversationId={conversationId}
             onClose={handleCloseFileViewer}
             onSendNotes={isWideDesktop && content.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
             patchContext={content.file.patchContext ?? undefined}
@@ -2899,6 +2900,7 @@ function ConversationPageContent({
           <FileViewer
             filePath={openFileState.path}
             rootDir={openFileState.rootDir}
+            conversationId={conversationId}
             onClose={handleCloseFileViewer}
             onSendNotes={handleSendNotes}
             patchContext={openFileState.patchContext ?? undefined}

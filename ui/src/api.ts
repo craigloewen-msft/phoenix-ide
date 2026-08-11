@@ -9,12 +9,16 @@ import type { ReleaseUpdateSnapshot } from './generated/ReleaseUpdateSnapshot';
 import type { ReleaseTransactionStatus } from './generated/ReleaseTransactionStatus';
 import type { ApproveReleaseUpdateResponse } from './generated/ApproveReleaseUpdateResponse';
 import type { FileViewerKind } from './generated/FileViewerKind';
+import type { ConversationFileContentResponse } from './generated/ConversationFileContentResponse';
+import type { PutConversationFileResponse } from './generated/PutConversationFileResponse';
 import type { UsageOverview } from './generated/UsageOverview';
 import type { ConversationUsageDetail } from './generated/ConversationUsageDetail';
 import type { QuotaDetails } from './generated/QuotaDetails';
 // Phoenix API Client
 
 export type { PlanDiffBaseline };
+export type { ConversationFileCapability } from './generated/ConversationFileCapability';
+export type { ConversationFileContentResponse } from './generated/ConversationFileContentResponse';
 export type { PlanDiffBaselineNote } from './generated/PlanDiffBaselineNote';
 
 /**
@@ -2171,6 +2175,57 @@ export const api = {
     );
     if (!resp.ok) throw new Error('Failed to fetch task counts');
     return resp.json();
+  },
+
+  async getConversationFileContent(
+    conversationId: string,
+    path: string,
+    signal?: AbortSignal,
+  ): Promise<ConversationFileContentResponse> {
+    const params = new URLSearchParams({ path });
+    const resp = await fetch(
+      `/api/conversations/${encodeURIComponent(conversationId)}/files/content?${params}`,
+      signal ? { signal } : undefined,
+    );
+    if (!resp.ok) {
+      const error = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      throw new ApiResponseError(error.error || 'Failed to read file', resp.status, error.error_type);
+    }
+    return resp.json();
+  },
+
+  async putConversationFileContent(
+    conversationId: string,
+    path: string,
+    content: string,
+    expectedVersion: string,
+  ): Promise<PutConversationFileResponse> {
+    const resp = await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/files/content`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path, content, expected_version: expectedVersion }),
+    });
+    if (!resp.ok) {
+      const error = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      throw new ApiResponseError(error.error || 'Failed to save file', resp.status, error.error_type);
+    }
+    return resp.json();
+  },
+
+  async deleteConversationFile(
+    conversationId: string,
+    path: string,
+    expectedVersion: string,
+  ): Promise<void> {
+    const resp = await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/files/content`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path, expected_version: expectedVersion }),
+    });
+    if (!resp.ok) {
+      const error = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      throw new ApiResponseError(error.error || 'Failed to delete file', resp.status, error.error_type);
+    }
   },
 
   async searchConversationFiles(

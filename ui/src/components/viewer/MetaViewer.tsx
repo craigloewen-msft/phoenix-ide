@@ -14,6 +14,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Maximize2, Minimize2 } from 'lucide-react';
+import { ApiResponseError, api } from '../../api';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
 import { FocusedReviewExitDialog, ViewerPresentationControl, ViewerShell } from './ViewerShell';
 import {
@@ -49,7 +50,13 @@ import type { ViewerBodyProps } from './AnnotatableBlock';
 import { useFocusedReviewExit } from './useFocusedReviewExit';
 import { useOptionalViewerSlotCommands } from '../../contexts/ViewerSlotContext';
 import { useReviewContext } from '../../contexts/useReviewContext';
+import { FileEditorBody } from './FileEditorBody';
 import './FileReviewDiffView.css';
+
+type FileEditConfirm =
+  | { kind: 'discard'; continueTransition: () => void }
+  | { kind: 'reload' }
+  | { kind: 'delete' };
 
 export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   useRegisterFocusScope('file-viewer');
@@ -61,6 +68,46 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const focus = textLike ? payload.focus : undefined;
   const focusLine = focus?.kind === 'line' ? focus.lineNumber : undefined;
   const focusRange = focus?.kind === 'range' ? focus : undefined;
+  const mutation = payload.mutation;
+  const editableText = textLike && mutation?.capability.kind === 'mutable_text';
+  const [editMode, setEditMode] = useState(false);
+  const [editBaseline, setEditBaseline] = useState(content);
+  const [editDraft, setEditDraft] = useState(content);
+  const [editVersion, setEditVersion] = useState(mutation?.capability.version ?? '');
+  const [editPending, setEditPending] = useState<'saving' | 'reloading' | 'deleting' | null>(null);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [editConflict, setEditConflict] = useState(false);
+  const [editConfirm, setEditConfirm] = useState<FileEditConfirm | null>(null);
+  const dirty = editableText && editDraft !== editBaseline;
+  const dirtyRef = useRef(dirty);
+  dirtyRef.current = dirty;
+  const editPendingRef = useRef(editPending);
+  editPendingRef.current = editPending;
+
+  const requestEditorTransition = useCallback((continueTransition: () => void): boolean => {
+    if (editPendingRef.current !== null) return true;
+    if (!dirtyRef.current) return false;
+    setEditConfirm({ kind: 'discard', continueTransition });
+    return true;
+  }, []);
+
+  useEffect(() => mutation?.registerTransitionGuard(requestEditorTransition), [mutation, requestEditorTransition]);
+
+  useEffect(() => {
+    if (!dirty) return undefined;
+    const beforeUnload = (event: BeforeUnloadEvent) => event.preventDefault();
+    window.addEventListener('beforeunload', beforeUnload);
+    return () => window.removeEventListener('beforeunload', beforeUnload);
+  }, [dirty]);
+
+  useEffect(() => {
+    if (editMode) return;
+    setEditBaseline(content);
+    setEditDraft(content);
+    setEditVersion(mutation?.capability.version ?? '');
+    setEditError(null);
+    setEditConflict(false);
+  }, [content, editMode, mutation?.capability.version]);
 
   const notes = useFileReviewNotes(absolutePath, onSendNotes, patchContext);
   const supportsFocusedReview = payload.kind === 'markdown';
@@ -86,6 +133,90 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     returnToPane,
     closeViewer: onClose,
   });
+  const runSave = useCallback(async () => {
+    if (!mutation || !editableText || editPending || !dirty) return;
+    setEditPending('saving');
+    setEditError(null);
+    setEditConflict(false);
+    try {
+      const result = await api.putConversationFileContent(
+        mutation.conversationId,
+        mutation.relativePath,
+        editDraft,
+        editVersion,
+      );
+      setEditBaseline(editDraft);
+      setEditVersion(result.version);
+      mutation.onSaved(editDraft, result.version);
+    } catch (error) {
+      const conflict = error instanceof ApiResponseError && error.status === 409;
+      setEditConflict(conflict);
+      setEditError(error instanceof Error ? error.message : 'Failed to save file');
+    } finally {
+      setEditPending(null);
+    }
+  }, [dirty, editDraft, editPending, editVersion, editableText, mutation]);
+
+  const runDelete = useCallback(async () => {
+    if (!mutation || editPending) return;
+    setEditPending('deleting');
+    setEditError(null);
+    setEditConflict(false);
+    try {
+      await api.deleteConversationFile(mutation.conversationId, mutation.relativePath, editVersion);
+      setEditConfirm(null);
+      mutation.onDeleted();
+    } catch (error) {
+      const conflict = error instanceof ApiResponseError && error.status === 409;
+      setEditConflict(conflict);
+      setEditError(error instanceof Error ? error.message : 'Failed to delete file');
+      setEditConfirm(null);
+      setEditPending(null);
+    }
+  }, [editPending, editVersion, mutation]);
+
+  const runReload = useCallback(async () => {
+    if (!mutation || editPending) return;
+    setEditPending('reloading');
+    setEditError(null);
+    setEditConflict(false);
+    try {
+      const latest = await api.getConversationFileContent(mutation.conversationId, mutation.relativePath);
+      if (latest.capability.kind === 'read_only') {
+        throw new Error(latest.capability.reason);
+      }
+      const latestVersion = latest.capability.version;
+      if (latest.content.kind === 'text') {
+        setEditBaseline(latest.content.content);
+        setEditDraft(latest.content.content);
+      }
+      setEditVersion(latestVersion);
+      mutation.onReloaded(latest);
+      setEditConfirm(null);
+    } catch (error) {
+      setEditError(error instanceof Error ? error.message : 'Failed to reload file');
+      setEditConfirm(null);
+    } finally {
+      setEditPending(null);
+    }
+  }, [editPending, mutation]);
+
+  const disarmEditor = useCallback(() => {
+    const disarm = () => {
+      setEditMode(false);
+      setEditConfirm(null);
+    };
+    if (!requestEditorTransition(disarm)) disarm();
+  }, [requestEditorTransition]);
+
+  const requestClose = useCallback(() => {
+    const close = focused ? focusedExit.requestClose : onClose;
+    if (!requestEditorTransition(close)) close();
+  }, [focused, focusedExit.requestClose, onClose, requestEditorTransition]);
+  const requestEscape = useCallback(() => {
+    const escape = focused ? focusedExit.requestReturn : onClose;
+    if (!requestEditorTransition(escape)) escape();
+  }, [focused, focusedExit.requestReturn, onClose, requestEditorTransition]);
 
   useEffect(() => {
     if (presentation === 'fullscreen' && canTogglePresentation && !supportsFocusedReview) {
@@ -102,7 +233,8 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   // handle instead.
   const htmlPreview = payload.kind === 'html' && htmlViewMode === 'preview';
   const rangeSource = focusRange !== undefined && !htmlPreview;
-  const usePierreCode = payload.kind === 'code' || payload.kind === 'text' || rangeSource;
+  const sourceEditorOpen = editMode && editableText;
+  const usePierreCode = !sourceEditorOpen && (payload.kind === 'code' || payload.kind === 'text' || rangeSource);
   const fileCodeRef = useRef<PhoenixFileCodeViewHandle>(null);
   const findButtonRef = useRef<HTMLButtonElement>(null);
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
@@ -397,17 +529,18 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     sendFind({ type: 'close' });
   }, [sendFind]);
 
+  const activeFindEligible = findEligible && !sourceEditorOpen;
   useViewerFindKeyboardShortcut({
     scopeId: 'file-viewer',
     onOpen: openFind,
-    enabled: findEligible,
+    enabled: activeFindEligible,
     dialogOpen: notes.annotating !== null,
   });
 
   useEffect(() => {
-    if (findEligible || !findOpen) return;
+    if (activeFindEligible || !findOpen) return;
     sendFind({ type: 'close' });
-  }, [findEligible, findOpen, sendFind]);
+  }, [activeFindEligible, findOpen, sendFind]);
 
   useEffect(() => {
     if (!findOpen) return;
@@ -431,11 +564,47 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     sendFind({ type: 'previous' });
   }, [sendFind]);
 
+  const mutationControls: ReactNode = mutation ? (
+    <>
+      <button
+        type="button"
+        className={`viewer-shell-toggle${editMode ? ' file-edit-mode--armed' : ''}`}
+        aria-pressed={editMode}
+        onClick={() => editMode ? disarmEditor() : setEditMode(true)}
+        disabled={editPending !== null}
+        title={editMode ? 'Turn off editing for this file' : 'Enable editing and deletion for this file'}
+      >
+        Edit mode: {editMode ? 'On' : 'Off'}
+      </button>
+      {editMode && editableText && (
+        <button
+          type="button"
+          className="viewer-shell-toggle"
+          onClick={() => { void runSave(); }}
+          disabled={!dirty || editPending !== null}
+        >
+          {editPending === 'saving' ? 'Saving…' : 'Save'}
+        </button>
+      )}
+      {editMode && (
+        <button
+          type="button"
+          className="viewer-shell-toggle file-edit-delete"
+          onClick={() => setEditConfirm({ kind: 'delete' })}
+          disabled={editPending !== null}
+        >
+          Delete
+        </button>
+      )}
+    </>
+  ) : null;
+
   const headerExtras: ReactNode = textLike ? (
     <>
+      {mutationControls}
       {/* Offered only for a file that is part of the change set — a DIFF
           button on an untouched file would have nothing to show. */}
-      {reviewableFile && (
+      {reviewableFile && !sourceEditorOpen && (
         <div className="frd-modes" role="group" aria-label="File view mode">
           <button type="button" className="viewer-shell-btn frd-mode--active" aria-pressed="true" title="Showing file source">
             FILE
@@ -450,7 +619,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
           </button>
         </div>
       )}
-      {findEligible && (
+      {activeFindEligible && (
         <button
           ref={findButtonRef}
           type="button"
@@ -462,14 +631,14 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
           Find
         </button>
       )}
-      <CopyButton text={content} className="viewer-shell-copy-btn" title="Copy file contents" />
+      {!sourceEditorOpen && <CopyButton text={content} className="viewer-shell-copy-btn" title="Copy file contents" />}
       {supportsFocusedReview && canTogglePresentation && onPresentationChange && (
         <ViewerPresentationControl
           fullscreen={focused}
           onToggle={focused ? focusedExit.requestReturn : () => onPresentationChange('fullscreen')}
         />
       )}
-      {payload.kind === 'html' && (
+      {payload.kind === 'html' && !sourceEditorOpen && (
         <>
           <button
             type="button"
@@ -493,6 +662,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     </>
   ) : payload.kind === 'image' ? (
     <>
+      {mutationControls}
       <a
         className="viewer-shell-toggle"
         href={payload.url}
@@ -539,6 +709,23 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     : payload.kind === 'html' && htmlViewMode === 'preview'
       ? 'Find unavailable in HTML preview; switch to source to search file contents.'
       : null;
+  const editStatusBanner: ReactNode = editError ? (
+    <span className="file-edit-error" role="alert">
+      {editError}
+      {editConflict && (
+        <>
+          {' '}
+          <button type="button" className="viewer-shell-toggle" onClick={() => dirty ? setEditConfirm({ kind: 'reload' }) : void runReload()}>
+            Reload latest
+          </button>
+        </>
+      )}
+    </span>
+  ) : sourceEditorOpen ? (
+    <span>Edit mode is enabled for this file only.{dirty ? ' Unsaved changes.' : ' No unsaved changes.'}</span>
+  ) : editMode && payload.kind === 'image' ? (
+    <span>Edit mode is enabled for deletion only. Images cannot be edited as text.</span>
+  ) : null;
   const banner: ReactNode = findSession ? (
     <FindBar
       query={findSession.query}
@@ -551,7 +738,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
       onClose={closeFind}
       autoFocus
     />
-  ) : viewerBanner ?? (findIneligibleReason ? <span>{findIneligibleReason}</span> : null);
+  ) : editStatusBanner ?? viewerBanner ?? (findIneligibleReason ? <span>{findIneligibleReason}</span> : null);
 
   const viewerMode = focused || (payload.kind === 'image' && imageTakeover) ? 'takeover' : inline ? 'inline' : 'overlay';
   const shell = (
@@ -563,16 +750,16 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
       title={title}
       titleTooltip={absolutePath}
       headerExtras={headerExtras}
-      noteCount={notes.fileNotes.length}
-      onToggleNotes={notes.togglePanel}
+      noteCount={sourceEditorOpen ? 0 : notes.fileNotes.length}
+      onToggleNotes={sourceEditorOpen ? () => undefined : notes.togglePanel}
       onSend={focused ? focusedExit.sendAndReturn : () => { void notes.send(); }}
       banner={banner}
-      onClose={focused ? focusedExit.requestClose : onClose}
-      onEscape={focused ? focusedExit.requestReturn : undefined}
+      onClose={requestClose}
+      onEscape={requestEscape}
       suppressCloseButtonFocus={findSession !== null}
-      bodyScroll={usePierreCode ? 'children' : 'shell'}
+      bodyScroll={usePierreCode || sourceEditorOpen ? 'children' : 'shell'}
       panel={
-        notes.showPanel ? (
+        !sourceEditorOpen && notes.showPanel ? (
           <NotesPanel
             notes={notes.fileNotes}
             onJumpTo={handleJumpTo}
@@ -584,7 +771,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
         ) : null
       }
       dialog={
-        notes.annotating ? (
+        !sourceEditorOpen && notes.annotating ? (
           <AnnotationDialog
             anchorLabel={`Line ${notes.annotating.lineNumber}`}
             lineContent={notes.annotating.lineContent}
@@ -593,7 +780,23 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
           />
         ) : null
       }
-      confirm={focusedExit.exitTarget ? (
+      confirm={editConfirm ? (
+        <FileEditConfirmDialog
+          confirm={editConfirm}
+          title={title}
+          pending={editPending}
+          onCancel={() => setEditConfirm(null)}
+          onDiscard={() => {
+            if (editConfirm.kind !== 'discard') return;
+            const transition = editConfirm.continueTransition;
+            setEditBaseline(editDraft);
+            setEditConfirm(null);
+            transition();
+          }}
+          onDelete={() => { void runDelete(); }}
+          onReload={() => { void runReload(); }}
+        />
+      ) : focusedExit.exitTarget ? (
         <FocusedReviewExitDialog
           target={focusedExit.exitTarget}
           sending={focusedExit.sending}
@@ -604,7 +807,18 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
         />
       ) : null}
     >
-      {usePierreCode ? (
+      {sourceEditorOpen ? (
+        <FileEditorBody
+          value={editDraft}
+          onChange={(value) => {
+            setEditDraft(value);
+            setEditError(null);
+            setEditConflict(false);
+          }}
+          disabled={editPending !== null}
+          label={`Edit ${title}`}
+        />
+      ) : usePierreCode ? (
         <PhoenixFileCodeView
           ref={fileCodeRef}
           filePath={absolutePath}
@@ -627,6 +841,65 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   );
 
   return shell;
+}
+
+function FileEditConfirmDialog({
+  confirm,
+  title,
+  pending,
+  onCancel,
+  onDiscard,
+  onDelete,
+  onReload,
+}: {
+  confirm: FileEditConfirm;
+  title: string;
+  pending: 'saving' | 'reloading' | 'deleting' | null;
+  onCancel: () => void;
+  onDiscard: () => void;
+  onDelete: () => void;
+  onReload: () => void;
+}) {
+  useEffect(() => {
+    if (pending !== null) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.stopPropagation();
+      onCancel();
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [onCancel, pending]);
+
+  const isDelete = confirm.kind === 'delete';
+  const isReload = confirm.kind === 'reload';
+  const heading = isDelete ? `Delete ${title}?` : isReload ? 'Discard changes and reload?' : 'Discard unsaved changes?';
+  const message = isDelete
+    ? `This permanently deletes ${title}. This cannot be undone.`
+    : isReload
+      ? 'Reloading the latest file content discards your unsaved changes.'
+      : 'The current file has unsaved changes. Discard them before leaving edit mode.';
+  return (
+    <div className="focused-review-exit-overlay" role="presentation">
+      <div className="modal confirm-dialog focused-review-exit" role="dialog" aria-modal="true" aria-label={heading}>
+        <h3>{heading}</h3>
+        <p>{message}</p>
+        <div className="modal-actions focused-review-exit-actions">
+          <button className="btn-secondary" type="button" onClick={onCancel} disabled={pending !== null}>
+            {confirm.kind === 'discard' ? 'Keep editing' : 'Cancel'}
+          </button>
+          <button
+            className={isDelete ? 'btn-danger' : 'btn-primary'}
+            type="button"
+            onClick={isDelete ? onDelete : isReload ? onReload : onDiscard}
+            disabled={pending !== null}
+          >
+            {pending === 'deleting' ? 'Deleting…' : pending === 'reloading' ? 'Reloading…' : isDelete ? 'Delete file' : isReload ? 'Discard and reload' : 'Discard changes'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 const EMPTY_FIND_SESSION_MATCHES: readonly FindSessionMatch<FileSearchMatchTarget>[] = [];
