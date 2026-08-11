@@ -737,7 +737,8 @@ fn spawn_child(
             command
         }
         BashSpawnMode::ExploreReadOnly | BashSpawnMode::SharedReadOnly => {
-            let sandbox_command = ExploreSandboxLauncher::command(cmd, &spawn_context.working_dir)?;
+            let sandbox_command = ExploreSandboxLauncher::command(cmd, &spawn_context.working_dir)
+                .map_err(|e| format!("failed to prepare explore sandbox launcher: {e}"))?;
             sandbox_scratch_dir = Some(sandbox_command.scratch_dir);
             Command::from(sandbox_command.command)
         }
@@ -769,7 +770,13 @@ fn spawn_child(
             if let Some(dir) = &sandbox_scratch_dir {
                 let _ = std::fs::remove_dir_all(dir);
             }
-            return Err(format!("failed to spawn bash child: {e}"));
+            let child_role = match spawn_mode {
+                BashSpawnMode::Direct => "bash child",
+                BashSpawnMode::ExploreReadOnly | BashSpawnMode::SharedReadOnly => {
+                    "explore sandbox launcher"
+                }
+            };
+            return Err(format!("failed to spawn {child_role}: {e}"));
         }
     };
 

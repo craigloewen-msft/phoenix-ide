@@ -704,6 +704,14 @@ applies a `nono` OS sandbox before execing `bash -c`
 AND SHALL NOT call `nono::Sandbox::apply()` in the long-running Phoenix server
 process
 
+ON Linux
+WHEN the filesystem entry used to start the running Phoenix server is replaced or
+unlinked
+THE Explore sandbox child SHALL remain launchable from the running server's own
+live process image
+AND SHALL NOT execute a replacement binary from the mutable launch pathname
+AND SHALL preserve the same sandbox-helper protocol and enforcement policy
+
 THE Explore bash sandbox SHALL provide:
 - broad filesystem read access matching Explore's existing read-only tool semantics
 - read-only Git metadata access sufficient for linked worktree commands such as
@@ -781,6 +789,11 @@ THE SYSTEM SHALL still apply command safety checks (REQ-BASH-011) to modes that
 expose bash
 AND the absence of Explore bash SHALL NOT prevent Direct, Work, or Branch mode
 from functioning
+
+WHEN Phoenix cannot launch the configured sandbox child executable
+THE SYSTEM SHALL return a structured `spawn_failed` tool error identifying the
+Explore sandbox launcher
+AND SHALL NOT execute the requested command without the sandbox
 
 **Rationale:** A tool-level read-only convention is not a security boundary. If
 Phoenix cannot enforce the Explore bash policy at the OS boundary, Explore mode

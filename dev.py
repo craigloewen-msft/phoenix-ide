@@ -1867,6 +1867,11 @@ def _probe_phoenix_scheme(port: int) -> str | None:
     return None
 
 
+def _running_phoenix_matches(port: int, tls: bool) -> bool:
+    desired_scheme = "https" if tls else "http"
+    return _probe_phoenix_scheme(port) == desired_scheme
+
+
 def _resolved_phoenix_env() -> dict[str, str]:
     """Phoenix env with the same .env overrides start_phoenix applies, for
     resolving TLS paths without starting the server."""
@@ -1944,12 +1949,10 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
     phoenix_tls = maybe_enable_auto_tls(env, tls)
 
     if get_pid(PHOENIX_PID_FILE):
-        desired_scheme = "https" if phoenix_tls else "http"
-        current_scheme = _probe_phoenix_scheme(port)
-        if current_scheme == desired_scheme or (current_scheme is None and desired_scheme == "http"):
+        if _running_phoenix_matches(port, phoenix_tls):
             print("Phoenix server already running")
             return phoenix_tls
-        print("Restarting Phoenix server for TLS mode change")
+        print("Restarting Phoenix server because its health or TLS mode does not match")
         stop_process(PHOENIX_PID_FILE, "Phoenix")
         time.sleep(0.5)
 
@@ -2172,7 +2175,19 @@ def cmd_up(
     print(f"  Hash: {get_worktree_hash()}, Port offsets: Phoenix +{phoenix_offset}, Vite +{vite_offset}")
     print()
     
-    build_rust(release=True)
+    configured_env = _resolved_phoenix_env()
+    requested_phoenix_tls = maybe_enable_auto_tls(configured_env, tls)
+    reuse_phoenix = phoenix_pid is not None and _running_phoenix_matches(
+        phoenix_port, requested_phoenix_tls
+    )
+    if reuse_phoenix:
+        print("Phoenix already running — skipping backend build (use ./dev.py restart for Rust changes).")
+    else:
+        if phoenix_pid is not None:
+            print("Stopping Phoenix before rebuild because its health or TLS mode does not match.")
+            stop_process(PHOENIX_PID_FILE, "Phoenix")
+            time.sleep(0.5)
+        build_rust(release=True)
 
     # Seed before Phoenix starts so the seeder remains the only database writer.
     # The release binary is already built, so seed can run its canonical

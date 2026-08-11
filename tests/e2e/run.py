@@ -312,6 +312,10 @@ class _StartupFailure(RuntimeError):
         self.retryable = retryable
 
 
+class ScenarioSkipped(RuntimeError):
+    pass
+
+
 def _is_addr_in_use(log_text: str) -> bool:
     return "kind: AddrInUse" in log_text or "Address already in use" in log_text
 
@@ -321,8 +325,11 @@ def _start_server_attempt(env: dict[str, str], tmpdir: Path, attempt: int):
     attempt_env = env | {"PHOENIX_PORT": str(port)}
     log_path = tmpdir / f"phoenix-startup-{attempt}.log"
     log_file = log_path.open("w")
+    server_binary = tmpdir / "phoenix_ide-live"
+    if not server_binary.exists():
+        shutil.copy2(BINARY, server_binary)
     proc = subprocess.Popen(
-        [str(BINARY)],
+        [str(server_binary)],
         cwd=tmpdir,
         env=attempt_env,
         stdout=log_file,
@@ -479,7 +486,20 @@ def _server():
                 extra={"kind": "e2e_startup", "process_role": "server"},
             )
 
+    precondition_error = None
+    if sys.platform.startswith("linux"):
+        # Remove the disposable launch path after startup so this server has the
+        # same deleted-inode process image as a live server whose binary was replaced.
+        (tmpdir / "phoenix_ide-live").unlink()
+        process_maps = (Path("/proc") / str(proc.pid) / "maps").read_text()
+        if "phoenix_ide-live (deleted)" not in process_maps:
+            precondition_error = RuntimeError(
+                "e2e server did not enter the deleted executable-image state"
+            )
+
     try:
+        if precondition_error is not None:
+            raise precondition_error
         yield base_url, log_path, proc.pid, profile_dir
     finally:
         teardown_started_wall_ns = time.time_ns()
@@ -549,6 +569,8 @@ def _new_conv(
     text: str,
     images: list[dict] | None = None,
     cwd: str | None = None,
+    mode: str | None = None,
+    base_branch: str | None = None,
 ) -> dict:
     payload = {
         "cwd": cwd if cwd is not None else str(ROOT),
@@ -557,6 +579,10 @@ def _new_conv(
         "images": images or [],
         "message_id": str(uuid.uuid4()),
     }
+    if mode is not None:
+        payload["mode"] = mode
+    if base_branch is not None:
+        payload["base_branch"] = base_branch
     r = httpx.post(f"{base_url}/api/conversations/new", json=payload, timeout=10.0)
     r.raise_for_status()
     return r.json()["conversation"]
@@ -571,6 +597,25 @@ def _cancel(base_url: str, conv_id: str) -> dict:
     r = httpx.post(f"{base_url}/api/conversations/{conv_id}/cancel", timeout=10.0)
     r.raise_for_status()
     return r.json()
+
+
+def _delete_conversation(base_url: str, conv_id: str) -> None:
+    delete_url = f"{base_url}/api/conversations/{conv_id}/delete"
+    response = httpx.post(delete_url, timeout=15.0)
+    if response.status_code != 409:
+        response.raise_for_status()
+        return
+
+    _cancel(base_url, conv_id)
+    deadline = time.monotonic() + SCENARIO_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        state = _state_str(_get_conv(base_url, conv_id)["conversation"]["state"])
+        if state == "idle":
+            retry = httpx.post(delete_url, timeout=15.0)
+            retry.raise_for_status()
+            return
+        time.sleep(0.1)
+    raise TimeoutError("conversation did not become idle after cleanup cancellation")
 
 
 def _get_conv(base_url: str, conv_id: str) -> dict:
@@ -939,6 +984,20 @@ def _user_message_images(message: dict) -> list[dict]:
     return []
 
 
+def _tool_messages(messages: list[dict]) -> list[dict]:
+    return [message for message in messages if message.get("message_type") == "tool"]
+
+
+def _assert_tool_results_succeeded(messages: list[dict], tool_name: str) -> None:
+    results = _tool_messages(messages)
+    assert results, f"expected at least one {tool_name} tool result message"
+    for message in results:
+        content = message.get("content") or {}
+        assert content.get("is_error") is False, (
+            f"{tool_name} tool result reported error: {content!r}"
+        )
+
+
 # ----------------------- scenarios -----------------------
 
 
@@ -972,8 +1031,75 @@ def scenario_multi_tool(base_url: str) -> None:
     )
     n_bash = _count_tool_use(final["messages"], "bash")
     assert n_bash == 2, f"expected 2 bash tool uses, got {n_bash}"
+    _assert_tool_results_succeeded(final["messages"], "bash")
     state = _state_str(final["conversation"]["state"])
     assert state == "idle", f"final state not idle: {state}"
+
+
+def scenario_explore_bash_after_binary_unlink(base_url: str) -> None:
+    if not sys.platform.startswith("linux"):
+        raise ScenarioSkipped("deleted executable-image regression is Linux-specific")
+
+    repo = Path(tempfile.mkdtemp(prefix="phoenix-e2e-explore-repo-"))
+    try:
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "e2e@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Phoenix E2E"], cwd=repo, check=True)
+        (repo / "README.md").write_text("explore bash fixture\n")
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "fixture"], cwd=repo, check=True)
+
+        conv = _new_conv(
+            base_url,
+            "[[scenario:plain_text]] prepare",
+            cwd=str(repo),
+            mode="managed",
+            base_branch="main",
+        )
+        try:
+            _poll_to_idle_with_messages(
+                base_url,
+                conv["id"],
+                lambda messages: bool(_agent_text(messages)),
+                "managed Explore conversation readiness",
+                timeout=SCENARIO_TIMEOUT_SECONDS,
+            )
+            prompt_response = httpx.get(
+                f"{base_url}/api/conversations/{conv['id']}/system-prompt",
+                timeout=10.0,
+            )
+            prompt_response.raise_for_status()
+            prompt = prompt_response.json().get("system_prompt", "")
+            if "`bash` is unavailable because this host cannot enforce" in prompt:
+                raise ScenarioSkipped("host cannot enforce the Explore Bash sandbox")
+            assert "`bash` is available for read-only local investigation" in prompt, prompt
+
+            _send_chat_and_stream(
+                base_url,
+                conv["id"],
+                "[[scenario:bash]] inspect",
+                SCENARIO_TIMEOUT_SECONDS,
+            )
+            final = _poll_to_idle_with_messages(
+                base_url,
+                conv["id"],
+                lambda messages: _has_tool_use(messages, "bash")
+                and bool(_tool_messages(messages)),
+                "successful Explore bash result after server binary unlink",
+                timeout=SCENARIO_TIMEOUT_SECONDS,
+            )
+            assert _has_tool_use(final["messages"], "bash")
+            _assert_tool_results_succeeded(final["messages"], "Explore bash")
+            tool_output = "\n".join(
+                str((message.get("content") or {}).get("content", ""))
+                for message in _tool_messages(final["messages"])
+            )
+            assert '"status":"exited"' in tool_output, tool_output
+            assert '"exit_code":0' in tool_output, tool_output
+        finally:
+            _delete_conversation(base_url, conv["id"])
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
 
 
 def scenario_think_tool(base_url: str) -> None:
@@ -1163,6 +1289,7 @@ SCENARIOS = [
     ("list_models", scenario_list_models),
     ("text_streaming", scenario_text_streaming),
     ("multi_tool", scenario_multi_tool),
+    ("explore_bash_unlinked", scenario_explore_bash_after_binary_unlink),
     ("think_tool", scenario_think_tool),
     ("read_file", scenario_read_file),
     ("patch", scenario_patch),
@@ -1452,6 +1579,7 @@ def main() -> int:
         return 1
     _build_binary()
     failures: list[tuple[str, str]] = []
+    skipped: list[tuple[str, str]] = []
     log_text = ""
     with _server() as (base_url, log_path, server_pid, profile_dir):
         print(f"[e2e] server up at {base_url}", flush=True)
@@ -1470,6 +1598,12 @@ def main() -> int:
                 scenario_status = "passed"
                 dt = (time.monotonic_ns() - started_monotonic_ns) / 1_000_000_000.0
                 print(f"  ✓ {name:<22s} {dt:6.2f}s", flush=True)
+            except ScenarioSkipped as error:
+                scenario_status = "skipped"
+                dt = (time.monotonic_ns() - started_monotonic_ns) / 1_000_000_000.0
+                detail = str(error)
+                print(f"  - {name:<22s} {dt:6.2f}s  skipped: {detail}", flush=True)
+                skipped.append((name, detail))
             except Exception as e:
                 dt = (time.monotonic_ns() - started_monotonic_ns) / 1_000_000_000.0
                 detail = f"{type(e).__name__}: {e}"
@@ -1545,8 +1679,10 @@ def main() -> int:
             print(f"  | {line}")
         print(f"\n✗ {len(failures)} e2e check(s) failed")
         return 1
+    passed = len(SCENARIOS) - len(skipped)
+    suffix = f", {len(skipped)} skipped" if skipped else ""
     print(
-        f"\n✓ all {len(SCENARIOS)} e2e scenarios passed "
+        f"\n✓ {passed} e2e scenarios passed{suffix} "
         "(no external MCP or slow-statement WARNs)"
     )
     return 0

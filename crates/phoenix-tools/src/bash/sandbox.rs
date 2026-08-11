@@ -133,9 +133,12 @@ impl ExploreSandboxLauncher {
     pub fn command(cmd: &str, working_dir: &Path) -> Result<ExploreSandboxCommand, String> {
         let policy = ExploreReadOnlyPolicy::discover(working_dir)
             .map_err(|e| format!("failed to create explore sandbox policy: {e}"))?;
-        let exe = std::env::current_exe()
+        #[cfg(target_os = "linux")]
+        let helper_executable = PathBuf::from("/proc/self/exe");
+        #[cfg(not(target_os = "linux"))]
+        let helper_executable = std::env::current_exe()
             .map_err(|e| format!("failed to resolve phoenix executable: {e}"))?;
-        let mut command = Command::new(exe);
+        let mut command = Command::new(helper_executable);
         command
             .arg("--sandbox-exec")
             .arg("--")
