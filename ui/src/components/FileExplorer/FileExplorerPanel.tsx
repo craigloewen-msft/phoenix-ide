@@ -119,7 +119,7 @@ function GitStatusDetails({ status }: { status: Extract<ConversationGitStatusRes
 }
 
 export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, showError, branchName, activeSlug, width, workScopeKey, liveWorkScope, canOpenWorkspaceDiff = false }: Props) {
-  const { openFile, activeFile } = useFileExplorer();
+  const { openFile, activeFile, fileMutation } = useFileExplorer();
   const { openDiffFullscreen, openFileDiff } = useViewerSlotCommands();
   const [reviewExpanded, setReviewExpanded] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -189,6 +189,12 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
     setRefreshKey(k => k + 1);
     void loadGitStatus();
   }, [loadGitStatus]);
+
+  useEffect(() => {
+    if (!fileMutation) return;
+    setRefreshKey((key) => key + 1);
+    void loadGitStatus();
+  }, [fileMutation, loadGitStatus]);
 
   const currentTaskId = extractTaskId(branchName);
   const workScopeCount = useSeededLiveCount(workScopeKey, conversationId, liveWorkScope);

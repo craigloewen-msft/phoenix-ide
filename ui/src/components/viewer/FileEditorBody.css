@@ -1,0 +1,39 @@
+.file-editor-body {
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  background: var(--bg-primary);
+}
+
+.file-editor-input {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  resize: none;
+  border: 0;
+  outline: 0;
+  padding: 14px 16px;
+  background: transparent;
+  color: var(--text-primary);
+  font: 13px/1.55 var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  tab-size: 2;
+  white-space: pre;
+  overflow: auto;
+}
+
+.file-editor-input:disabled {
+  opacity: 0.72;
+}
+
+.file-edit-mode--armed {
+  color: var(--accent-yellow, #d4b84b);
+  border-color: currentcolor;
+}
+
+.file-edit-delete {
+  color: var(--error-color, #e06c75);
+}
+
+.file-edit-error {
+  color: var(--error-color, #e06c75);
+}

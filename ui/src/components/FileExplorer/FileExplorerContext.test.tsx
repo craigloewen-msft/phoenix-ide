@@ -86,6 +86,31 @@ describe('FileExplorer adapter — URL-driven open file', () => {
     expect(search).not.toContain('root=');
   });
 
+  it('lets the active dirty editor hold a file replacement until discard is confirmed', () => {
+    let latest: ReturnType<typeof useFileExplorer> | null = null;
+    let heldTransition: (() => void) | null = null;
+    const onCtx = (ctx: ReturnType<typeof useFileExplorer>) => { latest = ctx; };
+
+    render(
+      <MemoryRouter initialEntries={['/c/conv-A']}>
+        <Providers scopeKey="conv-A"><Consumer onCtx={onCtx} /></Providers>
+      </MemoryRouter>,
+    );
+
+    act(() => { latest!.openFile('/repo/first.ts', '/repo'); });
+    act(() => {
+      latest!.registerFileTransitionGuard((transition) => {
+        heldTransition = transition;
+        return true;
+      });
+    });
+    act(() => { latest!.openFile('/repo/second.ts', '/repo'); });
+    expect(latest!.activeFile).toBe('/repo/first.ts');
+
+    act(() => { heldTransition!(); });
+    expect(latest!.activeFile).toBe('/repo/second.ts');
+  });
+
   it('hydrates openFileState from legacy file/root URL params (no ?viewer=)', () => {
     let latest: ReturnType<typeof useFileExplorer> | null = null;
     const onCtx = (ctx: ReturnType<typeof useFileExplorer>) => { latest = ctx; };

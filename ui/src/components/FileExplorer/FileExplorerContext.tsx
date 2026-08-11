@@ -1,7 +1,7 @@
-import { useMemo } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { FileExplorerContext } from './fileExplorerTypes';
-import type { OpenFileState } from './fileExplorerTypes';
+import type { FileMutation, FileTransitionGuard, OpenFileState } from './fileExplorerTypes';
 import { useViewerSlotData, useViewerSlotCommands } from '../../contexts/ViewerSlotContext';
 
 /**
@@ -14,6 +14,45 @@ import { useViewerSlotData, useViewerSlotCommands } from '../../contexts/ViewerS
 export function FileExplorerProvider({ children }: { children: ReactNode }) {
   const slot = useViewerSlotData();
   const { openProse, close } = useViewerSlotCommands();
+  const transitionGuardRef = useRef<FileTransitionGuard | null>(null);
+  const mutationSequenceRef = useRef(0);
+  const [fileMutation, setFileMutation] = useState<FileMutation | null>(null);
+
+  const requestFileTransition = useCallback((transition: () => void) => {
+    if (transitionGuardRef.current?.(transition)) return;
+    transition();
+  }, []);
+
+  const registerFileTransitionGuard = useCallback((guard: FileTransitionGuard) => {
+    transitionGuardRef.current = guard;
+    return () => {
+      if (transitionGuardRef.current === guard) transitionGuardRef.current = null;
+    };
+  }, []);
+
+  const notifyFileMutation = useCallback((mutation: Omit<FileMutation, 'sequence'>) => {
+    mutationSequenceRef.current += 1;
+    const sequence = mutationSequenceRef.current;
+    setFileMutation(mutation.kind === 'saved'
+      ? { kind: 'saved', path: mutation.path, sequence }
+      : { kind: 'deleted', path: mutation.path, sequence });
+  }, []);
+
+  const openFile = useCallback((
+    path: string,
+    rootDir: string,
+    options?: Parameters<typeof openProse>[2],
+    afterOpen?: () => void,
+  ) => {
+    requestFileTransition(() => {
+      openProse(path, rootDir, options);
+      afterOpen?.();
+    });
+  }, [openProse, requestFileTransition]);
+
+  const closeFile = useCallback(() => {
+    requestFileTransition(close);
+  }, [close, requestFileTransition]);
 
   const openFileState = useMemo<OpenFileState | null>(() => {
     if (slot.kind !== 'prose') return null;
@@ -24,11 +63,23 @@ export function FileExplorerProvider({ children }: { children: ReactNode }) {
   }, [slot]);
 
   const value = useMemo(() => ({
-    openFile: openProse,
-    closeFile: close,
+    openFile,
+    closeFile,
     activeFile: openFileState?.path ?? null,
     openFileState,
-  }), [openProse, close, openFileState]);
+    fileMutation,
+    notifyFileMutation,
+    requestFileTransition,
+    registerFileTransitionGuard,
+  }), [
+    openFile,
+    closeFile,
+    openFileState,
+    fileMutation,
+    notifyFileMutation,
+    requestFileTransition,
+    registerFileTransitionGuard,
+  ]);
 
   return (
     <FileExplorerContext.Provider value={value}>

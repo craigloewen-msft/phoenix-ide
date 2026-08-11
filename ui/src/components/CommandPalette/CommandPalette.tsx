@@ -32,7 +32,7 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
   const searchAbortRef = useRef<AbortController | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const { openFile } = useFileExplorer();
+  const { openFile, requestFileTransition } = useFileExplorer();
 
   // Extract current slug and active conversation
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
@@ -51,9 +51,12 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
   // conversations ref changes every 5s (DesktopLayout poll) but conversationIdsKey is
   // stable across same-content polls; use key as the real dep, capture conversations.
   const conversationSource = useMemo(
-    () => createConversationSource(conversations, (slug) => navigate(`/c/${slug}`)),
+    () => createConversationSource(
+      conversations,
+      (slug) => requestFileTransition(() => navigate(`/c/${slug}`)),
+    ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [conversationIdsKey, navigate],
+    [conversationIdsKey, navigate, requestFileTransition],
   );
 
   // FileSource and CodeSource — recomputed only when conversation id or file root actually changes.
@@ -95,7 +98,7 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
   const actions: PaletteAction[] = useMemo(
     () =>
       createBuiltInActions({
-        navigate,
+        navigate: (path) => requestFileTransition(() => navigate(path)),
         currentSlug,
         archiveCurrent: currentSlug
           ? () => {
@@ -109,14 +112,18 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
               const roots = computeChainRoots(conversations);
               const rootId = roots.get(conv.id);
               if (rootId) {
-                api.archiveChain(rootId).then(() => navigate('/'));
+                requestFileTransition(() => {
+                  void api.archiveChain(rootId).then(() => navigate('/'));
+                });
               } else {
-                api.archiveConversation(conv.id).then(() => navigate('/'));
+                requestFileTransition(() => {
+                  void api.archiveConversation(conv.id).then(() => navigate('/'));
+                });
               }
             }
           : undefined,
       }),
-    [navigate, currentSlug, activeConvId, conversations],
+    [navigate, requestFileTransition, currentSlug, activeConvId, conversations],
   );
 
   // Dispatch helper — state machine only needs actions now (sources are async)

@@ -238,9 +238,9 @@ function saveExpansion(convId: string, expanded: Set<string>) {
 }
 
 /**
- * Cheap fingerprint for a FileItem[]: concatenates name + modified_time per
- * item. Two arrays with the same fingerprint are treated as equal for the
- * purpose of the 10s auto-refresh loop — in that case we skip `setItems` so
+ * Cheap fingerprint for a FileItem[]: concatenates name, modification time,
+ * and size per item. Two arrays with the same fingerprint are treated as equal
+ * for the 10s auto-refresh loop — in that case we skip `setItems` so
  * the whole tree doesn't re-render.
  *
  * This is a hash only in spirit; collisions are harmless because the worst
@@ -251,6 +251,7 @@ function fingerprintFiles(items: FileItem[]): string {
   for (const it of items) {
     parts.push(it.name);
     parts.push(String(it.modified_time ?? 0));
+    parts.push(String(it.size ?? 0));
     parts.push(it.is_directory ? 'd' : 'f');
   }
   return parts.join('|');

@@ -23,6 +23,20 @@ export interface PatchContext {
   firstModifiedLine?: number | undefined;
 }
 
+export type FileMutationCapability =
+  | { kind: 'mutable_text'; version: string }
+  | { kind: 'delete_only'; version: string };
+
+export interface FileMutationActions {
+  conversationId: string;
+  relativePath: string;
+  capability: FileMutationCapability;
+  onSaved: (content: string, version: string) => void;
+  onReloaded: (response: import('../../api').ConversationFileContentResponse) => void;
+  onDeleted: () => void;
+  registerTransitionGuard: (guard: (continueTransition: () => void) => boolean) => () => void;
+}
+
 interface CommonPayload {
   /** Header title — typically the file name. */
   title: string;
@@ -40,6 +54,8 @@ interface CommonPayload {
   /** Whether a wide desktop pane is available as the alternate presentation. */
   canTogglePresentation?: boolean | undefined;
   onPresentationChange?: ((presentation: 'pane' | 'fullscreen') => void) | undefined;
+  /** Present only for active conversation files whose server-scoped read grants mutation. */
+  mutation?: FileMutationActions | undefined;
 }
 
 /** Shared shape for the four annotatable text render kinds. */

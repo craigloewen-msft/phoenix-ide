@@ -4,30 +4,34 @@ import { ViewerShell } from './viewer/ViewerShell';
 import { ReviewFocusToggleButton } from './viewer/DiffHeaderControls';
 import { MetaViewer } from './viewer/MetaViewer';
 import { classifyViewerFile } from './viewer/viewerFileTypes';
-import type { MetaViewerPayload, PatchContext, TextRenderMode, ViewerFocus } from './viewer/metaViewerTypes';
+import type { FileMutationActions, MetaViewerPayload, PatchContext, TextRenderMode, ViewerFocus } from './viewer/metaViewerTypes';
 import type { TextCategory } from '../generated/TextCategory';
 import { useOptionalViewerSlotCommands, useOptionalViewerSlotData } from '../contexts/ViewerSlotContext';
 import { useReviewContext } from '../contexts/useReviewContext';
 import type { ReviewFileEntry } from '../api';
 import { FileReviewDiffView } from './viewer/FileReviewDiffView';
+import { api, type ConversationFileCapability } from '../api';
+import { useOptionalFileExplorer } from '../hooks/useFileExplorer';
 
 /**
  * FileViewer — the file loader/adapter.
  *
  * Resolves a "view this file" request into a renderable `MetaViewerPayload`:
- * fetches `/api/files/read`, then classifies the result into a markdown / code /
- * text / html / image payload (trusting the server's `file_type` bucket). The
+ * fetches the conversation-scoped content route for conversation files (and the
+ * legacy `/api/files/read` route for standalone read-only callers), then classifies
+ * the result into a markdown / code / text / html / image payload. The
  * actual rendering is delegated to `MetaViewer`. Loading and error states are
  * owned here — they are not resolved payloads, so they never reach MetaViewer.
  */
 
 type ReadFileResult =
-  | { kind: 'text'; content: string; encoding: string; category: TextCategory }
-  | { kind: 'image'; mime_type: string; url: string };
+  | { kind: 'text'; content: string; encoding: string; category: TextCategory; capability?: ConversationFileCapability }
+  | { kind: 'image'; mime_type: string; url: string; capability?: ConversationFileCapability };
 
 export interface FileViewerProps {
   filePath: string;
   rootDir: string;
+  conversationId?: string | undefined;
   onClose: () => void;
   onSendNotes: (notes: string) => void | Promise<void>;
   patchContext?: PatchContext | undefined;
@@ -61,9 +65,18 @@ async function readFile(path: string): Promise<ReadFileResult> {
   };
 }
 
+function relativeFilePath(rootDir: string, absolutePath: string): string | null {
+  const root = rootDir.endsWith('/') ? rootDir.slice(0, -1) : rootDir;
+  const prefix = `${root}/`;
+  if (!absolutePath.startsWith(prefix)) return null;
+  const relative = absolutePath.slice(prefix.length);
+  return relative.length > 0 ? relative : null;
+}
+
 export function FileViewer({
   filePath,
   rootDir,
+  conversationId,
   onClose,
   onSendNotes,
   patchContext,
@@ -81,12 +94,18 @@ export function FileViewer({
   const viewerSlot = useOptionalViewerSlotData();
   const slotCommands = useOptionalViewerSlotCommands();
   const review = useReviewContext();
+  const fileExplorer = useOptionalFileExplorer();
 
   const absolutePath = useMemo(() => {
     if (filePath.startsWith('/')) return filePath;
     return rootDir.endsWith('/') ? rootDir + filePath : rootDir + '/' + filePath;
   }, [filePath, rootDir]);
   const fileName = filePath.split('/').pop() || filePath;
+  const conversationRelativePath = useMemo(
+    () => relativeFilePath(rootDir, absolutePath),
+    [absolutePath, rootDir],
+  );
+  const closeResolvedViewer = slotCommands?.close ?? onClose;
 
   // Repo-relative identity: the review manifest keys on it, not on the
   // absolute path the viewer otherwise uses.
@@ -146,7 +165,10 @@ export function FileViewer({
       setError(null);
       setFileData(null);
       try {
-        const result = await readFile(absolutePath);
+        const result = conversationId && conversationRelativePath
+          ? await api.getConversationFileContent(conversationId, conversationRelativePath)
+              .then(({ content, capability }) => ({ ...content, capability } as ReadFileResult))
+          : await readFile(absolutePath);
         if (!cancelled) setFileData(result);
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : 'Failed to load file');
@@ -156,7 +178,7 @@ export function FileViewer({
     }
     load();
     return () => { cancelled = true; };
-  }, [absolutePath]);
+  }, [absolutePath, conversationId, conversationRelativePath]);
 
   // Only a file that is actually part of the change set has a review diff.
   // Placed after all hooks so the hook order is identical in both modes.
@@ -199,12 +221,39 @@ export function FileViewer({
   }
 
   if (fileData) {
+    const mutation: FileMutationActions | undefined = conversationId
+      && conversationRelativePath
+      && fileData.capability
+      && fileData.capability.kind !== 'read_only'
+      && fileExplorer
+      ? {
+          conversationId,
+          relativePath: conversationRelativePath,
+          capability: fileData.capability,
+          onSaved: (content, version) => {
+            setFileData((current) => current?.kind === 'text'
+              ? { ...current, content, capability: { kind: 'mutable_text', version } }
+              : current);
+            fileExplorer.notifyFileMutation({ kind: 'saved', path: absolutePath });
+            review?.refresh();
+          },
+          onReloaded: ({ content, capability }) => {
+            setFileData({ ...content, capability } as ReadFileResult);
+          },
+          onDeleted: () => {
+            fileExplorer.notifyFileMutation({ kind: 'deleted', path: absolutePath });
+            review?.refresh();
+            closeResolvedViewer();
+          },
+          registerTransitionGuard: fileExplorer.registerFileTransitionGuard,
+        }
+      : undefined;
     const payload = buildPayload(fileData, {
       filePath,
       rootDir,
       absolutePath,
       fileName,
-      onClose,
+      onClose: closeResolvedViewer,
       onSendNotes,
       ...(patchContext !== undefined ? { patchContext } : {}),
       ...(focus !== undefined ? { focus } : {}),
@@ -212,8 +261,9 @@ export function FileViewer({
       ...(canTogglePresentation !== undefined ? { canTogglePresentation } : {}),
       ...(onPresentationChange !== undefined ? { onPresentationChange } : {}),
       ...(inline !== undefined ? { inline } : {}),
+      ...(mutation !== undefined ? { mutation } : {}),
     });
-    return <MetaViewer payload={payload} />;
+    return <MetaViewer key={absolutePath} payload={payload} />;
   }
 
   // Every terminal state keeps the shell header, so a review-focused reviewer
@@ -281,6 +331,7 @@ interface PayloadContext {
   canTogglePresentation?: boolean | undefined;
   onPresentationChange?: ((presentation: 'pane' | 'fullscreen') => void) | undefined;
   inline?: boolean | undefined;
+  mutation?: FileMutationActions | undefined;
 }
 
 function buildPayload(data: ReadFileResult, ctx: PayloadContext): MetaViewerPayload {
@@ -293,6 +344,7 @@ function buildPayload(data: ReadFileResult, ctx: PayloadContext): MetaViewerPayl
     ...(ctx.canTogglePresentation !== undefined ? { canTogglePresentation: ctx.canTogglePresentation } : {}),
     ...(ctx.onPresentationChange !== undefined ? { onPresentationChange: ctx.onPresentationChange } : {}),
     ...(ctx.inline !== undefined ? { inline: ctx.inline } : {}),
+    ...(ctx.mutation !== undefined ? { mutation: ctx.mutation } : {}),
   };
 
   if (data.kind === 'image') {

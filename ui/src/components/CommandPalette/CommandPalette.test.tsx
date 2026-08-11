@@ -66,6 +66,10 @@ function renderPalette(
         activeFile: null,
         closeFile: vi.fn(),
         openFileState: null,
+        fileMutation: null,
+        notifyFileMutation: vi.fn(),
+        requestFileTransition: (transition) => transition(),
+        registerFileTransitionGuard: () => () => undefined,
       }}>
         <CommandPalette
           conversations={conversations}

@@ -4,6 +4,10 @@ import type { FileExplorerContextValue } from '../components/FileExplorer/fileEx
 
 export type { FileExplorerContextValue };
 
+export function useOptionalFileExplorer(): FileExplorerContextValue | null {
+  return useContext(FileExplorerContext);
+}
+
 export function useFileExplorer(): FileExplorerContextValue {
   const ctx = useContext(FileExplorerContext);
   if (!ctx) {

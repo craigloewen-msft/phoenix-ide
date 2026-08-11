@@ -13,9 +13,11 @@ import type { CodexLoginPreflight } from '../api';
 import { subscribeModels } from '../modelsPoller';
 import { ConversationContext } from '../conversation/ConversationContext';
 import { getDisambiguatedPathLabels } from '../utils/conversationIdentity';
+import { useOptionalFileExplorer } from '../hooks/useFileExplorer';
 
 const PROJECT_FILTER_KEY = 'phoenix:sidebar-project-filter';
 const COLLAPSED_DOT_LIMIT = 9;
+const runFileTransition = (transition: () => void) => transition();
 
 function countForProject(conversations: readonly Conversation[], projectId: string | null): number {
   if (projectId === null) return conversations.length;
@@ -74,6 +76,8 @@ export function Sidebar({
 }: SidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
+  const fileExplorer = useOptionalFileExplorer();
+  const requestFileTransition = fileExplorer?.requestFileTransition ?? runFileTransition;
   const conversationStore = useContext(ConversationContext);
   const { theme, toggleTheme } = useTheme();
   const [codexPreflight, setCodexPreflight] = useState<CodexLoginPreflight | null>(null);
@@ -216,16 +220,24 @@ export function Sidebar({
   }, [activeSlug, conversations, archivedConversations, showArchived]);
 
   const handleNewClick = useCallback(() => {
-    navigate('/new');
-  }, [navigate]);
+    requestFileTransition(() => navigate('/new'));
+  }, [navigate, requestFileTransition]);
 
   const handleTerminalClick = useCallback(() => {
-    navigate('/terminal');
-  }, [navigate]);
+    requestFileTransition(() => navigate('/terminal'));
+  }, [navigate, requestFileTransition]);
+
+  const handleHomeClick = useCallback(() => {
+    requestFileTransition(() => navigate('/'));
+  }, [navigate, requestFileTransition]);
+
+  const handleCoordinatorClick = useCallback(() => {
+    requestFileTransition(() => navigate('/global'));
+  }, [navigate, requestFileTransition]);
 
   const handleConversationClick = useCallback((conv: Conversation) => {
-    navigate(`/c/${conv.slug}`);
-  }, [navigate]);
+    requestFileTransition(() => navigate(`/c/${conv.slug}`));
+  }, [navigate, requestFileTransition]);
 
   const handleArchive = useCallback(async (conv: Conversation) => {
     try {
@@ -337,7 +349,7 @@ export function Sidebar({
         <button className="sidebar-icon-btn sidebar-toggle" onClick={onToggle} title="Expand sidebar">
           <ChevronRight />
         </button>
-        <button className="sidebar-icon-btn" onClick={() => navigate('/')} title="Phoenix">
+        <button className="sidebar-icon-btn" onClick={handleHomeClick} title="Phoenix">
           <img src="/phoenix.svg" alt="Phoenix" className="sidebar-logo-icon" />
         </button>
         <button
@@ -356,7 +368,7 @@ export function Sidebar({
         </button>
         <button
           className={`sidebar-icon-btn ${isOnGlobalPage ? 'active' : ''}`}
-          onClick={() => navigate('/global')}
+          onClick={handleCoordinatorClick}
           title="Coordinator"
           aria-label="Coordinator"
         >
@@ -412,7 +424,7 @@ export function Sidebar({
         <button className="sidebar-toggle-expanded" onClick={onToggle} title="Collapse sidebar">
           <ChevronLeft />
         </button>
-        <button className="sidebar-brand" onClick={() => navigate('/')}>
+        <button className="sidebar-brand" onClick={handleHomeClick}>
           <img src="/phoenix.svg" alt="Phoenix" className="sidebar-logo" />
           <span className="sidebar-brand-text">Phoenix</span>
         </button>
@@ -432,7 +444,7 @@ export function Sidebar({
         </button>
         <button
           className={`sidebar-icon-btn ${isOnGlobalPage ? 'active' : ''}`}
-          onClick={() => navigate('/global')}
+          onClick={handleCoordinatorClick}
           title="Coordinator"
           aria-label="Coordinator"
         >
