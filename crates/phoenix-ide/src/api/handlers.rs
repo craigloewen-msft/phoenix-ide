@@ -324,6 +324,15 @@ pub fn create_router(state: AppState) -> Router {
         // File browser API (REQ-PF-001 through REQ-PF-004)
         .route("/api/files/list", get(list_files))
         .route("/api/files/read", get(read_file))
+        .route(
+            "/api/conversations/:id/files/content",
+            get(super::conversation_files::get_conversation_file)
+                .put(super::conversation_files::put_conversation_file)
+                .delete(super::conversation_files::delete_conversation_file)
+                .layer(DefaultBodyLimit::max(
+                    super::conversation_files::MAX_PUT_BODY_BYTES,
+                )),
+        )
         .route("/api/files/reveal", post(super::local_reveal::reveal_path))
         .route(
             "/api/conversations/:id/files/search",
@@ -6048,16 +6057,7 @@ async fn mkdir(
 // File Browser API (REQ-PF-001 through REQ-PF-004)
 // ============================================================
 
-/// Check if file content appears to be valid text
-fn is_valid_text(content: &[u8]) -> bool {
-    if content.contains(&0) {
-        return false;
-    }
-
-    std::str::from_utf8(content).is_ok()
-}
-
-fn preview_url_for_path(path: &std::path::Path) -> String {
+pub(crate) fn preview_url_for_path(path: &std::path::Path) -> String {
     format!("/preview{}", percent_encode_path(path))
 }
 
@@ -6324,16 +6324,32 @@ async fn read_file(
         return Err(AppError::BadRequest("Path is a directory".to_string()));
     }
 
-    let metadata = fs::metadata(&path)
-        .map_err(|e| AppError::BadRequest(format!("Cannot read file metadata: {e}")))?;
-    if metadata.len() > 10 * 1024 * 1024 {
-        return Err(AppError::BadRequest(
-            "File too large (max 10MB)".to_string(),
-        ));
-    }
+    let map_file_error = |error| match error {
+        super::file_content::FileContentError::Metadata(error) => {
+            AppError::BadRequest(format!("Cannot read file metadata: {error}"))
+        }
+        super::file_content::FileContentError::TooLarge => {
+            AppError::BadRequest("File too large (max 10MB)".to_string())
+        }
+        super::file_content::FileContentError::Unsupported
+        | super::file_content::FileContentError::InvalidText => {
+            AppError::BadRequest("File appears to be binary or has invalid encoding".to_string())
+        }
+        super::file_content::FileContentError::Read(error) => {
+            AppError::BadRequest(format!("Cannot read file: {error}"))
+        }
+    };
 
-    let category = match FileViewerKind::for_path(&path) {
+    match FileViewerKind::for_path(&path) {
         FileViewerKind::Image => {
+            let metadata = fs::metadata(&path).map_err(|error| {
+                map_file_error(super::file_content::FileContentError::Metadata(error))
+            })?;
+            if metadata.len() > super::file_content::MAX_FILE_CONTENT_BYTES as u64 {
+                return Err(map_file_error(
+                    super::file_content::FileContentError::TooLarge,
+                ));
+            }
             let mime_type = mime_guess::from_path(&path)
                 .first_or_octet_stream()
                 .to_string();
@@ -6349,33 +6365,20 @@ async fn read_file(
                 ),
                 None => preview_url_for_path(&path),
             };
-            return Ok(Json(ReadFileResponse::Image { mime_type, url }));
+            Ok(Json(ReadFileResponse::Image { mime_type, url }))
         }
-        FileViewerKind::Opaque => {
-            return Err(AppError::BadRequest(
-                "File appears to be binary or has invalid encoding".to_string(),
-            ));
+        FileViewerKind::Text { category } => {
+            let content = super::file_content::read_bounded_text(&path).map_err(map_file_error)?;
+            Ok(Json(ReadFileResponse::Text {
+                content,
+                encoding: "utf-8".to_string(),
+                category,
+            }))
         }
-        FileViewerKind::Text { category } => category,
-    };
-
-    let content =
-        fs::read(&path).map_err(|e| AppError::BadRequest(format!("Cannot read file: {e}")))?;
-
-    if !is_valid_text(&content) {
-        return Err(AppError::BadRequest(
-            "File appears to be binary or has invalid encoding".to_string(),
-        ));
+        FileViewerKind::Opaque => Err(map_file_error(
+            super::file_content::FileContentError::Unsupported,
+        )),
     }
-
-    let text = String::from_utf8(content)
-        .map_err(|_| AppError::BadRequest("Invalid UTF-8 encoding".to_string()))?;
-
-    Ok(Json(ReadFileResponse::Text {
-        content: text,
-        encoding: "utf-8".to_string(),
-        category,
-    }))
 }
 
 fn is_browser_screenshot_preview(requested: &FsPath, canonical: &FsPath) -> bool {

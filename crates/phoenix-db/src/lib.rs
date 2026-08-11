@@ -3427,6 +3427,35 @@ impl Database {
         })
     }
 
+    /// Read the lifecycle of a conversation's work scope.
+    ///
+    /// # Errors
+    /// Returns a database error when the query fails or the persisted lifecycle
+    /// is unknown. A conversation without a scope returns `None`.
+    pub async fn conversation_work_scope_lifecycle(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<phoenix_core::work_scope::WorkScopeLifecycle>> {
+        let lifecycle = sqlx::query_scalar::<_, String>(
+            "SELECT s.lifecycle
+             FROM conversations c
+             JOIN work_scopes s ON s.id = c.work_scope_id
+             WHERE c.id = ?1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        lifecycle
+            .map(|value| match value.as_str() {
+                "active" => Ok(phoenix_core::work_scope::WorkScopeLifecycle::Active),
+                "retired" => Ok(phoenix_core::work_scope::WorkScopeLifecycle::Retired),
+                other => Err(DbError::Serialization(format!(
+                    "unknown work scope lifecycle {other}"
+                ))),
+            })
+            .transpose()
+    }
+
     /// Get conversation by slug
     ///
     /// # Errors

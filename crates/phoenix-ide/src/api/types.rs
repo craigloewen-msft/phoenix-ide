@@ -473,6 +473,46 @@ pub enum ReadFileResponse {
     },
 }
 
+/// Mutation authority attached to a conversation-scoped file read. The tagged
+/// shape makes text replacement, delete-only image access, and ineligible
+/// read-only views disjoint, so the UI cannot accidentally render an editable
+/// session from an optional callback or a drifting boolean.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConversationFileCapability {
+    MutableText { version: String },
+    DeleteOnly { version: String },
+    ReadOnly { reason: String },
+}
+
+/// A conversation-authorized file payload and its mutation capability.
+#[derive(Debug, Serialize)]
+pub struct ConversationFileContentResponse {
+    pub content: ReadFileResponse,
+    pub capability: ConversationFileCapability,
+}
+
+/// Full-text replacement request for a conversation-scoped file.
+#[derive(Debug, Deserialize)]
+pub struct PutConversationFileRequest {
+    pub path: String,
+    pub content: String,
+    pub expected_version: String,
+}
+
+/// Versioned deletion request for a conversation-scoped file.
+#[derive(Debug, Deserialize)]
+pub struct DeleteConversationFileRequest {
+    pub path: String,
+    pub expected_version: String,
+}
+
+/// Successful full-text replacement response. Content is not echoed.
+#[derive(Debug, Serialize)]
+pub struct PutConversationFileResponse {
+    pub version: String,
+}
+
 /// Error response for file operations
 #[derive(Debug, Serialize)]
 #[allow(dead_code)] // Reserved for future use
