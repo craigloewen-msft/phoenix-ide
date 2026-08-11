@@ -57,6 +57,14 @@ export interface FileReviewDiffViewProps {
   onSendNotes: (notes: string) => void;
   /** Switch this file back to source rendering. */
   onShowSource: () => void;
+  /**
+   * Switch to source rendering with edit mode already armed.
+   *
+   * Absent when the file is not editable text — a read-only file, an image
+   * (deletable but not text-editable), or a file outside a live conversation
+   * environment. Absence removes the affordance rather than disabling it.
+   */
+  onEdit?: (() => void) | undefined;
   onMarkReviewed: (path: string, observedBlobSha: string) => void | Promise<void>;
   onUnmarkReviewed: (path: string) => void | Promise<void>;
   /** Advance to the next file still needing review, when there is one. */
@@ -92,6 +100,7 @@ export function FileReviewDiffView({
   onClose,
   onSendNotes,
   onShowSource,
+  onEdit,
   onMarkReviewed,
   onUnmarkReviewed,
   onNextUnreviewed,
@@ -311,6 +320,13 @@ export function FileReviewDiffView({
           ) : (
             <button type="button" className="viewer-shell-btn frd-mark" onClick={() => void handleMark()} title="Mark reviewed and move on">
               Mark reviewed
+            </button>
+          )}
+          {/* Reading a diff and wanting to fix it is one intent; this lands on
+              the source editor directly rather than via FILE then Edit mode. */}
+          {onEdit && (
+            <button type="button" className="viewer-shell-btn" onClick={onEdit} title="Edit this file's source">
+              Edit
             </button>
           )}
           <DiffStyleToggleButton diffStyle={diffStyle} onToggle={toggleDiffStyle} />

@@ -7,6 +7,7 @@ import { classifyViewerFile } from './viewer/viewerFileTypes';
 import type { FileMutationActions, MetaViewerPayload, PatchContext, TextRenderMode, ViewerFocus } from './viewer/metaViewerTypes';
 import type { TextCategory } from '../generated/TextCategory';
 import { useOptionalViewerSlotCommands, useOptionalViewerSlotData } from '../contexts/ViewerSlotContext';
+import { useScopedState } from '../hooks/useScopedState';
 import { useReviewContext } from '../contexts/useReviewContext';
 import type { ReviewFileEntry } from '../api';
 import { FileReviewDiffView } from './viewer/FileReviewDiffView';
@@ -125,6 +126,17 @@ export function FileViewer({
 
   const showSource = useCallback(() => slotCommands?.setFileViewMode('source'), [slotCommands]);
 
+  // Explicit "edit this file" intent carried across the diff→source flip. Scoped
+  // to the open path so an unconsumed request cannot arm the *next* file's
+  // session, and deliberately not persisted anywhere (see specs/file-explorer/
+  // requirements.md REQ-FE-013).
+  const [armEditOnOpen, setArmEditOnOpen] = useScopedState(absolutePath, false);
+  const editFromDiff = useCallback(() => {
+    setArmEditOnOpen(true);
+    slotCommands?.setFileViewMode('source');
+  }, [setArmEditOnOpen, slotCommands]);
+  const consumeArmEdit = useCallback(() => setArmEditOnOpen(false), [setArmEditOnOpen]);
+
   // Keyboard file navigation walks the manifest, which is the same ordering the
   // sidebar checklist shows, so `]f` and clicking down the list agree.
   const reviewFiles = review?.manifest?.files;
@@ -200,6 +212,13 @@ export function FileViewer({
     });
   }
   if (reviewDiffResolved) {
+    // The load effect above runs regardless of render mode, so the capability is
+    // already in hand here — offering Edit costs no extra request. Only
+    // mutable_text earns the button: an image is deletable but not text-editable,
+    // so labelling that "Edit" would misdescribe what the button does.
+    const editableHere = conversationRelativePath !== null
+      && fileData?.capability?.kind === 'mutable_text'
+      && fileExplorer !== null;
     return (
       <FileReviewDiffView
         conversationId={reviewDiffResolved.conversationId}
@@ -211,6 +230,7 @@ export function FileViewer({
         onClose={onClose}
         onSendNotes={(notes) => void onSendNotes(notes)}
         onShowSource={showSource}
+        {...(editableHere ? { onEdit: editFromDiff } : {})}
         onMarkReviewed={reviewDiffResolved.review.markReviewed}
         onUnmarkReviewed={reviewDiffResolved.review.unmarkReviewed}
         onNextUnreviewed={goToNextUnreviewed}
@@ -234,6 +254,8 @@ export function FileViewer({
           conversationId,
           relativePath: conversationRelativePath,
           capability: fileData.capability,
+          armOnOpen: armEditOnOpen,
+          onArmConsumed: consumeArmEdit,
           onSaved: (content, version) => {
             setFileData((current) => current?.kind === 'text'
               ? { ...current, content, capability: { kind: 'mutable_text', version } }

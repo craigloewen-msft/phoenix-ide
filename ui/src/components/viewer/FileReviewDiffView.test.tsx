@@ -75,6 +75,22 @@ describe('FileReviewDiffView', () => {
     await waitFor(() => expect(codeViewMockState.lastDiffStyle).toBe('split'));
   });
 
+  it('offers a direct route to the source editor only when the host says the file is editable', async () => {
+    const onEdit = vi.fn();
+    const { unmount } = renderView({ onEdit });
+    await waitFor(() => expect(codeViewMockState.lastDiffStyle).toBe('unified'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    expect(onEdit).toHaveBeenCalledTimes(1);
+    unmount();
+
+    // No handler means the file is not editable text; the affordance is absent
+    // rather than present-but-disabled.
+    renderView();
+    await waitFor(() => expect(codeViewMockState.lastDiffStyle).toBe('unified'));
+    expect(screen.queryByRole('button', { name: 'Edit' })).not.toBeInTheDocument();
+  });
+
   it('offers the conversation-collapse toggle only when the host supplies the handler', async () => {
     const onToggleReviewFocus = vi.fn();
     const view = renderView();

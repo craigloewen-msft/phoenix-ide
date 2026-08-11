@@ -1,7 +1,12 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { MemoryRouter } from 'react-router-dom';
 import { FileViewer } from './FileViewer';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
+import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
+import { ReviewProvider } from '../contexts/ReviewContext';
+import { api, type ReviewManifestResponse } from '../api';
+import { resetCodeViewMock } from './viewer/__testutils__/codeViewMock';
 import { FileExplorerContext } from './FileExplorer/fileExplorerTypes';
 import type { FileExplorerContextValue } from './FileExplorer/fileExplorerTypes';
 
@@ -282,6 +287,135 @@ describe('FileViewer safe editing', () => {
     );
     expect(await screen.findByTestId('codeview-mock')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Edit mode/ })).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * Reaching the editor from the review diff (REQ-FE-013, REQ-RV-006).
+ *
+ * The full provider stack is required: the diff mode is resolved from the
+ * viewer slot's URL params, and the review manifest is what makes the open file
+ * a reviewable one.
+ */
+describe('FileViewer edit from the review diff', () => {
+  const MANIFEST: ReviewManifestResponse = {
+    comparator: 'origin/main',
+    files: [
+      { path: 'notes.txt', status: 'modified', insertions: 1, deletions: 0, current_blob_sha: 'abc123', review: { kind: 'unreviewed' } },
+      { path: 'image.png', status: 'modified', insertions: 0, deletions: 0, current_blob_sha: 'def456', review: { kind: 'unreviewed' } },
+    ],
+    reviewed_count: 0,
+    total_count: 2,
+  };
+
+  let context: FileExplorerContextValue;
+
+  beforeEach(() => {
+    context = {
+      openFile: vi.fn(),
+      activeFile: null,
+      closeFile: vi.fn(),
+      openFileState: null,
+      fileMutation: null,
+      notifyFileMutation: vi.fn(),
+      requestFileTransition: (transition) => transition(),
+      registerFileTransitionGuard: () => () => undefined,
+    };
+    resetCodeViewMock();
+    vi.stubGlobal('fetch', vi.fn());
+    vi.spyOn(api, 'getReviewFiles').mockResolvedValue(MANIFEST);
+    vi.spyOn(api, 'getReviewFileDiff').mockImplementation(async (_conv, path, scope) => ({
+      path,
+      comparator: 'origin/main',
+      scope,
+      diff: 'diff --git a/notes.txt b/notes.txt\nindex 000..111 100644\n--- a/notes.txt\n+++ b/notes.txt\n@@ -0,0 +1 @@\n+hello\n',
+      current_blob_sha: 'abc123',
+    }));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function renderInDiffMode(fileName: string) {
+    return render(
+      <MemoryRouter initialEntries={[`/c/slug?viewer=prose&file=/tmp/project/${fileName}&root=/tmp/project&mode=diff`]}>
+        <ViewerSlotProvider scopeKey="conv-1" browserSessionActive={false}>
+          <ReviewProvider conversationId="conv-1" rootDir="/tmp/project" enabled agentState="idle">
+            <FileExplorerContext.Provider value={context}>
+              <ReviewNotesProvider>
+                <FileViewer
+                  filePath={fileName}
+                  rootDir="/tmp/project"
+                  conversationId="conv-1"
+                  onClose={() => undefined}
+                  onSendNotes={() => undefined}
+                />
+              </ReviewNotesProvider>
+            </FileExplorerContext.Provider>
+          </ReviewProvider>
+        </ViewerSlotProvider>
+      </MemoryRouter>,
+    );
+  }
+
+  function respondWithEditableText() {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify({
+      content: { kind: 'text', content: 'hello text file', encoding: 'utf-8', category: 'plain' },
+      capability: { kind: 'mutable_text', version: 'version-one' },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+  }
+
+  /** The diff surface marks its own mode button pressed; source mode marks FILE
+   *  instead. Waiting on this proves an assertion below is about the review
+   *  diff and not the source-rendering fallback taken before the manifest
+   *  arrives. */
+  function findDiffSurface() {
+    return screen.findByRole('button', { name: 'DIFF', pressed: true });
+  }
+
+  it('lands on the live source editor in one click', async () => {
+    respondWithEditableText();
+    renderInDiffMode('notes.txt');
+    await findDiffSurface();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+
+    // Armed on arrival: the editor is live without a second trip through the
+    // Edit mode toggle.
+    const editor = await screen.findByRole('textbox', { name: 'Edit notes.txt' });
+    expect(editor).toHaveValue('hello text file');
+    expect(screen.getByRole('button', { name: 'Edit mode: On' })).toBeInTheDocument();
+    // Save stays disabled until the draft actually differs (REQ-FE-014).
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
+  });
+
+  it('does not offer Edit for an image, which is deletable but not text-editable', async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify({
+      content: { kind: 'image', mime_type: 'image/png', url: '/preview/tmp/project/image.png' },
+      capability: { kind: 'delete_only', version: 'image-version' },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+
+    renderInDiffMode('image.png');
+    await findDiffSurface();
+
+    expect(screen.queryByRole('button', { name: 'Edit' })).not.toBeInTheDocument();
+  });
+
+  it('disarms when the reviewer leaves the editor, so the request cannot re-arm it', async () => {
+    respondWithEditableText();
+    renderInDiffMode('notes.txt');
+    await findDiffSurface();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    await screen.findByRole('textbox', { name: 'Edit notes.txt' });
+
+    // The one-shot is consumed on arrival, so a clean disarm stays disarmed
+    // rather than being undone by a re-render re-reading the request.
+    fireEvent.click(screen.getByRole('button', { name: 'Edit mode: On' }));
+    expect(await screen.findByRole('button', { name: 'Edit mode: Off' })).toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: 'Edit notes.txt' })).not.toBeInTheDocument();
   });
 });
 

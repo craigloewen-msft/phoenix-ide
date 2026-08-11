@@ -31,6 +31,17 @@ export interface FileMutationActions {
   conversationId: string;
   relativePath: string;
   capability: FileMutationCapability;
+  /**
+   * Open this session already armed, honouring an explicit edit request made
+   * from another render mode of the same file (the review diff's Edit button).
+   *
+   * One-shot: the viewer consumes it on mount via `onArmConsumed`, so a later
+   * disarm cannot be silently undone by a re-render. It lives on the mutation
+   * bundle — which exists only where mutation is possible — so "armed on a file
+   * with no mutation capability" is unrepresentable.
+   */
+  armOnOpen: boolean;
+  onArmConsumed: () => void;
   onSaved: (content: string, version: string) => void;
   onReloaded: (response: import('../../api').ConversationFileContentResponse) => void;
   onDeleted: () => void;

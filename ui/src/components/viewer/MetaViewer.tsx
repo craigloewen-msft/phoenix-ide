@@ -70,7 +70,10 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const focusRange = focus?.kind === 'range' ? focus : undefined;
   const mutation = payload.mutation;
   const editableText = textLike && mutation?.capability.kind === 'mutable_text';
-  const [editMode, setEditMode] = useState(false);
+  // Lazily initialized so the arm request is read once per file session. The
+  // viewer is keyed by absolutePath, so a new file gets a fresh, disarmed
+  // session unless it too was opened with an explicit edit request.
+  const [editMode, setEditMode] = useState(() => mutation?.armOnOpen ?? false);
   const [editBaseline, setEditBaseline] = useState(content);
   const [editDraft, setEditDraft] = useState(content);
   const [editVersion, setEditVersion] = useState(mutation?.capability.version ?? '');
@@ -92,6 +95,15 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   }, []);
 
   useEffect(() => mutation?.registerTransitionGuard(requestEditorTransition), [mutation, requestEditorTransition]);
+
+  // Consume the one-shot arm request: after this the flag is false, so a later
+  // disarm cannot be undone by a re-render that re-reads it.
+  const armOnOpen = mutation?.armOnOpen ?? false;
+  const onArmConsumed = mutation?.onArmConsumed;
+  useEffect(() => {
+    if (!armOnOpen) return;
+    onArmConsumed?.();
+  }, [armOnOpen, onArmConsumed]);
 
   useEffect(() => {
     if (!dirty) return undefined;
