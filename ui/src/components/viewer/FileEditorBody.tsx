@@ -1,4 +1,4 @@
-import { useCallback } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import './FileEditorBody.css';
 
 interface FileEditorBodyProps {
@@ -9,6 +9,18 @@ interface FileEditorBodyProps {
 }
 
 export function FileEditorBody({ value, onChange, disabled, label }: FileEditorBodyProps) {
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const pendingCaretRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    const caret = pendingCaretRef.current;
+    const textarea = textareaRef.current;
+    if (caret === null || !textarea?.isConnected) return;
+    textarea.selectionStart = caret;
+    textarea.selectionEnd = caret;
+    pendingCaretRef.current = null;
+  }, [value]);
+
   const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key !== 'Tab' || event.shiftKey || event.ctrlKey || event.metaKey || event.altKey) return;
     event.preventDefault();
@@ -16,16 +28,14 @@ export function FileEditorBody({ value, onChange, disabled, label }: FileEditorB
     const start = target.selectionStart;
     const end = target.selectionEnd;
     const next = `${value.slice(0, start)}  ${value.slice(end)}`;
+    pendingCaretRef.current = start + 2;
     onChange(next);
-    requestAnimationFrame(() => {
-      target.selectionStart = start + 2;
-      target.selectionEnd = start + 2;
-    });
   }, [onChange, value]);
 
   return (
     <div className="file-editor-body">
       <textarea
+        ref={textareaRef}
         className="file-editor-input"
         aria-label={label}
         value={value}

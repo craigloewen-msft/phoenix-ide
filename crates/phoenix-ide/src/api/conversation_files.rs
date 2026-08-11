@@ -82,7 +82,9 @@ async fn conversation_authority(
         .conversation_work_scope_lifecycle(conversation_id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
-    let mutation_denial = if conversation.archived {
+    let mutation_denial = if cfg!(not(unix)) {
+        Some("File mutations are unsupported on this platform".to_string())
+    } else if conversation.archived {
         Some("Archived conversations are read-only".to_string())
     } else if conversation.continued_in_conv_id.is_some() {
         Some("Continued conversations no longer own their file environment".to_string())
@@ -239,7 +241,15 @@ fn resolve_file_target(
 
 fn map_read_error(error: FileContentError, purpose: ResolvePurpose) -> AppError {
     if matches!(purpose, ResolvePurpose::Mutation) {
-        return version_conflict();
+        return match error {
+            FileContentError::Unsupported | FileContentError::InvalidText => version_conflict(),
+            FileContentError::TooLarge => {
+                AppError::BadRequest("File too large (max 10MB)".to_string())
+            }
+            FileContentError::Metadata(error) | FileContentError::Read(error) => {
+                AppError::Internal(format!("Cannot inspect file content: {error}"))
+            }
+        };
     }
     match error {
         FileContentError::Metadata(error) => {
@@ -289,6 +299,7 @@ struct AnchoredTemporary {
     parent_fd: OwnedFd,
     name: OsString,
     file: fs::File,
+    cleanup_entry: bool,
 }
 
 #[cfg(unix)]
@@ -314,6 +325,7 @@ impl AnchoredTemporary {
                         parent_fd,
                         name,
                         file: fs::File::from(fd),
+                        cleanup_entry: true,
                     });
                 }
                 Err(nix::errno::Errno::EEXIST) => {}
@@ -327,6 +339,14 @@ impl AnchoredTemporary {
         Err(AppError::Internal(
             "Cannot allocate a unique temporary file".to_string(),
         ))
+    }
+
+    fn preserve_entry(&mut self) {
+        self.cleanup_entry = false;
+    }
+
+    fn cleanup_entry(&mut self) {
+        self.cleanup_entry = true;
     }
 
     fn old_target_metadata(&self) -> Result<fs::Metadata, AppError> {
@@ -348,6 +368,13 @@ impl AnchoredTemporary {
 #[cfg(unix)]
 impl Drop for AnchoredTemporary {
     fn drop(&mut self) {
+        if !self.cleanup_entry {
+            tracing::error!(
+                entry = %self.name.to_string_lossy(),
+                "preserving temporary entry because it may contain user data"
+            );
+            return;
+        }
         let _ = nix::unistd::unlinkat(
             &self.parent_fd,
             Path::new(&self.name),
@@ -422,10 +449,7 @@ pub(crate) async fn get_conversation_file(
     Query(query): Query<ConversationFileQuery>,
 ) -> Result<Json<ConversationFileContentResponse>, AppError> {
     let authority = conversation_authority(&state, &conversation_id).await?;
-    #[cfg(not(unix))]
     let target = resolve_file_target(&authority, &query.path, ResolvePurpose::Read)?;
-    #[cfg(unix)]
-    let target = authority.root.join(validate_relative_path(&query.path)?);
     #[cfg(unix)]
     let content = read_confined_target(&authority, &query.path, ResolvePurpose::Read)?.content;
     #[cfg(not(unix))]
@@ -497,7 +521,7 @@ fn install_replacement(
     authority: &ConversationFileAuthority,
     relative_path: &str,
     current: &ConfinedRead,
-    replacement: AnchoredTemporary,
+    mut replacement: AnchoredTemporary,
 ) -> Result<(), AppError> {
     exchange_entries(
         &replacement.parent_fd,
@@ -505,23 +529,40 @@ fn install_replacement(
         &current.parent_fd,
         Path::new(&current.leaf),
     )?;
-    let exchanged = replacement.old_target_metadata()?;
-    let submitted = replacement
-        .file
-        .metadata()
-        .map_err(|_| version_conflict())?;
+    replacement.preserve_entry();
+    let exchanged = replacement.old_target_metadata().map_err(|_| {
+        AppError::Internal(format!(
+            "Save verification failed; original data was preserved as {}",
+            replacement.name.to_string_lossy()
+        ))
+    })?;
+    let submitted = replacement.file.metadata().map_err(|_| {
+        AppError::Internal(format!(
+            "Save verification failed; original data was preserved as {}",
+            replacement.name.to_string_lossy()
+        ))
+    })?;
     if current.stat.st_dev != exchanged.dev()
         || current.stat.st_ino != exchanged.ino()
         || !confined_path_matches(authority, relative_path, &submitted)
     {
-        exchange_entries(
+        if exchange_entries(
             &replacement.parent_fd,
             Path::new(&replacement.name),
             &current.parent_fd,
             Path::new(&current.leaf),
-        )?;
+        )
+        .is_err()
+        {
+            return Err(AppError::Internal(format!(
+                "File changed during save and rollback failed; original data was preserved as {}",
+                replacement.name.to_string_lossy()
+            )));
+        }
+        replacement.cleanup_entry();
         return Err(version_conflict());
     }
+    replacement.cleanup_entry();
     drop(replacement);
     Ok(())
 }
@@ -597,7 +638,7 @@ pub(crate) async fn put_conversation_file(
     }
 
     #[cfg(unix)]
-    let permissions = fs::Permissions::from_mode(current.stat.st_mode as u32);
+    let permissions = fs::Permissions::from_mode(current.stat.st_mode as u32 & 0o777);
     #[cfg(not(unix))]
     let permissions = fs::metadata(&current_target)
         .map_err(|_| version_conflict())?
@@ -668,25 +709,44 @@ pub(crate) async fn delete_conversation_file(
     tests::run_before_file_mutation();
     #[cfg(unix)]
     {
-        let tombstone = AnchoredTemporary::new(&current.parent_fd)?;
+        let mut tombstone = AnchoredTemporary::new(&current.parent_fd)?;
         exchange_entries(
             &tombstone.parent_fd,
             Path::new(&tombstone.name),
             &current.parent_fd,
             Path::new(&current.leaf),
         )?;
-        let exchanged = tombstone.old_target_metadata()?;
-        let marker = tombstone.file.metadata().map_err(|_| version_conflict())?;
+        tombstone.preserve_entry();
+        let exchanged = tombstone.old_target_metadata().map_err(|_| {
+            AppError::Internal(format!(
+                "Delete verification failed; original data was preserved as {}",
+                tombstone.name.to_string_lossy()
+            ))
+        })?;
+        let marker = tombstone.file.metadata().map_err(|_| {
+            AppError::Internal(format!(
+                "Delete verification failed; original data was preserved as {}",
+                tombstone.name.to_string_lossy()
+            ))
+        })?;
         if current.stat.st_dev != exchanged.dev()
             || current.stat.st_ino != exchanged.ino()
             || !confined_path_matches(&authority, &request.path, &marker)
         {
-            exchange_entries(
+            if exchange_entries(
                 &tombstone.parent_fd,
                 Path::new(&tombstone.name),
                 &current.parent_fd,
                 Path::new(&current.leaf),
-            )?;
+            )
+            .is_err()
+            {
+                return Err(AppError::Internal(format!(
+                    "File changed during delete and rollback failed; original data was preserved as {}",
+                    tombstone.name.to_string_lossy()
+                )));
+            }
+            tombstone.cleanup_entry();
             return Err(version_conflict());
         }
         nix::unistd::unlinkat(
@@ -694,7 +754,13 @@ pub(crate) async fn delete_conversation_file(
             Path::new(&current.leaf),
             nix::unistd::UnlinkatFlags::NoRemoveDir,
         )
-        .map_err(|_| version_conflict())?;
+        .map_err(|_| {
+            AppError::Internal(format!(
+                "Delete committed but cleanup failed; original data was preserved as {}",
+                tombstone.name.to_string_lossy()
+            ))
+        })?;
+        tombstone.cleanup_entry();
         drop(tombstone);
     }
     #[cfg(not(unix))]
@@ -717,6 +783,7 @@ mod tests {
 
     #[cfg(unix)]
     type MutationHook = Box<dyn FnOnce() + Send>;
+    #[cfg(unix)]
     static BEFORE_FILE_MUTATION: OnceLock<Mutex<Option<MutationHook>>> = OnceLock::new();
 
     #[cfg(unix)]
@@ -827,6 +894,46 @@ mod tests {
         (content, version)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn exchanged_temporary_preserves_entry_that_may_hold_original_data() {
+        let root = tempfile::tempdir().expect("root");
+        let root_fd = nix::fcntl::open(
+            root.path(),
+            nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )
+        .expect("open root");
+        fs::write(root.path().join("target.txt"), "original\n").expect("target");
+        let mut temporary = AnchoredTemporary::new(&root_fd).expect("temporary");
+        temporary
+            .file
+            .write_all(b"replacement\n")
+            .expect("write replacement");
+        exchange_entries(
+            &temporary.parent_fd,
+            Path::new(&temporary.name),
+            &root_fd,
+            Path::new("target.txt"),
+        )
+        .expect("exchange");
+        temporary.preserve_entry();
+        let preserved_name = temporary.name.clone();
+        drop(temporary);
+
+        assert_eq!(
+            fs::read_to_string(root.path().join("target.txt")).unwrap(),
+            "replacement\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join(&preserved_name)).unwrap(),
+            "original\n"
+        );
+        fs::remove_file(root.path().join(preserved_name)).expect("cleanup preserved data");
+    }
+
     #[tokio::test]
     async fn active_direct_text_read_is_mutable_and_versioned() {
         let root = tempfile::tempdir().expect("root");
@@ -908,7 +1015,7 @@ mod tests {
         let root = tempfile::tempdir().expect("root");
         let path = root.path().join("script.sh");
         fs::write(&path, "echo old\n").expect("write");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o6755)).expect("chmod");
         let state = direct_state(root.path()).await;
         let (_, version) = get_text(state.clone(), "script.sh").await;
 

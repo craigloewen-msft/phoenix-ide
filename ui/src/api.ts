@@ -9,12 +9,16 @@ import type { ReleaseUpdateSnapshot } from './generated/ReleaseUpdateSnapshot';
 import type { ReleaseTransactionStatus } from './generated/ReleaseTransactionStatus';
 import type { ApproveReleaseUpdateResponse } from './generated/ApproveReleaseUpdateResponse';
 import type { FileViewerKind } from './generated/FileViewerKind';
+import type { ConversationFileContentResponse } from './generated/ConversationFileContentResponse';
+import type { PutConversationFileResponse } from './generated/PutConversationFileResponse';
 import type { UsageOverview } from './generated/UsageOverview';
 import type { ConversationUsageDetail } from './generated/ConversationUsageDetail';
 import type { QuotaDetails } from './generated/QuotaDetails';
 // Phoenix API Client
 
 export type { PlanDiffBaseline };
+export type { ConversationFileCapability } from './generated/ConversationFileCapability';
+export type { ConversationFileContentResponse } from './generated/ConversationFileContentResponse';
 export type { PlanDiffBaselineNote } from './generated/PlanDiffBaselineNote';
 
 /**
@@ -842,20 +846,6 @@ export interface FileSearchEntry {
   /** Server's verdict on how the viewer treats this path — shared with the
    *  sidebar and quick-open via the same classifier. */
   viewer: FileViewerKind;
-}
-
-export type ConversationFileCapability =
-  | { kind: 'mutable_text'; version: string }
-  | { kind: 'delete_only'; version: string }
-  | { kind: 'read_only'; reason: string };
-
-export type ConversationFileContent =
-  | { kind: 'text'; content: string; encoding: string; category: import('./generated/TextCategory').TextCategory }
-  | { kind: 'image'; mime_type: string; url: string };
-
-export interface ConversationFileContentResponse {
-  content: ConversationFileContent;
-  capability: ConversationFileCapability;
 }
 
 export type GitFileStatus =
@@ -2209,7 +2199,7 @@ export const api = {
     path: string,
     content: string,
     expectedVersion: string,
-  ): Promise<{ version: string }> {
+  ): Promise<PutConversationFileResponse> {
     const resp = await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/files/content`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },

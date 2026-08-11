@@ -111,15 +111,13 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
               // keep the per-conv path.
               const roots = computeChainRoots(conversations);
               const rootId = roots.get(conv.id);
-              if (rootId) {
-                requestFileTransition(() => {
+              requestFileTransition(() => {
+                if (rootId) {
                   void api.archiveChain(rootId).then(() => navigate('/'));
-                });
-              } else {
-                requestFileTransition(() => {
+                } else {
                   void api.archiveConversation(conv.id).then(() => navigate('/'));
-                });
-              }
+                }
+              });
             }
           : undefined,
       }),

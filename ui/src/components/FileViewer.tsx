@@ -70,7 +70,11 @@ function relativeFilePath(rootDir: string, absolutePath: string): string | null 
   const prefix = `${root}/`;
   if (!absolutePath.startsWith(prefix)) return null;
   const relative = absolutePath.slice(prefix.length);
-  return relative.length > 0 ? relative : null;
+  const segments = relative.split('/');
+  if (relative.length === 0 || segments.some((segment) => segment.length === 0 || segment === '.' || segment === '..')) {
+    return null;
+  }
+  return relative;
 }
 
 export function FileViewer({

@@ -459,8 +459,9 @@ pub struct ListFilesResponse {
 }
 
 /// Response for file reading
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub enum ReadFileResponse {
     Text {
         content: String,
@@ -477,8 +478,9 @@ pub enum ReadFileResponse {
 /// shape makes text replacement, delete-only image access, and ineligible
 /// read-only views disjoint, so the UI cannot accidentally render an editable
 /// session from an optional callback or a drifting boolean.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub enum ConversationFileCapability {
     MutableText { version: String },
     DeleteOnly { version: String },
@@ -486,7 +488,8 @@ pub enum ConversationFileCapability {
 }
 
 /// A conversation-authorized file payload and its mutation capability.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ConversationFileContentResponse {
     pub content: ReadFileResponse,
     pub capability: ConversationFileCapability,
@@ -508,7 +511,8 @@ pub struct DeleteConversationFileRequest {
 }
 
 /// Successful full-text replacement response. Content is not echoed.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct PutConversationFileResponse {
     pub version: String,
 }

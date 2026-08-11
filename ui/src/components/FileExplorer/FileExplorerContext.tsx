@@ -15,11 +15,20 @@ export function FileExplorerProvider({ children }: { children: ReactNode }) {
   const slot = useViewerSlotData();
   const { openProse, close } = useViewerSlotCommands();
   const transitionGuardRef = useRef<FileTransitionGuard | null>(null);
+  const guardFileIdentityRef = useRef<string | null>(null);
   const mutationSequenceRef = useRef(0);
   const [fileMutation, setFileMutation] = useState<FileMutation | null>(null);
 
   const requestFileTransition = useCallback((transition: () => void) => {
-    if (transitionGuardRef.current?.(transition)) return;
+    const guard = transitionGuardRef.current;
+    if (guard) {
+      try {
+        if (guard(transition)) return;
+      } catch (error) {
+        transitionGuardRef.current = null;
+        console.error('File transition guard failed; continuing navigation', error);
+      }
+    }
     transition();
   }, []);
 
@@ -61,6 +70,12 @@ export function FileExplorerProvider({ children }: { children: ReactNode }) {
     if (slot.file.focus) state.focus = slot.file.focus;
     return state;
   }, [slot]);
+
+  const fileIdentity = openFileState?.path ?? null;
+  if (guardFileIdentityRef.current !== fileIdentity) {
+    guardFileIdentityRef.current = fileIdentity;
+    transitionGuardRef.current = null;
+  }
 
   const value = useMemo(() => ({
     openFile,
