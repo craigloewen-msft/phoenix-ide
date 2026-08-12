@@ -87,7 +87,14 @@ We're starting conservatively to learn how agents consume skills:
 | [phoenix-deployment](phoenix-deployment/SKILL.md) | Production deployment across native launchd (macOS), native systemd, and daemon modes |
 | [phoenix-task-tracking](phoenix-task-tracking/SKILL.md) | Task file format, CLI commands, issue discovery protocol |
 | [phoenix-release](phoenix-release/SKILL.md) | Cut a version, push the tag, replace auto-notes with a sub-agent-drafted changelog |
+| [phoenix-perf-preflight](phoenix-perf-preflight/SKILL.md) | Validate the environment before a React performance campaign |
+| [phoenix-perf-find-target](phoenix-perf-find-target/SKILL.md) | Find and rank a measurable React performance target |
+| [phoenix-perf-hunt](phoenix-perf-hunt/SKILL.md) | Capture a baseline and implement one focused React performance fix |
+| [phoenix-perf-review](phoenix-perf-review/SKILL.md) | Review performance patches against raw-sample statistics |
+| [phoenix-perf-submit](phoenix-perf-submit/SKILL.md) | Run the performance workflow with branch, commit, and PR automation |
 | [spears-v2-migrate](spears-v2-migrate/SKILL.md) | Temporary Phoenix workflow for retiring legacy `design.md` specs into spEARS v2 homes without keeping zombie artifacts |
+
+`phoenix-perf-shared/` is internal support material for the performance skills. It has no `SKILL.md` and is intentionally not projected into `.agents/skills/` or invoked directly.
 
 ---
 

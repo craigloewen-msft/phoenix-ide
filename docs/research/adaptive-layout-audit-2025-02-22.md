@@ -1,5 +1,7 @@
 # Phoenix IDE — Adaptive Desktop/Mobile UX Audit
 
+> **Historical UX audit.** This document describes commit `38fc610c`, before the persistent desktop layout and sidebar shipped. It is retained as design research, not as current UI documentation.
+
 **Date:** 2025-02-22  
 **Auditor context:** Single power user, genuine dual form-factor usage (desktop + mobile)  
 **Codebase version:** `38fc610c` | 230 active conversations | React + react-router SPA
