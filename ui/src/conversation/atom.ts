@@ -94,11 +94,6 @@ export interface ConversationAtom {
   liveBashProgress: Record<string, LiveBashProgress>;
   streamingBuffer: StreamingBuffer | null;
   uiError: UIError | null;
-  /** `Date.now()` when the current `tool_executing` phase began. Reset on
-   *  each new tool (a single agent turn may execute many tools sequentially).
-   *  `null` when not in `tool_executing`. Used by StateBar to render a live
-   *  elapsed-time counter. */
-  toolExecutingStartedAt: number | null;
   /** Server clock (unix ms) at which the conversation entered its current
    *  `phase`. Sourced from `StateChange.state_updated_at` and from
    *  `Init.conversation.state_updated_at`, both RFC3339 strings on the
@@ -396,7 +391,6 @@ export function createInitialAtom(): ConversationAtom {
     liveBashProgress: {},
     streamingBuffer: null,
     uiError: null,
-    toolExecutingStartedAt: null,
     phaseStateUpdatedAt: null,
     lastSseEventAt: Date.now(),
     firstByteRequestId: null,
@@ -710,7 +704,6 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
         phaseLastAppliedEventSeq: action.sequenceId,
         phaseStateUpdatedAt: action.stateUpdatedAt,
         firstByteRequestId: null,
-        toolExecutingStartedAt: action.phase.type === 'tool_executing' ? Date.now() : null,
       };
     }
     case 'sse_agent_done':
@@ -1223,7 +1216,6 @@ export function conversationReducer(
         messages: mergedMessages,
         streamingBuffer: phase1StreamingBuffer,
         uiError: null,
-        toolExecutingStartedAt: p.phase.type === 'tool_executing' ? Date.now() : null,
         // REQ-WPV-001: seed the server-authoritative phase-entry timestamp
         // from `Init.conversation.state_updated_at` (RFC3339 on the wire,
         // converted to ms here). Falls back to `null` if the server

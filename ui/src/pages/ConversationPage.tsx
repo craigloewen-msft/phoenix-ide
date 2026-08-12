@@ -2771,7 +2771,6 @@ function ConversationPageContent({
         onRetryNow={connectionInfo.retryNow}
         continuation={stateBarContinuation}
         onUpgradeModel={handleUpgradeModel}
-        toolExecutingStartedAt={atom.toolExecutingStartedAt}
         phaseStateUpdatedAt={atom.phaseStateUpdatedAt}
         firstByteRequestId={atom.firstByteRequestId}
         turnRetryContext={atom.turnRetryContext}

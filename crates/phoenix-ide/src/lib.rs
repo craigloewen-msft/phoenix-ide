@@ -22,7 +22,6 @@ mod runtime;
 mod send_chat_service;
 mod suggest;
 mod system_prompt;
-mod task_listing;
 mod title_generator;
 mod tls;
 

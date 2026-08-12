@@ -58,7 +58,6 @@ export type ConversationPageView = Pick<
   | 'contextWindow'
   | 'systemPrompt'
   | 'uiError'
-  | 'toolExecutingStartedAt'
   | 'phaseStateUpdatedAt'
   | 'phaseLastAppliedEventSeq'
   | 'firstByteRequestId'
@@ -75,7 +74,6 @@ const PAGE_VIEW_KEYS: readonly (keyof ConversationPageView)[] = [
   'contextWindow',
   'systemPrompt',
   'uiError',
-  'toolExecutingStartedAt',
   'phaseStateUpdatedAt',
   'phaseLastAppliedEventSeq',
   'firstByteRequestId',
@@ -124,7 +122,6 @@ export function useConversationView(
       contextWindow: a.contextWindow,
       systemPrompt: a.systemPrompt,
       uiError: a.uiError,
-      toolExecutingStartedAt: a.toolExecutingStartedAt,
       phaseStateUpdatedAt: a.phaseStateUpdatedAt,
       phaseLastAppliedEventSeq: a.phaseLastAppliedEventSeq,
       firstByteRequestId: a.firstByteRequestId,
