@@ -74,10 +74,10 @@ A red broad check is evidence to classify, not permission to ignore it or to fix
 |---|---|
 | Ambiguous feedback or breadth-first investigation | `phoenix-explore` |
 | Create/update task state | `phoenix-task-tracking` |
-| Rust implementation/review | `rust-dev` |
+| Rust implementation/review | `phoenix-development` (this skill) |
 | React implementation/performance patterns | `vercel-react-best-practices` |
 | Browser interaction | `agent-browser`; exploratory QA → `dogfood` |
-| Allium behavior work | `allium:distill`, `allium:tend`, `allium:propagate`, or `allium:weed` |
+| Allium behavior work | `allium:elicit`, `allium:distill`, or `allium:propagate` |
 | spEARS v2/spec migration | `spears`, `spears-v2-migrate` |
 | Production deploy/diagnosis | `phoenix-deployment` |
 | Release | `phoenix-release` |

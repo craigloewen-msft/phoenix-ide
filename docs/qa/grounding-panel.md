@@ -75,9 +75,7 @@ The command ensures Playwright's Chromium browser is installed, starts Ladle on 
 ui/qa-artifacts/grounding-panel/
 ```
 
-That directory is ignored by git. Do not commit regenerated PNGs during normal review; upload or share them as local/CI artifacts when needed.
-
-Historical screenshots from the redesign PR may remain under `docs/qa/artifacts/grounding-panel/`, but the productionized workflow no longer depends on committed binary churn.
+That directory is ignored by git. Do not commit regenerated PNGs during normal review; upload or share them as local/CI artifacts when needed. The repository does not retain historical capture binaries; Git history preserves prior review evidence without adding ongoing binary churn.
 
 ## Seeded integration conversation
 

@@ -1,5 +1,7 @@
 # Phoenix-IDE Rust Compile-Time & Binary Bloat Report
 
+> **Historical measurement baseline.** This report describes the repository at the dated branch snapshot below. Workspace structure, binaries, dependencies, and timings have changed; do not treat its inventory as current architecture.
+
 **Date:** 2026-05-25  
 **Branch:** main (worktree snazzy-jumping-hare)  
 **Method:** scientific — captured baselines via `cargo build --timings` (cold dev),
