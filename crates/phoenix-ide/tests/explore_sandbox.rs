@@ -218,9 +218,9 @@ fn explore_sandbox_enforces_read_only_policy() {
         .contains(&format!("tmp={}", platform_temp.display())));
     assert!(env_probe.stdout.contains("gh=unset"));
 
-    // HOME is the user's real home, passed through unchanged. The nono
-    // sandbox must block writes to it — only scratch and platform-temp are
-    // read-write. This is the core security invariant of not remapping HOME.
+    // HOME is passed through unchanged; this fixture uses an isolated path.
+    // The nono sandbox must block writes to it — only scratch and platform-temp
+    // are read-write. This exercises the invariant without touching user data.
     let home_write_denied = sandbox_run(
         bin,
         &SandboxFixture {

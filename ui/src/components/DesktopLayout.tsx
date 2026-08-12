@@ -20,7 +20,7 @@ import { SubAgentViewerProvider, useSubAgentViewer } from '../contexts/SubAgentV
 const SubAgentViewerPanel = lazy(() =>
   import('./SubAgentViewerPanel').then((m) => ({ default: m.SubAgentViewerPanel })),
 );
-import { CommandPalette } from './CommandPalette';
+import { CommandPalette } from './CommandPalette/CommandPalette';
 import { Toast } from './Toast';
 import { PaneDivider } from './PaneDivider';
 import { useToast } from '../hooks/useToast';

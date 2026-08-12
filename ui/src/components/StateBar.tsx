@@ -89,14 +89,6 @@ interface StateBarProps {
   continuation?: ContinuationState;
   /** Callback invoked when the user selects a different model or effort for this conversation */
   onUpgradeModel?: (newModelId: string, effort?: ModelEffort | null) => void;
-  /** `Date.now()` timestamp when the current tool_executing phase began.
-   *  Used to render a live elapsed-time counter ("running bash ... 4s").
-   *  `null` or `undefined` when not in tool_executing.
-   *  @deprecated Stage A: superseded by `phaseStateUpdatedAt` (server-
-   *  authoritative; covers every working phase). Retained while the
-   *  tool widget header continues to read it; the StateBar's elapsed
-   *  counter now derives from `phaseStateUpdatedAt`. */
-  toolExecutingStartedAt?: number | null;
   /** Server clock (unix ms) at which the conversation entered its
    *  current phase. Sourced from `Conversation.state_updated_at` and
    *  bumped on every `StateChange` SSE event. Used by the StateBar's
@@ -526,7 +518,6 @@ export function StateBar({
   onRetryNow,
   continuation,
   onUpgradeModel,
-  toolExecutingStartedAt: _deprecatedToolStartedAt,
   phaseStateUpdatedAt,
   lastSseEventAtRef,
   firstByteRequestId,
@@ -536,11 +527,6 @@ export function StateBar({
   prStatusHandle,
   workActionsAvailable = true,
 }: StateBarProps) {
-  // `toolExecutingStartedAt` is kept on the prop type for the
-  // tool-widget header (which still reads it from the atom). The
-  // StateBar's own elapsed counter switched to `phaseStateUpdatedAt`
-  // in Stage A — the destructured value is intentionally unused here.
-  void _deprecatedToolStartedAt;
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerShowAll, setPickerShowAll] = useState(false);
   const usesCompactLayout = useIsCompactLayout();
@@ -863,10 +849,8 @@ export function StateBar({
           case "provisioning":
             // REQ-WPV-001/003: elapsed counter is keyed off the
             // server-authoritative `phaseStateUpdatedAt`, so every
-            // working phase gets a live "<reason> Ns" display (not
-            // just tool_executing). The previous tool-only counter
-            // is retained on the tool widget header itself via
-            // `toolExecutingStartedAt`.
+            // working phase gets a live "<reason> Ns" display. Tool
+            // widgets use their own server-provided start timestamps.
             dotClass += " working";
             // REQ-WPV-007: once the first byte for the current LLM
             // request lands, switch the base reason from `awaiting LLM response Ns`

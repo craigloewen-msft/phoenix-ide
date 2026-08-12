@@ -89,7 +89,6 @@ which = "8"
 # Process-group / signal management for bash.
 libc = "0.2"
 nono = { version = "0.53", default-features = false }
-taskmd-core = ">=1.3,<2"
 tempfile = { version = "3", optional = true }
 
 # Typed errors.
