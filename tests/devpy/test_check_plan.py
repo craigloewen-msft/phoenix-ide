@@ -144,6 +144,17 @@ class CheckPlanTests(unittest.TestCase):
                     active, _ = self.dev._gate_lanes()
                 self.assertIn("spec-shape", active)
 
+    def test_phoenix_client_source_and_unit_test_activate_e2e(self):
+        for path in ("phoenix-client.py", "tests/test_phoenix_client.py"):
+            with self.subTest(path=path):
+                cats = self.dev._categorize_changed_paths({path})
+                self.assertIn("E2E", cats)
+                with mock.patch.object(
+                    self.dev, "_changed_paths_vs_base", return_value={path},
+                ):
+                    active, _ = self.dev._gate_lanes()
+                self.assertIn("e2e", active)
+
     def test_pr_433_task_only_rename_activates_only_task_group(self):
         paths = {"tasks/45002-p1-done--deterministic-message-scroll-state-machine.md"}
         with mock.patch.dict(os.environ, GATED_CI_ENV, clear=False), \
