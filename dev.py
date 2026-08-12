@@ -3996,7 +3996,10 @@ def _categorize_changed_paths(paths) -> set:
             cats.add("SPECS")
         if p.startswith("ast-grep-rules/"):
             cats.add("ASTGREP")
-        if p.startswith("tests/e2e/") or p == "phoenix-client.py":
+        if p.startswith("tests/e2e/") or p in {
+            "phoenix-client.py",
+            "tests/test_phoenix_client.py",
+        }:
             cats.add("E2E")
     return cats
 
@@ -5286,6 +5289,10 @@ def cmd_check(
         lane_clippy with its own CARGO_TARGET_DIR, so the only builds on the
         shared workspace lock are lane_rust's test compile and this bin build.
         """
+        run_step(
+            "phoenix-client unit tests",
+            ["uv", "run", "tests/test_phoenix_client.py"],
+        )
         run_step("e2e", ["uv", "run", "tests/e2e/run.py"])
 
     def check_package_lock_clean():

@@ -1,3 +1,12 @@
+#!/usr/bin/env -S uv run
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx",
+#     "httpx-sse",
+#     "click",
+# ]
+# ///
 import importlib.util
 import unittest
 from pathlib import Path
