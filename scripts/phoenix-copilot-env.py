@@ -202,6 +202,7 @@ OPENAI_CHAT_COMPLETIONS_BASE_URL={CHAT_URL}
 OPENAI_RESPONSES_BASE_URL={RESPONSES_URL}
 LLM_CUSTOM_HEADERS=Copilot-Integration-Id: {INTEGRATION_ID}\\nEditor-Version: {EDITOR_VERSION}
 DEFAULT_MODEL={default_model}
+PHOENIX_LLM_MODELS_ONLY=1
 PHOENIX_LLM_MODELS={json.dumps(specs, separators=(",", ":"))}
 """
     ENV_FILE.write_text(body)

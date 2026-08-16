@@ -175,10 +175,13 @@ pub struct LlmConfig {
     /// How credential helper output should be sent in HTTP headers.
     /// Parsed from `LLM_AUTH_HEADER` env var at startup.
     pub auth_style: AuthStyle,
-    /// Additional model specs loaded from `PHOENIX_LLM_MODELS` inline JSON.
-    /// These are additive only; duplicate IDs are ignored when merged with
-    /// built-ins.
+    /// Model specs loaded from `PHOENIX_LLM_MODELS` inline JSON.
+    /// Entries are additive unless `external_models_only` selects them as the
+    /// complete catalog.
     pub external_models: Vec<super::ModelSpec>,
+    /// Restrict the registry to `PHOENIX_LLM_MODELS` entries instead of
+    /// merging them with Phoenix's built-in catalog.
+    pub external_models_only: bool,
     /// User has signed into the native `ChatGPT` bridge.
     /// When true, `OpenAI` models route through the bridge; when true but
     /// `codex_credential` is `None` (load failed), `OpenAI` models are
@@ -226,6 +229,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("request_tags", &self.request_tags)
             .field("auth_style", &self.auth_style)
             .field("external_models", &self.external_models.len())
+            .field("external_models_only", &self.external_models_only)
             .field("use_codex_auth", &self.use_codex_auth)
             .field("codex_credential", &self.codex_credential.is_some())
             .field("codex_credential_path", &self.codex_credential_path)
@@ -249,6 +253,7 @@ impl Clone for LlmConfig {
             request_tags: self.request_tags.clone(),
             auth_style: self.auth_style,
             external_models: self.external_models.clone(),
+            external_models_only: self.external_models_only,
             use_codex_auth: self.use_codex_auth,
             codex_credential: self.codex_credential.as_ref().map(Arc::clone),
             codex_credential_path: self.codex_credential_path.clone(),
@@ -272,6 +277,7 @@ impl Default for LlmConfig {
             request_tags: std::collections::BTreeMap::new(),
             auth_style: AuthStyle::ApiKey,
             external_models: Vec::new(),
+            external_models_only: false,
             use_codex_auth: false,
             codex_credential: None,
             codex_credential_path: None,
@@ -339,6 +345,8 @@ impl LlmConfig {
                 }
             })
             .unwrap_or_default();
+        let external_models_only =
+            std::env::var("PHOENIX_LLM_MODELS_ONLY").is_ok_and(|value| value == "1");
 
         // Resolve Phoenix's native ChatGPT credential at startup.
         let active_auth_path = codex_credential::resolve_active_auth_path(&runtime_env);
@@ -382,6 +390,7 @@ impl LlmConfig {
                 AuthStyle::ApiKey
             },
             external_models,
+            external_models_only,
             use_codex_auth,
             codex_credential,
             codex_credential_path,
@@ -697,9 +706,13 @@ impl ModelRegistry {
         }
     }
 
-    /// Return built-in model specs plus valid external additions from config.
+    /// Return the model specs selected by the configured catalog policy.
     fn model_specs(config: &LlmConfig) -> Vec<super::ModelSpec> {
-        merge_model_specs(all_models(), &config.external_models)
+        if config.external_models_only {
+            config.external_models.clone()
+        } else {
+            merge_model_specs(all_models(), &config.external_models)
+        }
     }
 
     fn discovery_fallback_backends(
@@ -1962,6 +1975,27 @@ mod tests {
         assert!(registry.get("gpt-5.6-luna").is_some());
         assert!(registry.get("gpt-5.6-terra").is_some());
         assert!(registry.get("gpt-5.5").is_some());
+    }
+
+    #[test]
+    fn external_models_only_excludes_builtin_catalog() {
+        let external = external_gateway_model();
+        let external_id = external.id.clone();
+        let config = LlmConfig {
+            credential_helper: Some(crate::CredentialHelper::new(
+                "echo test-token".to_string(),
+                Duration::from_hours(1),
+            )),
+            external_models: vec![external],
+            external_models_only: true,
+            ..Default::default()
+        };
+
+        let registry = ModelRegistry::new(&config);
+
+        assert_eq!(registry.available_models(), vec![external_id]);
+        assert!(registry.get("claude-sonnet-5").is_none());
+        assert!(registry.get("gpt-5.6-sol").is_none());
     }
 
     /// Helper: build a `CodexCredential` pointing at a freshly-written valid

@@ -48,6 +48,10 @@ AND fall back per backend to the configured model list if model listing is unava
 WHEN client requests model list
 THE SYSTEM SHALL return only models that are currently available
 
+WHEN an external-only model catalog is configured
+THE SYSTEM SHALL exclude built-in model definitions
+AND expose only valid models declared by the external catalog
+
 **Rationale:** Opportunistic discovery from exact endpoint overrides lets configured models be validated without making model listing mandatory.
 
 ---
