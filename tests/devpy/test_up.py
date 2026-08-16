@@ -1,4 +1,5 @@
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -22,6 +23,9 @@ class UpCommandTest(unittest.TestCase):
     def _run_up(self, phoenix_pid, vite_pid, *, backend_matches):
         dev = self.dev
         call_order = []
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
+        state_path = Path(state_dir.name)
 
         def get_pid(path):
             if path == dev.PHOENIX_PID_FILE:
@@ -40,6 +44,12 @@ class UpCommandTest(unittest.TestCase):
             ),
             "get_worktree_hash": mock.patch.object(
                 dev, "get_worktree_hash", return_value="test"
+            ),
+            "phoenix_port_file": mock.patch.object(
+                dev, "PHOENIX_PORT_FILE", state_path / ".phoenix.port"
+            ),
+            "vite_port_file": mock.patch.object(
+                dev, "VITE_PORT_FILE", state_path / ".vite.port"
             ),
             "get_pid": mock.patch.object(dev, "get_pid", side_effect=get_pid),
             "select_dev_ports": mock.patch.object(

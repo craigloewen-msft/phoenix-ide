@@ -506,14 +506,21 @@ fn validate_submitted_text(content: &str) -> Result<(), AppError> {
 }
 
 #[cfg(unix)]
+fn stat_matches_metadata(stat: &nix::sys::stat::FileStat, metadata: &fs::Metadata) -> bool {
+    let Ok(stat_dev) = u64::try_from(stat.st_dev) else {
+        return false;
+    };
+    stat_dev == metadata.dev() && stat.st_ino == metadata.ino()
+}
+
+#[cfg(unix)]
 fn confined_path_matches(
     authority: &ConversationFileAuthority,
     relative_path: &str,
     expected: &fs::Metadata,
 ) -> bool {
-    open_confined_file(authority, relative_path, ResolvePurpose::Mutation).is_ok_and(|opened| {
-        opened.stat.st_dev == expected.dev() && opened.stat.st_ino == expected.ino()
-    })
+    open_confined_file(authority, relative_path, ResolvePurpose::Mutation)
+        .is_ok_and(|opened| stat_matches_metadata(&opened.stat, expected))
 }
 
 #[cfg(unix)]
@@ -542,8 +549,7 @@ fn install_replacement(
             replacement.name.to_string_lossy()
         ))
     })?;
-    if current.stat.st_dev != exchanged.dev()
-        || current.stat.st_ino != exchanged.ino()
+    if !stat_matches_metadata(&current.stat, &exchanged)
         || !confined_path_matches(authority, relative_path, &submitted)
     {
         if exchange_entries(
@@ -638,7 +644,7 @@ pub(crate) async fn put_conversation_file(
     }
 
     #[cfg(unix)]
-    let permissions = fs::Permissions::from_mode(current.stat.st_mode as u32 & 0o777);
+    let permissions = fs::Permissions::from_mode(u32::from(current.stat.st_mode) & 0o777);
     #[cfg(not(unix))]
     let permissions = fs::metadata(&current_target)
         .map_err(|_| version_conflict())?
@@ -729,8 +735,7 @@ pub(crate) async fn delete_conversation_file(
                 tombstone.name.to_string_lossy()
             ))
         })?;
-        if current.stat.st_dev != exchanged.dev()
-            || current.stat.st_ino != exchanged.ino()
+        if !stat_matches_metadata(&current.stat, &exchanged)
             || !confined_path_matches(&authority, &request.path, &marker)
         {
             if exchange_entries(
