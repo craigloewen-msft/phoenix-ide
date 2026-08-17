@@ -848,8 +848,8 @@ invariant LastSseEventAtPositive {
 -- <ConversationPage> must NOT subscribe to either. It selects a stable
 -- projection (useConversationView / ConversationPageView) over only the
 -- fields it renders — conversationId, conversation, phase, messages,
--- contextWindow, systemPrompt, uiError, toolExecutingStartedAt,
--- phaseStateUpdatedAt, firstByteRequestId, turnRetryContext — compared
+-- contextWindow, systemPrompt, uiError, phaseStateUpdatedAt,
+-- firstByteRequestId, turnRetryContext — compared
 -- by a cached-reference equality so an excluded-field bump yields an
 -- equal projection and no page re-render.
 --
