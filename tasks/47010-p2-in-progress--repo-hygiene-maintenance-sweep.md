@@ -120,7 +120,7 @@
 - The Phoenix client unit tests demonstrably execute through the selected `./dev.py` check lane, and planner tests prove both source and test changes trigger it.
 - `pnpm typecheck`, lint, Vitest, and a production UI build pass; `/`, `/assets/*`, `/phoenix.svg`, and `/service-worker.js` continue to use the `ui/dist` path.
 - Skill discovery lists `phoenix-ladle-fixture`, does not list `phoenix-perf-shared`, and documentation names only invokable skills.
-- `./dev.py check --all` runs with the lane summary captured on the first implementation run. Changed-surface failures must be fixed; unrelated baseline-red failures may be classified against task 24709 when their focused reruns and untouched ownership prove they are not introduced here.
+- `./dev.py check --all` runs with the lane summary captured on the first implementation run. A failure is classified as unrelated only when it names an exact failure already recorded by task 24709 or the exact failed test/lane passes in isolation while its owning code is untouched; no broader baseline waiver is allowed.
 - Review `git diff --stat`, deleted-file list, manifests/lockfiles, and docs moves before committing; split code/dependency, test-wiring, and docs/skill cleanup into logical commits if the diff warrants it.
 
 ## Risks and explicit non-goals
@@ -129,4 +129,4 @@
 - No deletion based solely on the words “legacy,” “unused,” or zero grep hits when dynamic discovery, persisted data, generated outputs, licenses, fixtures, or external/manual workflows may own the file.
 - Do not touch ready/in-progress task scopes such as legacy `design.md` migration, stale tool-result clearing, durable workflow consolidation, or Rust test-timing cleanup.
 - Do not remove undocumented standalone scripts in this pass; their potential human users cannot be disproved from repository references alone.
-- Full validation is classified, not silently waived: the implementation run exercised all lanes, then reran contention-sensitive failures alone and compared deterministic baseline failures with task 24709.
+- Full validation record: the all-lanes run passed 15/19 lanes. Complete Vitest (2,304 tests), E2E (including Phoenix-client unit coverage), and the exact MCP recovery test passed in isolation after their parallel-run failures. The exact `phoenix-llm registry::tests::test_no_api_keys_no_models` and bare-supervisor failures reproduced and match task 24709; their code is untouched. The changed dev.py/spec suites (`test_check_plan`, `test_skill_projections`, `test_spears_shape`) pass all 24 tests, and final allium/spec-anchor/task lanes pass. No other red result is waived.
