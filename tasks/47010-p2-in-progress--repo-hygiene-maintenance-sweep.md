@@ -120,7 +120,7 @@
 - The Phoenix client unit tests demonstrably execute through the selected `./dev.py` check lane, and planner tests prove both source and test changes trigger it.
 - `pnpm typecheck`, lint, Vitest, and a production UI build pass; `/`, `/assets/*`, `/phoenix.svg`, and `/service-worker.js` continue to use the `ui/dist` path.
 - Skill discovery lists `phoenix-ladle-fixture`, does not list `phoenix-perf-shared`, and documentation names only invokable skills.
-- `./dev.py check --all` passes, with the lane summary captured on the first implementation run.
+- `./dev.py check --all` runs with the lane summary captured on the first implementation run. Changed-surface failures must be fixed; unrelated baseline-red failures may be classified against task 24709 when their focused reruns and untouched ownership prove they are not introduced here.
 - Review `git diff --stat`, deleted-file list, manifests/lockfiles, and docs moves before committing; split code/dependency, test-wiring, and docs/skill cleanup into logical commits if the diff warrants it.
 
 ## Risks and explicit non-goals
@@ -129,4 +129,4 @@
 - No deletion based solely on the words “legacy,” “unused,” or zero grep hits when dynamic discovery, persisted data, generated outputs, licenses, fixtures, or external/manual workflows may own the file.
 - Do not touch ready/in-progress task scopes such as legacy `design.md` migration, stale tool-result clearing, durable workflow consolidation, or Rust test-timing cleanup.
 - Do not remove undocumented standalone scripts in this pass; their potential human users cannot be disproved from repository references alone.
-- The Explore sandbox could not produce a full baseline `./dev.py check --all`: uv's global cache and pnpm's temporary write under `ui/` are read-only here. The implementation worktree must establish the baseline/full result with normal write access.
+- Full validation is classified, not silently waived: the implementation run exercised all lanes, then reran contention-sensitive failures alone and compared deterministic baseline failures with task 24709.
