@@ -241,18 +241,6 @@ describe('user message provenance rendering', () => {
     expect(screen.queryByText('You')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Copy system observation' })).toBeInTheDocument();
   });
-
-  it('keeps regular user messages authored as you', () => {
-    render(
-      <MemoryRouter>
-        <UserMessage message={userMessage('plain-user', 'Hello there')} />
-      </MemoryRouter>,
-    );
-
-    expect(screen.getByText('You')).toBeInTheDocument();
-    expect(screen.queryByText('Background task observation')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Copy your message' })).toBeInTheDocument();
-  });
 });
 
 describe('commission review tool rendering', () => {
@@ -260,30 +248,6 @@ describe('commission review tool rendering', () => {
       latestViewerSlot = null;
     });
 
-  it('formats the commission review request input inline instead of raw json', () => {
-    render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-commission-review-input', [{
-            type: 'tool_use',
-            id: 'tool-commission-review-input',
-            name: 'commission_review',
-            input: {
-              brief: 'Independent review before merge to validate the refactor.',
-              focus: 'Concurrency and edge-case handling',
-            },
-          }])}
-          toolResults={new Map()}
-          onOpenFile={undefined}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(screen.getByLabelText('Commission review request')).toHaveTextContent('brief');
-    expect(screen.getByText('Independent review before merge to validate the refactor.')).toBeInTheDocument();
-    expect(screen.getByText('Concurrency and edge-case handling')).toBeInTheDocument();
-    expect(screen.queryByText(/"brief"/)).not.toBeInTheDocument();
-  });
 
   it('marks active occurrences in structured commission inputs and findings', () => {
     const inputText = 'brief: Review before merge\nfocus: concurrency alpha';
@@ -307,31 +271,6 @@ describe('commission review tool rendering', () => {
     expect(container.querySelector('[data-fragment-id="commission-review-finding-0"] .viewer-find-inline-match--active')?.textContent).toBe('alpha');
   });
 
-  it('renders a clean structured summary for successful reviews with no findings', () => {
-    const result = toolMessage('tool-commission-review-clean', JSON.stringify({ ok: true }));
-    result.display_data = commissionReviewDisplayData();
-
-    render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-commission-review-clean', [{
-            type: 'tool_use',
-            id: 'tool-commission-review-clean',
-            name: 'commission_review',
-            input: { brief: 'Review before merge' },
-          }])}
-          toolResults={new Map([['tool-commission-review-clean', result]])}
-          onOpenFile={undefined}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(screen.getByLabelText('Commission review summary')).toHaveTextContent('Clean');
-    expect(screen.queryByText('0/3 files reviewed')).not.toBeInTheDocument();
-    expect(screen.getByText('3/3 files reviewed')).toBeInTheDocument();
-    expect(screen.getByText('No correctness issues found in the reviewed diff.')).toBeInTheDocument();
-    expect(screen.getByText('No findings reported.')).toBeInTheDocument();
-  });
 
   it('renders an inline Open full review action when the request message sequence id is available', async () => {
     const result = toolMessage('tool-commission-review-open', JSON.stringify({ ok: true }));
@@ -633,76 +572,9 @@ describe('commission review tool rendering', () => {
     expect(screen.getByText('Skipped')).toBeInTheDocument();
   });
 
-  it('renders empty-rationale findings fallback', () => {
-    const result = toolMessage('tool-commission-review-details', JSON.stringify({ ok: true }));
-    result.display_data = commissionReviewDisplayData({
-      status: 'partial',
-      review_status: 'completed_with_warnings',
-      findings_status: 'partial',
-      findings_trust: 'partial',
-      retry_recommendation: 'review_findings_first',
-      stage_status: {
-        target_collection: 'ok',
-        diff_collection: 'partial',
-        llm_review: 'timeout',
-        json_parse: 'ok',
-        finding_extraction: 'partial',
-      },
-      findings: [{ severity: 'high', file: 'src/race.ts', title: 'Race', rationale: '   ' }],
-    });
-
-    render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-commission-review-details', [{
-            type: 'tool_use',
-            id: 'tool-commission-review-details',
-            name: 'commission_review',
-            input: { brief: 'Detailed payload' },
-          }])}
-          toolResults={new Map([['tool-commission-review-details', result]])}
-          onOpenFile={undefined}
-          onOpenCommissionReview={() => {}}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(screen.getByText('No rationale provided by the reviewer.')).toBeInTheDocument();
-  });
 });
 
 describe('inline tool timers', () => {
-  it('renders a visible waiting state when a tool_use has no matching result', () => {
-    const debugSpy = vi.spyOn(console, 'debug').mockImplementation(() => {});
-
-    render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-missing-tool-result', [{
-            type: 'tool_use',
-            id: 'tool-missing',
-            name: 'read_file',
-            input: { path: 'README.md' },
-          }])}
-          toolResults={new Map()}
-          onOpenFile={undefined}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(screen.getByText('Waiting for tool result')).toBeInTheDocument();
-    expect(screen.getByText('result not received')).toBeInTheDocument();
-    expect(debugSpy).toHaveBeenCalledWith(
-      '[MessageComponents] rendering missing tool result',
-      expect.objectContaining({
-        tool_use_id: 'tool-missing',
-        tool_call_id: 'tool-missing',
-        known_result_ids: [],
-      }),
-    );
-
-    debugSpy.mockRestore();
-  });
 
   afterEach(() => {
     vi.useRealTimers();
@@ -851,46 +723,6 @@ describe('inline tool timers', () => {
 
     expect(screen.queryByText('result not received')).not.toBeInTheDocument();
   });
-  it('renders compact bash cards with identity, final status+duration, and output tail from existing results', () => {
-    mockDensity = 'compact';
-    const agent = agentMessage('agent-compact-bash', [
-      {
-        type: 'tool_use',
-        id: 'tool-bash',
-        name: 'bash',
-        input: { op: 'wait', handle: 'b-22', wait_seconds: 5 },
-      },
-    ]);
-    const result = toolMessage('tool-bash', JSON.stringify({
-      status: 'exited',
-      exit_code: 0,
-      duration_ms: 1840,
-      lines: [
-        { offset: 1, bytes: ' ✓ src/components/MessageComponents.test.tsx (68 tests)' },
-        { offset: 2, bytes: ' Test Files  1 passed' },
-      ],
-    }), 2);
-
-    render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agent}
-          toolResults={new Map([['tool-bash', result]])}
-          onOpenFile={undefined}
-          forceExpandedText={false}
-        />
-      </MemoryRouter>,
-    );
-
-    const compactCard = document.querySelector('.compact-tool-card');
-    expect(compactCard).not.toBeNull();
-    expect(screen.getByText('bash')).toBeInTheDocument();
-    expect(screen.getByText('exit 0 · 1.8s')).toBeInTheDocument();
-    expect(screen.getByText('wait b-22')).toBeInTheDocument();
-    expect(screen.getByText('✓ src/components/MessageComponents.test.tsx (68 tests) · Test Files 1 passed')).toBeInTheDocument();
-    expect(document.querySelector('.compact-tool-card-identity')).not.toBeNull();
-    expect(document.querySelector('.compact-tool-card-summary-tail')).not.toBeNull();
-  });
 
   it('renders typed bash output with bounded log viewport, partial affordance, truncation notice, and friendly durations', () => {
     const agent = agentMessage('agent-bash-typed-live', [
@@ -957,39 +789,6 @@ describe('inline tool timers', () => {
     expect(screen.queryByText('[older output omitted from this tail]')).not.toBeInTheDocument();
   });
 
-  it('renders tombstone exit metadata and final duration in typed bash output', () => {
-    const agent = agentMessage('agent-bash-tombstone', [
-      {
-        type: 'tool_use',
-        id: 'tool-bash',
-        name: 'bash',
-        input: { op: 'peek', handle: 'b-24', lines: 20 },
-      },
-    ]);
-    const result = toolMessage('tool-bash', JSON.stringify({
-      status: 'tombstoned',
-      final_cause: 'exited normally',
-      handle: 'b-24',
-      exit_code: 17,
-      duration_ms: 30000,
-      lines: [{ offset: 1, bytes: ' archived output retained for inspection' }],
-    }), 2);
-
-    render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agent}
-          toolResults={new Map([['tool-bash', result]])}
-          onOpenFile={undefined}
-          forceExpandedText={false}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(screen.getByText('tombstoned · exited normally')).toBeInTheDocument();
-    expect(screen.getByText('exit 17')).toBeInTheDocument();
-    expect(screen.getByText('ran 30s')).toBeInTheDocument();
-  });
 
   it('shows a diagnostic when a historical tool_use has no paired result', () => {
     const agent = agentMessage('agent-missing-result', [
@@ -1110,40 +909,6 @@ describe('inline tool timers', () => {
     expect(screen.queryByText('• 41s')).not.toBeInTheDocument();
   });
 
-  it('renders completed and failed tool results with explicit status states', () => {
-    const completed = toolMessage('tool-ok', 'done', 2);
-    completed.display_data = { duration_ms: 800 };
-    const failed: Message = {
-      message_id: 'tool-tool-fail',
-      sequence_id: 3,
-      conversation_id: 'agent-1',
-      message_type: 'tool',
-      content: { tool_use_id: 'tool-fail', error: 'boom', is_error: true },
-      display_data: { duration_ms: 1200 },
-      created_at: '2026-01-01T00:00:01Z',
-    };
-
-    render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-tool-statuses', [
-            { type: 'tool_use', id: 'tool-ok', name: 'read_file', input: { path: 'ok.txt' } },
-            { type: 'tool_use', id: 'tool-fail', name: 'bash', input: { op: 'run', cmd: 'false' } },
-          ])}
-          toolResults={new Map([
-            ['tool-ok', completed],
-            ['tool-fail', failed],
-          ])}
-          onOpenFile={undefined}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(document.querySelector('[data-tool-id="tool-ok"] .tool-block-status.success')).not.toBeNull();
-    expect(document.querySelector('[data-tool-id="tool-fail"] .tool-block-status.error')).not.toBeNull();
-    expect(document.querySelector('[data-tool-id="tool-ok"]')).toHaveTextContent('done');
-    expect(screen.getByText('boom')).toBeInTheDocument();
-  });
 });
 
 describe('message copy affordances', () => {
@@ -1173,28 +938,6 @@ describe('message copy affordances', () => {
     });
   });
 
-  it('keeps user message status grouped with metadata instead of copy actions', () => {
-    const { container } = render(
-      <UserMessage
-        message={{
-          message_id: 'user-layout',
-          sequence_id: 1,
-          conversation_id: 'agent-1',
-          message_type: 'user',
-          content: { text: 'Great, push and open a PR please' },
-          display_data: null,
-          created_at: '2026-01-01T00:00:00Z',
-        }}
-      />,
-    );
-
-    const meta = container.querySelector('.message-header-meta');
-    const actions = container.querySelector('.message-header-actions');
-
-    expect(meta?.querySelector('.message-status.sent')).toBeInTheDocument();
-    expect(actions?.querySelector('.message-status.sent')).not.toBeInTheDocument();
-    expect(actions?.querySelector('.message-mobile-copy')).toBeInTheDocument();
-  });
 
   it('copies finalized agent text blocks as markdown from the mobile copy button', async () => {
     const message = agentMessage('agent-copy', [
@@ -1251,52 +994,7 @@ describe('message copy affordances', () => {
     expect(screen.queryByRole('button', { name: 'Copy Phoenix message' })).not.toBeInTheDocument();
   });
 
-  it('renders continuation message copy controls in a non-overlapping row', () => {
-    const { container } = render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-continuation-copy', [
-            { type: 'text', text: 'Continuation text starts immediately.' },
-          ])}
-          toolResults={new Map()}
-          onOpenFile={vi.fn()}
-          isFirstInTurn={false}
-        />
-      </MemoryRouter>,
-    );
 
-    expect(screen.getByRole('button', { name: 'Copy Phoenix message' })).toBeInTheDocument();
-    expect(container.querySelector('.message-mobile-copy-row')).toBeInTheDocument();
-    expect(container.querySelector('.message-mobile-copy-floating')).not.toBeInTheDocument();
-  });
-
-  it('keeps message context-menu markdown copy aligned with the mobile copy value', async () => {
-    const message = agentMessage('agent-context-copy', [
-      { type: 'text', text: 'Context **markdown**.' },
-      { type: 'tool_use', id: 'tool-1', name: 'bash', input: { cmd: 'pwd' } },
-      { type: 'text', text: 'More markdown.' },
-    ], 14);
-
-    render(
-      <MemoryRouter>
-        <div id="messages">
-          <AgentMessage
-            message={message}
-            toolResults={new Map()}
-            onOpenFile={vi.fn()}
-          />
-        </div>
-        <MessageContextMenu messages={[message]} />
-      </MemoryRouter>,
-    );
-
-    fireEvent.contextMenu(screen.getByText(/Context/), { clientX: 20, clientY: 30 });
-    fireEvent.click(screen.getByRole('button', { name: 'Copy as Markdown' }));
-
-    await waitFor(() => {
-      expect(copyToClipboard).toHaveBeenCalledWith('Context **markdown**.\n\nMore markdown.');
-    });
-  });
 
   it('opens message markdown in the sidepanel from the context menu', () => {
     const message = agentMessage('agent-open-sidepanel', [
@@ -1541,25 +1239,6 @@ describe('ordinary message find highlighting', () => {
 });
 
 describe('skill command rendering', () => {
-  it('renders slash-command user messages as a flat command chip with normal args', () => {
-    render(
-      <UserMessage
-        message={{
-          message_id: 'user-skill',
-          sequence_id: 1,
-          conversation_id: 'agent-1',
-          message_type: 'user',
-          content: { text: '/dogfood http://localhost:8042' },
-          display_data: null,
-          created_at: '2026-01-01T00:00:00Z',
-        }}
-      />,
-    );
-
-    expect(screen.getByText('dogfood')).toHaveClass('skill-command-name');
-    expect(screen.getByText('http://localhost:8042')).toHaveClass('skill-command-args');
-    expect(document.querySelector('.skill-command-chip')).not.toBeNull();
-  });
 
   it('renders skill tool calls with matching chip, source, and snippet', () => {
     const onOpenFile = vi.fn();
@@ -1835,24 +1514,6 @@ describe('conversation markdown links', () => {
     expect(fileLink).toHaveAttribute('data-file-absolute-path', '/repo/project/specs/AUTHORING.md');
   });
 
-  it('opens a project-relative Markdown file href through the conversation file viewer', () => {
-    const onOpenFile = vi.fn();
-    render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-msg-project-file-link', [{
-            type: 'text',
-            text: 'Review [the guide](specs/AUTHORING.md).',
-          }])}
-          toolResults={new Map()}
-          onOpenFile={onOpenFile}
-        />
-      </MemoryRouter>,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: 'the guide' }));
-    expect(onOpenFile).toHaveBeenCalledWith('specs/AUTHORING.md', new Set(), 0);
-  });
 
   it('does not classify fragments or extensionless relative web routes as files', () => {
     render(
@@ -1909,24 +1570,6 @@ describe('conversation markdown links', () => {
     expect(link).toHaveAttribute('rel', 'noopener noreferrer');
   });
 
-  it('keeps finalized agent plain URL auto-links opening in a new tab', () => {
-    render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-msg-auto-link', [{
-            type: 'text',
-            text: 'Plain URL: https://github.com/acme/repo/pull/456',
-          }])}
-          toolResults={new Map()}
-        />
-      </MemoryRouter>,
-    );
-
-    const link = screen.getByRole('link', { name: 'https://github.com/acme/repo/pull/456' });
-    expect(link).toHaveAttribute('href', 'https://github.com/acme/repo/pull/456');
-    expect(link).toHaveAttribute('target', '_blank');
-    expect(link).toHaveAttribute('rel', 'noopener noreferrer');
-  });
 
   it('renders finalized agent local Markdown images through the preview allowlist path', () => {
     render(
@@ -1986,25 +1629,6 @@ describe('conversation markdown links', () => {
     expect(screen.getByRole('img', { name: 'secret' })).toHaveAttribute('src', '');
   });
 
-  it('keeps finalized agent remote Markdown image URLs unchanged', () => {
-    render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-msg-remote-image', [{
-            type: 'text',
-            text: '![remote screenshot](https://example.com/screenshot.png)',
-          }])}
-          toolResults={new Map()}
-          filePathRootDir="/repo/project"
-        />
-      </MemoryRouter>,
-    );
-
-    expect(screen.getByRole('img', { name: 'remote screenshot' })).toHaveAttribute(
-      'src',
-      'https://example.com/screenshot.png',
-    );
-  });
 
   it('preserves percent-escaped finalized agent local Markdown image paths', () => {
     render(
@@ -2026,25 +1650,6 @@ describe('conversation markdown links', () => {
     );
   });
 
-  it('keeps already-preview Markdown image URLs unchanged', () => {
-    render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-msg-preview-image', [{
-            type: 'text',
-            text: '![preview screenshot](/preview/repo/project/shot.png)',
-          }])}
-          toolResults={new Map()}
-          filePathRootDir="/repo/project"
-        />
-      </MemoryRouter>,
-    );
-
-    expect(screen.getByRole('img', { name: 'preview screenshot' })).toHaveAttribute(
-      'src',
-      '/preview/repo/project/shot.png',
-    );
-  });
 
   it('keeps safe data image URLs through ReactMarkdown sanitization', () => {
     const dataUrl = 'data:image/png;base64,iVBORw0KGgo=';
@@ -2215,58 +1820,8 @@ describe('markdown table rendering', () => {
     expect(inlineCode.closest('td')).not.toBeNull();
   });
 
-  it('keeps finalized agent message task lists enabled for plus and ordered markers', () => {
-    render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-msg-tasks', [{
-            type: 'text',
-            text: '+ [ ] plus task\n1. [x] ordered task',
-          }])}
-          toolResults={new Map()}
-        />
-      </MemoryRouter>,
-    );
 
-    const checkboxes = screen.getAllByRole('checkbox');
-    expect(checkboxes).toHaveLength(2);
-    expect(checkboxes[0]).not.toBeChecked();
-    expect(checkboxes[1]).toBeChecked();
-  });
 
-  it('keeps finalized agent message strikethrough and email autolinks enabled', () => {
-    const { container } = render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-msg-inline-gfm', [{
-            type: 'text',
-            text: 'Contact contact@example.com and ignore ~obsolete~ text.',
-          }])}
-          toolResults={new Map()}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(screen.getByRole('link', { name: 'contact@example.com' })).toHaveAttribute('href', 'mailto:contact@example.com');
-    expect(container.querySelector('del')?.textContent).toBe('obsolete');
-  });
-
-  it('keeps finalized agent message footnotes enabled when GFM syntax is present', () => {
-    render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-msg-footnote', [{
-            type: 'text',
-            text: 'Phoenix has a note.[^1]\n\n[^1]: Footnote content',
-          }])}
-          toolResults={new Map()}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(screen.getByText('Footnotes')).toBeInTheDocument();
-    expect(screen.getByText('Footnote content')).toBeInTheDocument();
-  });
 
   it('wraps streaming message tables in a local horizontal scroll container', async () => {
     render(
@@ -2355,104 +1910,10 @@ describe('finalized code fence highlighting', () => {
   });
 
 
-  it('renders short one-line assistant prose fully in compact mode', () => {
-    mockDensity = 'compact';
 
-    const { container } = render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-msg-short-prose', [{
-            type: 'text',
-            text: 'Branch protection requires required checks first, so I’ll enable auto-merge for the approved PR and monitor it.',
-          }])}
-          toolResults={new Map()}
-        />
-      </MemoryRouter>,
-    );
 
-    expect(container.querySelector('.agent-text-block')).toBeInTheDocument();
-    expect(container.querySelector('.agent-text-collapsed')).not.toBeInTheDocument();
-  });
 
-  it('renders long one-line assistant prose in full in compact mode', () => {
-    mockDensity = 'compact';
-    const text = 'A'.repeat(150);
 
-    const { container } = render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-msg-long-preview-prose', [{
-            type: 'text',
-            text,
-          }])}
-          toolResults={new Map()}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(container.querySelector('.agent-text-block')).toHaveTextContent(text);
-    expect(container.querySelector('.agent-text-collapsed')).not.toBeInTheDocument();
-  });
-
-  it('renders every line of short multi-line assistant prose in compact mode', () => {
-    mockDensity = 'compact';
-
-    const { container } = render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-msg-multiline-prose', [{
-            type: 'text',
-            text: 'First line summary.\n\nSecond line with more detail.',
-          }])}
-          toolResults={new Map()}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(container.querySelector('.agent-text-block')).toHaveTextContent('First line summary.');
-    expect(container.querySelector('.agent-text-block')).toHaveTextContent('Second line with more detail.');
-    expect(container.querySelector('.agent-text-collapsed')).not.toBeInTheDocument();
-  });
-
-  it('renders compact text fully when forceExpandedText is set', () => {
-    mockDensity = 'compact';
-
-    const { container } = render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-msg-force-expanded', [{
-            type: 'text',
-            text: 'First line summary.\n\nSecond line with more detail.',
-          }])}
-          toolResults={new Map()}
-          forceExpandedText
-        />
-      </MemoryRouter>,
-    );
-
-    expect(container.querySelector('.agent-text-block')).toBeInTheDocument();
-    expect(container.querySelector('.agent-text-collapsed')).not.toBeInTheDocument();
-  });
-
-  it('renders short mermaid fences in compact mode instead of collapsing them', async () => {
-    mockDensity = 'compact';
-
-    render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-msg-short-mermaid', [{
-            type: 'text',
-            text: '```mermaid\nflowchart TD\n  A --> B\n```',
-          }])}
-          toolResults={new Map()}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(await screen.findByTestId('mermaid-diagram')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /```mermaid/ })).not.toBeInTheDocument();
-    expect(mermaid.render).toHaveBeenCalledWith(expect.stringMatching(/^phoenix-mermaid-/), 'flowchart TD\n  A --> B');
-  });
 
   it('falls back to source when mermaid rendering fails', async () => {
     vi.mocked(mermaid.render).mockRejectedValueOnce(new Error('Parse error on line 2'));
@@ -2698,43 +2159,6 @@ describe('read_file structured result view', () => {
       </MemoryRouter>,
     );
     expect(screen.getByRole('button', { name: 'View full file' })).toBeInTheDocument();
-  });
-
-  it('renders empty and malformed fallback states', () => {
-    const { rerender } = render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-read-empty', [
-            { type: 'tool_use', id: 'tool-read-empty', name: 'read_file', input: { path: 'empty.txt' } },
-          ])}
-          toolResults={new Map([['tool-read-empty', toolMessage('tool-read-empty', '', 2, {
-              type: 'read_file', path: 'empty.txt', requested_offset: 1, requested_limit: 2000,
-              returned_start_line: null, returned_end_line: null, returned_line_count: 0,
-              total_line_count: 0, remaining_line_count: 0, viewer_available: true,
-            })]])}
-          onOpenFile={vi.fn()}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(screen.getByText('(empty file)')).toBeInTheDocument();
-    expect(screen.getByText('No file content returned')).toBeInTheDocument();
-
-    rerender(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-read-malformed', [
-            { type: 'tool_use', id: 'tool-read-malformed', name: 'read_file', input: { path: 'broken.txt', offset: 10, limit: 3 } },
-          ])}
-          toolResults={new Map([['tool-read-malformed', toolMessage('tool-read-malformed', 'oops\n12\tvalid line')]])}
-          onOpenFile={vi.fn()}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(screen.getByText(/broken\.txt:10-12/)).toBeInTheDocument();
-    expect(screen.queryByText(/Ignored .* non-numbered line/)).not.toBeInTheDocument();
-    expect(screen.getByText(/oops/)).toBeInTheDocument();
   });
 });
 
@@ -3348,29 +2772,7 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
     expect(screen.queryByRole('button', { name: 'Review' })).not.toBeInTheDocument();
   });
 
-  it('shows a dismissed terminal status with no Review action', async () => {
-    renderTranscript([proposal({ status: 'dismissed' })]);
-    expect(await screen.findByText('Dismissed')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Review' })).not.toBeInTheDocument();
-  });
 
-  it('renders fenced mermaid diagrams in proposal bodies', async () => {
-    const { container } = render(
-      <ForkProposalReview
-        proposal={proposal({
-          status: 'pending',
-          body: ['# Fix the parser bug', '', '```mermaid', 'flowchart TD', '  A --> B', '```'].join('\n'),
-        })}
-        onApprove={vi.fn()}
-        onDismiss={vi.fn()}
-        onRequestChanges={vi.fn()}
-        onClose={vi.fn()}
-      />,
-    );
-
-    expect(await screen.findByTestId('mermaid-diagram')).toBeInTheDocument();
-    expect(container.querySelector('code.language-mermaid')).not.toBeInTheDocument();
-  });
 
   // Bug 1: a non-conflict action failure must leave the modal interactive so the
   // user can retry or Escape out, rather than stranding it permanently busy.

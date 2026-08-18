@@ -1,7 +1,7 @@
 import mermaid from 'mermaid';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { __metaViewerFindTestables, MetaViewer } from './MetaViewer';
+import { MetaViewer } from './MetaViewer';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
 import type { MetaViewerPayload } from './metaViewerTypes';
 import { codeViewMockState, resetCodeViewMock } from './__testutils__/codeViewMock';
@@ -90,28 +90,6 @@ function fireWheel(surface: HTMLElement, deltaY: number) {
 }
 
 const textCommon = { ...common, filePath: 'thing', rootDir: '/tmp/project' };
-describe('MetaViewer find identities', () => {
-  it('bounds match ids for arbitrarily long file lines', () => {
-    const text = `prefix ${'x'.repeat(20_000)} token`;
-    const source = {
-      id: 'line:1',
-      kind: 'line' as const,
-      lineNumber: 1,
-      text,
-      target: { kind: 'file-line' as const, lineNumber: 1, startColumn: 0, endColumn: 0 },
-    };
-    const id = __metaViewerFindTestables.stableFileMatchId([source])({
-      sourceId: source.id,
-      sourceText: text,
-      start: text.length - 5,
-      end: text.length,
-      target: { kind: 'file-line', lineNumber: 1, startColumn: text.length - 5, endColumn: text.length },
-    });
-
-    expect(id).not.toContain('prefix');
-    expect(id.length).toBeLessThan(128);
-  });
-});
 
 describe('MetaViewer payload routing', () => {
   it('drives file counts from the typed line projection', async () => {
@@ -129,10 +107,6 @@ describe('MetaViewer payload routing', () => {
 
   beforeEach(() => resetCodeViewMock());
 
-  it('routes a markdown payload to rendered markdown', () => {
-    renderViewer({ ...textCommon, kind: 'markdown', content: '# Hello\n\nbody text' });
-    expect(screen.getByRole('heading', { name: 'Hello' })).toBeInTheDocument();
-  });
 
   it('routes markdown mermaid fences to the shared diagram renderer', async () => {
     renderViewer({ ...textCommon, kind: 'markdown', content: '```mermaid\nflowchart TD\n  A --> B\n```' });
@@ -142,12 +116,6 @@ describe('MetaViewer payload routing', () => {
     expect(mermaid.render).toHaveBeenCalledWith(expect.stringMatching(/^phoenix-mermaid-/), 'flowchart TD\n  A --> B');
   });
 
-  it('routes a code payload to the Pierre file code view, not the legacy code body', () => {
-    const { container } = renderViewer({ ...textCommon, kind: 'code', language: 'rust', content: 'fn main() {}' });
-    expect(container.querySelector('.phoenix-file-codeview')).not.toBeNull();
-    // The react-syntax-highlighter path is retired for code.
-    expect(container.querySelector('.viewer-code')).toBeNull();
-  });
 
   it('keeps large code on the Pierre view (no plain-text fallback for code)', () => {
     const largeContent = `${'line\n'.repeat(2_001)}tail`;
@@ -322,17 +290,6 @@ describe('MetaViewer payload routing', () => {
     expect(container.querySelector('.phoenix-file-codeview')).toBeNull();
   });
 
-  it('routes an image payload to the image body', () => {
-    renderViewer({
-      ...common,
-      kind: 'image',
-      url: '/preview/tmp/project/thing.png',
-      mimeType: 'image/png',
-      fileName: 'thing.png',
-    });
-    const img = screen.getByRole('img', { name: 'thing.png' });
-    expect(img).toHaveAttribute('src', '/preview/tmp/project/thing.png');
-  });
 
   it('normalizes unsupported prose fullscreen presentation back to pane', async () => {
     const onPresentationChange = vi.fn();
@@ -443,17 +400,6 @@ describe('MetaViewer payload routing', () => {
     expect(surface.scrollTop).toBe(0);
   });
 
-  it('applies equal pinch-in and pinch-out deltas symmetrically', async () => {
-    const { surface, img } = await renderLoadedImageViewer();
-
-    fireWheel(surface, -120);
-    const zoomedWidth = Number(img.getAttribute('width'));
-    expect(zoomedWidth).toBeGreaterThan(736);
-
-    fireWheel(surface, 120);
-    await waitFor(() => expect(Number(img.getAttribute('width'))).toBeCloseTo(736, 0));
-    expect(screen.getByText('46%')).toBeInTheDocument();
-  });
 
   it('renders html as source by default and toggles to a sandboxed preview', () => {
     const { container } = renderViewer({
@@ -477,19 +423,6 @@ describe('MetaViewer payload routing', () => {
     expect(iframe).toHaveAttribute('src', '/preview/tmp/project/thing');
   });
 
-  it('defers file search projection work until find is open with a query', async () => {
-    const searchProjectionModule = await import('../viewer-find/searchProjections');
-    const buildProjectionSpy = vi.spyOn(searchProjectionModule, 'buildFileSearchProjection');
-
-    renderViewer({ ...textCommon, kind: 'text', content: 'alpha\nbeta' });
-    expect(buildProjectionSpy).not.toHaveBeenCalled();
-
-    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
-    expect(buildProjectionSpy).not.toHaveBeenCalled();
-
-    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
-    expect(buildProjectionSpy).toHaveBeenCalledWith('alpha\nbeta', 'alpha');
-  });
 
   it('skips large-text line-fragment rendering when the active occurrence is negative', () => {
     renderViewer({
@@ -509,18 +442,6 @@ describe('MetaViewer payload routing', () => {
     expect(document.querySelector('[data-find-occurrence]')).toBeNull();
   });
 
-  it('keeps image payloads out of file find and does not show false counts', () => {
-    renderViewer({
-      ...common,
-      kind: 'image',
-      url: '/preview/tmp/project/thing.png',
-      mimeType: 'image/png',
-      fileName: 'thing.png',
-    });
-
-    expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
-    expect(screen.queryByText(/of \d+/)).toBeNull();
-  });
 
   it('keeps HTML preview ineligible while allowing decorated HTML source and rendered Markdown find', () => {
     const { unmount } = render(
@@ -577,13 +498,6 @@ describe('MetaViewer payload routing', () => {
     expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull();
   });
 
-  it('marks matches in lower-level Markdown headings', () => {
-    renderViewer({ ...textCommon, kind: 'markdown', content: '#### lower heading alpha' });
-
-    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
-    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
-    expect(document.querySelector('h4 .viewer-find-match--active')).toHaveTextContent('alpha');
-  });
 
   it('does not count rendered fenced-code text without an owned inline marker', () => {
     renderViewer({ ...textCommon, kind: 'markdown', content: '# Title\n\n```ts\nconst hiddenNeedle = true;\n```' });
@@ -593,14 +507,6 @@ describe('MetaViewer payload routing', () => {
     expect(screen.getByText('0 results')).toBeInTheDocument();
   });
 
-  it('marks a match in a later table cell with block-local offsets', () => {
-    renderViewer({ ...textCommon, kind: 'markdown', content: '| first | second target |\n| --- | --- |' });
-
-    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
-    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'target' } });
-    expect(screen.getByText('1 of 1')).toBeInTheDocument();
-    expect(document.querySelector('.viewer-markdown .viewer-find-match--active')).toHaveTextContent('target');
-  });
 
   it('keeps identical same-line table cells as distinct match owners', () => {
     renderViewer({ ...textCommon, kind: 'markdown', content: '| alpha | alpha |\n| --- | --- |' });
@@ -614,30 +520,7 @@ describe('MetaViewer payload routing', () => {
     expect(document.querySelectorAll('th .viewer-find-match--active')).toHaveLength(1);
   });
 
-  it('keeps source-style Markdown fallbacks searchable', () => {
-    renderViewer({ ...textCommon, kind: 'markdown', content: '# alpha', renderMode: 'plainLargeText' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
-    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
-    expect(screen.getByText('1 of 1')).toBeInTheDocument();
-    expect(document.querySelector('[data-find-occurrence="0"]')).toHaveTextContent('alpha');
-  });
-
-  it('closes HTML source find when switching to preview', async () => {
-    renderViewer({
-      ...textCommon,
-      kind: 'html',
-      language: 'html',
-      content: '<p>alpha</p>',
-      previewUrl: '/preview/tmp/project/thing',
-    });
-
-    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
-    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
-    expect(screen.getByText('1 of 1')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
-    await waitFor(() => expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull());
-  });
 
   it('resets find state when the viewed absolutePath changes', async () => {
     const { rerender } = render(

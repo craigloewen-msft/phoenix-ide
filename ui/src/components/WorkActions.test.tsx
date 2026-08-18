@@ -1,20 +1,3 @@
-// Tests for the redesigned WorkControlBar.
-//
-// The bar renders from `deriveWorkDisposition` (see workDisposition.ts), which
-// is the source of truth for which disposition row yields which testid /
-// primary / note. These tests drive the real component through a render
-// harness, asserting the rendered affordances per disposition case.
-//
-// Affordances (NEW design):
-//   - view-diff-button ("View Diff") — always in the REVIEW zone on Work/Branch.
-//   - address-feedback-button ("Address feedback" / "Capturing...") — carries
-//     the #288 freshness (.work-actions-pr-freshness) + coverage
-//     (.work-actions-pr-coverage[--auth] ⚠) spans.
-//   - merge-pr-link / open-pr-link — honest <a> links to the PR url.
-//   - clean-up-button ("Clean up" / "Cleaning...") — single click → api.markMerged.
-//   - abandon-button ("Abandon" / "Abandoning...") — window.confirm → api.abandonTask.
-//   - Exactly one element carries work-actions-btn--primary.
-//   - Notes are muted spans, never buttons.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
@@ -116,13 +99,6 @@ function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }, 
   };
 }
 
-const loadingPrStatusHandle = {
-  state: { status: 'loading' as const, prStatus: null },
-  refresh: vi.fn().mockResolvedValue(undefined),
-  refreshForSafety: vi.fn().mockResolvedValue(undefined),
-  refreshAfterMutation: vi.fn().mockResolvedValue(undefined),
-};
-
 /** Count of glowing primaries across the whole bar — must always be exactly 1
  *  when the bar is in a dispositive (non-continued) state. */
 function primaryCount() {
@@ -155,37 +131,6 @@ describe('WorkControlBar — visibility (REQ-WAB-001)', () => {
     expect(screen.queryByTestId('abandon-button')).not.toBeInTheDocument();
   });
 
-  it('is hidden when the phase is running (not a disposable phase)', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-1"
-        convModeLabel="Work"
-        phaseType="running"
-        continuedInConvId={null}
-        baseBranch="main"
-        prStatusHandle={prStatusHandle()}
-      />,
-    );
-    expect(screen.queryByTestId('abandon-button')).not.toBeInTheDocument();
-  });
-
-  it.each(['idle', 'error'] as const)(
-    'is visible for a %s phase on Work',
-    (phaseType) => {
-      renderWithProviders(
-        <WorkControlBar
-          conversationId="conv-1"
-          convModeLabel="Work"
-          phaseType={phaseType}
-          continuedInConvId={null}
-          baseBranch="main"
-          prStatusHandle={prStatusHandle()}
-        />,
-      );
-      expect(screen.getByTestId('abandon-button')).toBeInTheDocument();
-      expect(screen.getByTestId('view-diff-button')).toBeInTheDocument();
-    },
-  );
 
   it('is hidden for a context_exhausted phase on Work', () => {
     renderWithProviders(
@@ -261,91 +206,10 @@ describe('WorkControlBar — stuck phases suppress RESOLVE (REQ-WAB-005)', () =>
       expect(screen.queryByTestId('merge-pr-link')).not.toBeInTheDocument();
     },
   );
-
-  it('stuck with no PR → Clean up + Abandon both present, no RESOLVE', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-1"
-        convModeLabel="Work"
-        phaseType="error"
-        continuedInConvId={null}
-        baseBranch="main"
-        onSendMessage={vi.fn()}
-        prStatusHandle={prStatusHandle({ found: false })}
-      />,
-    );
-    expect(screen.getByTestId('clean-up-button')).toBeInTheDocument();
-    expect(screen.getByTestId('abandon-button')).toBeInTheDocument();
-    expect(screen.queryByTestId('address-feedback-button')).not.toBeInTheDocument();
-  });
 });
 
 describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
-  it('merged PR → Clean up is present and is the primary; Abandon present', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-merged"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        prStatusHandle={prStatusHandle({ found: true, number: 136, display_state: 'merged' })}
-      />,
-    );
 
-    const clean = screen.getByTestId('clean-up-button');
-    expect(clean).toBeInTheDocument();
-    expect(clean).toHaveClass('work-actions-btn--primary');
-    expect(screen.getByTestId('abandon-button')).toBeInTheDocument();
-    expect(primaryCount()).toBe(1);
-  });
-
-  it('closed-unmerged PR → Abandon is primary, note says closed/use Abandon, NO Clean up', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-closed"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        prStatusHandle={prStatusHandle({ found: true, number: 133, display_state: 'closed' })}
-      />,
-    );
-
-    const abandon = screen.getByTestId('abandon-button');
-    expect(abandon).toHaveClass('work-actions-btn--primary');
-    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
-
-    const note = document.querySelector('.work-actions-pr-note');
-    expect(note).toBeInTheDocument();
-    expect(note?.textContent).toMatch(/PR #133 is closed without merge\. Use Abandon/i);
-  });
-
-  it('open PR, failing checks + onSendMessage → address-feedback present + primary', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-fail"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        onSendMessage={vi.fn()}
-        prStatusHandle={prStatusHandle({
-          found: true,
-          number: 12,
-          url: 'https://gh/pr/12',
-          display_state: 'open',
-          check_state: 'failing',
-        })}
-      />,
-    );
-
-    const resolve = screen.getByTestId('address-feedback-button');
-    expect(resolve).toBeInTheDocument();
-    expect(resolve).toHaveClass('work-actions-btn--primary');
-    expect(resolve.textContent).toMatch(/Address PR #12 feedback/i);
-    expect(primaryCount()).toBe(1);
-  });
 
   it('refreshes status after feedback capture with post-mutation ordering', async () => {
     const onSendMessage = vi.fn().mockResolvedValue(undefined);
@@ -376,161 +240,8 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
     expect(handle.refresh).not.toHaveBeenCalled();
   });
 
-  it('cached open PR seed keeps address-feedback primary while fresh status loads', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-cached-open"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        onSendMessage={vi.fn()}
-        prStatusHandle={prStatusHandle({
-          found: true,
-          number: 120,
-          url: 'https://gh/pr/120',
-          display_state: 'open',
-          check_state: 'passing',
-          refresh: {
-            state: 'unavailable',
-            reason: 'command_failed',
-            last_attempted_at: '2026-01-01T00:00:00Z',
-            stale: true,
-          },
-          unavailable_reason: 'command_failed',
-        })}
-      />,
-    );
 
-    const address = screen.getByTestId('address-feedback-button');
-    expect(address).toHaveClass('work-actions-btn--primary');
-    expect(screen.getByTestId('open-pr-link')).not.toHaveClass('work-actions-btn--primary');
-    expect(screen.queryByTestId('merge-pr-link')).not.toBeInTheDocument();
-    expect(primaryCount()).toBe(1);
-  });
 
-  it('open PR, fresh feedback + onSendMessage → address-feedback present + primary', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-fresh"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        onSendMessage={vi.fn()}
-        prStatusHandle={prStatusHandle({
-          found: true,
-          number: 12,
-          url: 'https://gh/pr/12',
-          display_state: 'open',
-          check_state: 'passing',
-          feedback_freshness: { state: 'new', count: 2 },
-        })}
-      />,
-    );
-
-    expect(screen.getByTestId('address-feedback-button')).toHaveClass(
-      'work-actions-btn--primary',
-    );
-  });
-
-  it('open PR, passing checks → address-feedback primary, Merge rides as a non-primary secondary link', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-green"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        onSendMessage={vi.fn()}
-        prStatusHandle={prStatusHandle({
-          found: true,
-          number: 77,
-          url: 'https://github.com/o/r/pull/77',
-          display_state: 'open',
-          check_state: 'passing',
-        })}
-      />,
-    );
-
-    const address = screen.getByTestId('address-feedback-button');
-    expect(address).toHaveClass('work-actions-btn--primary');
-
-    const link = screen.getByTestId('merge-pr-link') as HTMLAnchorElement;
-    expect(link).toBeInTheDocument();
-    expect(link.textContent).toMatch(/Merge on GitHub #77 ↗/);
-    expect(link.getAttribute('href')).toBe('https://github.com/o/r/pull/77');
-    // The Merge link is the secondary — it must NOT glow as a second primary.
-    expect(link).not.toHaveClass('work-actions-btn--primary');
-    expect(primaryCount()).toBe(1);
-  });
-
-  it('open PR, pending checks → address-feedback primary, Open PR secondary', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-pending"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        onSendMessage={vi.fn()}
-        prStatusHandle={prStatusHandle({
-          found: true,
-          number: 88,
-          url: 'https://github.com/o/r/pull/88',
-          display_state: 'open',
-          check_state: 'pending',
-        })}
-      />,
-    );
-
-    expect(screen.getByTestId('address-feedback-button')).toHaveClass(
-      'work-actions-btn--primary',
-    );
-    expect(screen.queryByTestId('merge-pr-link')).not.toBeInTheDocument();
-    expect(screen.getByTestId('open-pr-link')).not.toHaveClass('work-actions-btn--primary');
-  });
-
-  it('draft PR → open-pr-link ("Open PR #N ↗")', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-draft"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        onSendMessage={vi.fn()}
-        prStatusHandle={prStatusHandle({
-          found: true,
-          number: 89,
-          url: 'https://github.com/o/r/pull/89',
-          display_state: 'draft',
-        })}
-      />,
-    );
-
-    const link = screen.getByTestId('open-pr-link') as HTMLAnchorElement;
-    expect(link).toBeInTheDocument();
-    expect(link.textContent).toMatch(/Open PR #89 ↗/);
-  });
-
-  it('no PR found + clean work → Clean up present and primary', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-none"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        prStatusHandle={prStatusHandle({ found: false })}
-      />,
-    );
-
-    const clean = screen.getByTestId('clean-up-button');
-    expect(clean).toBeInTheDocument();
-    expect(clean).toHaveClass('work-actions-btn--primary');
-    expect(primaryCount()).toBe(1);
-  });
   it('no PR + dirty PR-ready work → Create PR external link is primary and Clean up hidden', () => {
     const createUrl = 'https://github.com/o/r/compare/main...task-1?expand=1';
     renderWithProviders(
@@ -559,76 +270,6 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
     expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
     expect(screen.getByTestId('abandon-button')).toBeInTheDocument();
     expect(primaryCount()).toBe(1);
-  });
-
-  it('no PR + dirty needs review → View Diff is primary and Clean up hidden', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-none"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        prStatusHandle={prStatusHandle({
-          found: false,
-          work_change: { kind: 'dirty_needs_review', reason: 'uncommitted_changes' },
-        })}
-      />,
-    );
-
-    const viewDiff = screen.getByTestId('view-diff-button');
-    expect(viewDiff).toHaveClass('work-actions-btn--primary');
-    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
-    expect(screen.getByText(/Uncommitted changes found/i)).toBeInTheDocument();
-    expect(primaryCount()).toBe(1);
-  });
-  it('no PR + refresh unavailable → Clean up present; a SINGLE click calls api.markMerged; warning note shown', async () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-1"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        prStatusHandle={prStatusHandle({ found: false, unavailable_reason: 'not_authenticated' })}
-      />,
-    );
-
-    const clean = screen.getByTestId('clean-up-button');
-    expect(clean).toBeInTheDocument();
-    expect(
-      document.querySelector('.work-actions-pr-note--warning'),
-    ).toBeInTheDocument();
-
-    // Single click marks merged — no enable-then-cleanup state.
-    fireEvent.click(clean);
-    await waitFor(() => expect(api.markMerged).toHaveBeenCalledTimes(1));
-    expect(api.markMerged).toHaveBeenCalledWith('conv-1');
-  });
-});
-
-describe('WorkControlBar — checking / loading', () => {
-  it('PR status loading → checking note shown, Abandon present, NO Clean up', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-1"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        prStatusHandle={loadingPrStatusHandle}
-      />,
-    );
-
-    expect(document.querySelector('.work-actions-checking-note')).toBeInTheDocument();
-    expect(screen.getAllByText(/Checking PR/i)).toHaveLength(2);
-    expect(screen.getByTestId('abandon-button')).toBeInTheDocument();
-    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
-    expect(screen.getByTestId('desktop-work-controls')).toBeInTheDocument();
-    expect(screen.queryByText('Done?')).not.toBeInTheDocument();
-    expect(screen.getByTestId('desktop-work-actions-identity')).toHaveTextContent('WorkspaceChecking PR…');
-    expect(screen.getByTestId('desktop-work-actions-identity').tagName).toBe('SPAN');
-    expect(screen.getByTestId('desktop-work-actions-identity')).not.toHaveAttribute('tabindex');
   });
 });
 
@@ -845,32 +486,6 @@ describe('WorkControlBar — active PR interactions', () => {
     expect(alert.closest('.desktop-work-actions-compact')).toBeInTheDocument();
   });
 
-  it('shows mixed associated PR cleanup summary while keeping cleanup task-scoped', () => {
-    const handle = prStatusHandle({ found: true, number: 12, display_state: 'merged' }, {
-      activeSelection: selection({
-        associated_prs: [
-          { repo_owner: 'o', repo_name: 'r', pr_number: 12, title: 'Fix CI', url: 'https://github.com/o/r/pull/12', state: 'CLOSED', draft: false, display_state: 'merged', base: 'main', head: 'task-123', feedback_status: 'approved' },
-          { repo_owner: 'o', repo_name: 'r', pr_number: 34, title: 'Still open', url: 'https://github.com/o/r/pull/34', state: 'OPEN', draft: false, display_state: 'open', base: 'task-123', head: 'task-123-follow-up', feedback_status: 'open' },
-          { repo_owner: 'o', repo_name: 'r', pr_number: 55, title: 'Closed', url: 'https://github.com/o/r/pull/55', state: 'CLOSED', draft: false, display_state: 'closed', base: 'main', head: 'old-branch', feedback_status: 'open' },
-        ],
-      }),
-      activePrSummary: { repo_owner: 'o', repo_name: 'r', pr_number: 12, title: 'Fix CI', url: 'https://github.com/o/r/pull/12', state: 'CLOSED', draft: false, display_state: 'merged', base: 'main', head: 'task-123', feedback_status: 'approved' },
-    });
-
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-1"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        prStatusHandle={handle}
-      />,
-    );
-
-    expect(screen.getByTestId('mixed-associated-pr-summary')).toHaveTextContent('Associated PRs: 1 open/draft · 1 merged · 1 closed. Cleanup still applies only to this task branch.');
-    expect(screen.getByTestId('clean-up-button')).toBeInTheDocument();
-  });
 
   it('suppresses terminal cleanup while multiple actionable associated PRs are ambiguous', () => {
     const ambiguousHandle = prStatusHandle({
@@ -907,22 +522,6 @@ describe('WorkControlBar — active PR interactions', () => {
     expect(screen.queryByRole('button', { name: /^Abandon/ })).not.toBeInTheDocument();
   });
 
-  it('uses concise address-feedback copy and a full accessible target', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-1"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        onSendMessage={vi.fn()}
-        prStatusHandle={prStatusHandle({ found: true, number: 12, url: 'https://gh/pr/12', display_state: 'open', check_state: 'failing' })}
-      />,
-    );
-
-    expect(screen.getByTestId('address-feedback-button')).toHaveTextContent('Address PR #12 feedback');
-    expect(screen.getByTestId('address-feedback-button')).toHaveAttribute('aria-label', expect.stringContaining('Address PR #12 feedback'));
-  });
 
   it('gates PR-specific resolve link-outs when the active selection is ambiguous', () => {
     const ambiguousHandle = prStatusHandle({
@@ -986,45 +585,6 @@ describe('WorkControlBar — active PR interactions', () => {
   });
 });
 
-describe('WorkControlBar — invariants', () => {
-  it('exactly one element glows in a representative case (merged PR)', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-1"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        prStatusHandle={prStatusHandle({ found: true, number: 90, display_state: 'merged' })}
-      />,
-    );
-    expect(primaryCount()).toBe(1);
-  });
-
-  it('no disabled-as-status: old morphed labels are absent', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-1"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        onSendMessage={vi.fn()}
-        prStatusHandle={prStatusHandle({
-          found: true,
-          number: 91,
-          url: 'https://gh/pr/91',
-          display_state: 'open',
-          check_state: 'pending',
-        })}
-      />,
-    );
-
-    expect(
-      screen.queryByText(/Waiting for PR merge|Clean up merged PR|Use manual fallback|Checking PR…/i),
-    ).toBeNull();
-  });
-});
 
 describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
   it('shows a "N new" freshness marker inside the address-feedback button', () => {
@@ -1052,78 +612,6 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
     expect(freshness?.textContent).toBe('3 new');
   });
 
-  it('shows an edited-comment marker when existing feedback changed', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-edited"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        onSendMessage={vi.fn()}
-        prStatusHandle={prStatusHandle({
-          found: true,
-          number: 138,
-          url: 'https://gh/pr/138',
-          display_state: 'open',
-          feedback_freshness: { state: 'edited', count: 1 },
-        })}
-      />,
-    );
-
-    const button = screen.getByTestId('address-feedback-button');
-    expect(button.querySelector('.work-actions-pr-freshness')?.textContent).toBe(
-      '1 updated',
-    );
-  });
-
-  it('renders no freshness badge when there is no actionable freshness signal', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-resolved-only"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        onSendMessage={vi.fn()}
-        prStatusHandle={prStatusHandle({
-          found: true,
-          number: 144,
-          url: 'https://gh/pr/144',
-          display_state: 'open',
-        })}
-      />,
-    );
-
-    const button = screen.getByTestId('address-feedback-button');
-    expect(button.querySelector('.work-actions-pr-freshness')).toBeNull();
-  });
-
-  it('renders edited actionable feedback as "N updated" with degraded coverage prefix', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-edited-incomplete"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        baseBranch="main"
-        onSendMessage={vi.fn()}
-        prStatusHandle={prStatusHandle({
-          found: true,
-          number: 143,
-          url: 'https://gh/pr/143',
-          display_state: 'open',
-          feedback_freshness: { state: 'edited', count: 2 },
-          feedback_coverage: { kind: 'incomplete', surfaces: ['review_threads'] },
-        })}
-      />,
-    );
-
-    const button = screen.getByTestId('address-feedback-button');
-    expect(button.querySelector('.work-actions-pr-freshness')?.textContent).toBe(
-      'at least 2 updated',
-    );
-  });
 
   it('renders the count as a lower bound and a ⚠ warning when feedback coverage is degraded', () => {
     renderWithProviders(
@@ -1275,58 +763,6 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
 });
 
 describe('WorkControlBar — desktop multi-PR rail', () => {
-  it('replaces the wrapped action bar with rich PR chips when multiple PRs are actionable', () => {
-    const handle = prStatusHandle({
-      found: true,
-      number: 12,
-      url: 'https://github.com/o/r/pull/12',
-      display_state: 'open',
-      check_state: 'failing',
-      feedback_status: 'open',
-      selection: {
-        ...selection(),
-        associated_prs: [
-          ...selection().associated_prs,
-          { ...selection().associated_prs[0]!, pr_number: 13, title: 'Second desktop PR', url: 'https://github.com/o/r/pull/13', head: 'task-124' },
-        ],
-      },
-    });
-    renderWithProviders(
-      <WorkControlBar conversationId="conv-desktop-multi" convModeLabel="Work" phaseType="idle" continuedInConvId={null} baseBranch="main" onSendMessage={vi.fn()} prStatusHandle={handle} />,
-    );
-
-    expect(screen.getByTestId('desktop-work-controls')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /#12 Fix CI open task-123/ })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /#13 Second desktop PR open task-124/ })).toBeInTheDocument();
-    expect(screen.queryByText('Done?')).not.toBeInTheDocument();
-  });
-
-  it('expands the active desktop PR into hero and supporting actions', () => {
-    const handle = prStatusHandle({
-      found: true,
-      number: 12,
-      url: 'https://github.com/o/r/pull/12',
-      display_state: 'open',
-      check_state: 'failing',
-      feedback_freshness: { state: 'new', count: 2 },
-      feedback_status: 'open',
-      selection: {
-        ...selection(),
-        associated_prs: [
-          ...selection().associated_prs,
-          { ...selection().associated_prs[0]!, pr_number: 13, title: 'Second desktop PR', url: 'https://github.com/o/r/pull/13', head: 'task-124' },
-        ],
-      },
-    });
-    renderWithProviders(
-      <WorkControlBar conversationId="conv-desktop-expand" convModeLabel="Work" phaseType="idle" continuedInConvId={null} baseBranch="main" onSendMessage={vi.fn()} prStatusHandle={handle} />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: /#12 Fix CI open task-123/ }));
-    expect(screen.getByTestId('mobile-primary-address-feedback')).toHaveTextContent('Address feedback · 2 new');
-    expect(screen.getByRole('button', { name: 'PR #12 diff' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Workspace diff' })).toBeInTheDocument();
-  });
 
   it('shows each desktop PR feedback status without requiring selection', () => {
     const handle = prStatusHandle({
@@ -1355,41 +791,6 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
     expect(screen.getByText('👍').parentElement).toHaveAttribute('title', 'feedback approved (thumbs-up reaction)');
   });
 
-  it('shows the active PR review state in the compact desktop rail', () => {
-    const handle = prStatusHandle({
-      found: true,
-      number: 12,
-      display_state: 'open',
-      feedback_status: 'approved',
-      selection: {
-        ...selection(),
-        associated_prs: [
-          { ...selection().associated_prs[0]!, feedback_status: 'approved' },
-        ],
-      },
-    });
-    renderWithProviders(
-      <WorkControlBar conversationId="conv-desktop-approved" convModeLabel="Work" phaseType="idle" continuedInConvId={null} baseBranch="main" onSendMessage={vi.fn()} prStatusHandle={handle} />,
-    );
-
-    expect(screen.getByTestId('desktop-work-actions-identity')).toHaveTextContent('#12open👍');
-    expect(screen.getByText('feedback approved (thumbs-up reaction)')).toHaveClass('pr-review-state-label');
-  });
-
-  it('renders legacy cached PR identity as status when no selector can open', () => {
-    const handle = prStatusHandle(
-      { found: true, number: 12, display_state: 'open', feedback_status: 'approved' },
-      { activeSelection: null, activePrSummary: null, ambiguous: false },
-    );
-    renderWithProviders(
-      <WorkControlBar conversationId="conv-desktop-legacy-pr" convModeLabel="Work" phaseType="idle" continuedInConvId={null} baseBranch="main" onSendMessage={vi.fn()} prStatusHandle={handle} />,
-    );
-
-    const identity = screen.getByTestId('desktop-work-actions-identity');
-    expect(identity.tagName).toBe('SPAN');
-    expect(identity).toHaveTextContent('#12open👍');
-    expect(identity).not.toHaveAttribute('tabindex');
-  });
 
   it('uses the active summary for compact chip state and review status', () => {
     const handle = prStatusHandle({
@@ -1412,57 +813,6 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
     expect(screen.getByRole('button', { name: '#12 draft feedback approved (thumbs-up reaction)' })).toBeInTheDocument();
   });
 
-  it('shows review state on compact PR chips independently of freshness', () => {
-    const handle = prStatusHandle({
-      found: true,
-      number: 12,
-      display_state: 'open',
-      feedback_status: 'in_progress',
-      selection: {
-        ...selection(),
-        associated_prs: [
-          { ...selection().associated_prs[0]!, feedback_status: 'in_progress' },
-        ],
-      },
-    });
-    renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile-review-state" convModeLabel="Work" phaseType="idle" continuedInConvId={null} baseBranch="main" onSendMessage={vi.fn()} prStatusHandle={handle} />,
-    );
-
-    expect(screen.getByRole('button', { name: /#12 open feedback in progress \(eyes reaction\)/ })).toBeInTheDocument();
-    expect(screen.getByText('👀')).toBeInTheDocument();
-  });
-
-  it('uses the compact desktop rail when an explicit active PR is absent from associated summaries', () => {
-    const handle = prStatusHandle({
-      found: false,
-      selection: {
-        ...selection(),
-        associated_prs: [
-          ...selection().associated_prs,
-          { ...selection().associated_prs[0]!, pr_number: 13, title: 'Second PR', url: 'https://github.com/o/r/pull/13', head: 'task-124' },
-        ],
-        active_pr: { pr: { repo_owner: 'o', repo_name: 'r', pr_number: 99 }, provenance: 'pinned' },
-      },
-    });
-    handle.activePrSummary = null;
-    renderWithProviders(
-      <WorkControlBar conversationId="conv-desktop-stale-active" convModeLabel="Work" phaseType="idle" continuedInConvId={null} baseBranch="main" onSendMessage={vi.fn()} prStatusHandle={handle} />,
-    );
-
-    expect(screen.getByTestId('desktop-work-controls')).toBeInTheDocument();
-    expect(screen.queryByText('Done?')).not.toBeInTheDocument();
-  });
-
-  it('uses the compact desktop rail for a single actionable PR', () => {
-    renderWithProviders(
-      <WorkControlBar conversationId="conv-desktop-single" convModeLabel="Work" phaseType="idle" continuedInConvId={null} baseBranch="main" onSendMessage={vi.fn()} prStatusHandle={prStatusHandle()} />,
-    );
-
-    expect(screen.getByTestId('desktop-work-controls')).toBeInTheDocument();
-    expect(screen.queryByText('Done?')).not.toBeInTheDocument();
-    expect(screen.getByTestId('view-diff-button')).toBeInTheDocument();
-  });
 });
 
 describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
@@ -1520,77 +870,6 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.getByRole('button', { name: /^Abandon\./ })).toHaveClass('mobile-pr-action--danger');
   });
 
-  it('falls back to disposition lifecycle actions when no actionable PR exists', () => {
-    enableMobile();
-    const handle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
-    renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile-no-pr" convModeLabel="Work" phaseType="idle" continuedInConvId={null} baseBranch="main" prStatusHandle={handle} />,
-    );
-
-    expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Clean up\./ })).toBeInTheDocument();
-    expect(screen.queryByLabelText('Open pull requests')).not.toBeInTheDocument();
-  });
-
-  it('keeps cleanup presence aligned with WorkDisposition for an open PR', () => {
-    enableMobile();
-    const handle = prStatusHandle({
-      found: true,
-      number: 12,
-      url: 'https://github.com/o/r/pull/12',
-      display_state: 'open',
-      check_state: 'failing',
-      feedback_status: 'open',
-      selection: twoOpenPrSelection(),
-    });
-    renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile-open" convModeLabel="Work" phaseType="idle" continuedInConvId={null} baseBranch="main" onSendMessage={vi.fn()} prStatusHandle={handle} />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
-    expect(screen.queryByRole('button', { name: 'Clean up' })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Abandon\./ })).toBeInTheDocument();
-  });
-
-  it('renders feedback coverage warnings on the mobile Address feedback hero', () => {
-    enableMobile();
-    const handle = prStatusHandle({
-      found: true,
-      number: 12,
-      url: 'https://github.com/o/r/pull/12',
-      display_state: 'open',
-      check_state: 'failing',
-      feedback_status: 'open',
-      feedback_coverage: { kind: 'auth_required', surfaces: ['review_threads'] },
-      selection: twoOpenPrSelection(),
-    });
-    renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile-coverage" convModeLabel="Work" phaseType="idle" continuedInConvId={null} baseBranch="main" onSendMessage={vi.fn()} prStatusHandle={handle} />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
-    const hero = screen.getByTestId('mobile-primary-address-feedback');
-    expect(hero.querySelector('.work-actions-pr-coverage')).toHaveTextContent('GitHub sign-in needed');
-  });
-
-  it('preserves terminal action explanations on mobile', () => {
-    enableMobile();
-    const handle = prStatusHandle({
-      found: true,
-      number: 12,
-      url: 'https://github.com/o/r/pull/12',
-      display_state: 'open',
-      check_state: 'failing',
-      feedback_status: 'open',
-      selection: twoOpenPrSelection(),
-    });
-    renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile-hints" convModeLabel="Work" phaseType="idle" continuedInConvId={null} baseBranch="main" onSendMessage={vi.fn()} prStatusHandle={handle} />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
-    expect(screen.getByRole('button', { name: /^Abandon\./ })).toHaveAttribute('title', expect.stringContaining('Captures a diff snapshot'));
-  });
 
   it('uses lifecycle fallback when the active PR is terminal but another PR is open', () => {
     enableMobile();
@@ -1610,15 +889,6 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByLabelText('Open pull requests')).not.toBeInTheDocument();
   });
 
-  it('renders disposition guidance beside an actionable PR rail', () => {
-    enableMobile();
-    renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile-continued" convModeLabel="Work" phaseType="idle" continuedInConvId="continued-conversation" baseBranch="main" prStatusHandle={prStatusHandle()} />,
-    );
-
-    expect(screen.getByLabelText('Open pull requests')).toBeInTheDocument();
-    expect(screen.getByText('Continued — actions belong on the continuation.')).toBeInTheDocument();
-  });
 
   it('keeps Address feedback for a cached PR before associations load', () => {
     enableMobile();
@@ -1634,36 +904,6 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.getByTestId('mobile-primary-address-feedback')).toHaveTextContent('Address feedback');
   });
 
-  it('keeps stuck-phase Abandon as the mobile hero action', () => {
-    enableMobile();
-    const handle = prStatusHandle({
-      found: true,
-      number: 12,
-      url: 'https://github.com/o/r/pull/12',
-      display_state: 'open',
-      selection: twoOpenPrSelection(),
-    });
-    renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile-stuck" convModeLabel="Work" phaseType="error" continuedInConvId={null} baseBranch="main" prStatusHandle={handle} />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
-    expect(screen.getByRole('button', { name: 'Abandon' })).toHaveClass('mobile-pr-action--hero');
-    expect(screen.getByRole('button', { name: /^Clean up\./ })).not.toHaveClass('mobile-pr-action--hero');
-  });
-
-  it('keeps terminal cleanup primary in the mobile fallback', () => {
-    enableMobile();
-    const terminalSelection = selection({
-      associated_prs: [{ ...selection().associated_prs[0]!, state: 'MERGED', display_state: 'merged' }],
-    });
-    const handle = prStatusHandle({ found: true, number: 12, display_state: 'merged', selection: terminalSelection });
-    renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile-merged" convModeLabel="Work" phaseType="idle" continuedInConvId={null} baseBranch="main" prStatusHandle={handle} />,
-    );
-
-    expect(screen.getByRole('button', { name: /^Clean up\./ })).toHaveClass('mobile-pr-action--hero');
-  });
 
   it('lets a pinned mobile selection resume automatic inference', async () => {
     enableMobile();

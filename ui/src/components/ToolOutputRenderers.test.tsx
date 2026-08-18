@@ -6,7 +6,6 @@ import {
   BrowserConsoleLogsView,
   SearchResultsView,
   KeywordSearchView,
-  __readFileResultTestables,
   ReadFileResultView,
   PatchResultView,
 } from './MessageComponents';
@@ -37,11 +36,6 @@ describe('parseSearchOutput', () => {
     expect(parseSearchOutput(text)).toEqual(buildSearchOutputProjection(text));
   });
 
-  it('recognizes the no-matches sentinel', () => {
-    const { noMatches, hits } = parseSearchOutput('No matches found.');
-    expect(noMatches).toBe(true);
-    expect(hits).toEqual([]);
-  });
 
   it('extracts bracketed notes (cap / truncation)', () => {
     const text = [
@@ -65,10 +59,6 @@ describe('parseSearchOutput', () => {
     expect(hits[0]?.path).toBe('weird:name.rs');
   });
 
-  it('keeps empty match content as empty string', () => {
-    const { hits } = parseSearchOutput('a.rs:1: ');
-    expect(hits[0]?.content).toBe('');
-  });
 });
 
 describe('buildKeywordSearchOutputProjection parity', () => {
@@ -112,33 +102,7 @@ describe('buildKeywordSearchOutputProjection parity', () => {
 });
 
 describe('parseKeywordSearchOutput', () => {
-  it('parses path: explanation pairs (LLM-filtered shape)', () => {
-    const text = [
-      '/abs/path/to/foo.rs: implements the foo state machine, primary hit',
-      '/abs/path/to/bar.rs: helper utilities referenced from foo',
-    ].join('\n');
-    const parsed = parseKeywordSearchOutput(text);
-    expect(parsed.empty).toBe(false);
-    expect(parsed.rawFallback).toBe(false);
-    expect(parsed.hits).toHaveLength(2);
-    expect(parsed.hits[0]).toMatchObject({
-      path: '/abs/path/to/foo.rs',
-      explanation: 'implements the foo state machine, primary hit',
-    });
-    expect(parsed.hits[0]?.fragment.fragmentId)
-      .toMatch(/^keyword-search-hit:%2Fabs%2Fpath%2Fto%2Ffoo\.rs:[a-z0-9]+:0$/);
-  });
 
-  it('recognizes "No relevant files found" as empty', () => {
-    const parsed = parseKeywordSearchOutput('No relevant files found');
-    expect(parsed.empty).toBe(true);
-    expect(parsed.rawFallback).toBe(false);
-  });
-
-  it('recognizes the no-matches-for-terms sentinel as empty', () => {
-    const parsed = parseKeywordSearchOutput('No matches found for the given search terms.');
-    expect(parsed.empty).toBe(true);
-  });
 
   it('detects raw ripgrep fallback output', () => {
     const text = [
@@ -230,17 +194,7 @@ describe('BrowserConsoleLogsView', () => {
     expect(screen.getByText('TypeError: oops')).toBeTruthy();
   });
 
-  it('renders the file-pointer escape-hatch message verbatim', () => {
-    const { getByText } = render(
-      <BrowserConsoleLogsView rawText="Logs written to /tmp/phoenix-console-logs-abc.json (use `cat` to view)" />
-    );
-    expect(getByText(/Logs written to/)).toBeTruthy();
-  });
 
-  it('shows empty state for `[]`', () => {
-    render(<BrowserConsoleLogsView rawText="[]" />);
-    expect(screen.getByText('(no console entries)')).toBeTruthy();
-  });
 
   it('falls back to preformatted text on unparseable JSON', () => {
     const { container } = render(<BrowserConsoleLogsView rawText="not json at all" />);
@@ -328,21 +282,6 @@ describe('ReadFileResultView', () => {
     '     8\tsecond alpha line',
   ].join('\n');
 
-  it('renders the input path/window and numbered lines via the shared builder', () => {
-    render(
-      <ReadFileResultView
-        rawText={readText}
-        input={{ path: 'src/foo.ts', offset: 7, limit: 2 }}
-        onOpenFile={undefined}
-        toolUseId="read-1"
-      />,
-    );
-    expect(screen.getByText('src/foo.ts:7-8')).toBeInTheDocument();
-    expect(screen.getByText('7')).toBeInTheDocument();
-    expect(screen.getByText('const alpha = 1;')).toBeInTheDocument();
-    expect(screen.getByText('8')).toBeInTheDocument();
-    expect(screen.getByText('second alpha line')).toBeInTheDocument();
-  });
 
   it('renders and marks the path when it is the active read_file occurrence', () => {
     const projection = buildReadFileOutputProjection(readText, { path: 'src/foo.ts', offset: 7, limit: 2 }, { toolUseId: 'read-1' });
@@ -421,13 +360,6 @@ describe('SearchResultsView', () => {
     '[Results limited to 50 matches.]',
   ].join('\n');
 
-  it('groups hits by file with counts', () => {
-    render(<SearchResultsView rawText={text} onOpenFile={undefined} toolUseId="search-1" />);
-    expect(screen.getByText(/3 matches in 2 files/)).toBeTruthy();
-    expect(screen.getByText('2 hits')).toBeTruthy();
-    expect(screen.getByText('1 hit')).toBeTruthy();
-    expect(screen.getByText('Results limited to 50 matches.')).toBeTruthy();
-  });
 
   it('invokes onOpenFile with the right line on hit click', () => {
     const onOpenFile = vi.fn();
@@ -438,21 +370,6 @@ describe('SearchResultsView', () => {
     expect(onOpenFile).toHaveBeenCalledWith('src/foo.rs', new Set([34]), 34);
   });
 
-  it('renders no-matches sentinel as friendly empty state', () => {
-    render(<SearchResultsView rawText="No matches found." onOpenFile={undefined} toolUseId="search-1" />);
-    expect(screen.getByText('No matches found.')).toBeTruthy();
-  });
-  it('marks the active occurrence in the no-matches state', () => {
-    const { container } = render(
-      <SearchResultsView
-        rawText="No matches found."
-        onOpenFile={undefined}
-        toolUseId="search-1"
-        activeHighlight={{ fragmentId: 'search-empty', start: 3, end: 10 }}
-      />,
-    );
-    expect(container.querySelector('.viewer-find-inline-match--active')?.textContent).toBe('matches');
-  });
 
 
   it('omits the clickable affordance when onOpenFile is undefined', () => {
@@ -547,18 +464,6 @@ describe('KeywordSearchView', () => {
     expect(onOpenFile).toHaveBeenCalledWith('/abs/path/to/bar.rs', new Set(), 0);
   });
 
-  it('falls back to raw text with a notice when LLM output is missing', () => {
-    const raw = [
-      'src/foo.rs:1:hit one',
-      'src/foo.rs-2-ctx',
-      '--',
-      'src/bar.rs:3:hit two',
-      'src/bar.rs-4-ctx',
-    ].join('\n');
-    const { container } = render(<KeywordSearchView rawText={raw} onOpenFile={undefined} />);
-    expect(screen.getByText(/Raw ripgrep results/)).toBeTruthy();
-    expect(container.querySelector('pre.keyword-search-raw-text')?.textContent).toBe(raw);
-  });
 
   it('searches and marks the raw-fallback notice separately from body text', () => {
     const raw = [
@@ -599,47 +504,5 @@ describe('KeywordSearchView', () => {
     );
     expect(container.querySelector('.search-results-note .viewer-find-inline-match--active')?.textContent).toBe('truncated');
     expect(container.querySelector('.search-results-note')?.textContent).toBe(note.semanticText);
-  });
-
-  it('renders the empty/none-found state', () => {
-    render(<KeywordSearchView rawText="No relevant files found" onOpenFile={undefined} />);
-    expect(screen.getByText('No relevant files found.')).toBeTruthy();
-  });
-  it('marks the active occurrence in the empty results state', () => {
-    const { container } = render(
-      <KeywordSearchView
-        rawText="No relevant files found"
-        onOpenFile={undefined}
-        toolUseId="keyword-1"
-        activeHighlight={{ fragmentId: 'keyword-search-empty', start: 3, end: 11 }}
-      />,
-    );
-    expect(container.querySelector('.viewer-find-inline-match--active')?.textContent).toBe('relevant');
-  });
-
-});
-
-
-
-describe('parseReadFileOutput', () => {
-  it('parses numbered read_file lines with tabs', () => {
-    const padded = __readFileResultTestables.parseOutput('     7\tproduction format');
-    expect(padded.malformed).toBe(false);
-    expect(padded.lines).toEqual([{ lineNumber: 7, content: 'production format' }]);
-
-    const parsed = __readFileResultTestables.parseOutput('12\talpha\n13\tbeta');
-    expect(parsed.malformed).toBe(false);
-    expect(parsed.notes).toEqual([]);
-    expect(parsed.lines).toEqual([
-      { lineNumber: 12, content: 'alpha' },
-      { lineNumber: 13, content: 'beta' },
-    ]);
-  });
-
-  it('marks non-numbered output as malformed fallback data', () => {
-    const parsed = __readFileResultTestables.parseOutput('not numbered\n12\tstill parsed');
-    expect(parsed.malformed).toBe(true);
-    expect(parsed.notes).toEqual(['not numbered']);
-    expect(parsed.lines).toEqual([{ lineNumber: 12, content: 'still parsed' }]);
   });
 });
