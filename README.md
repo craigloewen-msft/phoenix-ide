@@ -191,12 +191,8 @@ you (prod reads `.phoenix-ide.env` from the repo root of the checkout you deploy
 | `LLM_AUTH_HEADER` | `bearer` → send the key as `Authorization: Bearer …`; anything else → provider's native API-key header | api-key style |
 | `PHOENIX_ENABLE_MOCK_MODEL` | `1` → register the deterministic mock provider (testing only) | off |
 
-Phoenix also probes the configured Ollama endpoint at startup without sending an
-authentication header. If `/v1/models` reports `OLLAMA_MODEL`, Phoenix registers
-it as `ollama/gpt-oss:120b`; otherwise startup continues without the local model.
-Cloud providers still require their normal credentials. When neither cloud
-credentials nor a discovered Ollama model is available, the server starts with
-no models and logs a warning.
+To enable local GPT-OSS delegation: run `ollama pull gpt-oss:120b`, start Ollama,
+and restart Phoenix.
 
 `PHOENIX_LLM_MODELS` is additive. It does not override built-in model IDs; a
 configured duplicate ID is ignored and Phoenix logs a warning while keeping the
@@ -227,30 +223,6 @@ values are `anthropic` (Anthropic Messages-compatible), `openai_responses`
 Completions-compatible). `family` controls the user-facing provider label and
 defaults from `backend`; set it when model ownership differs from wire format.
 `max_output_tokens` is optional and defaults to a context-safe cap.
-
-### Local GPT-OSS delegation with Ollama
-
-Install the model before starting Phoenix:
-
-```bash
-ollama pull gpt-oss:120b
-ollama serve
-```
-
-Restart Phoenix, then open a fresh parent conversation. Its `spawn_agents` tool
-will list `ollama/gpt-oss:120b` and describe it as a local worker that does not
-consume remote provider rate limits. The parent model decides when a bounded task
-is suitable and selects that model explicitly; Phoenix does not silently reroute
-work. A custom Ollama bind or model alias can be configured in `.phoenix-ide.env`:
-
-```env
-OLLAMA_CHAT_COMPLETIONS_BASE_URL=http://127.0.0.1:11434/v1/chat/completions
-OLLAMA_MODEL=my-gpt-oss-alias
-```
-
-Ollama must be reachable when Phoenix starts. Model availability is frozen into
-each parent conversation's tool schema, so restart Phoenix and begin a fresh
-conversation after installing, removing, or renaming the local model.
 
 Example Anthropic-compatible provider POC:
 
