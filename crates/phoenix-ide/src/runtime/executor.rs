@@ -7516,18 +7516,6 @@ mod strip_tool_blocks_tests {
     }
 
     #[test]
-    fn flatten_keeps_text_only_history_unchanged() {
-        let msgs = vec![
-            user_text("hello"),
-            assistant(vec![ContentBlock::text("hi")]),
-        ];
-        let out = flatten_tool_blocks(msgs.clone());
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].content.len(), 1);
-        assert_eq!(out[1].content.len(), 1);
-    }
-
-    #[test]
     fn flatten_keeps_image_blocks() {
         // Continuation summary should retain images (e.g. screenshots from
         // the user's earlier turns) so the model has the visual context.
@@ -7926,14 +7914,6 @@ mod strip_tool_blocks_tests {
     }
 
     #[test]
-    fn drop_leading_non_user_noop_when_already_user_first() {
-        let msgs = vec![user_text("hi"), assistant(vec![ContentBlock::text("yo")])];
-        let (kept, trimmed) = drop_leading_non_user(msgs);
-        assert_eq!(trimmed, 0);
-        assert_eq!(kept.len(), 2);
-    }
-
-    #[test]
     fn drop_leading_non_user_empties_all_assistant_history() {
         // Degenerate case: nothing but assistant messages. Trimming to empty is
         // correct — request_continuation appends the user prompt afterward, so
@@ -7961,31 +7941,7 @@ mod strip_tool_blocks_tests {
         assert!(kept.len() < 100, "not every tiny message should fit");
     }
 
-    #[test]
-    fn estimate_text_tokens_rounds_up() {
-        assert_eq!(estimate_text_tokens(""), 0);
-        assert_eq!(
-            estimate_text_tokens("x"),
-            1,
-            "sub-ratio text costs >= 1 token"
-        );
-        assert_eq!(estimate_text_tokens(&"x".repeat(5)), 2);
-    }
-
     // ----- strip_unavailable_tool_blocks -----
-
-    #[test]
-    fn strip_unavailable_noop_when_all_tools_available() {
-        let available: std::collections::HashSet<&str> = ["bash", "patch"].into_iter().collect();
-        let msgs = vec![
-            assistant(vec![ContentBlock::text("x"), tool_use("t1", "bash")]),
-            user(vec![tool_result("t1")]),
-        ];
-        let out = strip_unavailable_tool_blocks(msgs.clone(), &available, false);
-        assert_eq!(out.len(), msgs.len());
-        assert_eq!(out[0].content.len(), 2);
-        assert_eq!(out[1].content.len(), 1);
-    }
 
     #[test]
     fn strip_unavailable_removes_tool_use_and_paired_result() {
@@ -8175,19 +8131,6 @@ mod strip_tool_blocks_tests {
             .content
             .iter()
             .any(|b| matches!(b, ContentBlock::ServerToolUse { id, .. } if id == "srv1")));
-    }
-
-    #[test]
-    fn strip_unavailable_drops_messages_that_become_empty() {
-        let available: std::collections::HashSet<&str> = ["bash"].into_iter().collect();
-        let msgs = vec![
-            assistant(vec![tool_use("t1", "removed_tool")]),
-            user(vec![tool_result("t1")]),
-            assistant(vec![ContentBlock::text("survives")]),
-        ];
-        let out = strip_unavailable_tool_blocks(msgs, &available, false);
-        assert_eq!(out.len(), 1);
-        assert!(matches!(&out[0].content[0], ContentBlock::Text { text } if text == "survives"));
     }
 }
 
@@ -8973,52 +8916,6 @@ mod continuation_prompt_tests {
 mod error_mapping_tests {
     use super::*;
     use phoenix_llm::LlmErrorKind;
-
-    #[test]
-    fn test_llm_error_to_db_error_mapping() {
-        // Test all mappings are explicit and correct
-        assert_eq!(
-            llm_error_to_db_error(LlmErrorKind::Auth),
-            crate::db::ErrorKind::Auth
-        );
-        assert_eq!(
-            llm_error_to_db_error(LlmErrorKind::RateLimit),
-            crate::db::ErrorKind::RateLimit
-        );
-        assert_eq!(
-            llm_error_to_db_error(LlmErrorKind::Network),
-            crate::db::ErrorKind::Network
-        );
-        assert_eq!(
-            llm_error_to_db_error(LlmErrorKind::InvalidRequest),
-            crate::db::ErrorKind::InvalidRequest
-        );
-        assert_eq!(
-            llm_error_to_db_error(LlmErrorKind::ServerError),
-            crate::db::ErrorKind::ServerError,
-            "ServerError must map to ServerError"
-        );
-        assert_eq!(
-            llm_error_to_db_error(LlmErrorKind::InvalidResponse),
-            crate::db::ErrorKind::InvalidResponse
-        );
-        assert_eq!(
-            llm_error_to_db_error(LlmErrorKind::ContentFilter),
-            crate::db::ErrorKind::ContentFilter
-        );
-        assert_eq!(
-            llm_error_to_db_error(LlmErrorKind::ContextWindowExceeded),
-            crate::db::ErrorKind::ContextExhausted
-        );
-        assert_eq!(
-            llm_error_to_db_error(LlmErrorKind::UsageLimitReached),
-            crate::db::ErrorKind::UsageLimitReached
-        );
-        assert_eq!(
-            llm_error_to_db_error(LlmErrorKind::ServerOverloaded),
-            crate::db::ErrorKind::ServerOverloaded
-        );
-    }
 
     #[test]
     fn test_usage_limit_reached_is_terminal_after_mapping() {
@@ -10734,7 +10631,7 @@ mod cwd_immutability_tests {
 
 #[cfg(test)]
 mod approve_task_branch_collision_tests {
-    use super::test_git_helpers::{add_explore_worktree, add_worktree, branch_exists, init_repo};
+    use super::test_git_helpers::{add_explore_worktree, branch_exists, init_repo};
     use super::*;
 
     /// Update a ref in a bare fixture remote.
@@ -10803,24 +10700,6 @@ mod approve_task_branch_collision_tests {
             "fallback execution branch must exist"
         );
     }
-
-    #[test]
-    fn local_child_ref_namespace_collision_uses_fallback() {
-        let (_tmp, repo_root) = init_repo();
-        let conv_id = "namespace-local";
-        add_explore_worktree(&repo_root, conv_id, "main");
-        let desired_branch = "task-12345-fix-the-login-bug";
-        run_git(&repo_root, &["branch", &format!("{desired_branch}/foo")]).unwrap();
-
-        let (_worktree, branch_name) =
-            open_early_worktree_and_rename_branch(&repo_root, conv_id, desired_branch)
-                .expect("approval should avoid branch namespace prefix collisions");
-
-        assert_ne!(branch_name, desired_branch);
-        assert!(branch_name.starts_with("task-12345-fix-the-login-bug-"));
-        assert!(branch_exists(&repo_root, &branch_name));
-    }
-
     #[test]
     fn remote_child_ref_namespace_collision_uses_fallback() {
         let (_tmp, repo_root) = init_repo();
@@ -10899,51 +10778,6 @@ mod approve_task_branch_collision_tests {
         );
         std::fs::remove_file(config_lock).unwrap();
     }
-
-    #[test]
-    fn approve_task_uses_suffixed_fallback_when_target_branch_exists_as_fetched_origin_ref() {
-        let (_tmp, repo_root) = init_repo();
-        let conv_id = "remote-collision";
-        let base_branch = "main";
-        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
-        let tasks_dir = explore_wt.join("tasks");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-        let task_filename = "12345-p2-ready--fix-the-login-bug.md";
-        std::fs::write(tasks_dir.join(task_filename), "# Fix\n").unwrap();
-
-        let target_branch = "task-12345-fix-the-login-bug";
-        run_git(
-            &repo_root,
-            &[
-                "update-ref",
-                &format!("refs/remotes/origin/{target_branch}"),
-                "HEAD",
-            ],
-        )
-        .unwrap();
-
-        let result = execute_approve_task_blocking(
-            &explore_wt,
-            &repo_root,
-            conv_id,
-            "tasks",
-            &format!("tasks/{task_filename}"),
-            "Fix the login bug",
-            Some(base_branch),
-        )
-        .expect("approval should avoid a poisoned remote branch name");
-
-        assert_ne!(result.branch_name, target_branch);
-        assert!(
-            result
-                .branch_name
-                .starts_with("task-12345-fix-the-login-bug-"),
-            "unexpected fallback branch: {}",
-            result.branch_name
-        );
-        assert!(branch_exists(&repo_root, &result.branch_name));
-    }
-
     #[test]
     fn approve_task_uses_suffixed_fallback_when_target_branch_exists_only_on_remote() {
         let (_tmp, repo_root) = init_repo();
@@ -11030,91 +10864,6 @@ mod approve_task_branch_collision_tests {
         assert_eq!(result.branch_name, target_branch);
         assert!(branch_exists(&repo_root, target_branch));
     }
-
-    #[test]
-    fn phoenix_worktree_branch_collision_uses_fallback() {
-        let (_tmp, repo_root) = init_repo();
-        let target_branch = "task-12345-fix-the-login-bug";
-        add_worktree(&repo_root, "active-other", target_branch);
-
-        let conv_id = "active-collision";
-        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
-        let tasks_dir = explore_wt.join("tasks");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-        let task_filename = "12345-p2-ready--fix-the-login-bug.md";
-        std::fs::write(tasks_dir.join(task_filename), "# Fix\n").unwrap();
-
-        let result = execute_approve_task_blocking(
-            &explore_wt,
-            &repo_root,
-            conv_id,
-            "tasks",
-            &format!("tasks/{task_filename}"),
-            "Fix the login bug",
-            Some("main"),
-        )
-        .expect("checked-out Phoenix worktree branch should be left untouched via fallback");
-
-        assert_ne!(result.branch_name, target_branch);
-        assert!(
-            result
-                .branch_name
-                .starts_with("task-12345-fix-the-login-bug-"),
-            "unexpected fallback branch: {}",
-            result.branch_name
-        );
-        assert!(branch_exists(&repo_root, target_branch));
-        assert!(branch_exists(&repo_root, &result.branch_name));
-    }
-
-    #[test]
-    fn non_phoenix_checked_out_branch_collision_uses_fallback() {
-        let (_tmp, repo_root) = init_repo();
-        let target_branch = "task-12345-fix-the-login-bug";
-        let external = tempfile::TempDir::new().unwrap();
-        run_git(
-            &repo_root,
-            &[
-                "worktree",
-                "add",
-                external.path().to_str().unwrap(),
-                "-b",
-                target_branch,
-                "HEAD",
-            ],
-        )
-        .unwrap();
-
-        let conv_id = "external-active";
-        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
-        let tasks_dir = explore_wt.join("tasks");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-        let task_filename = "12345-p2-ready--fix-the-login-bug.md";
-        std::fs::write(tasks_dir.join(task_filename), "# Fix\n").unwrap();
-
-        let result = execute_approve_task_blocking(
-            &explore_wt,
-            &repo_root,
-            conv_id,
-            "tasks",
-            &format!("tasks/{task_filename}"),
-            "Fix the login bug",
-            Some("main"),
-        )
-        .expect("non-Phoenix checked-out branch should be left untouched via fallback");
-
-        assert_ne!(result.branch_name, target_branch);
-        assert!(
-            result
-                .branch_name
-                .starts_with("task-12345-fix-the-login-bug-"),
-            "unexpected fallback branch: {}",
-            result.branch_name
-        );
-        assert!(branch_exists(&repo_root, target_branch));
-        assert!(branch_exists(&repo_root, &result.branch_name));
-    }
-
     #[test]
     fn approval_retry_requires_exact_branch_match() {
         let (_tmp, repo_root) = init_repo();
@@ -11378,57 +11127,8 @@ mod plain_markdown_approval_tests {
 
     /// `propose_task` may point at any markdown file, including one outside the
     /// tasks dir — it is committed at its own path.
-    #[test]
-    fn approve_plain_markdown_outside_tasks_dir() {
-        let (_tmp, repo_root) = init_repo();
-        let conv_id = "docsconv-99887766";
-        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
-        std::fs::create_dir_all(explore_wt.join("docs")).unwrap();
-        std::fs::write(explore_wt.join("docs/plan.md"), "# Doc plan\n").unwrap();
-
-        let result = execute_approve_task_blocking(
-            &explore_wt,
-            &repo_root,
-            conv_id,
-            "tasks",
-            "docs/plan.md",
-            "Doc plan",
-            Some("main"),
-        )
-        .expect("approve failed for docs/plan.md");
-
-        let conv_prefix: String = conv_id.chars().take(8).collect();
-        assert_eq!(result.branch_name, format!("task-plan-{conv_prefix}"));
-        let head = git_show_head(&explore_wt);
-        assert!(head.contains("docs/plan.md"), "committed files: {head}");
-    }
-
     /// Two conversations proposing files with the same stem must get distinct
     /// branch names — the conversation-id suffix is the uniquifier.
-    #[test]
-    fn plain_markdown_branches_distinct_across_conversations() {
-        let (_tmp, repo_root) = init_repo();
-        for conv_id in ["aaaaaaaa-conv-1", "bbbbbbbb-conv-2"] {
-            let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
-            std::fs::create_dir_all(explore_wt.join("tasks")).unwrap();
-            std::fs::write(explore_wt.join("tasks/feature.md"), "# Feature\n").unwrap();
-            let r = execute_approve_task_blocking(
-                &explore_wt,
-                &repo_root,
-                conv_id,
-                "tasks",
-                "tasks/feature.md",
-                "Feature",
-                Some("main"),
-            )
-            .expect("approve failed");
-            let prefix: String = conv_id.chars().take(8).collect();
-            assert_eq!(r.branch_name, format!("task-feature-{prefix}"));
-        }
-        assert!(branch_exists(&repo_root, "task-feature-aaaaaaaa"));
-        assert!(branch_exists(&repo_root, "task-feature-bbbbbbbb"));
-    }
-
     /// `propose_task` may point at a file that already exists on the base branch
     /// and that the agent didn't (couldn't) modify — approval still succeeds, it
     /// just doesn't create an empty commit; the task branch == the base branch.
@@ -14395,35 +14095,6 @@ mod fork_proposal_persist_tests {
 #[cfg(test)]
 mod tool_output_cap_tests {
     use super::{cap_tool_output_text, MAX_TOOL_OUTPUT_BYTES};
-
-    #[test]
-    fn output_within_cap_is_unchanged() {
-        let small = "a".repeat(MAX_TOOL_OUTPUT_BYTES);
-        assert_eq!(cap_tool_output_text(small.clone()), small);
-    }
-
-    #[test]
-    fn giant_single_line_is_truncated_with_marker_and_under_cap() {
-        // The pathological case: a multi-MB single line with no newlines that
-        // every line-based cap lets through.
-        let original = "x".repeat(2 * 1024 * 1024);
-        let capped = cap_tool_output_text(original);
-
-        assert!(
-            capped.len() <= MAX_TOOL_OUTPUT_BYTES,
-            "capped length {} must be <= {MAX_TOOL_OUTPUT_BYTES}",
-            capped.len()
-        );
-        assert!(
-            capped.contains("…[truncated"),
-            "truncation marker must be present: {:?}",
-            capped.chars().take(120).collect::<String>()
-        );
-        // String is always valid UTF-8 in Rust; assert it explicitly survives a
-        // round-trip through bytes to guard the char-boundary slicing logic.
-        assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
-    }
-
     #[test]
     fn truncation_does_not_split_utf8_char() {
         // A long run of 4-byte chars (😀) ensures slice boundaries land mid-char

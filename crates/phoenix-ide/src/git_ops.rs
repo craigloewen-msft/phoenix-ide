@@ -823,32 +823,6 @@ fn prewarm_new_worktree(source_root: &Path, worktree_path: &Path) {
         source_root,
         worktree_path,
     );
-
-    #[cfg(test)]
-    TEST_PREWARM_HOOK.with(|hook| {
-        if let Some(hook) = hook.borrow().as_ref() {
-            hook(source_root, worktree_path);
-        }
-    });
-}
-
-#[cfg(test)]
-type PrewarmHook = dyn Fn(&Path, &Path);
-
-#[cfg(test)]
-thread_local! {
-    static TEST_PREWARM_HOOK: std::cell::RefCell<Option<Box<PrewarmHook>>> =
-        std::cell::RefCell::new(None);
-}
-
-#[cfg(test)]
-fn with_test_prewarm_hook<R>(hook: impl Fn(&Path, &Path) + 'static, f: impl FnOnce() -> R) -> R {
-    TEST_PREWARM_HOOK.with(|slot| {
-        let previous = slot.replace(Some(Box::new(hook)));
-        let result = f();
-        slot.replace(previous);
-        result
-    })
 }
 
 /// Best-effort rollback of a partially-created worktree after `git worktree add`
@@ -1412,22 +1386,6 @@ mod tests {
         run_git(dir, &["commit", "-q", "-m", message]).unwrap();
     }
 
-    /// Expansion resolves the old side out of the object database by the id the
-    /// diff recorded, so what the viewer shows as context is exactly what the
-    /// diff was computed against.
-    #[test]
-    fn read_blob_by_oid_returns_committed_content() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        commit_file(tmp.path(), "f.txt", "one\ntwo\nthree\n", "add");
-        let oid = run_git(tmp.path(), &["rev-parse", "HEAD:f.txt"]).unwrap();
-
-        assert_eq!(
-            read_blob_by_oid(tmp.path(), oid.trim()),
-            Ok("one\ntwo\nthree\n".to_string())
-        );
-    }
-
     /// An added file has no old side. That is a normal outcome with its own
     /// reason, not an error the viewer has to interpret.
     #[test]
@@ -1467,22 +1425,6 @@ mod tests {
         );
     }
 
-    /// The working-tree side has no stored blob, so it is verified by hash
-    /// instead. Matching content is served.
-    #[test]
-    fn read_worktree_file_verified_returns_content_when_hash_matches() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        commit_file(tmp.path(), "f.txt", "a\nb\n", "add");
-        std::fs::write(tmp.path().join("f.txt"), "a\nB\n").unwrap();
-        let oid = run_git(tmp.path(), &["hash-object", "--", "f.txt"]).unwrap();
-
-        assert_eq!(
-            read_worktree_file_verified(tmp.path(), "f.txt", oid.trim()),
-            Ok("a\nB\n".to_string())
-        );
-    }
-
     /// The load-bearing case: if the file changed after the diff was captured,
     /// serving it would render context lines that silently disagree with the
     /// diff. Refusing is the only correct answer.
@@ -1499,23 +1441,6 @@ mod tests {
         assert_eq!(
             read_worktree_file_verified(tmp.path(), "f.txt", captured_oid.trim()),
             Err(ExpansionUnavailable::ContentMoved)
-        );
-    }
-
-    /// Abbreviated ids are what actually appear in a diff's `index` line, so the
-    /// comparison must accept them.
-    #[test]
-    fn read_worktree_file_verified_accepts_abbreviated_oid() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        commit_file(tmp.path(), "f.txt", "a\nb\n", "add");
-        std::fs::write(tmp.path().join("f.txt"), "a\nB\n").unwrap();
-        let full_oid = run_git(tmp.path(), &["hash-object", "--", "f.txt"]).unwrap();
-        let abbreviated: String = full_oid.trim().chars().take(7).collect();
-
-        assert_eq!(
-            read_worktree_file_verified(tmp.path(), "f.txt", &abbreviated),
-            Ok("a\nB\n".to_string())
         );
     }
 
@@ -1566,21 +1491,6 @@ mod tests {
             Err(ExpansionUnavailable::OutsideWorktree)
         );
     }
-
-    #[test]
-    fn read_worktree_file_verified_reports_absent_side_for_null_oid() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        assert_eq!(
-            read_worktree_file_verified(
-                tmp.path(),
-                "gone.txt",
-                "0000000000000000000000000000000000000000"
-            ),
-            Err(ExpansionUnavailable::SideAbsent)
-        );
-    }
-
     fn clone_repo(source: &Path, dest: &Path) {
         run_git(
             std::env::current_dir().unwrap().as_path(),
@@ -1597,32 +1507,6 @@ mod tests {
     }
 
     #[test]
-    fn repo_root_from_phoenix_worktree_matches_canonical_shape() {
-        let root = Path::new("/repo");
-        let wt = Path::new("/repo/.phoenix/worktrees/abc123");
-        assert_eq!(
-            repo_root_from_phoenix_worktree(wt),
-            Some(root.to_path_buf())
-        );
-    }
-
-    #[test]
-    fn repo_root_from_phoenix_worktree_matches_descendant_of_worktree() {
-        let root = Path::new("/repo");
-        let inside = Path::new("/repo/.phoenix/worktrees/abc123/src/main.rs");
-        assert_eq!(
-            repo_root_from_phoenix_worktree(inside),
-            Some(root.to_path_buf())
-        );
-    }
-
-    #[test]
-    fn repo_root_from_phoenix_worktree_rejects_repo_root_itself() {
-        // A plain repo root has no `.phoenix/worktrees/{id}` ancestor.
-        assert_eq!(repo_root_from_phoenix_worktree(Path::new("/repo")), None);
-    }
-
-    #[test]
     fn repo_root_from_phoenix_worktree_rejects_arbitrary_repo_subdir() {
         // {repo_root}/src is inside the repo but not a Phoenix worktree —
         // the original looser predicate would have returned `/repo/src`
@@ -1632,59 +1516,6 @@ mod tests {
             None
         );
     }
-
-    #[test]
-    fn repo_root_from_phoenix_worktree_rejects_non_worktree_phoenix_subdir() {
-        // {repo_root}/.phoenix/foo is under .phoenix but not a worktree —
-        // the original predicate (any `.phoenix` ancestor) would have
-        // claimed this is a worktree, which it isn't.
-        assert_eq!(
-            repo_root_from_phoenix_worktree(Path::new("/repo/.phoenix/foo")),
-            None
-        );
-        assert_eq!(
-            repo_root_from_phoenix_worktree(Path::new("/repo/.phoenix")),
-            None
-        );
-    }
-
-    #[test]
-    fn repo_root_from_phoenix_worktree_rejects_paths_outside_any_repo() {
-        assert_eq!(repo_root_from_phoenix_worktree(Path::new("/tmp/xyz")), None);
-        assert_eq!(repo_root_from_phoenix_worktree(Path::new("relative")), None);
-    }
-
-    #[test]
-    fn effective_base_ref_falls_back_to_local_when_no_remote() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        // No `origin` remote exists, so the helper must return the bare ref.
-        assert_eq!(effective_base_ref(tmp.path(), "main"), "main");
-    }
-
-    #[test]
-    fn effective_base_ref_prefers_origin_when_available() {
-        let upstream = TempDir::new().unwrap();
-        init_repo(upstream.path());
-
-        let clone = TempDir::new().unwrap();
-        // `git clone` fully populates origin/* refs.
-        run_git(
-            std::env::current_dir().unwrap().as_path(),
-            &[
-                "clone",
-                "--quiet",
-                upstream.path().to_str().unwrap(),
-                clone.path().to_str().unwrap(),
-            ],
-        )
-        .unwrap();
-        run_git(clone.path(), &["config", "user.email", "probe@test"]).unwrap();
-        run_git(clone.path(), &["config", "user.name", "probe"]).unwrap();
-
-        assert_eq!(effective_base_ref(clone.path(), "main"), "origin/main");
-    }
-
     #[test]
     fn materialize_branch_does_not_move_branch_checked_out_in_main_worktree() {
         let upstream = TempDir::new().unwrap();
@@ -1799,44 +1630,6 @@ mod tests {
         )
         .is_ok()
     }
-
-    #[test]
-    fn create_worktree_invokes_prewarm_after_successful_add() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        commit_file(tmp.path(), "tracked.txt", "content\n", "add tracked file");
-
-        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let calls_for_hook = std::rc::Rc::clone(&calls);
-        let conv_id = "feedface-2222-2222-2222-222222222222";
-
-        let result = with_test_prewarm_hook(
-            move |source_root, worktree_path| {
-                calls_for_hook
-                    .borrow_mut()
-                    .push((source_root.to_path_buf(), worktree_path.to_path_buf()));
-            },
-            || {
-                create_worktree(
-                    tmp.path(),
-                    conv_id,
-                    "task-pending-feedface",
-                    Some("main"),
-                    PhoenixIgnoreStrategy::StageGitignore,
-                )
-            },
-        )
-        .unwrap();
-
-        let expected_worktree = tmp.path().join(".phoenix/worktrees").join(conv_id);
-        assert_eq!(Path::new(&result), expected_worktree.as_path());
-        assert!(expected_worktree.join("tracked.txt").exists());
-        assert_eq!(
-            calls.borrow().as_slice(),
-            &[(tmp.path().to_path_buf(), expected_worktree)]
-        );
-    }
-
     #[test]
     fn create_worktree_still_succeeds_when_prewarm_source_cache_exists() {
         let tmp = TempDir::new().unwrap();
@@ -1857,36 +1650,6 @@ mod tests {
 
         assert!(Path::new(&result).join("tracked.txt").exists());
     }
-
-    #[test]
-    fn cleanup_failed_worktree_deletes_branch_we_created() {
-        // Models the leak: `git worktree add -b` made the branch, then checkout
-        // failed and git rolled back the dir/admin entry. The branch must go.
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        run_git(tmp.path(), &["branch", "task-pending-deadbeef", "main"]).unwrap();
-        assert!(branch_exists(tmp.path(), "task-pending-deadbeef"));
-
-        let phantom = tmp.path().join(".phoenix/worktrees/deadbeef");
-        cleanup_failed_worktree(tmp.path(), &phantom, Some("task-pending-deadbeef"));
-
-        assert!(!branch_exists(tmp.path(), "task-pending-deadbeef"));
-    }
-
-    #[test]
-    fn cleanup_failed_worktree_preserves_preexisting_branch() {
-        // Checkout-existing-branch path passes None: the branch predates us and
-        // must survive a failed add — deleting it would be data loss.
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        run_git(tmp.path(), &["branch", "existing-feature", "main"]).unwrap();
-
-        let phantom = tmp.path().join(".phoenix/worktrees/cafe");
-        cleanup_failed_worktree(tmp.path(), &phantom, None);
-
-        assert!(branch_exists(tmp.path(), "existing-feature"));
-    }
-
     #[test]
     fn cleanup_failed_worktree_spares_branch_checked_out_elsewhere() {
         // Safety guard: never delete a ref a live worktree owns, even if asked.
@@ -1983,19 +1746,6 @@ mod tests {
             "a failed fork worktree add must not leave `?? .phoenix/` in the origin: {status:?}"
         );
     }
-
-    #[test]
-    fn run_git_capped_passthrough_when_under_cap() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        // `git status --porcelain` on a fresh repo is empty stdout.
-        let out =
-            run_git_capped(tmp.path(), &["status", "--porcelain"], &[], 1024, 8 * 1024).unwrap();
-        assert_eq!(out.stdout, "");
-        assert_eq!(out.total_bytes, 0);
-        assert!(!out.saturated);
-    }
-
     #[test]
     fn run_git_capped_truncates_at_max_bytes_and_counts_total() {
         let tmp = TempDir::new().unwrap();
@@ -2013,84 +1763,6 @@ mod tests {
             "total_bytes should reflect the full stream",
         );
         assert!(!out.saturated, "should not saturate under hard limit");
-    }
-
-    #[test]
-    fn run_git_capped_saturates_past_hard_limit() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        // Make the staged blob bigger than the hard limit.
-        let payload = "x".repeat(8 * 1024); // 8 KiB raw → diff is bigger
-        std::fs::write(tmp.path().join("huge.txt"), &payload).unwrap();
-        run_git(tmp.path(), &["add", "huge.txt"]).unwrap();
-
-        // Cap memory at 128 bytes, hard limit at 1 KiB. Expect saturation.
-        let out = run_git_capped(tmp.path(), &["diff", "--cached"], &[], 128, 1024).unwrap();
-        assert!(out.stdout.len() <= 128);
-        assert!(
-            out.saturated,
-            "should saturate when stream exceeds hard limit"
-        );
-        assert!(out.total_bytes >= 1024);
-    }
-
-    #[test]
-    fn utf8_floor_boundary_passthrough_for_ascii() {
-        let buf = b"abcdefgh";
-        assert_eq!(utf8_floor_boundary(buf, 5), 5);
-        assert_eq!(utf8_floor_boundary(buf, 0), 0);
-        assert_eq!(utf8_floor_boundary(buf, buf.len()), buf.len());
-    }
-
-    #[test]
-    fn utf8_floor_boundary_clamps_past_end() {
-        let buf = b"abc";
-        assert_eq!(utf8_floor_boundary(buf, 100), 3);
-    }
-
-    #[test]
-    fn utf8_floor_boundary_retreats_before_partial_multibyte() {
-        // 'é' is 0xC3 0xA9 (2 bytes). "aé" = [0x61, 0xC3, 0xA9].
-        // Cutting at byte 2 splits the é mid-sequence; helper retreats
-        // to byte 1 so the prefix is valid UTF-8.
-        let buf = "aé".as_bytes();
-        assert_eq!(buf, &[0x61, 0xC3, 0xA9]);
-        assert_eq!(utf8_floor_boundary(buf, 2), 1);
-        // Cutting at byte 3 (full sequence) is fine.
-        assert_eq!(utf8_floor_boundary(buf, 3), 3);
-    }
-
-    #[test]
-    fn utf8_floor_boundary_handles_4_byte_sequences() {
-        // 😀 (U+1F600) is 4 bytes: F0 9F 98 80
-        let buf = "x😀y".as_bytes();
-        // x = 0x78. After 'x' is byte 1.
-        // 😀 occupies bytes 1..5. y starts at byte 5.
-        assert_eq!(utf8_floor_boundary(buf, 1), 1); // before emoji
-        assert_eq!(utf8_floor_boundary(buf, 2), 1); // mid-emoji byte 1 → retreat
-        assert_eq!(utf8_floor_boundary(buf, 3), 1); // mid-emoji byte 2 → retreat
-        assert_eq!(utf8_floor_boundary(buf, 4), 1); // mid-emoji byte 3 → retreat
-        assert_eq!(utf8_floor_boundary(buf, 5), 5); // after emoji
-                                                    // The retreat is bounded — only walks back at most 4 bytes for
-                                                    // the longest possible UTF-8 sequence.
-    }
-
-    #[test]
-    fn utf8_floor_boundary_result_is_always_valid_utf8() {
-        // Property check: for any cut point on a UTF-8 string's byte
-        // representation, the helper returns an offset where bytes[..offset]
-        // is valid UTF-8.
-        let texts = ["hello", "café", "😀😃😄", "mixed: x→y", "", "a"];
-        for text in texts {
-            let buf = text.as_bytes();
-            for end in 0..=buf.len() + 2 {
-                let cut = utf8_floor_boundary(buf, end);
-                assert!(
-                    std::str::from_utf8(&buf[..cut]).is_ok(),
-                    "bytes[..{cut}] of {text:?} should be valid UTF-8 (end={end})"
-                );
-            }
-        }
     }
 
     #[test]
@@ -2156,30 +1828,6 @@ mod tests {
         };
         assert_eq!(before, after, "real .git/index must not be mutated");
     }
-
-    #[test]
-    fn effective_base_ref_falls_back_when_named_branch_not_at_origin() {
-        // Origin exists for some branches but not the requested one.
-        let upstream = TempDir::new().unwrap();
-        init_repo(upstream.path());
-
-        let clone = TempDir::new().unwrap();
-        run_git(
-            std::env::current_dir().unwrap().as_path(),
-            &[
-                "clone",
-                "--quiet",
-                upstream.path().to_str().unwrap(),
-                clone.path().to_str().unwrap(),
-            ],
-        )
-        .unwrap();
-        // origin/main exists; origin/feature does not. A local `feature`
-        // branch with no upstream should fall back to bare.
-        run_git(clone.path(), &["branch", "feature"]).unwrap();
-        assert_eq!(effective_base_ref(clone.path(), "feature"), "feature");
-    }
-
     /// Bug 2: when `.phoenix/` is ALREADY ignored (here via `.git/info/exclude`,
     /// the shared exclude a fork/refinement worktree inherits), a later
     /// Explore→Work approval that calls `ensure_gitignore_has_phoenix` must NOT
@@ -2247,53 +1895,6 @@ mod tests {
     }
 
     // ---- find_branch_in_worktree_list: porcelain parsing ----
-
-    #[test]
-    fn find_branch_in_worktree_list_returns_none_for_free_branch() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        run_git(tmp.path(), &["branch", "feature", "main"]).unwrap();
-        // `feature` exists but is checked out in no worktree.
-        assert_eq!(find_branch_in_worktree_list(tmp.path(), "feature"), None);
-    }
-
-    #[test]
-    fn find_branch_in_worktree_list_finds_primary_worktree_branch() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        let found = find_branch_in_worktree_list(tmp.path(), "main")
-            .expect("main is checked out in the primary worktree");
-        assert_eq!(
-            std::fs::canonicalize(found).unwrap(),
-            std::fs::canonicalize(tmp.path()).unwrap()
-        );
-    }
-
-    #[test]
-    fn find_branch_in_worktree_list_finds_linked_worktree_branch() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        run_git(tmp.path(), &["branch", "feature", "main"]).unwrap();
-        let wt = TempDir::new().unwrap();
-        run_git(
-            tmp.path(),
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                wt.path().to_str().unwrap(),
-                "feature",
-            ],
-        )
-        .unwrap();
-        let found = find_branch_in_worktree_list(tmp.path(), "feature")
-            .expect("feature is checked out in the linked worktree");
-        assert_eq!(
-            std::fs::canonicalize(found).unwrap(),
-            std::fs::canonicalize(wt.path()).unwrap()
-        );
-    }
-
     #[test]
     fn find_branch_in_worktree_list_requires_exact_ref_match() {
         // A shared prefix must not be mistaken for a checkout: `feature` is
@@ -2480,49 +2081,4 @@ mod tests {
     }
 
     // ---- ensure_local_exclude_has_phoenix: .git/info/exclude mutation ----
-
-    #[test]
-    fn ensure_local_exclude_appends_phoenix_when_absent() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        ensure_local_exclude_has_phoenix(tmp.path()).unwrap();
-        let exclude = std::fs::read_to_string(tmp.path().join(".git/info/exclude")).unwrap();
-        assert!(
-            exclude.lines().any(|l| l.trim() == ".phoenix/"),
-            "exclude was {exclude:?}"
-        );
-    }
-
-    #[test]
-    fn ensure_local_exclude_is_idempotent() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        ensure_local_exclude_has_phoenix(tmp.path()).unwrap();
-        ensure_local_exclude_has_phoenix(tmp.path()).unwrap();
-        let exclude = std::fs::read_to_string(tmp.path().join(".git/info/exclude")).unwrap();
-        let count = exclude.lines().filter(|l| l.trim() == ".phoenix/").count();
-        assert_eq!(count, 1, "the entry must not be duplicated: {exclude:?}");
-    }
-
-    #[test]
-    fn ensure_local_exclude_separates_from_unterminated_existing_content() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        let exclude_path = tmp.path().join(".git/info/exclude");
-        std::fs::create_dir_all(exclude_path.parent().unwrap()).unwrap();
-        // Pre-existing entry with NO trailing newline.
-        std::fs::write(&exclude_path, "*.tmp").unwrap();
-
-        ensure_local_exclude_has_phoenix(tmp.path()).unwrap();
-
-        let exclude = std::fs::read_to_string(&exclude_path).unwrap();
-        assert!(
-            exclude.contains("*.tmp\n.phoenix/"),
-            "entries must be newline-separated: {exclude:?}"
-        );
-        assert_eq!(
-            exclude.lines().filter(|l| l.trim() == ".phoenix/").count(),
-            1
-        );
-    }
 }

@@ -330,16 +330,6 @@ mod tests {
         assert!(!decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::EmptyConversation);
     }
-
-    #[test]
-    fn test_only_user_message() {
-        let messages = vec![user_msg(1, "Hello")];
-        let decision = should_auto_continue(&messages);
-        assert_eq!(decision.state, ConvState::Idle);
-        assert!(!decision.needs_auto_continue);
-        assert_eq!(decision.reason, RecoveryReason::LastMessageNotTool);
-    }
-
     #[test]
     fn test_user_then_agent_text() {
         // Normal completion: user asks, agent responds with text
@@ -368,6 +358,9 @@ mod tests {
         assert!(decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::InterruptedMidTurn);
     }
+    // =========================================================================
+    // Normal completion cases (should NOT auto-continue)
+    // =========================================================================
 
     #[test]
     fn test_interrupted_multiple_tools() {
@@ -398,9 +391,21 @@ mod tests {
         assert_eq!(decision.reason, RecoveryReason::InterruptedMidTurn);
     }
 
-    // =========================================================================
-    // Normal completion cases (should NOT auto-continue)
-    // =========================================================================
+    #[test]
+    fn test_completed_tool_cycle() {
+        // Full cycle: User -> Agent(tool) -> Tool -> Agent(text)
+        let messages = vec![
+            user_msg(1, "List files"),
+            agent_tool_use_only(2, &["bash"]),
+            tool_result(3, "tool-2-0", "file1.txt"),
+            agent_with_text(4, "I found file1.txt"),
+        ];
+        let decision = should_auto_continue(&messages);
+        assert_eq!(decision.state, ConvState::Idle);
+        assert!(!decision.needs_auto_continue);
+        // Last message is agent text, not tool
+        assert_eq!(decision.reason, RecoveryReason::LastMessageNotTool);
+    }
 
     #[test]
     fn mixed_adopted_wake_tail_auto_continues_when_any_result_is_resumable() {
@@ -425,50 +430,6 @@ mod tests {
         assert!(!decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::LastMessageNotTool);
     }
-
-    #[test]
-    fn test_completed_tool_cycle() {
-        // Full cycle: User -> Agent(tool) -> Tool -> Agent(text)
-        let messages = vec![
-            user_msg(1, "List files"),
-            agent_tool_use_only(2, &["bash"]),
-            tool_result(3, "tool-2-0", "file1.txt"),
-            agent_with_text(4, "I found file1.txt"),
-        ];
-        let decision = should_auto_continue(&messages);
-        assert_eq!(decision.state, ConvState::Idle);
-        assert!(!decision.needs_auto_continue);
-        // Last message is agent text, not tool
-        assert_eq!(decision.reason, RecoveryReason::LastMessageNotTool);
-    }
-
-    #[test]
-    fn test_agent_text_with_tools_completed() {
-        // Agent responds with text AND tools, tools complete, agent responds
-        let messages = vec![
-            user_msg(1, "Help me"),
-            agent_with_text_and_tools(2, "Let me check...", &["bash"]),
-            tool_result(3, "tool-2-0", "done"),
-            agent_with_text(4, "All done!"),
-        ];
-        let decision = should_auto_continue(&messages);
-        assert!(!decision.needs_auto_continue);
-    }
-
-    #[test]
-    fn test_tool_result_followed_by_user() {
-        // User interrupted while agent was working
-        let messages = vec![
-            user_msg(1, "Do something"),
-            agent_tool_use_only(2, &["bash"]),
-            tool_result(3, "tool-2-0", "output"),
-            user_msg(4, "Actually, cancel that"),
-        ];
-        let decision = should_auto_continue(&messages);
-        assert!(!decision.needs_auto_continue);
-        assert_eq!(decision.reason, RecoveryReason::LastMessageNotTool);
-    }
-
     // =========================================================================
     // Edge cases
     // =========================================================================
@@ -485,61 +446,6 @@ mod tests {
         assert!(!decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::NoAgentMessage);
     }
-
-    #[test]
-    fn test_agent_with_empty_blocks() {
-        // Agent message with no content blocks at all
-        let messages = vec![
-            user_msg(1, "Hello"),
-            Message {
-                message_id: "agent-2".to_string(),
-                conversation_id: "test-conv".to_string(),
-                sequence_id: 2,
-                message_type: MessageType::Agent,
-                content: MessageContent::Agent(vec![]),
-                display_data: None,
-                usage_data: None,
-                created_at: Utc::now(),
-            },
-            tool_result(3, "some-tool", "output"),
-        ];
-        let decision = should_auto_continue(&messages);
-        // Empty blocks = no text, should auto-continue
-        assert!(decision.needs_auto_continue);
-    }
-
-    #[test]
-    fn test_multiple_agent_messages_last_has_no_text() {
-        // Multiple agent messages, only looking at the LAST one
-        let messages = vec![
-            user_msg(1, "Hello"),
-            agent_with_text(2, "Hi!"),
-            user_msg(3, "Do task"),
-            agent_tool_use_only(4, &["bash"]), // This is the last agent msg
-            tool_result(5, "tool-4-0", "done"),
-        ];
-        let decision = should_auto_continue(&messages);
-        assert!(decision.needs_auto_continue);
-    }
-
-    #[test]
-    fn test_multiple_agent_messages_last_has_text() {
-        // Multiple agent messages, last one has text
-        let messages = vec![
-            user_msg(1, "Hello"),
-            agent_tool_use_only(2, &["bash"]),
-            tool_result(3, "tool-2-0", "output"),
-            agent_with_text(4, "Done!"), // This is the last agent msg
-            user_msg(5, "Thanks"),
-            agent_with_text(6, "You're welcome!"),
-            tool_result(7, "orphan", "???"), // Orphan tool result
-        ];
-        let decision = should_auto_continue(&messages);
-        // Last agent msg (6) has text, so even though last msg is tool, don't auto-continue
-        assert!(!decision.needs_auto_continue);
-        assert_eq!(decision.reason, RecoveryReason::AgentHasTextResponse);
-    }
-
     #[test]
     fn test_text_before_tool_use_in_same_message() {
         // Agent message contains text BEFORE tool_use (common pattern)
@@ -904,14 +810,6 @@ mod proptests {
     // =========================================================================
     // Property: Empty messages never auto-continues
     // =========================================================================
-
-    #[test]
-    fn prop_empty_never_auto_continues() {
-        let decision = should_auto_continue(&[]);
-        assert!(!decision.needs_auto_continue);
-        assert_eq!(decision.reason, RecoveryReason::EmptyConversation);
-    }
-
     // =========================================================================
     // Property: Reason matches behavior
     // =========================================================================

@@ -34,16 +34,6 @@ impl CheckedToolCall {
     pub fn into_parts(self) -> (String, Value) {
         (self.name, self.input)
     }
-
-    /// Test-only mint. `#[cfg(test)]` keeps it out of production builds, so the
-    /// sole-mint guarantee (`DenyGate::check`) holds wherever it matters.
-    #[cfg(test)]
-    pub fn cleared_for_test(name: impl Into<String>, input: Value) -> Self {
-        Self {
-            name: name.into(),
-            input,
-        }
-    }
 }
 
 /// A structured rejection from the deny layer (specs/permissions REQ-PERM-004,

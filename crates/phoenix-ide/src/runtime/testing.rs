@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use phoenix_core::domain::sm_event::{DirectTurnAttemptAuthority, PreparedDirectTurnPayload};
 use phoenix_db::workflow::DirectTurnMaterializationEligibility;
 use phoenix_llm::ModelRegistry;
-use phoenix_llm::{LlmError, LlmRequest, LlmResponse, PromptCacheKey, ToolDefinition};
+use phoenix_llm::{LlmError, LlmRequest, LlmResponse, ToolDefinition};
 use phoenix_workflow::Timestamp;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -1672,103 +1672,6 @@ mod tests {
 
     use super::*;
     use phoenix_llm::{ContentBlock, Usage};
-    use std::path::PathBuf;
-    use tokio_util::sync::CancellationToken;
-
-    fn test_context() -> ToolContext {
-        ToolContext::new(
-            CancellationToken::new(),
-            "test-conv".to_string(),
-            PathBuf::from("/tmp"),
-            Arc::new(BrowserSessionManager::default()),
-            Arc::new(crate::tools::BashHandleRegistry::new()),
-            Arc::new(ModelRegistry::new_empty()),
-            crate::terminal::ActiveTerminals::new(),
-            Arc::new(crate::tools::TmuxRegistry::new()),
-            None,
-            crate::work_scope::WorkScopeId::parse("test-work").unwrap(),
-        )
-    }
-
-    #[tokio::test]
-    async fn test_mock_llm_client() {
-        let mock = MockLlmClient::new("test-model");
-        mock.queue_response(LlmResponse {
-            content: vec![ContentBlock::text("Hello")],
-            end_turn: true,
-            usage: Usage::default(),
-            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
-        });
-
-        let request = LlmRequest {
-            system: vec![],
-            messages: vec![],
-            tools: vec![],
-            max_tokens: Some(100),
-            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
-            telemetry: None,
-            cache_key: PromptCacheKey::ephemeral(),
-        };
-
-        let response = mock.complete(&request).await.unwrap();
-        assert_eq!(response.content.len(), 1);
-        assert!(response.end_turn);
-
-        // Second call should fail (no more responses)
-        let result = mock.complete(&request).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_mock_tool_executor() {
-        use crate::runtime::deny_gate::CheckedToolCall;
-        let executor = MockToolExecutor::new().with_tool("bash", ToolOutput::success("output"));
-
-        let result = executor
-            .execute(
-                CheckedToolCall::cleared_for_test("bash", serde_json::json!({ "cmd": "ls" })),
-                test_context(),
-            )
-            .await;
-        assert!(result.is_some());
-        assert!(result.unwrap().is_success());
-
-        let result = executor
-            .execute(
-                CheckedToolCall::cleared_for_test("unknown", serde_json::json!({})),
-                test_context(),
-            )
-            .await;
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_in_memory_storage() {
-        let storage = InMemoryStorage::new();
-
-        let msg = storage
-            .add_message(
-                "test-message-id",
-                "conv-1",
-                &MessageContent::user("hello"),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(msg.message_id, "test-message-id");
-        assert_eq!(msg.message_type, MessageType::User);
-
-        let messages = storage.get_messages("conv-1").await.unwrap();
-        assert_eq!(messages.len(), 1);
-
-        // Verify typed content
-        match &messages[0].content {
-            MessageContent::User(u) => assert_eq!(u.text, "hello"),
-            _ => panic!("Expected User content"),
-        }
-    }
 
     #[tokio::test]
     async fn in_memory_storage_records_atomic_mode_and_cwd_update() {

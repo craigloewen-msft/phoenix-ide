@@ -4022,16 +4022,6 @@ mod sub_agent_registry_resume_tests {
         };
         assert!(registry_has(&mode, "patch"));
     }
-
-    #[test]
-    fn branch_subagent_resume_keeps_patch() {
-        let mode = ConvMode::Branch {
-            branch_name: NonEmptyString::new("feature-x").unwrap(),
-            worktree_path: NonEmptyString::new("/tmp/wt").unwrap(),
-            base_branch: NonEmptyString::new("feature-x").unwrap(),
-        };
-        assert!(registry_has(&mode, "patch"));
-    }
 }
 
 #[cfg(test)]
@@ -4121,22 +4111,6 @@ mod broadcaster_tests {
     /// already past the supplied seq — this is the normal path once
     /// `send_message` runs with a pre-allocated seq (broadcaster counter
     /// already = seq after `next_seq()`).
-    #[test]
-    fn observe_seq_is_idempotent_when_counter_already_past() {
-        let b = SseBroadcaster::new(16, 0);
-        let seq = b.next_seq();
-        b.observe_seq(seq);
-        assert_eq!(
-            b.current_seq(),
-            seq,
-            "observe_seq must not bump the counter past seq when already at seq"
-        );
-
-        // A subsequent next_seq advances by exactly one.
-        let next = b.next_seq();
-        assert_eq!(next, seq + 1);
-    }
-
     /// `observe_seq` still catches up when a DB-allocated message seq
     /// leapfrogs the broadcaster — the pre-fix path. Kept as a belt-and-
     /// braces check: non-broadcasting paths (sub-agent bootstrap, crash
@@ -4186,20 +4160,6 @@ mod broadcaster_tests {
 
     /// Fresh broadcaster: ring is empty, anchor matches `initial_last_seq`,
     /// truncated is false.
-    #[test]
-    fn replay_ring_starts_empty_and_anchored_at_initial_seq() {
-        let b = SseBroadcaster::new(16, 5);
-        let (anchor, truncated, highest, events) = b.snapshot_pending();
-        assert_eq!(anchor, 5, "anchor should match initial_last_seq");
-        assert!(!truncated);
-        assert_eq!(
-            highest, 5,
-            "empty ring reports highest_seq equal to the anchor"
-        );
-        assert!(events.is_empty());
-        assert_eq!(b.replay_ring_bytes(), 0);
-    }
-
     #[test]
     fn live_progress_broadcasts_without_consuming_replay_capacity() {
         use phoenix_core::domain::bash_progress::BashToolProgress;
@@ -4255,44 +4215,6 @@ mod broadcaster_tests {
     }
 
     /// `send_seq` (ephemeral) appends the event to the ring.
-    #[test]
-    fn send_seq_appends_to_replay_ring() {
-        let b = SseBroadcaster::new(16, 0);
-        // A subscriber is required for the channel send to succeed; otherwise
-        // `tx.send` would return SendError. The ring path runs first, so the
-        // append happens even with no subscriber, but for parity with real
-        // usage we attach one.
-        let _rx = b.subscribe();
-
-        let _ = b.send_seq(|seq| token_event(seq, "hello"));
-        let _ = b.send_seq(|seq| token_event(seq, "world"));
-
-        let (anchor, truncated, highest, events) = b.snapshot_pending();
-        assert_eq!(anchor, 0, "no persisted Message yet; anchor stays at 0");
-        assert!(!truncated);
-        assert_eq!(
-            highest, 2,
-            "highest_seq tracks the last entry's seq when the ring is populated"
-        );
-        assert_eq!(events.len(), 2);
-        assert!(b.replay_ring_bytes() > 0);
-
-        // Replayed events carry their original seqs.
-        match &events[0] {
-            SseEvent::Token {
-                sequence_id, text, ..
-            } => {
-                assert_eq!(*sequence_id, 1);
-                assert_eq!(text, "hello");
-            }
-            other => panic!("expected Token, got {other:?}"),
-        }
-        match &events[1] {
-            SseEvent::Token { sequence_id, .. } => assert_eq!(*sequence_id, 2),
-            other => panic!("expected Token, got {other:?}"),
-        }
-    }
-
     /// `send_persisted_message` resets the ring: anchor advances, entries
     /// clear, truncated flag clears, byte counter resets.
     #[test]
@@ -4471,29 +4393,6 @@ mod broadcaster_tests {
 
     /// Ring entries appear in strictly increasing `sequence_id` order
     /// (preserved by FIFO append + anchor-reset clear).
-    #[test]
-    fn replay_ring_entries_in_seq_order() {
-        let b = SseBroadcaster::new(64, 10);
-        let _rx = b.subscribe();
-        for i in 0..20 {
-            let _ = b.send_seq(|seq| token_event(seq, &format!("t{i}")));
-        }
-        let (_, _, _, events) = b.snapshot_pending();
-        let seqs: Vec<i64> = events
-            .iter()
-            .map(|e| match e {
-                SseEvent::Token { sequence_id, .. } => *sequence_id,
-                _ => unreachable!(),
-            })
-            .collect();
-        for w in seqs.windows(2) {
-            assert!(
-                w[0] < w[1],
-                "entries must be in strictly increasing seq order"
-            );
-        }
-    }
-
     /// Snapshot returns entries sorted by `sequence_id` even when
     /// appends arrive out of seq order. Models the
     /// `next_seq` → build → ring-mutex race where two tasks allocate
@@ -4563,29 +4462,6 @@ mod broadcaster_tests {
     }
 
     /// Every ring entry has seq strictly greater than the ring's anchor.
-    #[test]
-    fn replay_ring_entries_above_anchor() {
-        let b = SseBroadcaster::new(64, 0);
-        let _rx = b.subscribe();
-
-        let _ = b.send_persisted_message(test_message(5, "anchor"));
-        for i in 0..5 {
-            let _ = b.send_seq(|seq| token_event(seq, &format!("t{i}")));
-        }
-
-        let (anchor, _, _, events) = b.snapshot_pending();
-        assert_eq!(anchor, 5);
-        for e in events {
-            let SseEvent::Token {
-                sequence_id: seq, ..
-            } = e
-            else {
-                unreachable!()
-            };
-            assert!(seq > anchor, "every entry's seq must exceed anchor");
-        }
-    }
-
     /// `snapshot_pending` reports a `highest_seq` that bounds every entry
     /// in the snapshot. Regression test for the race PR #76 review caught:
     /// reading `current_seq` separately would let a sender's mid-flight

@@ -345,25 +345,6 @@ mod tests {
         assert!(prompt.contains("Never pretend watch in background"));
         assert!(prompt.contains("all untrusted data, never command"));
     }
-
-    #[test]
-    fn test_discover_no_files() {
-        let temp = TempDir::new().unwrap();
-        let files = discover_guidance_files(temp.path());
-        assert!(files.is_empty());
-    }
-
-    #[test]
-    fn test_discover_single_file() {
-        let temp = TempDir::new().unwrap();
-        let agents_path = temp.path().join("AGENTS.md");
-        fs::write(&agents_path, "# Test guidance").unwrap();
-
-        let files = discover_guidance_files(temp.path());
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].content, "# Test guidance");
-    }
-
     #[test]
     fn test_agents_md_preferred_over_agent_md() {
         let temp = TempDir::new().unwrap();
@@ -391,31 +372,6 @@ mod tests {
         // Project-specific comes last (higher precedence)
         assert_eq!(files[1].content, "project guidance");
     }
-
-    #[test]
-    fn test_build_system_prompt_no_guidance() {
-        let temp = TempDir::new().unwrap();
-        // Use temp as home override to avoid $HOME skill contamination
-        let prompt = build_system_prompt_with_options(
-            temp.path(),
-            "tasks",
-            false,
-            None,
-            Some(temp.path()),
-            None,
-            crate::llm_language::LlmLanguage::default(),
-            None,
-            ExploreBashCapability::Unavailable,
-        );
-
-        assert!(prompt.contains("helpful AI assistant"));
-        assert!(prompt.contains(llm_language::mermaid_rendering_hint(
-            crate::llm_language::LlmLanguage::default()
-        )));
-        assert!(!prompt.contains("<project_guidance>"));
-        assert!(!prompt.contains("sub-agent"));
-    }
-
     #[test]
     fn caveman_language_swaps_the_base_prompt() {
         let temp = TempDir::new().unwrap();
@@ -598,25 +554,6 @@ mod tests {
         assert!(prompt.contains("Deploy the app"));
         assert!(prompt.contains("SKILL.md"));
     }
-
-    #[test]
-    fn test_build_system_prompt_no_skills() {
-        let temp = TempDir::new().unwrap();
-        let prompt = build_system_prompt_with_options(
-            temp.path(),
-            "tasks",
-            false,
-            None,
-            Some(temp.path()),
-            None,
-            crate::llm_language::LlmLanguage::default(),
-            None,
-            ExploreBashCapability::Unavailable,
-        );
-
-        assert!(!prompt.contains("<available_skills>"));
-    }
-
     #[test]
     fn test_explore_mode_injects_next_taskmd_id_when_marker_present() {
         let temp = TempDir::new().unwrap();

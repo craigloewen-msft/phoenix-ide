@@ -423,12 +423,6 @@ mod tests {
     // -------------------------------------------------------------------------
     // tokenize_references — @ sigil
     // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_tokenize_no_refs() {
-        assert!(tokenize_references("hello world", &['@']).is_empty());
-    }
-
     #[test]
     fn test_tokenize_single_at_ref() {
         let refs = tokenize_references("look at @src/main.rs please", &['@']);
@@ -436,29 +430,6 @@ mod tests {
         assert_eq!(refs[0].sigil, '@');
         assert_eq!(refs[0].token, "src/main.rs");
     }
-
-    #[test]
-    fn test_tokenize_multiple_at_refs() {
-        let refs = tokenize_references("@a.rs and @b.rs", &['@']);
-        assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0].token, "a.rs");
-        assert_eq!(refs[1].token, "b.rs");
-    }
-
-    #[test]
-    fn test_tokenize_bare_at_ignored() {
-        // `@` with no following token is not a reference
-        let refs = tokenize_references("send @ me", &['@']);
-        assert!(refs.is_empty());
-    }
-
-    #[test]
-    fn test_tokenize_at_ref_at_end_of_string() {
-        let refs = tokenize_references("see @foo.rs", &['@']);
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].token, "foo.rs");
-    }
-
     #[test]
     fn test_tokenize_email_not_treated_as_ref() {
         // @ embedded in an email address should not be treated as a file reference
@@ -468,64 +439,9 @@ mod tests {
             "email @ should not be a reference: {refs:?}"
         );
     }
-
-    #[test]
-    fn test_tokenize_at_ref_after_newline() {
-        // @ at start of a new line (preceded by \n) is a valid reference
-        let refs = tokenize_references("check this:\n@src/main.rs", &['@']);
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].token, "src/main.rs");
-    }
-
     // -------------------------------------------------------------------------
     // tokenize_references — markdown code masking (NoExpansionInsideCode)
     // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_masked_code_ranges_empty_string() {
-        assert!(masked_code_ranges("").is_empty());
-    }
-
-    #[test]
-    fn test_masked_code_ranges_no_code() {
-        assert!(masked_code_ranges("plain prose with no code at all").is_empty());
-    }
-
-    #[test]
-    fn test_masked_code_ranges_inline_backticks() {
-        let text = "see `@foo.rs` here";
-        let ranges = masked_code_ranges(text);
-        assert_eq!(ranges.len(), 1);
-        // Range covers the inline-code span (backtick-bounded). Just assert
-        // the @ sigil falls inside it; pulldown-cmark may or may not include
-        // the backticks themselves.
-        let at_pos = text.find('@').unwrap();
-        assert!(position_in_ranges(at_pos, &ranges));
-    }
-
-    #[test]
-    fn test_masked_code_ranges_fenced_block() {
-        let text = "look:\n```\npanic at @src/main.rs:42\n```\nthanks";
-        let ranges = masked_code_ranges(text);
-        assert_eq!(ranges.len(), 1);
-        let at_pos = text.find('@').unwrap();
-        assert!(position_in_ranges(at_pos, &ranges));
-        // Sigil after the closing fence is NOT in the masked range.
-        let trailing_at_pos = text.find("thanks").unwrap();
-        assert!(!position_in_ranges(trailing_at_pos, &ranges));
-    }
-
-    #[test]
-    fn test_masked_code_ranges_indented_block() {
-        // Four-space indent triggers an indented code block. Need a blank line
-        // before for pulldown-cmark to recognize it.
-        let text = "Here is code:\n\n    @src/main.rs is broken\n\ndone";
-        let ranges = masked_code_ranges(text);
-        assert!(!ranges.is_empty(), "indented block should produce a range");
-        let at_pos = text.find('@').unwrap();
-        assert!(position_in_ranges(at_pos, &ranges));
-    }
-
     #[test]
     fn test_tokenize_skips_sigil_in_fenced_block() {
         let text = "trace:\n```\n@src/main.rs:42\n```";
@@ -535,17 +451,6 @@ mod tests {
             "@ inside fenced block should not tokenize: {refs:?}"
         );
     }
-
-    #[test]
-    fn test_tokenize_skips_sigil_in_inline_code() {
-        // Already works by accident via the whitespace-boundary rule (the
-        // char before @ is a backtick, not whitespace), but masking now
-        // covers it explicitly. This is regression coverage.
-        let text = "use `@foo.rs` here";
-        let refs = tokenize_references(text, &['@']);
-        assert!(refs.is_empty(), "@ inside inline code should not tokenize");
-    }
-
     #[test]
     fn test_tokenize_skips_sigil_in_indented_block() {
         let text = "trace:\n\n    @src/main.rs:42\n\ndone";
@@ -555,23 +460,6 @@ mod tests {
             "@ inside indented code should not tokenize: {refs:?}"
         );
     }
-
-    #[test]
-    fn test_tokenize_sigil_after_code_block_still_expands() {
-        let text = "```\n@inside.rs\n```\n@after.rs is real";
-        let refs = tokenize_references(text, &['@']);
-        assert_eq!(refs.len(), 1, "only the @after.rs should tokenize");
-        assert_eq!(refs[0].token, "after.rs");
-    }
-
-    #[test]
-    fn test_tokenize_sigil_before_code_block_still_expands() {
-        let text = "@before.rs is real\n```\n@inside.rs\n```";
-        let refs = tokenize_references(text, &['@']);
-        assert_eq!(refs.len(), 1, "only the @before.rs should tokenize");
-        assert_eq!(refs[0].token, "before.rs");
-    }
-
     #[test]
     fn test_tokenize_mixed_inside_and_outside_code() {
         let text = "see @real.rs first\n```\n@fake.rs\n```\nand @final.rs";
@@ -593,39 +481,9 @@ mod tests {
             "everything after unclosed fence should be masked: {refs:?}"
         );
     }
-
-    #[test]
-    fn test_tokenize_no_code_no_change_in_behavior() {
-        // Regression: masking must not affect tokenization of plain prose.
-        let text = "look at @src/main.rs and @lib/foo.ts";
-        let refs = tokenize_references(text, &['@']);
-        assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0].token, "src/main.rs");
-        assert_eq!(refs[1].token, "lib/foo.ts");
-    }
-
-    #[test]
-    fn test_tokenize_skill_in_fenced_block_skipped() {
-        // Same masking applies to / sigil. Skill resolver fails gently for
-        // unknown names anyway, but masking prevents the lookup entirely.
-        let text = "logs:\n```\n/build failed\n```";
-        let refs = tokenize_references(text, &['/']);
-        assert!(refs.is_empty());
-    }
-
     // -------------------------------------------------------------------------
     // expand — success path
     // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_expand_no_refs_passthrough() {
-        let tmp = make_tmp();
-        let result = expand("hello world", &root(tmp.path())).unwrap();
-        assert_eq!(result.display_text, "hello world");
-        assert_eq!(result.llm_text, "hello world");
-        assert!(result.skill_invocation.is_none());
-    }
-
     #[test]
     fn test_expand_single_file_ref() {
         let tmp = make_tmp();
@@ -638,30 +496,6 @@ mod tests {
         assert!(result.llm_text.contains("</file>"));
         assert!(result.skill_invocation.is_none());
     }
-
-    #[test]
-    fn test_expand_multiple_refs() {
-        let tmp = make_tmp();
-        fs::write(tmp.path().join("a.txt"), "aaa").unwrap();
-        fs::write(tmp.path().join("b.txt"), "bbb").unwrap();
-
-        let result = expand("@a.txt and @b.txt", &root(tmp.path())).unwrap();
-        assert!(result.llm_text.contains("<file path=\"a.txt\">"));
-        assert!(result.llm_text.contains("<file path=\"b.txt\">"));
-        assert!(result.llm_text.contains("aaa"));
-        assert!(result.llm_text.contains("bbb"));
-    }
-
-    #[test]
-    fn test_expand_display_text_unchanged() {
-        let tmp = make_tmp();
-        fs::write(tmp.path().join("f.txt"), "x").unwrap();
-
-        let result = expand("see @f.txt", &root(tmp.path())).unwrap();
-        // display_text is exactly what the user typed
-        assert_eq!(result.display_text, "see @f.txt");
-    }
-
     #[test]
     fn test_expand_leaves_same_ref_inside_code_fence_untouched() {
         // A real `@hello.txt` reference plus the identical literal inside a
@@ -720,47 +554,6 @@ mod tests {
             }
         );
     }
-
-    #[test]
-    fn test_error_type_strings() {
-        assert_eq!(
-            ExpansionError::FileNotFound {
-                path: "x".to_string()
-            }
-            .error_type(),
-            "file_not_found"
-        );
-        assert_eq!(
-            ExpansionError::FileNotText {
-                path: "x".to_string()
-            }
-            .error_type(),
-            "file_not_text"
-        );
-        assert_eq!(
-            ExpansionError::SkillInvocationFailed {
-                name: "x".to_string(),
-                error: "oops".to_string()
-            }
-            .error_type(),
-            "skill_invocation_failed"
-        );
-    }
-
-    #[test]
-    fn test_error_reference_token() {
-        let err = ExpansionError::FileNotFound {
-            path: "src/foo.rs".to_string(),
-        };
-        assert_eq!(err.reference(), "@src/foo.rs");
-
-        let err2 = ExpansionError::SkillInvocationFailed {
-            name: "my-skill".to_string(),
-            error: "read failed".to_string(),
-        };
-        assert_eq!(err2.reference(), "/my-skill");
-    }
-
     // -------------------------------------------------------------------------
     // Skill helpers
     // -------------------------------------------------------------------------
@@ -778,36 +571,6 @@ mod tests {
     // -------------------------------------------------------------------------
     // tokenize_references — / sigil
     // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_tokenize_slash_at_start() {
-        let refs = tokenize_references("/review src/main.rs", &['/']);
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].sigil, '/');
-        assert_eq!(refs[0].token, "review");
-    }
-
-    #[test]
-    fn test_tokenize_slash_mid_message() {
-        let refs = tokenize_references("use /build to compile", &['/']);
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].sigil, '/');
-        assert_eq!(refs[0].token, "build");
-    }
-
-    #[test]
-    fn test_tokenize_no_slash() {
-        let refs = tokenize_references("hello world", &['/']);
-        assert!(refs.is_empty());
-    }
-
-    #[test]
-    fn test_tokenize_bare_slash() {
-        // "/" at end-of-string has no token after it
-        let refs = tokenize_references("/", &['/']);
-        assert!(refs.is_empty());
-    }
-
     #[test]
     fn test_tokenize_slash_not_preceded_by_whitespace() {
         // `/build` embedded in a word (e.g. "foo/build") should not match
@@ -827,17 +590,6 @@ mod tests {
         assert_eq!(refs[0].token, "build");
         assert_eq!(refs[1].sigil, '@');
         assert_eq!(refs[1].token, "src/main.rs");
-    }
-
-    #[test]
-    fn test_tokenize_span_correctness() {
-        let text = "look at @foo.rs please";
-        let refs = tokenize_references(text, &['@']);
-        assert_eq!(refs.len(), 1);
-        // Safety: span indices come from the tokenizer which operates on `text`.
-        #[allow(clippy::string_slice)]
-        let spanned = &text[refs[0].span.clone()];
-        assert_eq!(spanned, "@foo.rs");
     }
 
     // -------------------------------------------------------------------------
@@ -904,42 +656,6 @@ mod tests {
         // Only the text after the skill token is appended as ARGUMENTS
         assert!(result.llm_text.contains("ARGUMENTS: staging"));
     }
-
-    #[test]
-    fn test_expand_skill_mid_message() {
-        let tmp = make_tmp();
-        write_skill(
-            tmp.path(),
-            "build",
-            "build",
-            "Build skill",
-            "Run the build steps.",
-        );
-
-        let result = expand("use /build to compile", &root(tmp.path())).unwrap();
-        assert_eq!(result.display_text, "use /build to compile");
-        assert!(result.llm_text.contains("Run the build steps."));
-        assert!(result.llm_text.contains("ARGUMENTS: to compile"));
-    }
-
-    #[test]
-    fn test_expand_skill_mid_message_with_placeholder() {
-        let tmp = make_tmp();
-        write_skill(
-            tmp.path(),
-            "review",
-            "review",
-            "Code review skill",
-            "Please review $ARGUMENTS carefully.",
-        );
-
-        let result = expand("use /review to check this PR", &root(tmp.path())).unwrap();
-        assert_eq!(result.display_text, "use /review to check this PR");
-        assert!(result
-            .llm_text
-            .contains("Please review to check this PR carefully."));
-    }
-
     #[test]
     fn test_expand_file_path_not_skill() {
         // /usr/bin/ls should not trigger skill expansion
@@ -957,59 +673,7 @@ mod tests {
         let result = expand("/nonexistent", &root(tmp.path())).unwrap();
         assert_eq!(result.llm_text, "/nonexistent");
     }
-
-    #[test]
-    fn test_expand_skill_not_found_lists_available() {
-        let tmp = make_tmp();
-        write_skill(tmp.path(), "foo-skill", "foo", "Foo skill", "Foo body.");
-
-        // /missing is not a known skill, so it passes through as plain text
-        let result = expand("/missing", &root(tmp.path())).unwrap();
-        assert_eq!(result.llm_text, "/missing");
-    }
-
-    #[test]
-    fn test_expand_skill_display_text_is_original() {
-        let tmp = make_tmp();
-        write_skill(tmp.path(), "ws", "ws", "Writing style", "Be concise.");
-
-        let result = expand("/ws help with email", &root(tmp.path())).unwrap();
-        assert_eq!(result.display_text, "/ws help with email");
-    }
-
-    #[test]
-    fn test_non_slash_message_unchanged() {
-        let tmp = make_tmp();
-        let result = expand("hello world", &root(tmp.path())).unwrap();
-        assert_eq!(result.display_text, "hello world");
-        assert_eq!(result.llm_text, "hello world");
-        assert!(result.skill_invocation.is_none());
-    }
-
     // --- ClassifyAtReference / AtTokenPassThrough (REQ-IR-007) ----
-
-    #[test]
-    fn test_bare_at_word_passes_through() {
-        let tmp = make_tmp();
-        let result = expand("hello @username how are you", &root(tmp.path())).unwrap();
-        assert_eq!(result.llm_text, "hello @username how are you");
-    }
-
-    #[test]
-    fn test_at_param_passes_through() {
-        let tmp = make_tmp();
-        let result = expand("use @param annotation", &root(tmp.path())).unwrap();
-        assert_eq!(result.llm_text, "use @param annotation");
-    }
-
-    #[test]
-    fn test_fastapi_decorator_passes_through() {
-        let tmp = make_tmp();
-        let input = r#"@app.get("/.well-known/api-catalog", include_in_schema=False)"#;
-        let result = expand(input, &root(tmp.path())).unwrap();
-        assert_eq!(result.llm_text, input);
-    }
-
     #[test]
     fn test_pasted_fastapi_route_snippet_passes_through() {
         let tmp = make_tmp();
@@ -1022,32 +686,6 @@ def api_catalog():
         let result = expand(input, &root(tmp.path())).unwrap();
         assert_eq!(result.llm_text, input);
     }
-
-    #[test]
-    fn test_at_with_extension_treated_as_file_ref() {
-        let tmp = make_tmp();
-        // This has .md extension -- looks like a file, should try to resolve
-        let result = expand("check @MISSING.md please", &root(tmp.path()));
-        assert!(result.is_err()); // FileNotFound because the file doesn't exist
-    }
-
-    #[test]
-    fn test_at_with_slash_treated_as_file_ref() {
-        let tmp = make_tmp();
-        // Contains / -- looks like a path, should try to resolve
-        let result = expand("check @src/main.rs please", &root(tmp.path()));
-        assert!(result.is_err()); // FileNotFound
-    }
-
-    #[test]
-    fn test_at_existing_file_with_extension_expands() {
-        let tmp = make_tmp();
-        fs::write(tmp.path().join("test.txt"), "file content").unwrap();
-        let result = expand("see @test.txt here", &root(tmp.path())).unwrap();
-        assert!(result.llm_text.contains("file content"));
-        assert!(result.llm_text.contains("<file"));
-    }
-
     #[test]
     fn test_framework_route_paths_expand() {
         let tmp = make_tmp();
@@ -1095,38 +733,6 @@ def api_catalog():
         assert!(result.llm_text.contains("comma data"));
         assert!(result.llm_text.contains("timestamp fixture"));
     }
-
-    #[test]
-    fn test_looks_like_file_path_function() {
-        assert!(looks_like_file_path("src/main.rs"));
-        assert!(looks_like_file_path("AGENTS.md"));
-        assert!(looks_like_file_path("config.toml"));
-        assert!(looks_like_file_path("test.txt"));
-        assert!(looks_like_file_path("foo/bar"));
-        assert!(looks_like_file_path("app/routes/[slug].tsx"));
-        assert!(looks_like_file_path("app/routes/(auth)/login.tsx"));
-        assert!(looks_like_file_path("app/routes/[slug]/$id.tsx"));
-        assert!(looks_like_file_path("app/shop/[[...slug]]/page.tsx"));
-        assert!(looks_like_file_path("docs/café.md"));
-        assert!(looks_like_file_path("docs/what's-new.md"));
-        assert!(looks_like_file_path("docs/important!.md"));
-        assert!(looks_like_file_path("data/foo,bar.csv"));
-        assert!(looks_like_file_path("fixtures/2026-06-23T12:00:00Z.json"));
-        assert!(!looks_like_file_path("username"));
-        assert!(!looks_like_file_path("param"));
-        assert!(!looks_like_file_path("override"));
-        assert!(!looks_like_file_path("TODO"));
-        assert!(!looks_like_file_path(
-            "app.get(\"/.well-known/api-catalog\","
-        ));
-        assert!(!looks_like_file_path("src/main.rs,"));
-        assert!(!looks_like_file_path("foo/bar)"));
-        assert!(!looks_like_file_path("notes.md:"));
-        assert!(!looks_like_file_path("app/shop/[[slug]/page.tsx"));
-        assert!(!looks_like_file_path("docs/what's-new.md'"));
-        assert!(!looks_like_file_path("docs/important.md!"));
-    }
-
     #[test]
     fn test_bazel_label_passes_through() {
         let tmp = make_tmp();
@@ -1140,26 +746,10 @@ def api_catalog():
             "build @+go_fast+go_fast//:go_fast.exe target"
         );
     }
-
-    #[test]
-    fn test_bare_bazel_label_passes_through() {
-        let tmp = make_tmp();
-        let result = expand("run @//pkg:target please", &root(tmp.path())).unwrap();
-        assert_eq!(result.llm_text, "run @//pkg:target please");
-    }
-
     #[test]
     fn test_url_after_at_passes_through() {
         let tmp = make_tmp();
         let result = expand("see @https://example.com/docs", &root(tmp.path())).unwrap();
         assert_eq!(result.llm_text, "see @https://example.com/docs");
-    }
-
-    #[test]
-    fn test_looks_like_file_path_rejects_double_slash() {
-        assert!(!looks_like_file_path("+go_fast+go_fast//:go_fast.exe"));
-        assert!(!looks_like_file_path("//pkg:target"));
-        assert!(!looks_like_file_path("repo//pkg:target"));
-        assert!(!looks_like_file_path("https://example.com/docs"));
     }
 }

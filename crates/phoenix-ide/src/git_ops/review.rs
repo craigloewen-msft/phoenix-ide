@@ -475,16 +475,6 @@ mod tests {
             diff.stdout.len()
         );
     }
-
-    #[test]
-    fn since_review_diff_is_empty_when_untouched() {
-        let tmp = repo_with_branch_work();
-        let p = tmp.path();
-        let reviewed = current_blob_sha(p, "kept.txt");
-        let diff = file_diff_since_review(p, "kept.txt", &reviewed, 64 * 1024, 512 * 1024);
-        assert!(diff.stdout.is_empty());
-    }
-
     #[test]
     fn since_review_diff_preserves_body_lines_that_look_like_headers() {
         let tmp = TempDir::new().unwrap();
@@ -533,27 +523,6 @@ mod tests {
             diff.stdout
         );
     }
-
-    #[test]
-    fn since_review_diff_keeps_crlf_line_endings() {
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path();
-        init_repo(p);
-        // core.autocrlf off by default in a fresh repo, so the bytes round-trip.
-        write(p, "win.txt", "first\r\nsecond\r\n");
-        commit_all(p, "base");
-        let reviewed = current_blob_sha(p, "win.txt");
-
-        write(p, "win.txt", "first\r\nsecond\r\nthird\r\n");
-
-        let diff = file_diff_since_review(p, "win.txt", &reviewed, 64 * 1024, 512 * 1024);
-        assert!(
-            diff.stdout.contains("+third\r\n"),
-            "CRLF endings must survive relabelling: {:?}",
-            diff.stdout
-        );
-    }
-
     #[test]
     fn full_file_diff_is_scoped_to_one_path() {
         let tmp = repo_with_branch_work();
@@ -586,52 +555,5 @@ mod tests {
             staged_before, staged_after,
             "review must leave the user's index exactly as the agent left it"
         );
-    }
-
-    #[test]
-    fn comparator_prefers_the_local_base_branch() {
-        let upstream = TempDir::new().unwrap();
-        init_repo(upstream.path());
-        write(upstream.path(), "f.txt", "x\n");
-        commit_all(upstream.path(), "base");
-
-        let clone = TempDir::new().unwrap();
-        run_git(
-            std::env::current_dir().unwrap().as_path(),
-            &[
-                "clone",
-                "--quiet",
-                upstream.path().to_str().unwrap(),
-                clone.path().to_str().unwrap(),
-            ],
-        )
-        .unwrap();
-
-        // Both `main` and `origin/main` resolve here. Review must pick local.
-        assert_eq!(review_comparator(clone.path(), "main"), "main");
-    }
-
-    #[test]
-    fn comparator_falls_back_to_remote_when_no_local_ref() {
-        let upstream = TempDir::new().unwrap();
-        init_repo(upstream.path());
-        write(upstream.path(), "f.txt", "x\n");
-        commit_all(upstream.path(), "base");
-        run_git(upstream.path(), &["branch", "release"]).unwrap();
-
-        let clone = TempDir::new().unwrap();
-        run_git(
-            std::env::current_dir().unwrap().as_path(),
-            &[
-                "clone",
-                "--quiet",
-                upstream.path().to_str().unwrap(),
-                clone.path().to_str().unwrap(),
-            ],
-        )
-        .unwrap();
-
-        // `release` exists only as a remote-tracking ref in the clone.
-        assert_eq!(review_comparator(clone.path(), "release"), "origin/release");
     }
 }

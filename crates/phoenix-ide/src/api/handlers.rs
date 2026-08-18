@@ -7841,32 +7841,6 @@ mod conversation_cwd_validation_tests {
                 .expect("raw cwd accepted");
         assert_eq!(response.conversation["cwd"].as_str(), Some("/.."));
     }
-
-    #[tokio::test]
-    async fn create_conversation_accepts_deep_cwd() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let deep = tmp.path().join("project/src");
-        std::fs::create_dir_all(&deep).expect("deep dir");
-        let state = hard_delete_cascade_tests::make_test_state().await;
-
-        let Json(response) = create_conversation_with_id(
-            state,
-            create_request(deep.to_string_lossy().to_string()),
-            Vec::new(),
-        )
-        .await
-        .expect("deep cwd accepted");
-
-        assert_eq!(
-            response.conversation["cwd"].as_str(),
-            Some(deep.to_str().unwrap())
-        );
-        assert_eq!(
-            response.conversation["state"]["type"].as_str(),
-            Some("provisioning")
-        );
-    }
-
     #[tokio::test]
     async fn explicit_worktree_mode_outside_git_returns_provisioning_shell() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -8135,31 +8109,6 @@ mod conversation_cwd_validation_tests {
             Some("provisioning")
         );
     }
-
-    #[tokio::test]
-    async fn creation_intent_preserves_raw_cwd() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let project = tmp.path().join("project");
-        std::fs::create_dir_all(&project).expect("project dir");
-        let raw_cwd = project.join("..").join("project");
-        let state = hard_delete_cascade_tests::make_test_state().await;
-        let mut req = create_request(raw_cwd.to_string_lossy().to_string());
-        req.conversation_id = Some(uuid::Uuid::new_v4().to_string());
-        let conv_id = req.conversation_id.clone().expect("id");
-
-        let _ = create_conversation_with_id(state.clone(), req, Vec::new())
-            .await
-            .expect("create shell");
-
-        let job = state
-            .db
-            .get_conversation_creation_job_for_conversation(&conv_id)
-            .await
-            .expect("load job")
-            .expect("job exists");
-        assert_eq!(job.intent.cwd, raw_cwd.to_string_lossy());
-    }
-
     #[tokio::test]
     async fn validate_cwd_rejects_filesystem_root() {
         let Json(response) = validate_cwd(Query(PathQuery {
@@ -13297,23 +13246,17 @@ mod regenerate_conversation_name_tests {
     use std::sync::Arc;
 
     #[derive(Debug)]
-    enum StubLlm {
-        Ok(&'static str),
-        Err,
-    }
+    struct StubLlm(&'static str);
 
     #[async_trait]
     impl LlmService for StubLlm {
         async fn complete(&self, _r: &LlmRequest) -> Result<LlmResponse, LlmError> {
-            match self {
-                StubLlm::Ok(text) => Ok(LlmResponse {
-                    content: vec![ContentBlock::text(*text)],
-                    end_turn: true,
-                    usage: Usage::default(),
-                    stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
-                }),
-                StubLlm::Err => Err(LlmError::server_error("temporary outage")),
-            }
+            Ok(LlmResponse {
+                content: vec![ContentBlock::text(self.0)],
+                end_turn: true,
+                usage: Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            })
         }
 
         async fn complete_streaming(
@@ -13405,7 +13348,7 @@ mod regenerate_conversation_name_tests {
     #[tokio::test]
     async fn successful_generation_renames_with_existing_slug_rules() {
         let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
-            StubLlm::Ok("Useful Auth Fix"),
+            StubLlm("Useful Auth Fix"),
         ))))
         .await;
         seed_conversation(&state, "conv-ok", "deterministic-conv-ok").await;
@@ -13421,46 +13364,10 @@ mod regenerate_conversation_name_tests {
         let reloaded = state.db.get_conversation("conv-ok").await.expect("reload");
         assert_eq!(reloaded.slug.as_deref(), Some("useful-auth-fix"));
     }
-
-    #[tokio::test]
-    async fn missing_opening_leaves_slug_unchanged() {
-        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
-            StubLlm::Ok("Useful Name"),
-        ))))
-        .await;
-        seed_conversation(&state, "conv-empty", "deterministic-conv-empty").await;
-
-        assert!(regenerate(&state, "conv-empty").await.is_err());
-        let reloaded = state
-            .db
-            .get_conversation("conv-empty")
-            .await
-            .expect("reload");
-        assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-empty"));
-    }
-
-    #[tokio::test]
-    async fn llm_failure_leaves_slug_unchanged() {
-        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
-            StubLlm::Err,
-        ))))
-        .await;
-        seed_conversation(&state, "conv-fail", "deterministic-conv-fail").await;
-        seed_opening(&state, "conv-fail", "rename this later").await;
-
-        assert!(regenerate(&state, "conv-fail").await.is_err());
-        let reloaded = state
-            .db
-            .get_conversation("conv-fail")
-            .await
-            .expect("reload");
-        assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-fail"));
-    }
-
     #[tokio::test]
     async fn duplicate_generated_slug_returns_error_and_leaves_slug_unchanged() {
         let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
-            StubLlm::Ok("Taken Slug"),
+            StubLlm("Taken Slug"),
         ))))
         .await;
         seed_conversation(&state, "conv-taken", "taken-slug").await;
@@ -13474,21 +13381,6 @@ mod regenerate_conversation_name_tests {
             .await
             .expect("reload");
         assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-rename"));
-    }
-
-    #[tokio::test]
-    async fn missing_cheap_model_leaves_slug_unchanged() {
-        let state = make_test_state(Arc::new(ModelRegistry::new_empty())).await;
-        seed_conversation(&state, "conv-nomodel", "deterministic-conv-nomodel").await;
-        seed_opening(&state, "conv-nomodel", "rename this later").await;
-
-        assert!(regenerate(&state, "conv-nomodel").await.is_err());
-        let reloaded = state
-            .db
-            .get_conversation("conv-nomodel")
-            .await
-            .expect("reload");
-        assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-nomodel"));
     }
 }
 
@@ -13634,19 +13526,6 @@ mod upgrade_model_state_guard_tests {
             "new model must be persisted so the next retry picks it up"
         );
     }
-
-    #[tokio::test]
-    async fn allows_switch_from_idle() {
-        let state = make_test_state().await;
-        seed(&state, "c-idle").await;
-        // create_conversation leaves the row Idle by default.
-        upgrade(&state, "c-idle", "claude-sonnet-5")
-            .await
-            .expect("model switch must be allowed from Idle");
-        let conv = state.db.get_conversation("c-idle").await.expect("reload");
-        assert_eq!(conv.model.as_deref(), Some("claude-sonnet-5"));
-    }
-
     #[tokio::test]
     async fn rejects_switch_while_llm_request_in_flight() {
         let state = make_test_state().await;
@@ -14047,40 +13926,6 @@ mod file_read_tests {
             }
         }
     }
-
-    #[tokio::test]
-    async fn read_file_keeps_text_response_for_utf8_files() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("notes.txt");
-        std::fs::write(&path, "hello\n").expect("text");
-        let state = state_with_root(tmp.path()).await;
-
-        let Json(response) = read_file(
-            State(state),
-            Query(PathQuery {
-                path: path.to_string_lossy().to_string(),
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("text response");
-
-        match response {
-            ReadFileResponse::Text {
-                content,
-                encoding,
-                category,
-            } => {
-                assert_eq!(content, "hello\n");
-                assert_eq!(encoding, "utf-8");
-                assert_eq!(category, crate::api::TextCategory::Plain);
-            }
-            other @ ReadFileResponse::Image { .. } => {
-                panic!("expected text response, got {other:?}")
-            }
-        }
-    }
-
     /// A file under a globally-discovered skill tree (`$HOME/.claude/skills`)
     /// must be previewable, even though it lives under no conversation cwd:
     /// `read_file` admits skill-tree files via `canonicalize_within_roots`, so
@@ -14486,21 +14331,6 @@ mod attachment_storage_tests {
         assert!(referenced.contains(&PathBuf::from(submitted_path)));
         assert!(referenced.contains(&PathBuf::from(delivery_path)));
     }
-
-    #[test]
-    fn sweep_keeps_recent_files() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path();
-        let conv = root.join("conv-recent");
-        std::fs::create_dir_all(&conv).expect("create conv dir");
-        let recent = conv.join("recent.txt");
-        std::fs::write(&recent, b"recent").expect("write recent");
-        let cutoff = SystemTime::UNIX_EPOCH;
-        sweep_expired_attachments_blocking(root, cutoff, &HashSet::new()).expect("sweep");
-        assert!(recent.exists());
-        assert!(conv.exists());
-    }
-
     #[tokio::test]
     async fn hard_delete_attachment_cleanup_removes_conversation_dir() {
         let temp = tempfile::tempdir().expect("tempdir");

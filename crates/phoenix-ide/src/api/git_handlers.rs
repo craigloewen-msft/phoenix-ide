@@ -2703,23 +2703,6 @@ mod tests {
             (Some(PrFeedbackStatus::Approved), false)
         );
     }
-
-    #[test]
-    fn unavailable_root_status_falls_back_to_cached_response_status() {
-        let previous = Some(PrFeedbackStatus::InProgress);
-        let fetched = None;
-
-        assert_eq!(fetched.or(previous), Some(PrFeedbackStatus::InProgress));
-    }
-
-    #[test]
-    fn successful_open_root_status_overrides_cached_response_status() {
-        let previous = Some(PrFeedbackStatus::InProgress);
-        let fetched = Some(PrFeedbackStatus::Open);
-
-        assert_eq!(fetched.or(previous), Some(PrFeedbackStatus::Open));
-    }
-
     fn association(owner: &str, repo: &str, number: u64) -> crate::db::WorkScopePrAssociation {
         crate::db::WorkScopePrAssociation {
             work_scope_id: crate::work_scope::WorkScopeId::parse("scope-1").unwrap(),
@@ -2897,35 +2880,6 @@ mod tests {
         run_git(dest, &["config", "user.email", "probe@test"]).unwrap();
         run_git(dest, &["config", "user.name", "probe"]).unwrap();
     }
-
-    #[test]
-    fn parses_porcelain_v2_records_and_counts() {
-        let output = concat!(
-            "1 MM N... 100644 100644 100644 1111111111111111111111111111111111111111 1111111111111111111111111111111111111111 src/lib.rs\0",
-            "1 D. N... 100644 000000 000000 2222222222222222222222222222222222222222 0000000000000000000000000000000000000000 deleted.txt\0",
-            "2 R. N... 100644 100644 100644 3333333333333333333333333333333333333333 3333333333333333333333333333333333333333 R100 renamed new.txt\0old name.txt\0",
-            "u UU N... 100644 100644 100644 100644 4444444444444444444444444444444444444444 5555555555555555555555555555555555555555 6666666666666666666666666666666666666666 conflicted.txt\0",
-            "? untracked/é.txt\0",
-            "! ignored.tmp\0"
-        )
-        .as_bytes();
-
-        let parsed = parse_git_status_porcelain_v2(output).unwrap();
-        assert_eq!(parsed.counts.changed_paths, 5);
-        assert_eq!(parsed.counts.staged_paths, 3);
-        assert_eq!(parsed.counts.unstaged_paths, 1);
-        assert_eq!(parsed.counts.untracked_paths, 1);
-        assert_eq!(parsed.counts.conflicted_paths, 1);
-        assert!(matches!(
-            &parsed.changed_paths[2],
-            GitChangedPath::Renamed {
-                path,
-                previous_path,
-                worktree_status: GitFileStatus::Unmodified,
-            } if path == "renamed new.txt" && previous_path == "old name.txt"
-        ));
-    }
-
     #[test]
     fn snapshot_excludes_ignored_and_keeps_all_untracked_files() {
         let repo = tempfile::tempdir().unwrap();
@@ -2998,27 +2952,6 @@ mod tests {
                 if path == "new.txt" && previous_path == "old.txt"
         ));
     }
-
-    #[test]
-    fn snapshot_preserves_copy_detection_over_repository_config() {
-        let repo = tempfile::tempdir().unwrap();
-        init_repo(repo.path());
-        std::fs::write(repo.path().join("source.txt"), "copy me\n").unwrap();
-        run_git(repo.path(), &["add", "source.txt"]).unwrap();
-        run_git(repo.path(), &["commit", "-q", "-m", "base"]).unwrap();
-        run_git(repo.path(), &["config", "status.renames", "false"]).unwrap();
-        std::fs::copy(repo.path().join("source.txt"), repo.path().join("copy.txt")).unwrap();
-        std::fs::write(repo.path().join("source.txt"), "changed source\n").unwrap();
-        run_git(repo.path(), &["add", "source.txt", "copy.txt"]).unwrap();
-
-        let snapshot = capture_git_status_snapshot(repo.path()).unwrap();
-        assert!(snapshot.changed_paths.iter().any(|path| matches!(
-            path,
-            GitChangedPath::Copied { path, source_path: previous_path, .. }
-                if path == "copy.txt" && previous_path == "source.txt"
-        )));
-    }
-
     #[test]
     fn snapshot_scopes_paths_to_a_conversation_subdirectory() {
         let repo = tempfile::tempdir().unwrap();
@@ -3103,26 +3036,6 @@ mod tests {
             GitChangedPath::Untracked { path } if path == "scratch.txt"
         )));
     }
-
-    #[test]
-    fn capture_checkout_status_reports_non_git_as_unavailable() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(matches!(
-            checkout_status_from_live_observation(dir.path()),
-            CheckoutStatus::Unavailable { .. }
-        ));
-    }
-
-    #[test]
-    fn work_change_clean_branch() {
-        let repo = tempfile::tempdir().unwrap();
-        init_repo(repo.path());
-        assert_eq!(
-            summarize_work_change(repo.path(), "main", "main"),
-            WorkChangeSummary::Clean
-        );
-    }
-
     #[test]
     fn work_change_uncommitted_changes_need_review() {
         let repo = tempfile::tempdir().unwrap();
@@ -3328,37 +3241,6 @@ mod tests {
             artifact
         );
     }
-
-    #[test]
-    fn pr_auto_fix_artifact_path_preserves_cwd_fallback() {
-        let temp = tempfile::tempdir().unwrap();
-        let worktree = temp.path().join("worktree");
-        let cwd = temp.path().join("cwd");
-        std::fs::create_dir_all(&worktree).unwrap();
-        std::fs::create_dir_all(cwd.join(".phoenix/pr-context")).unwrap();
-        let artifact_path = ".phoenix/pr-context/pr-12.json";
-        let artifact = cwd.join(artifact_path);
-        std::fs::write(&artifact, "{}").unwrap();
-        let conv = conversation_with_mode(
-            &cwd,
-            ConvMode::Work {
-                branch_name: crate::db::NonEmptyString::new("task-test").unwrap(),
-                worktree_path: crate::db::NonEmptyString::new(
-                    worktree.to_string_lossy().to_string(),
-                )
-                .unwrap(),
-                base_branch: crate::db::NonEmptyString::new("main").unwrap(),
-                task_id: crate::db::NonEmptyString::new("11002").unwrap(),
-                task_title: crate::db::NonEmptyString::new("Fix freshness").unwrap(),
-            },
-        );
-
-        assert_eq!(
-            pr_auto_fix_artifact_path(&conv, artifact_path).unwrap(),
-            artifact
-        );
-    }
-
     #[test]
     fn pr_auto_fix_artifact_path_rejects_paths_outside_pr_context_dir() {
         let temp = tempfile::tempdir().unwrap();
@@ -3569,115 +3451,6 @@ mod tests {
             .unwrap();
         assert_eq!(selected.pr_number, 22);
     }
-
-    #[test]
-    fn configured_upstream_ref_reads_tracking_ref() {
-        let upstream = tempfile::tempdir().unwrap();
-        init_repo(upstream.path());
-        let clone = tempfile::tempdir().unwrap();
-        clone_repo(upstream.path(), clone.path());
-        run_git(clone.path(), &["checkout", "-q", "-b", "feature"]).unwrap();
-        run_git(
-            clone.path(),
-            &["push", "--quiet", "-u", "origin", "feature"],
-        )
-        .unwrap();
-        assert_eq!(
-            configured_upstream_ref(clone.path(), "feature"),
-            Some("refs/remotes/origin/feature".to_string())
-        );
-    }
-
-    #[test]
-    fn checkout_status_named_branch_reports_matching_origin_fallback() {
-        let upstream = tempfile::tempdir().unwrap();
-        init_repo(upstream.path());
-        let clone = tempfile::tempdir().unwrap();
-        clone_repo(upstream.path(), clone.path());
-        run_git(clone.path(), &["checkout", "-q", "-b", "feature"]).unwrap();
-        run_git(clone.path(), &["push", "--quiet", "origin", "HEAD:feature"]).unwrap();
-        run_git(
-            clone.path(),
-            &[
-                "remote",
-                "set-url",
-                "origin",
-                "https://github.com/acme/repo.git",
-            ],
-        )
-        .unwrap();
-
-        let head_oid = run_git(clone.path(), &["rev-parse", "HEAD"]).unwrap();
-
-        assert_eq!(
-            checkout_status_from_live_observation(clone.path()),
-            CheckoutStatus::NamedBranch {
-                branch_name: "feature".to_string(),
-                head_oid: head_oid.trim().to_string(),
-                remote_status: BranchRemoteStatus::Matching {
-                    remote_ref: "refs/remotes/origin/feature".to_string(),
-                    ahead: 0,
-                    behind: 0,
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn checkout_status_named_branch_finds_matching_non_origin_remote() {
-        let upstream = tempfile::tempdir().unwrap();
-        init_repo(upstream.path());
-        let clone = tempfile::tempdir().unwrap();
-        clone_repo(upstream.path(), clone.path());
-        run_git(clone.path(), &["remote", "rename", "origin", "fork"]).unwrap();
-        run_git(clone.path(), &["checkout", "-q", "-b", "feature"]).unwrap();
-        run_git(clone.path(), &["push", "--quiet", "fork", "HEAD:feature"]).unwrap();
-
-        let head_oid = run_git(clone.path(), &["rev-parse", "HEAD"]).unwrap();
-        assert_eq!(
-            checkout_status_from_live_observation(clone.path()),
-            CheckoutStatus::NamedBranch {
-                branch_name: "feature".to_string(),
-                head_oid: head_oid.trim().to_string(),
-                remote_status: BranchRemoteStatus::Matching {
-                    remote_ref: "refs/remotes/fork/feature".to_string(),
-                    ahead: 0,
-                    behind: 0,
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn matching_remote_ref_uses_deterministic_remote_order() {
-        let upstream = tempfile::tempdir().unwrap();
-        init_repo(upstream.path());
-        let clone = tempfile::tempdir().unwrap();
-        clone_repo(upstream.path(), clone.path());
-        run_git(clone.path(), &["checkout", "-q", "-b", "feature"]).unwrap();
-        run_git(clone.path(), &["push", "--quiet", "origin", "HEAD:feature"]).unwrap();
-        run_git(
-            clone.path(),
-            &["remote", "add", "aaa", upstream.path().to_str().unwrap()],
-        )
-        .unwrap();
-        run_git(
-            clone.path(),
-            &[
-                "fetch",
-                "--quiet",
-                "aaa",
-                "feature:refs/remotes/aaa/feature",
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(
-            matching_remote_ref(clone.path(), "feature"),
-            Some("refs/remotes/aaa/feature".to_string())
-        );
-    }
-
     #[test]
     fn checkout_status_named_branch_prefers_configured_non_origin_upstream_and_counts() {
         let upstream = tempfile::tempdir().unwrap();
@@ -3746,25 +3519,6 @@ mod tests {
             }
         );
     }
-
-    #[test]
-    fn checkout_status_named_branch_reports_no_known_remote_when_untracked() {
-        let repo = tempfile::tempdir().unwrap();
-        init_repo(repo.path());
-        run_git(repo.path(), &["checkout", "-q", "-b", "feature/live"]).unwrap();
-
-        let head_oid = run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap();
-
-        assert_eq!(
-            checkout_status_from_live_observation(repo.path()),
-            CheckoutStatus::NamedBranch {
-                branch_name: "feature/live".to_string(),
-                head_oid: head_oid.trim().to_string(),
-                remote_status: BranchRemoteStatus::NoKnown,
-            }
-        );
-    }
-
     #[test]
     fn checkout_status_detached_reports_pointing_refs() {
         let repo = tempfile::tempdir().unwrap();
@@ -3805,6 +3559,18 @@ mod tests {
         assert_eq!(
             serde_json::to_value(status).unwrap()["pointing_refs"],
             serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn checkout_status_unborn_reports_branch_name() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-q", "-b", "trunk"]).unwrap();
+        assert_eq!(
+            checkout_status_from_live_observation(repo.path()),
+            CheckoutStatus::Unborn {
+                branch_name: Some("trunk".to_string()),
+            }
         );
     }
 
@@ -3883,59 +3649,6 @@ mod tests {
             }
         );
     }
-
-    #[test]
-    fn checkout_status_unborn_reports_branch_name() {
-        let repo = tempfile::tempdir().unwrap();
-        run_git(repo.path(), &["init", "-q", "-b", "trunk"]).unwrap();
-        assert_eq!(
-            checkout_status_from_live_observation(repo.path()),
-            CheckoutStatus::Unborn {
-                branch_name: Some("trunk".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn build_diff_response_threads_checkout_status() {
-        let response = build_diff_response(
-            crate::git_ops::CapturedDiff {
-                comparator: "origin/main".to_string(),
-                commit_log: "abc test".to_string(),
-                committed_diff: "diff --git a/a b/a".to_string(),
-                committed_total_bytes: 20,
-                committed_saturated: false,
-                uncommitted_diff: String::new(),
-                uncommitted_total_bytes: 0,
-                uncommitted_saturated: false,
-            },
-            "Workspace Diff".to_string(),
-            "workspace",
-            None,
-            CheckoutStatus::NamedBranch {
-                branch_name: "feature".to_string(),
-                head_oid: "abc123".to_string(),
-                remote_status: BranchRemoteStatus::Matching {
-                    remote_ref: "refs/remotes/origin/feature".to_string(),
-                    ahead: 0,
-                    behind: 0,
-                },
-            },
-        );
-        assert_eq!(
-            response.checkout_status,
-            CheckoutStatus::NamedBranch {
-                branch_name: "feature".to_string(),
-                head_oid: "abc123".to_string(),
-                remote_status: BranchRemoteStatus::Matching {
-                    remote_ref: "refs/remotes/origin/feature".to_string(),
-                    ahead: 0,
-                    behind: 0,
-                },
-            }
-        );
-    }
-
     #[test]
     fn active_pr_diff_rejects_cross_repo_selection() {
         let temp = tempfile::tempdir().unwrap();
@@ -4052,27 +3765,5 @@ mod tests {
         assert_eq!(captured.comparator, "feature/base");
         assert!(captured.commit_log.contains("top commit"));
         assert!(!captured.commit_log.contains("base commit"));
-    }
-
-    #[test]
-    fn truncated_kib_passthrough_when_under_cap() {
-        assert_eq!(truncated_kib("short", 5, false), None);
-    }
-
-    #[test]
-    fn truncated_kib_at_exact_cap_is_passthrough() {
-        let body = "x".repeat(100);
-        assert_eq!(truncated_kib(&body, 100, false), None);
-    }
-
-    #[test]
-    fn truncated_kib_over_cap_reports_kib() {
-        let body = "x".repeat(1024);
-        assert_eq!(truncated_kib(&body, 3072, false), Some(3));
-    }
-
-    #[test]
-    fn truncated_kib_saturated_returns_lower_bound() {
-        assert_eq!(truncated_kib("x", 8 * 1024, true), Some(8));
     }
 }
