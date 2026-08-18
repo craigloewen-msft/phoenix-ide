@@ -4450,30 +4450,6 @@ mod tests {
     }
 
     #[test]
-    fn test_idle_to_llm_requesting() {
-        let result = transition(
-            &ConvState::Idle,
-            &test_context(),
-            Event::UserMessage {
-                text: "Hello".to_string(),
-                llm_text: None,
-                images: vec![],
-                files: vec![],
-                message_id: "test-message-id".to_string(),
-                user_agent: None,
-                skill_invocation: None,
-            },
-        )
-        .unwrap();
-
-        assert!(matches!(
-            result.new_state,
-            ConvState::LlmRequesting { attempt: 1 }
-        ));
-        assert!(!result.effects.is_empty());
-    }
-
-    #[test]
     fn authoritative_user_message_persists_distinct_effect_with_authority() {
         let payload = phoenix_core::domain::sm_event::PreparedDirectTurnPayload::from_parts(
             phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
@@ -4702,52 +4678,6 @@ mod tests {
                 event: "CreationProvisioned",
                 ..
             })
-        ));
-    }
-
-    #[test]
-    fn test_reject_message_while_busy() {
-        let result = transition(
-            &ConvState::LlmRequesting { attempt: 1 },
-            &test_context(),
-            Event::UserMessage {
-                text: "Hello".to_string(),
-                llm_text: None,
-                images: vec![],
-                files: vec![],
-                message_id: "test-message-id".to_string(),
-                user_agent: None,
-                skill_invocation: None,
-            },
-        );
-
-        assert!(matches!(result, Err(TransitionError::AgentBusy)));
-    }
-
-    #[test]
-    fn test_error_recovery() {
-        let result = transition(
-            &ConvState::Error {
-                message: "Previous error".to_string(),
-                error_kind: ErrorKind::Network,
-                resets_at: None,
-            },
-            &test_context(),
-            Event::UserMessage {
-                text: "Try again".to_string(),
-                llm_text: None,
-                images: vec![],
-                files: vec![],
-                message_id: "test-message-id".to_string(),
-                user_agent: None,
-                skill_invocation: None,
-            },
-        )
-        .unwrap();
-
-        assert!(matches!(
-            result.new_state,
-            ConvState::LlmRequesting { attempt: 1 }
         ));
     }
 

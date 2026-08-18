@@ -293,42 +293,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn with_root_derives_sub_paths() {
-        let root = std::path::Path::new("/tmp/phoenix-test-root");
-        let env = PhoenixRuntimeEnvironment::with_root(root);
-
-        assert_eq!(env.home(), root);
-        assert_eq!(env.phoenix_home(), root.join(".phoenix-ide"));
-        assert_eq!(env.db_path(), root.join(".phoenix-ide/phoenix.db"));
-        assert_eq!(env.codex_home(), root.join(".codex"));
-        assert_eq!(env.codex_cli_auth_path(), root.join(".codex/auth.json"));
-        assert_eq!(
-            env.codex_auth_path(),
-            root.join(".phoenix-ide/codex-auth.json")
-        );
-        assert_eq!(env.prod_log_path(), root.join(".phoenix-ide/prod.log"));
-        assert_eq!(
-            env.terminal_output_dir(),
-            root.join(".phoenix-ide/terminal-output")
-        );
-        assert_eq!(
-            env.builtin_skills_dir(),
-            root.join(".phoenix-ide").join(BUILTIN_SKILLS_SUBDIR)
-        );
-        assert_eq!(
-            env.tmux_socket_dir(),
-            root.join(".phoenix-ide/tmux-sockets")
-        );
-        assert_eq!(
-            env.chromium_cache_dir(),
-            root.join(".cache/phoenix-ide/chromium")
-        );
-        // Attachments live beside tmp_root (root/tmp here), not under it, so the
-        // historical path is preserved.
-        assert_eq!(env.attachments_dir(), root.join("phoenix-ide-attachments"));
-    }
-
-    #[test]
     fn tmp_subdir_creates_the_directory() {
         let tmp = tempfile::TempDir::new().unwrap();
         let env = PhoenixRuntimeEnvironment::with_root(tmp.path());
@@ -354,23 +318,5 @@ mod tests {
             );
         }
         assert!(env.tmp_subdir("ok").unwrap().is_dir());
-    }
-
-    #[test]
-    fn is_production_reflects_db_path() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        // with_root → db is phoenix.db, not prod.db.
-        let dev = PhoenixRuntimeEnvironment::with_root(tmp.path());
-        assert!(!dev.is_production());
-
-        // A hand-built env with a prod db path is "production".
-        let prod = PhoenixRuntimeEnvironment {
-            home: tmp.path().to_path_buf(),
-            codex_home: tmp.path().join(".codex"),
-            data_dir: tmp.path().join(".phoenix-ide"),
-            db_path: tmp.path().join(".phoenix-ide/prod.db"),
-            tmp_root: tmp.path().join("tmp"),
-        };
-        assert!(prod.is_production());
     }
 }

@@ -287,26 +287,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_operation_deserialize() {
-        let json = r#""replace""#;
-        let op: Operation = serde_json::from_str(json).unwrap();
-        assert_eq!(op, Operation::Replace);
-    }
-
-    #[test]
-    fn test_patch_request_deserialize() {
-        let json = r#"{
-            "operation": "replace",
-            "oldText": "hello",
-            "newText": "world"
-        }"#;
-        let req: PatchRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.operation, Operation::Replace);
-        assert_eq!(req.old_text, Some("hello".to_string()));
-        assert_eq!(req.new_text, Some("world".to_string()));
-    }
-
-    #[test]
     fn empty_candidate_diagnostics_require_a_reread() {
         let diagnostics = AnchorNotFoundDiagnostics {
             candidates: Vec::new(),

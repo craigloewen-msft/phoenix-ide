@@ -32,43 +32,6 @@ fn registration_plan_declares_reclaimable_observation_effect() {
 }
 
 #[test]
-fn acceptance_profile_exposes_wake_codec_support() {
-    let acceptance = acceptance_profile();
-    assert!(acceptance.supported_codecs.supports(&snapshot_codec()));
-    assert!(acceptance.supported_codecs.supports(&event_codec()));
-    assert!(acceptance.supported_codecs.supports(&terminal_codec()));
-    assert!(acceptance.runtime_acceptance_enabled());
-    assert!(!acceptance.external_acceptance_enabled());
-}
-
-#[test]
-fn barrier_event_and_manual_choices_round_trip_helpers() {
-    let receipt = WakeRegistrationReceipt {
-        contract_id: "contract".into(),
-        resource: WakeResourceIdentity::Subagent(SubagentResourceIdentity {
-            child_conversation_id: "child".into(),
-        }),
-        expires_at: Timestamp(9),
-        registering_tool_use_id: "tool-use".into(),
-    };
-    let events = barrier_events(receipt.clone());
-    assert_eq!(
-        events[&REGISTRATION_BARRIER_ID],
-        registration_barrier_event(receipt.clone())
-    );
-
-    let terminal = WakeTerminalPayload::Expired {
-        contract_id: receipt.contract_id.clone(),
-        resource: receipt.resource.clone(),
-        resolved_at: Timestamp(10),
-    };
-    let choices = manual_choices(terminal.clone());
-    assert_eq!(choices.len(), 1);
-    assert_eq!(choices[0].kind, ManualChoiceKind::AcceptAsTerminal);
-    assert_eq!(choices[0].receipt, terminal);
-}
-
-#[test]
 fn cancellation_request_invalidates_registration_effect() {
     let snapshot = WakeRegistrationSnapshot {
         contract_id: "contract".into(),

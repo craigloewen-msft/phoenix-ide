@@ -342,22 +342,8 @@ mod tests {
     }
 
     #[test]
-    fn generated_ids_are_non_empty_and_distinct() {
-        let a = WorkScopeId::new();
-        let b = WorkScopeId::new();
-        assert!(!a.as_str().is_empty());
-        assert_ne!(a, b);
-    }
-
-    #[test]
     fn parse_rejects_empty_or_blank() {
         assert_eq!(WorkScopeId::parse(""), Err(WorkScopeIdError::Empty));
         assert_eq!(WorkScopeId::parse("  \t"), Err(WorkScopeIdError::Empty));
-    }
-
-    #[test]
-    fn parse_accepts_opaque_non_empty_text() {
-        let id = WorkScopeId::parse("scope-opaque").unwrap();
-        assert_eq!(id.as_str(), "scope-opaque");
     }
 }

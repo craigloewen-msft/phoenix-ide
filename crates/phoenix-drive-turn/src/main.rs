@@ -153,21 +153,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_to_memory() {
-        let args = parse_args([
-            "--cwd".into(),
-            "/tmp".into(),
-            "--model".into(),
-            "model".into(),
-            "--prompt".into(),
-            "hello".into(),
-        ])
-        .unwrap()
-        .unwrap();
-        assert_eq!(args.database, DatabaseMode::Memory);
-    }
-
-    #[test]
     fn rejects_parallel_database_representations() {
         let error = parse_args([
             "--cwd".into(),

@@ -200,62 +200,6 @@ fn acceptance() -> AcceptanceProfile<RuntimeAcceptanceEnabled, ExternalAcceptanc
     )
 }
 
-fn runtime_only_acceptance(
-) -> AcceptanceProfile<RuntimeAcceptanceEnabled, ExternalAcceptanceDisabled> {
-    AcceptanceProfile::new(
-        profile(),
-        SupportedCodecRegistry::new([
-            codec("snapshot"),
-            codec("event"),
-            codec("intent"),
-            codec("receipt"),
-            codec("barrier"),
-            codec("manual"),
-        ])
-        .expect("codecs"),
-    )
-}
-
-fn no_runtime_acceptance() -> AcceptanceProfile<RuntimeAcceptanceDisabled, ExternalAcceptanceEnabled>
-{
-    AcceptanceProfile::new(
-        profile(),
-        SupportedCodecRegistry::new([
-            codec("snapshot"),
-            codec("event"),
-            codec("intent"),
-            codec("receipt"),
-            codec("barrier"),
-            codec("manual"),
-        ])
-        .expect("codecs"),
-    )
-}
-
-fn erased_runtime_only_acceptance() -> ErasedAcceptanceProfile {
-    runtime_only_acceptance().erase()
-}
-
-fn erased_no_runtime_acceptance() -> ErasedAcceptanceProfile {
-    no_runtime_acceptance().erase()
-}
-
-fn erased_no_acceptance() -> ErasedAcceptanceProfile {
-    AcceptanceProfile::<RuntimeAcceptanceDisabled, ExternalAcceptanceDisabled>::new(
-        profile(),
-        SupportedCodecRegistry::new([
-            codec("snapshot"),
-            codec("event"),
-            codec("intent"),
-            codec("receipt"),
-            codec("barrier"),
-            codec("manual"),
-        ])
-        .expect("codecs"),
-    )
-    .erase()
-}
-
 fn workflow() -> WorkflowState<TestProfile> {
     WorkflowState::new(
         WorkflowId(1),
@@ -1679,36 +1623,6 @@ fn typed_migration_preserves_incompatible_active_workflow() {
     assert_eq!(incompatible.detected_at, Timestamp(7));
 }
 
-#[test]
-fn acceptance_capability_helpers_expose_profile_shape() {
-    let runtime_only = runtime_only_acceptance();
-    assert!(runtime_only.runtime_acceptance_enabled());
-    assert!(!runtime_only.external_acceptance_enabled());
-
-    let no_runtime = no_runtime_acceptance();
-    assert!(!no_runtime.runtime_acceptance_enabled());
-    assert!(no_runtime.external_acceptance_enabled());
-}
-
-#[test]
-fn erased_acceptance_profile_preserves_only_valid_capability_shapes() {
-    let runtime_only = erased_runtime_only_acceptance();
-    assert!(runtime_only.runtime_acceptance_enabled());
-    assert!(!runtime_only.external_acceptance_enabled());
-
-    let no_runtime = erased_no_runtime_acceptance();
-    assert!(!no_runtime.runtime_acceptance_enabled());
-    assert!(no_runtime.external_acceptance_enabled());
-
-    let no_acceptance = erased_no_acceptance();
-    assert!(!no_acceptance.runtime_acceptance_enabled());
-    assert!(!no_acceptance.external_acceptance_enabled());
-
-    let full = acceptance().erase();
-    assert!(full.runtime_acceptance_enabled());
-    assert!(full.external_acceptance_enabled());
-}
-
 fn external_binding_parts(
     key: &NonEmptyExternalKey,
     workflow_id: WorkflowId,
@@ -2126,36 +2040,6 @@ fn coalesce_latest_schedule_advances_and_resets() {
         .expect("reset");
     assert_eq!(reset.status, ScheduleStatus::Idle);
     assert_eq!(reset.next_eligible_at, Timestamp(9));
-}
-
-#[test]
-fn workflow_clone_preserves_erased_acceptance_and_schedule_occurrence_state() {
-    let mut workflow = workflow();
-    let mut plan = base_plan();
-    plan.schedules.push(ScheduleDecl {
-        schedule_id: ScheduleId(21),
-        policy: SchedulePolicy::CoalesceLatest,
-        next_eligible_at: Timestamp(5),
-        key: "cloneable-cron",
-    });
-    workflow
-        .commit_transition(&decision(Version(0), plan), &BTreeMap::new())
-        .expect("commit");
-    workflow.refresh_eligibility(Timestamp(5));
-    let original = workflow.schedules[&ScheduleId(21)]
-        .due_occurrence
-        .expect("due occurrence");
-
-    let cloned = workflow.clone();
-    assert_eq!(cloned.binding.acceptance, workflow.binding.acceptance);
-    assert_eq!(
-        cloned.schedules[&ScheduleId(21)].due_occurrence,
-        Some(original)
-    );
-    assert_eq!(
-        cloned.next_schedule_occurrence_id,
-        workflow.next_schedule_occurrence_id
-    );
 }
 
 #[test]

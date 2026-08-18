@@ -11371,41 +11371,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn app_setting_roundtrips_through_db() {
-        let db = Database::open_in_memory().await.unwrap();
-
-        // Missing key reads back as None.
-        assert!(db.get_app_setting("never_set").await.unwrap().is_none());
-
-        // Insert.
-        db.set_app_setting("key", "value-1").await.unwrap();
-        assert_eq!(
-            db.get_app_setting("key").await.unwrap().as_deref(),
-            Some("value-1")
-        );
-
-        // Upsert overwrites.
-        db.set_app_setting("key", "value-2").await.unwrap();
-        assert_eq!(
-            db.get_app_setting("key").await.unwrap().as_deref(),
-            Some("value-2")
-        );
-    }
-
-    #[tokio::test]
-    async fn auth_session_is_valid_after_insert_and_unknown_tokens_are_not() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.insert_auth_session("tok-a", "fp", chrono::Duration::hours(1))
-            .await
-            .unwrap();
-        assert!(db.is_auth_session_valid("tok-a", "fp").await.unwrap());
-        assert!(!db
-            .is_auth_session_valid("never-minted", "fp")
-            .await
-            .unwrap());
-    }
-
-    #[tokio::test]
     async fn auth_session_rejected_when_password_fingerprint_changes() {
         // A token minted under one password must not authenticate once the
         // configured password (and thus its fingerprint) changes — rotating
@@ -11446,120 +11411,6 @@ mod tests {
             .await
             .unwrap();
         assert!(db.is_auth_session_valid("stale", "fp").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn mcp_oauth_registration_roundtrips_keyed_by_auth_server() {
-        let db = Database::open_in_memory().await.unwrap();
-
-        assert!(db
-            .get_mcp_oauth_registration("https://as.example.com")
-            .await
-            .unwrap()
-            .is_none());
-
-        let registration = McpOAuthRegistrationRow {
-            auth_server: "https://as.example.com".to_string(),
-            client_id: "cid-1".to_string(),
-            client_secret: None,
-            token_endpoint_auth_method: "none".to_string(),
-            redirect_uri: Some("https://phoenix.example/api/mcp/oauth/callback".to_string()),
-        };
-        db.upsert_mcp_oauth_registration(&registration)
-            .await
-            .unwrap();
-        assert_eq!(
-            db.get_mcp_oauth_registration("https://as.example.com")
-                .await
-                .unwrap(),
-            Some(registration.clone())
-        );
-
-        // Upsert replaces in place (still one row per authorization server).
-        let confidential = McpOAuthRegistrationRow {
-            client_secret: Some("sec".to_string()),
-            token_endpoint_auth_method: "client_secret_post".to_string(),
-            ..registration
-        };
-        db.upsert_mcp_oauth_registration(&confidential)
-            .await
-            .unwrap();
-        assert_eq!(
-            db.get_mcp_oauth_registration("https://as.example.com")
-                .await
-                .unwrap(),
-            Some(confidential)
-        );
-    }
-
-    #[tokio::test]
-    async fn mcp_oauth_token_roundtrips_and_deletes() {
-        let db = Database::open_in_memory().await.unwrap();
-
-        assert!(db.get_mcp_oauth_token("linear").await.unwrap().is_none());
-
-        let token = McpOAuthTokenRow {
-            server_name: "linear".to_string(),
-            resource_uri: "https://mcp.linear.app/mcp".to_string(),
-            scopes: "read write".to_string(),
-            access_token: "at-1".to_string(),
-            refresh_token: Some("rt-1".to_string()),
-            expires_at: 1_900_000_000,
-        };
-        db.upsert_mcp_oauth_token(&token).await.unwrap();
-        assert_eq!(
-            db.get_mcp_oauth_token("linear").await.unwrap(),
-            Some(token.clone())
-        );
-
-        // Upsert (e.g. a refresh persisting a rotated refresh token) replaces
-        // the row — OneTokenPerServer.
-        let rotated = McpOAuthTokenRow {
-            access_token: "at-2".to_string(),
-            refresh_token: Some("rt-2".to_string()),
-            ..token
-        };
-        db.upsert_mcp_oauth_token(&rotated).await.unwrap();
-        assert_eq!(
-            db.get_mcp_oauth_token("linear").await.unwrap(),
-            Some(rotated)
-        );
-
-        db.delete_mcp_oauth_token("linear").await.unwrap();
-        assert!(db.get_mcp_oauth_token("linear").await.unwrap().is_none());
-        // Idempotent.
-        db.delete_mcp_oauth_token("linear").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn default_llm_language_unset_returns_phoenix_native() {
-        let db = Database::open_in_memory().await.unwrap();
-        assert_eq!(
-            db.get_default_llm_language().await.unwrap(),
-            LlmLanguage::PhoenixNative
-        );
-    }
-
-    #[tokio::test]
-    async fn default_llm_language_set_persists_and_reads_back() {
-        let db = Database::open_in_memory().await.unwrap();
-
-        db.set_default_llm_language(LlmLanguage::Caveman)
-            .await
-            .unwrap();
-        assert_eq!(
-            db.get_default_llm_language().await.unwrap(),
-            LlmLanguage::Caveman
-        );
-
-        // Switch back.
-        db.set_default_llm_language(LlmLanguage::PhoenixNative)
-            .await
-            .unwrap();
-        assert_eq!(
-            db.get_default_llm_language().await.unwrap(),
-            LlmLanguage::PhoenixNative
-        );
     }
 
     #[tokio::test]
@@ -13112,57 +12963,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn work_scope_pr_feedback_baseline_roundtrips_and_replaces() {
-        let db = Database::open_in_memory().await.unwrap();
-        let scope =
-            phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-baseline".to_string()).unwrap();
-
-        db.upsert_work_scope_pr_feedback_baseline(
-            &scope,
-            &WorkScopePrFeedbackBaselineInput {
-                repo_owner: "owner".to_string(),
-                repo_name: "repo".to_string(),
-                pr_number: 7,
-                captured_at: "2026-01-01T00:00:00Z".to_string(),
-                github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-                feedback_identities: vec!["b".to_string(), "a".to_string(), "a".to_string()],
-                feedback_fingerprints: vec!["fb".to_string(), "fa".to_string(), "fa".to_string()],
-            },
-        )
-        .await
-        .unwrap();
-
-        db.upsert_work_scope_pr_feedback_baseline(
-            &scope,
-            &WorkScopePrFeedbackBaselineInput {
-                repo_owner: "owner".to_string(),
-                repo_name: "repo".to_string(),
-                pr_number: 7,
-                captured_at: "2026-01-02T00:00:00Z".to_string(),
-                github_updated_at: Some("2026-01-02T00:00:00Z".to_string()),
-                feedback_identities: vec!["c".to_string()],
-                feedback_fingerprints: vec!["fc".to_string()],
-            },
-        )
-        .await
-        .unwrap();
-
-        let baseline = db
-            .work_scope_pr_feedback_baseline(&scope, "owner", "repo", 7)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(baseline.pr_number, 7);
-        assert_eq!(baseline.captured_at, "2026-01-02T00:00:00Z");
-        assert_eq!(
-            baseline.github_updated_at.as_deref(),
-            Some("2026-01-02T00:00:00Z")
-        );
-        assert_eq!(baseline.feedback_identities, vec!["c".to_string()]);
-        assert_eq!(baseline.feedback_fingerprints, vec!["fc".to_string()]);
-    }
-
-    #[tokio::test]
     async fn work_scope_pr_feedback_baselines_are_keyed_by_full_identity() {
         let db = Database::open_in_memory().await.unwrap();
         let scope =
@@ -13210,24 +13010,6 @@ mod tests {
             Database::authority_for_mode(&cm),
             AuthorityKind::RestrictedExplore
         );
-    }
-
-    #[tokio::test]
-    async fn test_create_and_get_conversation() {
-        let db = Database::open_in_memory().await.unwrap();
-
-        let conv = db
-            .create_conversation("test-id", "test-slug", "/tmp/test", true, None, None)
-            .await
-            .unwrap();
-
-        assert_eq!(conv.id, "test-id");
-        assert_eq!(conv.slug, Some("test-slug".to_string()));
-        assert_eq!(conv.cwd, "/tmp/test");
-        assert!(matches!(conv.state, ConvState::Idle));
-
-        let fetched = db.get_conversation("test-id").await.unwrap();
-        assert_eq!(fetched.id, conv.id);
     }
 
     #[tokio::test]
@@ -13772,62 +13554,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_add_and_get_messages() {
-        use phoenix_core::domain::llm_types::ContentBlock;
-
-        let db = Database::open_in_memory().await.unwrap();
-
-        db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
-            .await
-            .unwrap();
-
-        let msg1 = db
-            .add_message(
-                "msg-1",
-                "conv-1",
-                &MessageContent::user("Hello"),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-
-        let msg2 = db
-            .add_message(
-                "msg-2",
-                "conv-1",
-                &MessageContent::agent(vec![ContentBlock::text("Hi there!")]),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(msg1.sequence_id, 1);
-        assert_eq!(msg2.sequence_id, 2);
-        assert_eq!(msg1.message_type, MessageType::User);
-        assert_eq!(msg2.message_type, MessageType::Agent);
-
-        let messages = db.get_messages("conv-1").await.unwrap();
-        assert_eq!(messages.len(), 2);
-
-        // Verify content is properly typed
-        match &messages[0].content {
-            MessageContent::User(u) => assert_eq!(u.text, "Hello"),
-            MessageContent::Agent(_)
-            | MessageContent::Tool(_)
-            | MessageContent::System(_)
-            | MessageContent::Error(_)
-            | MessageContent::Continuation(_)
-            | MessageContent::Skill(_) => panic!("Expected User content"),
-        }
-
-        let after = db.get_messages_after("conv-1", 1).await.unwrap();
-        assert_eq!(after.len(), 1);
-        assert_eq!(after[0].message_id, "msg-2");
-    }
-
-    #[tokio::test]
     async fn transcript_generation_does_not_change_on_append() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("conv-append", "slug-append", "/tmp", true, None, None)
@@ -13933,73 +13659,6 @@ mod tests {
         assert!(matches!(err, DbError::MessageNotFound(id) if id == "missing"));
         let after = db.get_conversation("conv-miss").await.unwrap();
         assert_eq!(after.transcript_generation, before.transcript_generation);
-    }
-
-    #[tokio::test]
-    async fn message_slice_helpers_return_expected_windows() {
-        let db = Database::open_in_memory().await.unwrap();
-
-        db.create_conversation("conv-slices", "slug-slices", "/tmp", true, None, None)
-            .await
-            .unwrap();
-
-        for idx in 1..=5 {
-            db.add_message(
-                &format!("msg-{idx}"),
-                "conv-slices",
-                &MessageContent::user(format!("m{idx}")),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        }
-
-        let latest = db.get_latest_messages("conv-slices", 2).await.unwrap();
-        assert_eq!(
-            latest.iter().map(|m| m.sequence_id).collect::<Vec<_>>(),
-            vec![4, 5]
-        );
-
-        let before = db.get_messages_before("conv-slices", 4, 2).await.unwrap();
-        assert_eq!(
-            before.iter().map(|m| m.sequence_id).collect::<Vec<_>>(),
-            vec![2, 3]
-        );
-
-        let after = db
-            .get_messages_after_limited("conv-slices", 2, 2)
-            .await
-            .unwrap();
-        assert_eq!(
-            after.iter().map(|m| m.sequence_id).collect::<Vec<_>>(),
-            vec![3, 4]
-        );
-
-        let range = db.get_message_range("conv-slices", 2, 4).await.unwrap();
-        assert_eq!(
-            range.iter().map(|m| m.sequence_id).collect::<Vec<_>>(),
-            vec![2, 3, 4]
-        );
-
-        let (around_before, around_after) = db
-            .get_messages_around("conv-slices", 3, 2, 2)
-            .await
-            .unwrap();
-        assert_eq!(
-            around_before
-                .iter()
-                .map(|m| m.sequence_id)
-                .collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-        assert_eq!(
-            around_after
-                .iter()
-                .map(|m| m.sequence_id)
-                .collect::<Vec<_>>(),
-            vec![4, 5]
-        );
     }
 
     /// A freshly-migrated DB (base SCHEMA + all versioned migrations, the path

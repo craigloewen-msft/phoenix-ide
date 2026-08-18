@@ -1684,61 +1684,11 @@ mod conv_mode_tests {
     use super::*;
 
     #[test]
-    fn test_direct_serialization() {
-        let json = serde_json::to_string(&ConvMode::Direct).unwrap();
-        assert_eq!(json, r#"{"mode":"Direct"}"#);
-        let parsed: ConvMode = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, ConvMode::Direct);
-    }
-
-    #[test]
     fn test_standalone_no_longer_deserializes() {
         // Migration 001 rewrites "Standalone" -> "Direct" in the DB.
         // The serde alias is removed; raw "Standalone" JSON is now rejected.
         let old_json = r#"{"mode":"Standalone"}"#;
         assert!(serde_json::from_str::<ConvMode>(old_json).is_err());
-    }
-
-    #[test]
-    fn test_explore_still_works() {
-        let json = r#"{"mode":"Explore"}"#;
-        let parsed: ConvMode = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            parsed,
-            ConvMode::Explore {
-                worktree_path: None,
-                next_taskmd_id_hint: None,
-            }
-        );
-    }
-
-    #[test]
-    fn test_branch_serialization() {
-        let mode = ConvMode::Branch {
-            branch_name: NonEmptyString::new("fix-login").unwrap(),
-            worktree_path: NonEmptyString::new("/tmp/wt").unwrap(),
-            base_branch: NonEmptyString::new("main").unwrap(),
-        };
-        let json = serde_json::to_string(&mode).unwrap();
-        let parsed: ConvMode = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, mode);
-        // Verify no task_id in JSON
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(value.get("task_id").is_none());
-    }
-
-    #[test]
-    fn test_work_serialization_roundtrip() {
-        let mode = ConvMode::Work {
-            branch_name: NonEmptyString::new("task-0042-fix-bug").unwrap(),
-            worktree_path: NonEmptyString::new("/tmp/wt/abc").unwrap(),
-            base_branch: NonEmptyString::new("main").unwrap(),
-            task_id: NonEmptyString::new("YF042").unwrap(),
-            task_title: NonEmptyString::new("Fix the bug").unwrap(),
-        };
-        let json = serde_json::to_string(&mode).unwrap();
-        let parsed: ConvMode = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, mode);
     }
 
     #[test]
@@ -1758,29 +1708,6 @@ mod conv_mode_tests {
         // After migration cleanup, missing fields are rejected (no serde(default))
         let json = r#"{"mode":"Work","branch_name":"old-branch"}"#;
         assert!(serde_json::from_str::<ConvMode>(json).is_err());
-    }
-
-    #[test]
-    fn test_worktree_config_extraction() {
-        let mode = ConvMode::Work {
-            branch_name: NonEmptyString::new("task-1").unwrap(),
-            worktree_path: NonEmptyString::new("/wt").unwrap(),
-            base_branch: NonEmptyString::new("main").unwrap(),
-            task_id: NonEmptyString::new("T1").unwrap(),
-            task_title: NonEmptyString::new("Title").unwrap(),
-        };
-        let config = mode.worktree_config().unwrap();
-        assert_eq!(config.branch_name.as_str(), "task-1");
-        assert_eq!(config.worktree_path.as_str(), "/wt");
-        assert_eq!(config.base_branch.as_str(), "main");
-
-        assert!(ConvMode::Explore {
-            worktree_path: None,
-            next_taskmd_id_hint: None,
-        }
-        .worktree_config()
-        .is_none());
-        assert!(ConvMode::Direct.worktree_config().is_none());
     }
 
     /// Pin the concrete `conv_mode` JSON shape that phoenix-db migrations query

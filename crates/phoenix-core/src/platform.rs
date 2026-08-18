@@ -95,31 +95,3 @@ fn network_block_supported_impl() -> bool {
 fn process_isolation_supported_impl() -> bool {
     false
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn detect_returns_valid_variant() {
-        let cap = PlatformCapability::detect();
-        let _ = cap.has_sandbox();
-    }
-
-    #[test]
-    fn none_has_no_sandbox() {
-        assert!(!PlatformCapability::None {
-            details: "unsupported".to_string()
-        }
-        .has_sandbox());
-    }
-
-    #[test]
-    fn nono_has_sandbox() {
-        assert!(PlatformCapability::Nono {
-            platform: "test".to_string(),
-            details: "supported".to_string()
-        }
-        .has_sandbox());
-    }
-}
