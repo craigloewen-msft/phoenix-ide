@@ -2,10 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { Conversation } from './api';
 import { notificationRoute } from './notifications/store';
 import {
-  AGENT_FINISHED_THRESHOLD_MS,
   DEFAULT_NOTIFICATION_SETTINGS,
   closeNotificationsForConversation,
-  notifyCatchUp,
   notifyConversationStateChange,
   registerCoordinatorForNotifications,
   resetNotificationRuntimeForTest,

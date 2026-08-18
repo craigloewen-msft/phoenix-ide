@@ -83,6 +83,15 @@ This is a starting set, not a quota. Apply the deletion rule across every test-b
 - The final report records before/after test counts by Rust/UI/Python and wall-time measurements, and explains any major suite intentionally left intact.
 - `./dev.py check` passes, with targeted reruns for affected process/browser suites where full-check parallelism is behaviorally relevant.
 
+## Completion results
+
+- Removed 381 counted tests and 6,248 net lines across 59 files while retaining the durable suites named above.
+- Count changes: Rust 3,049 → 2,783 (-266, -8.7%); UI 2,200 → 2,086 (-114, -5.2%); Python 321 → 311 (-10, -3.1%).
+- The same-command wall-time comparison was: Rust workspace tests 508.927s → 331.430s (-177.497s, -34.9%); Vitest 31.411s → 35.772s (+4.361s, +13.9%); dev.py Python tests 230.528s → 46.470s (-184.058s, -79.8%); Phoenix client tests 0.689s → 0.297s (-0.392s, -56.9%). Single-run figures are environment-sensitive, especially the parallel UI/Python runs.
+- Both Rust timing runs stopped at the same ambient-environment failure in `registry::tests::test_no_api_keys_no_models`, tracked by task 82005. The full runtime crate separately ran 1,077 passing tests plus one unrelated filesystem race that passed on exact rerun.
+- Both Vitest timing runs retained the same baseline `localStorage` environment failure family. Modified non-storage suites passed targeted runs; TypeScript and ESLint pass after pruning.
+- The final all-lane check reached all 19 lanes through ignored local Corepack/pnpm shims. Task validation, spec shape/anchors, formatting, lint, typecheck, codegen, package-lock, client, compile, and Python lanes passed. Remaining red lanes were the baseline Vitest storage failures, ambient model configuration affecting Rust and E2E, and target-specific conversion warnings in unchanged `conversation_files.rs` under this host toolchain.
+
 ## Risks and non-goals
 
 - This is not an exercise in maximizing deletion count or optimizing for code coverage percentage.

@@ -3162,7 +3162,7 @@ pub fn transition_sub_agent(
                 assistant_message,
                 pending_sub_agents,
             }),
-            SubAgentEvent::Core(CoreEvent::UserCancel { reason: _, .. }),
+            SubAgentEvent::Core(CoreEvent::UserCancel { .. }),
         ) => Ok(
             SubAgentTransitionResult::new(SubAgentState::Core(CoreState::CancellingTool {
                 tool_use_id: current_tool.id.clone(),
@@ -3224,7 +3224,7 @@ pub fn transition_sub_agent(
         // ToolAborted/ToolComplete settles the round (arm above).
         (
             cancelling @ SubAgentState::Core(CoreState::CancellingTool { .. }),
-            SubAgentEvent::Core(CoreEvent::UserCancel { reason: _, .. }),
+            SubAgentEvent::Core(CoreEvent::UserCancel { .. }),
         ) => Ok(SubAgentTransitionResult::new(cancelling.clone())),
 
         // ============================================================
