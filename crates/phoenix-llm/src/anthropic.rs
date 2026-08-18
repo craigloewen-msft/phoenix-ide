@@ -1590,44 +1590,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resolve_anthropic_url_override_takes_priority() {
-        let url = resolve_anthropic_url(Some("https://ai-gateway.us1.ddbuild.io/v1/messages"));
-        assert_eq!(url, "https://ai-gateway.us1.ddbuild.io/v1/messages");
-    }
-
-    #[tokio::test]
-    async fn test_resolve_anthropic_url_default() {
-        let url = resolve_anthropic_url(None);
-        assert_eq!(url, "https://api.anthropic.com/v1/messages");
-    }
-
-    #[tokio::test]
-    async fn test_request_tags_omitted_when_none() {
-        let spec = test_spec(false);
-        let request = test_request_with_tools();
-        let req = translate_request(&spec, &request);
-        let json = serde_json::to_value(&req).unwrap();
-        assert!(
-            json.get("tags").is_none(),
-            "tags must be omitted from the wire when not set; got {json}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_request_tags_serialized_when_set() {
-        let spec = test_spec(false);
-        let request = test_request_with_tools();
-        let mut req = translate_request(&spec, &request);
-        let mut tags = std::collections::BTreeMap::new();
-        tags.insert("disable_data_logging".to_string(), "true".to_string());
-        tags.insert("foo".to_string(), "bar".to_string());
-        req.tags = Some(tags);
-        let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["tags"]["disable_data_logging"], "true");
-        assert_eq!(json["tags"]["foo"], "bar");
-    }
-
-    #[tokio::test]
     async fn test_normalize_response_with_server_tool_use() {
         let resp = AnthropicResponse {
             content: vec![

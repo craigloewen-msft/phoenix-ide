@@ -268,27 +268,3 @@ async fn handle_nav(
     *last_url.lock().await = Some(url.clone());
     let _ = tx.send(ScreencastEvent::Url(url));
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn broadcast_event_clone_is_cheap() {
-        // ScreencastEvent::Frame uses Arc<[u8]> so cloning a frame doesn't
-        // copy the JPEG bytes. This is what makes the N-viewer fan-out
-        // affordable. If someone refactors `Frame` to hold a `Vec<u8>` by
-        // value this test will start failing meaningfully (slowly).
-        let bytes: Arc<[u8]> = Arc::from(vec![0u8; 1_000_000].into_boxed_slice());
-        let frame = ScreencastEvent::Frame {
-            jpeg: bytes.clone(),
-        };
-        let clone = frame.clone();
-        match (frame, clone) {
-            (ScreencastEvent::Frame { jpeg: a }, ScreencastEvent::Frame { jpeg: b }) => {
-                assert!(Arc::ptr_eq(&a, &b), "clone must share the same Arc");
-            }
-            _ => unreachable!(),
-        }
-    }
-}

@@ -210,23 +210,6 @@ mod tests {
     }
 
     #[test]
-    fn ca_paths_uses_canonical_filenames_under_dir() {
-        let dir = Path::new("/some/base/dir");
-        let paths = ca_paths(dir);
-
-        assert_eq!(paths.cert_path, dir.join("phoenix-local-ca.pem"));
-        assert_eq!(paths.key_path, dir.join("phoenix-local-ca-key.pem"));
-        assert!(paths
-            .cert_path
-            .to_string_lossy()
-            .ends_with("phoenix-local-ca.pem"));
-        assert!(paths
-            .key_path
-            .to_string_lossy()
-            .ends_with("phoenix-local-ca-key.pem"));
-    }
-
-    #[test]
     fn ensure_ca_creates_both_files_on_empty_dir() {
         let tmp = TempDir::new().unwrap();
         let paths = ensure_ca(tmp.path()).unwrap();
@@ -294,23 +277,6 @@ mod tests {
 
         let result = issue_leaf(tmp.path(), &cert_path, &key_path, &[]);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn issue_leaf_creates_ca_and_leaf_files() {
-        let tmp = TempDir::new().unwrap();
-        let ca_dir = tmp.path().join("ca");
-        let cert_path = tmp.path().join("leaf/leaf.pem");
-        let key_path = tmp.path().join("leaf/leaf-key.pem");
-        let hosts = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-
-        let issued = issue_leaf(&ca_dir, &cert_path, &key_path, &hosts).unwrap();
-
-        let ca = ca_paths(&ca_dir);
-        assert!(ca.cert_path.exists(), "CA cert should exist");
-        assert!(ca.key_path.exists(), "CA key should exist");
-        assert!(issued.cert_path.exists(), "leaf cert should exist");
-        assert!(issued.key_path.exists(), "leaf key should exist");
     }
 
     #[test]

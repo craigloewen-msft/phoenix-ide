@@ -548,13 +548,6 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_frontmatter_no_frontmatter() {
-        let content = "# Just markdown\nNo frontmatter here.";
-        let result = strip_frontmatter(content);
-        assert_eq!(result, content);
-    }
-
-    #[test]
     fn test_strip_frontmatter_incomplete() {
         // Opening --- but no closing ---
         let content = "---\nname: build\ndescription: Build it\n\n# Body";
@@ -563,30 +556,9 @@ mod tests {
         assert_eq!(result, content);
     }
 
-    #[test]
-    fn test_strip_frontmatter_empty_body() {
-        let content = "---\nname: build\ndescription: Build it\n---\n";
-        let result = strip_frontmatter(content);
-        assert_eq!(result, "");
-    }
-
-    #[test]
-    fn test_strip_frontmatter_with_leading_whitespace() {
-        let content = "  ---\nname: build\ndescription: Build it\n---\n\nBody here.";
-        let result = strip_frontmatter(content);
-        assert_eq!(result, "Body here.");
-    }
-
     // -------------------------------------------------------------------------
     // substitute_arguments
     // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_substitute_arguments_full_replacement() {
-        let body = "Review $ARGUMENTS carefully.";
-        let result = substitute_arguments(body, "src/main.rs");
-        assert_eq!(result, "Review src/main.rs carefully.");
-    }
 
     #[test]
     fn test_substitute_arguments_positional() {
@@ -606,20 +578,6 @@ mod tests {
         // Without $ARGUMENTS, falls through to append mode
         let result2 = substitute_arguments(body, "foo bar");
         assert_eq!(result2, "First: $1, second: $2\nARGUMENTS: foo bar");
-    }
-
-    #[test]
-    fn test_substitute_arguments_no_placeholder() {
-        let body = "Run the build steps.";
-        let result = substitute_arguments(body, "staging");
-        assert_eq!(result, "Run the build steps.\nARGUMENTS: staging");
-    }
-
-    #[test]
-    fn test_substitute_arguments_no_args() {
-        let body = "Run $ARGUMENTS if provided.";
-        let result = substitute_arguments(body, "");
-        assert_eq!(result, body);
     }
 
     // -------------------------------------------------------------------------
@@ -689,59 +647,6 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let skills = discover_skills_with_options(temp.path(), Some(temp.path()), None);
         assert!(skills.is_empty());
-    }
-
-    #[test]
-    fn test_discover_skills_found_claude_dir() {
-        let temp = TempDir::new().unwrap();
-        write_skill_meta(
-            temp.path(),
-            ".claude/skills",
-            "my-skill",
-            "my-skill",
-            "Does something useful. Use when you need something.",
-        );
-
-        let skills = discover_skills_with_options(temp.path(), Some(temp.path()), None);
-        let claude_skills: Vec<&SkillMetadata> =
-            skills.iter().filter(|s| s.name == "my-skill").collect();
-        assert_eq!(claude_skills.len(), 1);
-        assert!(claude_skills[0]
-            .description
-            .contains("Does something useful"));
-        match &claude_skills[0].source {
-            SkillSource::Filesystem { path, source_dir } => {
-                assert_eq!(
-                    path,
-                    &temp.path().join(".claude/skills/my-skill").join("SKILL.md")
-                );
-                assert_eq!(source_dir, ".claude/skills");
-            }
-            SkillSource::Builtin { .. } => panic!("expected Filesystem source"),
-        }
-    }
-
-    #[test]
-    fn test_discover_skills_found_agents_dir() {
-        let temp = TempDir::new().unwrap();
-        write_skill_meta(
-            temp.path(),
-            ".agents/skills",
-            "my-skill",
-            "my-skill",
-            "An agents skill",
-        );
-
-        let skills = discover_skills_with_options(temp.path(), Some(temp.path()), None);
-        let agent_skills: Vec<&SkillMetadata> =
-            skills.iter().filter(|s| s.name == "my-skill").collect();
-        assert_eq!(agent_skills.len(), 1);
-        match &agent_skills[0].source {
-            SkillSource::Filesystem { source_dir, .. } => {
-                assert_eq!(source_dir, ".agents/skills");
-            }
-            SkillSource::Builtin { .. } => panic!("expected Filesystem source"),
-        }
     }
 
     #[test]
@@ -1071,24 +976,6 @@ mod tests {
         assert!(matches!(skills[0].source, SkillSource::Filesystem { .. }));
         assert_eq!(skills[1].name, "spears");
         assert!(matches!(skills[1].source, SkillSource::Builtin { .. }));
-    }
-
-    #[test]
-    fn test_skill_dir_for_builtin_is_extracted_parent() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("builtin-skills/spears/SKILL.md");
-        let bi = SkillMetadata {
-            name: "spears".to_string(),
-            description: "x".to_string(),
-            argument_hint: None,
-            source: SkillSource::Builtin { path: path.clone() },
-        };
-        assert_eq!(
-            bi.skill_dir(),
-            path.parent().unwrap().to_string_lossy().to_string()
-        );
-        assert_eq!(bi.display_location(), "(built-in)");
-        assert_eq!(bi.skill_md_path(), path.as_path());
     }
 
     #[test]

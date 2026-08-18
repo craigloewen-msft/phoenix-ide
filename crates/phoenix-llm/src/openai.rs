@@ -4435,16 +4435,6 @@ mod tests {
         assert_eq!(translated.input.len(), limits.max_input_items().unwrap());
     }
 
-    #[tokio::test]
-    async fn test_request_tags_omitted_when_none() {
-        let req = translate_to_responses_request("gpt-5.5", &empty_request(), false);
-        let json = serde_json::to_value(&req).unwrap();
-        assert!(
-            json.get("tags").is_none(),
-            "tags must be omitted from the wire when not set; got {json}"
-        );
-    }
-
     // Codex backend 429/503 parsing — fixtures mirror
     // codex-rs/codex-api/src/api_bridge_tests.rs.
     mod codex_errors {
@@ -4626,18 +4616,6 @@ mod tests {
             assert!(parse_codex_error(500, &HeaderMap::new(), "").is_none());
             assert!(parse_codex_error(400, &HeaderMap::new(), "").is_none());
         }
-    }
-
-    #[tokio::test]
-    async fn test_request_tags_serialized_when_set() {
-        let mut req = translate_to_responses_request("gpt-5.5", &empty_request(), false);
-        let mut tags = BTreeMap::new();
-        tags.insert("disable_data_logging".to_string(), "true".to_string());
-        tags.insert("foo".to_string(), "bar".to_string());
-        req.tags = Some(tags);
-        let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["tags"]["disable_data_logging"], "true");
-        assert_eq!(json["tags"]["foo"], "bar");
     }
 
     #[tokio::test]

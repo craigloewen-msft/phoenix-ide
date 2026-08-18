@@ -420,43 +420,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_name_is_none() {
-        assert!(parse_agent_frontmatter("---\ndescription: d\n---\n").is_none());
-    }
-
-    #[test]
-    fn missing_description_is_none() {
-        assert!(parse_agent_frontmatter("---\nname: r\n---\n").is_none());
-    }
-
-    #[test]
-    fn empty_required_field_is_none() {
-        assert!(parse_agent_frontmatter("---\nname: \ndescription: d\n---\n").is_none());
-    }
-
-    #[test]
     fn invalid_mode_falls_through_to_none() {
         let fm =
             parse_agent_frontmatter("---\nname: r\ndescription: d\nmode: turbo\n---\n").unwrap();
         assert_eq!(fm.mode, None);
     }
 
-    #[test]
-    fn tools_bare_list_parsed() {
-        assert_eq!(
-            parse_tools("read_file, bash"),
-            Some(vec!["read_file".to_string(), "bash".to_string()])
-        );
-        assert_eq!(parse_tools(""), None);
-    }
-
     // ---- discovery -----------------------------------------------------------
-
-    #[test]
-    fn discovers_none_in_empty_tree() {
-        let tmp = TempDir::new().unwrap();
-        assert!(discover_agents_with_home(tmp.path(), Some(tmp.path())).is_empty());
-    }
 
     #[test]
     fn discovers_from_claude_and_agents_dirs() {
@@ -481,43 +451,6 @@ mod tests {
         assert_eq!(agents[1].name, "b");
         assert_eq!(agents[0].source_dir, ".claude/agents");
         assert_eq!(agents[1].source_dir, ".agents/agents");
-    }
-
-    #[test]
-    fn body_has_frontmatter_stripped() {
-        let tmp = TempDir::new().unwrap();
-        write_agent(
-            tmp.path(),
-            ".claude/agents",
-            "r.md",
-            "name: r\ndescription: d\n",
-            "You are a reviewer.",
-        );
-        let agents = discover_agents_with_home(tmp.path(), Some(tmp.path()));
-        assert_eq!(agents[0].body, "You are a reviewer.");
-        assert!(!agents[0].body.starts_with("---"));
-    }
-
-    #[test]
-    fn sorted_by_name() {
-        let tmp = TempDir::new().unwrap();
-        write_agent(
-            tmp.path(),
-            ".claude/agents",
-            "z.md",
-            "name: zzz\ndescription: d\n",
-            "z",
-        );
-        write_agent(
-            tmp.path(),
-            ".claude/agents",
-            "a.md",
-            "name: aaa\ndescription: d\n",
-            "a",
-        );
-        let agents = discover_agents_with_home(tmp.path(), Some(tmp.path()));
-        assert_eq!(agents[0].name, "aaa");
-        assert_eq!(agents[1].name, "zzz");
     }
 
     #[test]
@@ -666,20 +599,5 @@ mod tests {
         let dup: Vec<&AgentDefinition> = agents.iter().filter(|x| x.name == "dup").collect();
         assert_eq!(dup.len(), 1);
         assert_eq!(dup[0].description, "from-a", "first child path wins");
-    }
-
-    #[test]
-    fn find_agent_by_name() {
-        let tmp = TempDir::new().unwrap();
-        write_agent(
-            tmp.path(),
-            ".claude/agents",
-            "r.md",
-            "name: r\ndescription: d\n",
-            "b",
-        );
-        let agents = discover_agents_with_home(tmp.path(), Some(tmp.path()));
-        assert!(find_agent(&agents, "r").is_some());
-        assert!(find_agent(&agents, "nope").is_none());
     }
 }

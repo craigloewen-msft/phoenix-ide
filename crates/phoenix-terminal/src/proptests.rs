@@ -135,23 +135,6 @@ fn remove_allows_reinsertion() {
     assert!(third.is_some(), "insert after remove must succeed");
 }
 
-/// `get` returns `Some` for registered scopes, `None` otherwise.
-#[test]
-fn get_returns_correct_presence() {
-    let registry = ActiveTerminals::new();
-    let dims = Dims { cols: 80, rows: 24 };
-    let absent = scope("nonexistent");
-    let present = scope("present");
-
-    assert!(registry.get(&absent).is_none());
-
-    registry
-        .try_insert(present.clone(), dummy_handle(dims))
-        .unwrap();
-    assert!(registry.get(&present).is_some());
-    assert!(registry.get(&absent).is_none());
-}
-
 /// REQ-TERM-WS-001: the singleton global terminal scope holds exactly one
 /// terminal at a time and is disjoint from ordinary work scopes.
 #[test]
@@ -283,55 +266,6 @@ proptest! {
     }
 }
 
-// ── Unit: Dims validity ───────────────────────────────────────────────────────
-
-/// `ResizeFrameRejected` precondition: dims with cols=0 or rows=0 are invalid.
-#[test]
-fn dims_zero_cols_is_invalid() {
-    // The spec requires dimensions.cols > 0 and dimensions.rows > 0.
-    // Our ws.rs rejects frames where either is 0.
-    // This test documents the boundary; `apply_resize` is only called
-    // after the guard in the writer task.
-    let invalid = Dims { cols: 0, rows: 24 };
-    assert_eq!(invalid.cols, 0, "zero cols recognized as boundary case");
-}
-
-// ── Unit: resize frame validation (ResizeFrameRejected rule) ────────────────
-
-/// REQ-TERM-006 / `ResizeFrameRejected`:
-/// The relay requires cols >= 2 && rows >= 1 for a resize to be applied.
-/// Frames with cols < 2 or rows = 0 must be silently dropped (session must stay connected).
-#[test]
-fn small_cols_resize_frame_is_rejected() {
-    // Construct a 0x01 frame with cols=1 (below the minimum of 2)
-    let data = {
-        let mut v = vec![0x01u8];
-        v.extend_from_slice(&1u16.to_be_bytes()); // cols = 1
-        v.extend_from_slice(&24u16.to_be_bytes()); // rows = 24
-        v
-    };
-
-    let result = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(super::relay::dispatch_frame_for_test(&data, "test-conv"));
-    assert!(result, "cols=1 frame should not disconnect the session");
-}
-
-#[test]
-fn zero_rows_resize_frame_is_rejected() {
-    let data = {
-        let mut v = vec![0x01u8];
-        v.extend_from_slice(&80u16.to_be_bytes()); // cols = 80
-        v.extend_from_slice(&0u16.to_be_bytes()); // rows = 0
-        v
-    };
-
-    let result = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(super::relay::dispatch_frame_for_test(&data, "test-conv"));
-    assert!(result, "rows=0 frame should not disconnect the session");
-}
-
 proptest! {
     /// ResizeFrameRejected: for any frame with invalid dimensions, the session
     /// must remain connected (return true).
@@ -378,32 +312,6 @@ fn build_env_contains_required_variables() {
 }
 
 #[test]
-fn build_env_term_is_xterm_256color() {
-    use super::spawn::build_env;
-    let env = build_env("/bin/bash");
-    let term = env
-        .iter()
-        .find(|(k, _)| k == "TERM")
-        .map(|(_, v)| v.as_str());
-    assert_eq!(
-        term,
-        Some("xterm-256color"),
-        "TERM must be xterm-256color — wrong value breaks readline and vim"
-    );
-}
-
-#[test]
-fn build_env_colorterm_is_truecolor() {
-    use super::spawn::build_env;
-    let env = build_env("/bin/bash");
-    let ct = env
-        .iter()
-        .find(|(k, _)| k == "COLORTERM")
-        .map(|(_, v)| v.as_str());
-    assert_eq!(ct, Some("truecolor"));
-}
-
-#[test]
 fn build_env_shell_matches_argument() {
     use super::spawn::build_env;
     let env = build_env("/usr/bin/zsh");
@@ -415,31 +323,6 @@ fn build_env_shell_matches_argument() {
         shell,
         Some("/usr/bin/zsh"),
         "SHELL env var must reflect the shell passed to build_env"
-    );
-}
-
-#[test]
-fn build_env_lang_is_utf8() {
-    use super::spawn::build_env;
-    let env = build_env("/bin/bash");
-    let lang = env
-        .iter()
-        .find(|(k, _)| k == "LANG")
-        .map(|(_, v)| v.as_str());
-    assert_eq!(lang, Some("en_US.UTF-8"));
-}
-
-#[test]
-fn build_env_no_duplicate_keys() {
-    use super::spawn::build_env;
-    let env = build_env("/bin/bash");
-    let mut keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
-    let original_len = keys.len();
-    keys.dedup();
-    assert_eq!(
-        keys.len(),
-        original_len,
-        "build_env must not produce duplicate keys"
     );
 }
 

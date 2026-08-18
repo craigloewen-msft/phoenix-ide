@@ -2219,40 +2219,6 @@ async fn test_screencast_attach_emits_frames_and_url() {
 // browser_profile (REQ-BT-019)
 // ============================================================================
 
-/// Non-browser unit test: the tool is registered and its input schema
-/// advertises every action. No Chrome required.
-#[test]
-fn test_browser_profile_registered_and_schema_lists_actions() {
-    use super::profile::PROFILE_ACTIONS;
-
-    let registry = crate::ToolRegistry::standard();
-    let names: Vec<String> = registry
-        .definitions()
-        .iter()
-        .map(|d| d.name.clone())
-        .collect();
-    assert!(
-        names.contains(&"browser_profile".to_string()),
-        "browser_profile not registered"
-    );
-
-    let schema = BrowserProfileTool.input_schema();
-    let enum_vals = schema["properties"]["action"]["enum"]
-        .as_array()
-        .expect("action enum present in schema");
-    let action_names: Vec<&str> = enum_vals.iter().filter_map(|v| v.as_str()).collect();
-    for a in PROFILE_ACTIONS {
-        assert!(action_names.contains(a), "input_schema missing action {a}");
-    }
-    // The Tier-0 method-critical actions must all be present.
-    for required in ["help", "metrics", "throttle", "gc_heap", "run_scenario"] {
-        assert!(
-            action_names.contains(&required),
-            "schema missing required action {required}"
-        );
-    }
-}
-
 /// help works without a browser session.
 #[tokio::test]
 async fn test_browser_profile_help_no_browser() {

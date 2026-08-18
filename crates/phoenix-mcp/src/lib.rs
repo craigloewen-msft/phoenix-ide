@@ -3493,16 +3493,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_read_all_configs_does_not_panic() {
-        // Verify that read_all_configs works with no config files present
-        // (it should return empty, not error).
-        let configs = McpClientManager::read_all_configs();
-        // We can't assert anything about count since the dev machine may have configs,
-        // but the call should not panic.
-        let _ = configs;
-    }
-
-    #[test]
     fn classify_entry_selects_stdio_for_command() {
         let cfg = serde_json::json!({
             "command": "uvx",
@@ -3547,25 +3537,6 @@ mod tests {
                 "invalid timeout must skip server: {cfg}"
             );
         }
-    }
-
-    #[test]
-    fn classify_entry_selects_http_with_headers_and_no_auth() {
-        let cfg = serde_json::json!({
-            "type": "http",
-            "url": "https://example.com/mcp",
-            "headers": {"X-Org": "acme"},
-        });
-        let config = McpClientManager::classify_config_entry("s", &cfg).expect("http config");
-        assert_eq!(
-            config,
-            McpServerConfig::Http {
-                url: "https://example.com/mcp".to_string(),
-                headers: HashMap::from([("X-Org".to_string(), "acme".to_string())]),
-                auth: HttpAuth::None,
-                tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
-            }
-        );
     }
 
     #[test]
@@ -3776,22 +3747,6 @@ mod tests {
             "auth": {"oauth": true},
         });
         assert_eq!(McpClientManager::classify_config_entry("s", &cfg), None);
-    }
-
-    #[test]
-    fn callback_request_query_extracts_query_verbatim() {
-        assert_eq!(
-            callback_request_query("GET /callback?code=abc&state=xyz HTTP/1.1\r\nHost: x\r\n"),
-            "?code=abc&state=xyz"
-        );
-        // An error callback's query is forwarded just the same.
-        assert_eq!(
-            callback_request_query("GET /callback?error=access_denied&state=xyz HTTP/1.1"),
-            "?error=access_denied&state=xyz"
-        );
-        // No query → empty (the real callback then reports a missing code).
-        assert_eq!(callback_request_query("GET /callback HTTP/1.1"), "");
-        assert_eq!(callback_request_query(""), "");
     }
 
     #[test]

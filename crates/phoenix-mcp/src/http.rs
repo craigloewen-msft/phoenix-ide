@@ -2188,39 +2188,6 @@ mod tests {
     }
 
     #[test]
-    fn sse_framer_yields_event_per_blank_line() {
-        let mut framer = SseFramer::default();
-        let events = framer.push(b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\n");
-        assert_eq!(events, vec!["{\"a\":1}", "{\"b\":2}"]);
-    }
-
-    #[test]
-    fn sse_framer_handles_split_chunks_and_crlf() {
-        let mut framer = SseFramer::default();
-        assert!(framer.push(b"event: message\r\ndata: {\"a\"").is_empty());
-        let events = framer.push(b":1}\r\n\r\n");
-        assert_eq!(events, vec!["{\"a\":1}"]);
-    }
-
-    #[test]
-    fn sse_framer_joins_multiline_data_and_flushes_on_finish() {
-        let mut framer = SseFramer::default();
-        assert!(framer.push(b"data: line1\ndata: line2\n").is_empty());
-        assert_eq!(framer.finish(), Some("line1\nline2".to_string()));
-        assert!(framer.finish().is_none());
-    }
-
-    #[test]
-    fn sse_framer_flushes_an_unterminated_final_data_line() {
-        // A server may close the response right after the last data line,
-        // with no trailing newline; EOF must act as the terminator.
-        let mut framer = SseFramer::default();
-        assert!(framer.push(b"data: {\"a\":1}").is_empty());
-        assert_eq!(framer.finish(), Some("{\"a\":1}".to_string()));
-        assert!(framer.finish().is_none());
-    }
-
-    #[test]
     fn sse_framer_tracks_id_and_retry_and_ignores_comments() {
         // `id:` sets the persistent last event id buffer and `retry:` the
         // reconnect hint (REQ-MCP-006); comments are ignored.

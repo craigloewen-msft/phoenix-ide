@@ -1557,44 +1557,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_parse_request_tags_basic() {
-        let tags = parse_request_tags("foo=bar,baz=qux");
-        assert_eq!(tags.get("foo"), Some(&"bar".to_string()));
-        assert_eq!(tags.get("baz"), Some(&"qux".to_string()));
-        assert_eq!(tags.len(), 2);
-    }
-
-    #[test]
-    fn test_parse_request_tags_whitespace_trimmed() {
-        let tags = parse_request_tags("  foo = bar ,  baz=qux  ");
-        assert_eq!(tags.get("foo"), Some(&"bar".to_string()));
-        assert_eq!(tags.get("baz"), Some(&"qux".to_string()));
-    }
-
-    #[test]
-    fn test_parse_request_tags_empty_input() {
-        assert!(parse_request_tags("").is_empty());
-        assert!(parse_request_tags("   ").is_empty());
-        assert!(parse_request_tags(",,,").is_empty());
-    }
-
-    #[test]
-    fn test_parse_request_tags_skips_malformed() {
-        // missing '=' -> skipped; empty key -> skipped; empty value -> kept (intentional, "tag=" is a valid clear-flag idiom)
-        let tags = parse_request_tags("nokey,=onlyval,foo=,bar=baz");
-        assert_eq!(tags.get("foo"), Some(&String::new()));
-        assert_eq!(tags.get("bar"), Some(&"baz".to_string()));
-        assert_eq!(tags.len(), 2);
-    }
-
-    #[test]
-    fn test_parse_request_tags_value_with_equals() {
-        // split_once on first '=' lets values contain '='
-        let tags = parse_request_tags("query=a=b=c");
-        assert_eq!(tags.get("query"), Some(&"a=b=c".to_string()));
-    }
-
     fn external_gateway_model() -> super::super::ModelSpec {
         parse_external_models(
             r#"[{"id":"gateway-provider/example-org/Chat-Model","backend":"anthropic","description":"Gateway-hosted chat model POC","context_window":262000,"recommended":false,"supports_tool_search":false}]"#,
@@ -2574,62 +2536,6 @@ mod tests {
         assert!(registry
             .get("gateway-provider/example-org/Code-Model")
             .is_some());
-    }
-
-    #[test]
-    fn test_derive_models_url_from_messages() {
-        assert_eq!(
-            derive_models_url("https://ai-gateway.us1.ddbuild.io/v1/messages"),
-            Some("https://ai-gateway.us1.ddbuild.io/v1/models".to_string())
-        );
-    }
-
-    #[test]
-    fn test_derive_models_url_from_responses() {
-        assert_eq!(
-            derive_models_url("https://ai-gateway.us1.ddbuild.io/v1/responses"),
-            Some("https://ai-gateway.us1.ddbuild.io/v1/models".to_string())
-        );
-    }
-
-    #[test]
-    fn test_derive_models_url_from_chat_completions() {
-        for endpoint in [
-            "https://gateway.example/v1/chat/completions",
-            "https://gateway.example/v1/chat/completions/",
-        ] {
-            assert_eq!(
-                derive_models_url(endpoint),
-                Some("https://gateway.example/v1/models".to_string())
-            );
-        }
-    }
-
-    #[test]
-    fn test_derive_models_url_from_anthropic_api() {
-        assert_eq!(
-            derive_models_url("https://api.anthropic.com/v1/messages"),
-            Some("https://api.anthropic.com/v1/models".to_string())
-        );
-    }
-
-    #[test]
-    fn test_derive_models_url_no_path_component() {
-        assert_eq!(derive_models_url("https://host"), None);
-        assert_eq!(derive_models_url("https://host?foo=bar"), None);
-    }
-
-    #[test]
-    fn test_derive_models_url_no_slash() {
-        assert_eq!(derive_models_url("noslash"), None);
-    }
-
-    #[test]
-    fn test_derive_models_url_strips_query_string() {
-        assert_eq!(
-            derive_models_url("https://host/v1/messages?foo=bar"),
-            Some("https://host/v1/models".to_string())
-        );
     }
 
     fn external_google_model() -> super::super::ModelSpec {

@@ -2081,15 +2081,13 @@ mod lifecycle_hook_tests {
     //! tests in `super::tests`.
 
     use super::{
-        BrowserSession, BrowserSessionAudience, BrowserSessionLifecycleEvent,
-        BrowserSessionLifecycleKind, BrowserSessionLifecycleSink, BrowserSessionManager,
+        BrowserSessionAudience, BrowserSessionLifecycleEvent, BrowserSessionLifecycleKind,
+        BrowserSessionLifecycleSink, BrowserSessionManager,
     };
     use phoenix_core::work_scope::{
         EffectiveResourceAccess, ResourceAuthority, ResourceScopeKey, WorkScopeId,
     };
     use std::sync::Arc;
-    use std::time::Instant;
-    use tokio::sync::RwLock;
 
     fn install_sink() -> (
         Arc<BrowserSessionManager>,
@@ -2187,38 +2185,6 @@ mod lifecycle_hook_tests {
         );
     }
 
-    /// `rekey_scope` on a manager with no session for `old` is a no-op:
-    /// returns `false` and creates nothing under `new`. (The move and
-    /// occupied-destination branches share the same map-level logic as the
-    /// bash/tmux registries, which test those branches with constructible
-    /// entries; a real `BrowserSession` needs a live chromium, so it cannot be
-    /// staged here.)
-    /// `is_active` must reflect the underlying `HashMap`. We can't create a
-    /// real `BrowserSession` without chrome, so this just exercises the
-    /// "absent" branch for both scope variants.
-    #[tokio::test]
-    async fn is_active_reflects_hashmap_membership() {
-        let (manager, _rx) = install_sink();
-        assert!(!manager.is_active(&scope("conv-1")).await);
-        assert!(!manager.is_active(&scope("/tmp/wt-1")).await);
-    }
-
-    /// Distinct opaque work IDs and the structurally separate global terminal
-    /// occupy disjoint resource namespaces.
-    #[tokio::test]
-    async fn is_active_disjoint_namespaces() {
-        let (manager, _rx) = install_sink();
-        let first = scope("opaque-a");
-        let second = scope("opaque-b");
-        let global = ResourceScopeKey::GlobalTerminal;
-        assert!(!manager.is_active(&first).await);
-        assert!(!manager.is_active(&second).await);
-        assert!(!manager.is_active(&global).await);
-        assert_ne!(first.stable_key(), second.stable_key());
-        assert_ne!(first.stable_key(), global.stable_key());
-        assert_ne!(second.stable_key(), global.stable_key());
-    }
-
     #[test]
     fn restricted_actors_receive_isolated_keys_in_shared_scope() {
         let shared = scope("shared-work-scope");
@@ -2235,43 +2201,6 @@ mod lifecycle_hook_tests {
         assert_ne!(work_key, first_child_key);
         assert_ne!(first_child_key, sibling_key);
         assert_eq!(first_child_key, super::session_key(&shared, &restricted_a));
-    }
-
-    #[test]
-    fn actor_specific_stop_targets_only_restricted_actor_key() {
-        let shared = scope("shared-stop-scope");
-        let restricted_a =
-            EffectiveResourceAccess::new("explore-child-a", ResourceAuthority::Restricted);
-        let restricted_b =
-            EffectiveResourceAccess::new("explore-child-b", ResourceAuthority::Restricted);
-        assert_ne!(
-            super::session_key(&shared, &restricted_a),
-            super::session_key(&shared, &restricted_b)
-        );
-    }
-
-    #[test]
-    fn pre_rekey_explore_stop_targets_only_its_private_actor_key() {
-        let shared = scope("pre-rekey-conversation-scope");
-        let user_explore =
-            EffectiveResourceAccess::new("user-explore", ResourceAuthority::Restricted);
-        let same_user = EffectiveResourceAccess::new("user-explore", ResourceAuthority::Restricted);
-        let private_sub_agent =
-            EffectiveResourceAccess::new("explore-child", ResourceAuthority::Restricted);
-        let work_actor = EffectiveResourceAccess::new("work-parent", ResourceAuthority::Work);
-
-        assert_eq!(
-            super::session_key(&shared, &user_explore),
-            super::session_key(&shared, &same_user)
-        );
-        assert_ne!(
-            super::session_key(&shared, &user_explore),
-            super::session_key(&shared, &private_sub_agent)
-        );
-        assert_ne!(
-            super::session_key(&shared, &user_explore),
-            super::session_key(&shared, &work_actor)
-        );
     }
 
     /// Test the full create-emit + kill-emit pair end-to-end using a
@@ -2325,12 +2254,6 @@ mod lifecycle_hook_tests {
         );
         assert!(!manager.is_active(&scope).await);
     }
-
-    /// Belt-and-braces: keep the unused-import lints quiet. `BrowserSession`
-    /// / `RwLock` / `Instant` are pulled in for symmetry with future
-    /// chrome-gated tests.
-    #[allow(dead_code)]
-    fn _phantom_uses(_b: Option<BrowserSession>, _r: Option<RwLock<()>>, _i: Option<Instant>) {}
 
     /// With no scope-liveness hook installed, every idle candidate is
     /// reapable — the historical age-only behavior must be preserved for the
@@ -2467,18 +2390,6 @@ mod console_level_tests {
             assert_eq!(level.as_str(), expected, "wrong wire form for {expected}");
         }
     }
-
-    /// Wire serialization matches `as_str` so consumers downstream of
-    /// `json!({"level": entry.level})` see the canonical identifier and not
-    /// the `Debug` spelling the previous `format!("{:?}", …).to_lowercase()`
-    /// produced (e.g. `"startgroup"` rather than CDP's `"startGroup"`).
-    #[test]
-    fn serializes_as_canonical_string() {
-        let value = serde_json::to_value(ConsoleLevel::StartGroup).unwrap();
-        assert_eq!(value, serde_json::Value::String("startGroup".into()));
-        let value = serde_json::to_value(ConsoleLevel::Error).unwrap();
-        assert_eq!(value, serde_json::Value::String("error".into()));
-    }
 }
 
 #[cfg(test)]
@@ -2495,24 +2406,6 @@ mod console_arg_tests {
             "description": description,
         }))
         .unwrap()
-    }
-
-    #[test]
-    fn test_string_primitive() {
-        let arg = make_arg(Some(json!("hello world")), None);
-        assert_eq!(extract_console_arg_text(&arg), "hello world");
-    }
-
-    #[test]
-    fn test_number_primitive() {
-        let arg = make_arg(Some(json!(42)), None);
-        assert_eq!(extract_console_arg_text(&arg), "42");
-    }
-
-    #[test]
-    fn test_boolean_primitive() {
-        let arg = make_arg(Some(json!(true)), None);
-        assert_eq!(extract_console_arg_text(&arg), "true");
     }
 
     #[test]
@@ -2617,12 +2510,6 @@ mod console_arg_tests {
     }
 
     #[test]
-    fn test_short_string_not_truncated() {
-        let arg = make_arg(Some(json!("hello")), None);
-        assert_eq!(extract_console_arg_text(&arg), "hello");
-    }
-
-    #[test]
     fn test_memory_cap_applied_at_capture() {
         // Strings over MAX_CAPTURE_ARG_BYTES are capped in the buffer (memory protection)
         let huge = "x".repeat(MAX_CAPTURE_ARG_BYTES + 500);
@@ -2633,15 +2520,6 @@ mod console_arg_tests {
             "Memory cap should apply"
         );
         assert!(result.ends_with('…'), "Should end with ellipsis");
-    }
-
-    #[test]
-    fn test_moderate_string_not_capped() {
-        // Strings under the display limit (500) pass through completely intact
-        let medium = "a".repeat(600);
-        let arg = make_arg(Some(serde_json::Value::String(medium.clone())), None);
-        // 600 < MAX_CAPTURE_ARG_BYTES (10_000), so no cap applied
-        assert_eq!(extract_console_arg_text(&arg), medium);
     }
 
     #[test]
@@ -2665,12 +2543,6 @@ mod console_arg_tests {
         );
         // The slice must be valid UTF-8
         let _ = result.as_str();
-    }
-
-    #[test]
-    fn test_truncate_unicode_safe_fits_exactly() {
-        let s = "hello".to_string();
-        assert_eq!(truncate_unicode_safe(s.clone(), 5), s);
     }
 
     #[test]

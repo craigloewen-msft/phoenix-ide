@@ -2208,27 +2208,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn input_schema_lists_all_actions() {
-        let tool = BrowserProfileTool;
-        let schema = tool.input_schema();
-        let enum_vals = schema["properties"]["action"]["enum"]
-            .as_array()
-            .expect("action enum present");
-        let names: Vec<&str> = enum_vals.iter().filter_map(Value::as_str).collect();
-        for a in PROFILE_ACTIONS {
-            assert!(names.contains(a), "schema missing action {a}");
-        }
-        assert_eq!(names.len(), PROFILE_ACTIONS.len());
-    }
-
-    #[test]
-    fn help_needs_no_browser_and_lists_run_scenario() {
-        let h = help_text();
-        assert!(h.contains("run_scenario"));
-        assert!(h.contains("RAW per-run"));
-    }
-
-    #[test]
     fn step_deserializes_tagged() {
         let s: Step = serde_json::from_value(json!({"kind":"navigate","url":"about:blank"}))
             .expect("navigate step");

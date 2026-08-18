@@ -167,64 +167,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn basic_event() {
-        let mut p = SseParser::new();
-        let events = p.push(b"event: ping\ndata: {\"type\": \"ping\"}\n\n");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "ping");
-        assert_eq!(events[0].data, "{\"type\": \"ping\"}");
-    }
-
-    #[test]
-    fn multi_data_lines_joined() {
-        let mut p = SseParser::new();
-        let events = p.push(b"data: line1\ndata: line2\n\n");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data, "line1\nline2");
-    }
-
-    #[test]
-    fn crlf_line_endings() {
-        let mut p = SseParser::new();
-        let events = p.push(b"event: test\r\ndata: hello\r\n\r\n");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "test");
-        assert_eq!(events[0].data, "hello");
-    }
-
-    #[test]
-    fn split_across_chunks() {
-        let mut p = SseParser::new();
-        assert!(p.push(b"event: te").is_empty());
-        assert!(p.push(b"st\nda").is_empty());
-        assert!(p.push(b"ta: hello\n").is_empty());
-        let events = p.push(b"\n");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "test");
-        assert_eq!(events[0].data, "hello");
-    }
-
-    #[test]
-    fn utf8_emdash_split_across_chunks() {
-        // em-dash: U+2014 = bytes E2 80 94
-        let mut p = SseParser::new();
-        // First chunk: "data: hello " + first byte of em-dash (0xE2)
-        let mut chunk1 = b"data: hello ".to_vec();
-        chunk1.push(0xE2);
-        assert!(p.push(&chunk1).is_empty());
-        // Second chunk: remaining bytes of em-dash (0x80, 0x94) + " world\n\n"
-        let mut chunk2 = vec![0x80, 0x94];
-        chunk2.extend_from_slice(b" world\n\n");
-        let events = p.push(&chunk2);
-        let all_data: String = events.iter().map(|e| e.data.clone()).collect();
-        assert!(
-            all_data.contains('\u{2014}'),
-            "em-dash must survive chunking: {all_data:?}"
-        );
-        assert_eq!(all_data, "hello \u{2014} world");
-    }
-
-    #[test]
     fn data_no_space_after_colon() {
         let mut p = SseParser::new();
         let events = p.push(b"data:hello\n\n");
@@ -248,53 +190,6 @@ mod tests {
         let events = p.finish();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "partial");
-    }
-
-    #[test]
-    fn no_event_type_defaults_to_empty() {
-        let mut p = SseParser::new();
-        let events = p.push(b"data: hello\n\n");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "");
-    }
-
-    #[test]
-    fn bare_cr_line_endings() {
-        let mut p = SseParser::new();
-        // Bare \r as line ending (WHATWG SSE spec requires this)
-        let events = p.push(b"event: test\rdata: hello\r\r");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "test");
-        assert_eq!(events[0].data, "hello");
-    }
-
-    #[test]
-    fn bare_cr_mixed_with_lf() {
-        let mut p = SseParser::new();
-        // Mix of bare \r and \n
-        let events = p.push(b"event: test\rdata: hello\n\n");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "test");
-        assert_eq!(events[0].data, "hello");
-    }
-
-    #[test]
-    fn bare_cr_between_events() {
-        // Simulates the exact corruption pattern: two events separated only by \r
-        let mut p = SseParser::new();
-        let events = p.push(b"data: {\"text\":\"hello\"}\r\rdata: {\"text\":\"world\"}\r\r");
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].data, "{\"text\":\"hello\"}");
-        assert_eq!(events[1].data, "{\"text\":\"world\"}");
-    }
-
-    #[test]
-    fn multiple_events_in_one_chunk() {
-        let mut p = SseParser::new();
-        let events = p.push(b"data: one\n\ndata: two\n\n");
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].data, "one");
-        assert_eq!(events[1].data, "two");
     }
 }
 

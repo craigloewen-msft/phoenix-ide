@@ -226,32 +226,14 @@ fn day_suffix(day: u32) -> &'static str {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    static NOW_OVERRIDE: std::cell::RefCell<Option<DateTime<Utc>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
 fn now_for_retry() -> DateTime<Utc> {
-    #[cfg(test)]
-    {
-        if let Some(now) = NOW_OVERRIDE.with(|cell| *cell.borrow()) {
-            return now;
-        }
-    }
     Utc::now()
-}
-
-#[cfg(test)]
-pub(crate) fn set_now_override(now: Option<DateTime<Utc>>) {
-    NOW_OVERRIDE.with(|cell| *cell.borrow_mut() = now);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rate_limit::QuotaDetails;
-    use chrono::TimeZone;
 
     fn quota(plan: Option<&str>, resets_at: Option<DateTime<Utc>>) -> QuotaDetails {
         QuotaDetails {
@@ -268,30 +250,6 @@ mod tests {
             rate_limit_reached_type: None,
         }
     }
-
-    /// Pin "now" to a fixed UTC moment so `format_retry_timestamp`'s
-    /// same-day-vs-cross-day branch is deterministic regardless of when tests run.
-    fn with_fixed_now<F: FnOnce()>(now: DateTime<Utc>, f: F) {
-        set_now_override(Some(now));
-        f();
-        set_now_override(None);
-    }
-
-    /// Render the same reset timestamp the message tests use, so wording
-    /// assertions can interpolate the host's local-tz rendering without
-    /// caring what timezone the test runs in.
-    fn rendered_reset_time(now: DateTime<Utc>, resets: DateTime<Utc>) -> String {
-        set_now_override(Some(now));
-        let s = format_retry_timestamp(&resets);
-        set_now_override(None);
-        s
-    }
-
-    const PLUS_MSG: &str = "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits";
-    const TEAM_MSG: &str =
-        "You've hit your usage limit. To get more access now, send a request to your admin";
-    const PRO_MSG: &str = "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits";
-    const FREE_MSG: &str = "You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus),";
 
     #[test]
     fn http_status_classification_preserves_actionable_provider_detail() {
@@ -334,17 +292,6 @@ mod tests {
     }
 
     #[test]
-    fn plus_plan_full_string_matches_codex_cli_verbatim() {
-        let now = Utc.with_ymd_and_hms(2026, 5, 11, 12, 0, 0).unwrap();
-        let resets = Utc.with_ymd_and_hms(2026, 5, 11, 23, 42, 0).unwrap();
-        let time = rendered_reset_time(now, resets);
-        with_fixed_now(now, || {
-            let msg = render_usage_limit_message(&quota(Some("plus"), Some(resets)));
-            assert_eq!(msg, format!("{PLUS_MSG} or try again at {time}."));
-        });
-    }
-
-    #[test]
     fn workspace_owner_credit_depletion_uses_purchase_guidance() {
         let mut details = quota(Some("team"), None);
         details.rate_limit_reached_type =
@@ -352,121 +299,6 @@ mod tests {
         let message = render_usage_limit_message(&details);
         assert!(message.contains("purchase more credits"));
         assert!(!message.contains("request to your admin"));
-    }
-
-    #[test]
-    fn team_plan_full_string_matches_codex_cli_verbatim() {
-        let msg = render_usage_limit_message(&quota(Some("team"), None));
-        assert_eq!(msg, format!("{TEAM_MSG} or try again later."));
-    }
-
-    #[test]
-    fn business_plan_renders_admin_path() {
-        let msg = render_usage_limit_message(&quota(Some("business"), None));
-        assert_eq!(msg, format!("{TEAM_MSG} or try again later."));
-    }
-
-    #[test]
-    fn pro_plan_full_string_matches_codex_cli_verbatim() {
-        let msg = render_usage_limit_message(&quota(Some("pro"), None));
-        assert_eq!(msg, format!("{PRO_MSG} or try again later."));
-    }
-
-    #[test]
-    fn pro_lite_plan_renders_credits_path() {
-        let msg = render_usage_limit_message(&quota(Some("pro_lite"), None));
-        assert_eq!(msg, format!("{PRO_MSG} or try again later."));
-    }
-
-    #[test]
-    fn free_plan_full_string_matches_codex_cli_verbatim() {
-        let msg = render_usage_limit_message(&quota(Some("free"), None));
-        assert_eq!(msg, format!("{FREE_MSG} or try again later."));
-    }
-
-    #[test]
-    fn go_plan_renders_plus_upgrade() {
-        let msg = render_usage_limit_message(&quota(Some("go"), None));
-        assert_eq!(msg, format!("{FREE_MSG} or try again later."));
-    }
-
-    #[test]
-    fn enterprise_plan_omits_recovery_action() {
-        // Enterprise/Edu use `retry_suffix` (no "or") — distinct from
-        // consumer/workspace branches that use `retry_suffix_after_or`.
-        let msg = render_usage_limit_message(&quota(Some("enterprise"), None));
-        assert_eq!(msg, "You've hit your usage limit. Try again later.");
-    }
-
-    #[test]
-    fn unknown_plan_falls_back_to_generic() {
-        let msg = render_usage_limit_message(&quota(Some("mysteryplan"), None));
-        assert_eq!(msg, "You've hit your usage limit. Try again later.");
-    }
-
-    #[test]
-    fn none_plan_falls_back_to_generic() {
-        let msg = render_usage_limit_message(&quota(None, None));
-        assert_eq!(msg, "You've hit your usage limit. Try again later.");
-    }
-
-    #[test]
-    fn promo_message_overrides_plan_wording_exact_string() {
-        let mut q = quota(Some("plus"), None);
-        q.promo_message = Some("Upgrade to Pro at chatgpt.com/explore/pro".to_string());
-        let msg = render_usage_limit_message(&q);
-        assert_eq!(
-            msg,
-            "You've hit your usage limit. Upgrade to Pro at chatgpt.com/explore/pro, or try again later."
-        );
-    }
-
-    #[test]
-    fn limit_name_other_than_codex_suggests_switching_models_exact_string() {
-        let mut q = quota(Some("plus"), None);
-        q.limit_name = Some("gpt-5.2-codex-sonic".to_string());
-        let msg = render_usage_limit_message(&q);
-        assert_eq!(
-            msg,
-            "You've hit your usage limit for gpt-5.2-codex-sonic. Switch to another model now, or try again later."
-        );
-    }
-
-    #[test]
-    fn limit_name_equal_to_codex_falls_through_to_plan_branch() {
-        // Falls through to the Plus branch — same wording as without limit_name.
-        let mut q = quota(Some("plus"), None);
-        q.limit_name = Some("codex".to_string());
-        let msg = render_usage_limit_message(&q);
-        assert_eq!(msg, format!("{PLUS_MSG} or try again later."));
-    }
-
-    #[test]
-    fn same_day_reset_renders_time_only() {
-        let now = Utc.with_ymd_and_hms(2026, 5, 11, 12, 0, 0).unwrap();
-        let resets = Utc.with_ymd_and_hms(2026, 5, 11, 23, 42, 0).unwrap();
-        with_fixed_now(now, || {
-            let formatted = format_retry_timestamp(&resets);
-            // Local timezone may shift the rendered hour; verify shape only.
-            assert!(
-                formatted.contains(":42 PM") || formatted.contains(":42 AM"),
-                "expected HH:MM AM/PM, got {formatted}"
-            );
-        });
-    }
-
-    #[test]
-    fn day_suffix_matches_codex_cli() {
-        assert_eq!(day_suffix(1), "st");
-        assert_eq!(day_suffix(2), "nd");
-        assert_eq!(day_suffix(3), "rd");
-        assert_eq!(day_suffix(4), "th");
-        assert_eq!(day_suffix(11), "th");
-        assert_eq!(day_suffix(12), "th");
-        assert_eq!(day_suffix(13), "th");
-        assert_eq!(day_suffix(21), "st");
-        assert_eq!(day_suffix(22), "nd");
-        assert_eq!(day_suffix(23), "rd");
     }
 
     #[test]

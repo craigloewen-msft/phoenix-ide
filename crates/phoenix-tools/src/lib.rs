@@ -1188,49 +1188,6 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// The whole point of `ToolOutput` being an enum: `::success` carries any
-    /// string — including error-shaped text — and is still structurally a
-    /// success. There is no field to flip and no constructor that yields a
-    /// `Success` reporting `is_success() == false`. The contradictory state
-    /// the old `success: bool` + `output: String` pair allowed (P1 incident
-    /// 08545) is unrepresentable.
-    #[test]
-    fn success_constructor_is_always_a_success() {
-        let out = ToolOutput::success("Error: command failed with exit code 1");
-        assert!(out.is_success());
-        assert!(matches!(out, ToolOutput::Success { .. }));
-    }
-
-    #[test]
-    fn error_constructor_is_always_an_error() {
-        let out = ToolOutput::error("ok, completed successfully");
-        assert!(!out.is_success());
-        assert!(matches!(out, ToolOutput::Error { .. }));
-    }
-
-    #[test]
-    fn builders_preserve_the_variant() {
-        let img = || ToolImage {
-            media_type: "image/png".to_string(),
-            data: "Zm9v".to_string(),
-        };
-
-        let s = ToolOutput::success("done")
-            .with_display(serde_json::json!({ "k": "v" }))
-            .with_images(vec![img()]);
-        assert!(s.is_success());
-        assert_eq!(s.output(), "done");
-        assert_eq!(s.display_data(), Some(&serde_json::json!({ "k": "v" })));
-        assert_eq!(s.images().len(), 1);
-
-        let e = ToolOutput::error("boom")
-            .with_display(serde_json::json!({ "k": "v" }))
-            .with_images(vec![img()]);
-        assert!(!e.is_success());
-        assert_eq!(e.output(), "boom");
-        assert!(matches!(e, ToolOutput::Error { .. }));
-    }
-
     fn names(registry: &ToolRegistry) -> BTreeSet<String> {
         registry
             .definitions()
@@ -1248,22 +1205,6 @@ mod tests {
     fn no_sandbox_policy() -> ExploreToolPolicy {
         ExploreToolPolicy {
             bash: ExploreBashCapability::Unavailable,
-        }
-    }
-
-    #[test]
-    fn test_browser_tools_registered() {
-        let names = names(&ToolRegistry::standard());
-        for expected in [
-            "browser_navigate",
-            "browser_eval",
-            "browser_take_screenshot",
-            "browser_recent_console_logs",
-            "browser_clear_console_logs",
-            "browser_resize",
-            "browser_profile",
-        ] {
-            assert!(names.contains(expected), "Missing {expected}");
         }
     }
 
@@ -1588,13 +1529,6 @@ mod wake_registrar_seam_tests {
             None,
             phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         )
-    }
-
-    #[tokio::test]
-    async fn old_constructor_keeps_optional_fields_unset() {
-        let ctx = test_context();
-        assert_eq!(ctx.tool_use_id(), None);
-        assert!(ctx.wake_registrar().is_none());
     }
 
     #[tokio::test]

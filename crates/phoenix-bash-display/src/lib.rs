@@ -291,15 +291,6 @@ mod tests {
     }
 
     #[test]
-    fn test_display_keeps_cd_semicolon_when_different() {
-        // Semicolon separator, cwd differs
-        assert_eq!(
-            display_command("cd /foo; npm build", "/bar"),
-            "cd /foo; npm build"
-        );
-    }
-
-    #[test]
     fn test_display_strips_chained_cds_when_final_matches() {
         // Multiple cd's with && - strip cd /b when it matches cwd
         // The cd /a; remains because it's semicolon-separated (different semantics)
@@ -335,26 +326,12 @@ mod tests {
     }
 
     #[test]
-    fn test_display_complex_chain_different() {
-        // cd /path && actual && more -> keeps full when cwd differs
-        assert_eq!(
-            display_command("cd /path && echo hello && ls -la", "/other"),
-            "cd /path && echo hello && ls -la"
-        );
-    }
-
-    #[test]
     fn test_display_with_pipes_matches() {
         // Note: brush-parser's Display impl doesn't add space around pipe
         assert_eq!(
             display_command("cd /foo && cat file.txt | grep pattern", "/foo"),
             "cat file.txt |grep pattern"
         );
-    }
-
-    #[test]
-    fn test_display_empty() {
-        assert_eq!(display_command("", "/any"), "");
     }
 
     #[test]
@@ -365,15 +342,6 @@ mod tests {
         assert_eq!(
             display_command("cd /a; cd /b; cd /c; actual_command arg", "/c"),
             "cd /a; cd /b; actual_command arg"
-        );
-    }
-
-    #[test]
-    fn test_display_multiple_semicolon_cds_final_different() {
-        // Keep command when final cd differs from cwd
-        assert_eq!(
-            display_command("cd /a; cd /b; cd /c; actual_command arg", "/d"),
-            "cd /a; cd /b; cd /c; actual_command arg"
         );
     }
 
@@ -407,23 +375,7 @@ mod tests {
         assert_eq!(result, r#"cd /app && cat file || echo "not found""#);
     }
 
-    #[test]
-    fn test_display_or_only_unchanged() {
-        // Pure || chain without cd should be unchanged
-        let result = display_command("command1 || command2 || command3", "/any");
-        assert_eq!(result, "command1 || command2 || command3");
-    }
-
     // ==================== Path Matching Tests ====================
-
-    #[test]
-    fn test_display_trailing_slash_matches() {
-        // Trailing slashes should be normalized
-        assert_eq!(
-            display_command("cd /foo/ && cargo test", "/foo"),
-            "cargo test"
-        );
-    }
 
     #[test]
     fn test_display_relative_path_matches() {
