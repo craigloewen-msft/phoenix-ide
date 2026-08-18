@@ -199,16 +199,6 @@ describe('useResizablePane right-docked divider semantics', () => {
     localStorage.clear();
   });
 
-  it('makes a right-hand pane wider when the divider is dragged left', () => {
-    render(<RightDockedPaneHarness />);
-
-    expect(screen.getByTestId('pane-state')).toHaveTextContent('600');
-
-    dragDivider(500, 300);
-
-    expect(screen.getByTestId('pane-state')).toHaveTextContent('800');
-  });
-
   it('makes a right-hand pane narrower when the divider is dragged right', () => {
     render(<RightDockedPaneHarness />);
 

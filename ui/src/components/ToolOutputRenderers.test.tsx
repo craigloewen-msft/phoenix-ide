@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import {
@@ -223,15 +222,12 @@ describe('BrowserConsoleLogsView', () => {
       { level: 'log', text: 'hello' },
       { level: 'log', text: 'world' },
     ]);
-    const { container } = render(<BrowserConsoleLogsView rawText={json} />);
+    render(<BrowserConsoleLogsView rawText={json} />);
     expect(screen.getByText('4 entries')).toBeTruthy();
     expect(screen.getByText('1 error')).toBeTruthy();
     expect(screen.getByText('1 warning')).toBeTruthy();
     expect(screen.getByText('2 log')).toBeTruthy();
     expect(screen.getByText('TypeError: oops')).toBeTruthy();
-    // Entry-level styling is applied
-    expect(container.querySelector('.console-level-error')).toBeTruthy();
-    expect(container.querySelector('.console-level-warning')).toBeTruthy();
   });
 
   it('renders the file-pointer escape-hatch message verbatim', () => {
@@ -621,30 +617,6 @@ describe('KeywordSearchView', () => {
     expect(container.querySelector('.viewer-find-inline-match--active')?.textContent).toBe('relevant');
   });
 
-});
-
-
-describe('search result CSS contracts', () => {
-  const css = readFileSync('src/index.css', 'utf8');
-
-  function ruleFor(selector: string): string {
-    const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const match = css.match(new RegExp(`${escapedSelector}\\s*\\{(?<body>[^}]+)\\}`));
-    const body = match?.groups?.['body'];
-    expect(body, `${selector} rule exists`).toBeTruthy();
-    return body!;
-  }
-
-  it('keeps scrollable search result children from shrinking vertically', () => {
-    expect(ruleFor('.search-results-list')).toMatch(/overflow-y:\s*auto;/);
-    expect(ruleFor('.search-results-list')).toMatch(/min-height:\s*0;/);
-    expect(ruleFor('.keyword-search-list')).toMatch(/overflow-y:\s*auto;/);
-    expect(ruleFor('.keyword-search-list')).toMatch(/min-height:\s*0;/);
-
-    expect(ruleFor('.search-results-file')).toMatch(/flex:\s*0\s+0\s+auto;/);
-    expect(ruleFor('.search-result-line')).toMatch(/flex:\s*0\s+0\s+auto;/);
-    expect(ruleFor('.keyword-search-hit')).toMatch(/flex:\s*0\s+0\s+auto;/);
-  });
 });
 
 

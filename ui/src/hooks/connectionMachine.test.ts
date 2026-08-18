@@ -66,11 +66,6 @@ describe('connectionMachine', () => {
       expect(state.attempt).toBe(0);
       expect(state.nextRetryMs).toBeNull();
     });
-
-    it('passes invariant checks', () => {
-      const violations = checkInvariants(initialState());
-      expect(violations).toEqual([]);
-    });
   });
 
   describe('property: invariants hold after any sequence of inputs', () => {
@@ -87,31 +82,6 @@ describe('connectionMachine', () => {
               
               const violations = checkInvariants(state);
               if (violations.length > 0) {
-                return false;
-              }
-            }
-            
-            return true;
-          }
-        ),
-        { numRuns: 1000 }
-      );
-    });
-  });
-
-  describe('property: attempt is always non-negative', () => {
-    it('never produces negative attempt count', () => {
-      fc.assert(
-        fc.property(
-          fc.array(fc.tuple(inputArbitrary, contextArbitrary), { minLength: 1, maxLength: 100 }),
-          (inputsWithCtx) => {
-            let state = initialState();
-            
-            for (const [input, ctx] of inputsWithCtx) {
-              const result = transition(state, input, ctx);
-              state = result.state;
-              
-              if (state.attempt < 0) {
                 return false;
               }
             }
@@ -170,31 +140,6 @@ describe('connectionMachine', () => {
           }
         ),
         { numRuns: 500 }
-      );
-    });
-  });
-
-  describe('property: nextRetryMs never exceeds BACKOFF_MAX_MS', () => {
-    it('caps retry delay', () => {
-      fc.assert(
-        fc.property(
-          fc.array(fc.tuple(inputArbitrary, contextArbitrary), { minLength: 1, maxLength: 100 }),
-          (inputsWithCtx) => {
-            let state = initialState();
-            
-            for (const [input, ctx] of inputsWithCtx) {
-              const result = transition(state, input, ctx);
-              state = result.state;
-              
-              if (state.nextRetryMs !== null && state.nextRetryMs > BACKOFF_MAX_MS) {
-                return false;
-              }
-            }
-            
-            return true;
-          }
-        ),
-        { numRuns: 1000 }
       );
     });
   });

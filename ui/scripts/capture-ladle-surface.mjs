@@ -45,11 +45,6 @@ function screenshotFileName(id, viewport) {
   return viewport.name ? `${id}--${viewport.name}.png` : `${id}.png`;
 }
 
-export const __testables = {
-  normalizeViewportMatrix,
-  screenshotFileName,
-};
-
 async function waitForLadle() {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {

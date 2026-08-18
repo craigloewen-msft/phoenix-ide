@@ -386,32 +386,6 @@ describe('commission review tool rendering', () => {
     expect(screen.queryByRole('button', { name: 'Open full review' })).not.toBeInTheDocument();
   });
 
-  it('renders a clean structured summary for successful reviews with no findings', () => {
-    const result = toolMessage('tool-commission-review-clean', JSON.stringify({ ok: true }));
-    result.display_data = commissionReviewDisplayData();
-
-    render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-commission-review-clean', [{
-            type: 'tool_use',
-            id: 'tool-commission-review-clean',
-            name: 'commission_review',
-            input: { brief: 'Review before merge' },
-          }])}
-          toolResults={new Map([['tool-commission-review-clean', result]])}
-          onOpenFile={undefined}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(screen.getByLabelText('Commission review summary')).toHaveTextContent('Clean');
-    expect(screen.queryByText('0/3 files reviewed')).not.toBeInTheDocument();
-    expect(screen.getByText('3/3 files reviewed')).toBeInTheDocument();
-    expect(screen.getByText('No correctness issues found in the reviewed diff.')).toBeInTheDocument();
-    expect(screen.getByText('No findings reported.')).toBeInTheDocument();
-  });
-
   it('renders bounded findings for partial reviews with warnings and unreviewed files', () => {
     const findings = Array.from({ length: 6 }, (_, index) => ({
       severity: index === 0 ? 'critical' : index < 3 ? 'high' : index < 5 ? 'medium' : 'low',

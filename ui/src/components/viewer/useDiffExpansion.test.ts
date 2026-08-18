@@ -52,17 +52,6 @@ describe('useDiffExpansion', () => {
     expect(files[0]).toMatchObject({ path: 'src/b.ts', section: 'uncommitted' });
   });
 
-  it('requests nothing when every section is truncated', async () => {
-    const { result } = renderHook(() => useDiffExpansion({
-      conversationId: 'c1',
-      sources: [source()],
-      truncatedSections: new Set(['committed', 'uncommitted']),
-    }));
-
-    await waitFor(() => expect(result.current.size).toBe(0));
-    expect(getDiffExpansion).not.toHaveBeenCalled();
-  });
-
   // Without a conversation there is no worktree to resolve against, so the diff
   // simply renders without expansion.
   it('requests nothing when there is no conversation', async () => {

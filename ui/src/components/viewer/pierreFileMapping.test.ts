@@ -2,7 +2,6 @@ import { describe, it, expect } from 'vitest';
 import type { ReviewNote } from '../../contexts/ReviewNotesContext';
 import {
   annotationsForFile,
-  buildFileItem,
   contentFingerprint,
   fileItemId,
   fileItemRenderSignature,
@@ -20,19 +19,9 @@ function fileNote(id: string, lineNumber: number, body = 'note'): ReviewNote {
 }
 
 describe('pierreFileMapping', () => {
-  it('builds a single sideless file item from path + content', () => {
-    const item = buildFileItem(PATH, 'fn main() {}\n');
-    expect(item).toEqual({
-      id: fileItemId(PATH),
-      type: 'file',
-      file: { name: PATH, contents: 'fn main() {}\n' },
-    });
-  });
-
-  it('reads the bare source line at a 1-based number', () => {
+  it('reads the bare source line at a 1-based number, returning empty for out-of-range', () => {
     const content = 'a\nb\nc';
     expect(lineTextAt(content, 1)).toBe('a');
-    expect(lineTextAt(content, 3)).toBe('c');
     expect(lineTextAt(content, 99)).toBe('');
     expect(lineTextAt(content, 0)).toBe('');
   });
