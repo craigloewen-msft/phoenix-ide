@@ -10,11 +10,12 @@
 
 import { useCallback, useState } from 'react';
 import type { ReviewDiffScope } from '../../api';
+import { readLocalStorage, writeLocalStorage } from './storage';
 
 const REVIEW_DIFF_SCOPE_KEY = 'phoenix-review-diff-scope';
 
 function initialReviewDiffScope(): ReviewDiffScope {
-  return localStorage.getItem(REVIEW_DIFF_SCOPE_KEY) === 'since_review' ? 'since_review' : 'full';
+  return readLocalStorage(REVIEW_DIFF_SCOPE_KEY) === 'since_review' ? 'since_review' : 'full';
 }
 
 export function useReviewDiffScope(): {
@@ -25,7 +26,7 @@ export function useReviewDiffScope(): {
   const toggleScopePreference = useCallback(() => {
     setScopePreference((prev) => {
       const next = prev === 'full' ? 'since_review' : 'full';
-      localStorage.setItem(REVIEW_DIFF_SCOPE_KEY, next);
+      writeLocalStorage(REVIEW_DIFF_SCOPE_KEY, next);
       return next;
     });
   }, []);

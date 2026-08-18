@@ -5,14 +5,14 @@
  */
 
 import { useCallback, useState } from 'react';
+import { readLocalStorage, writeLocalStorage } from './storage';
 
 export type DiffStyle = 'unified' | 'split';
 
 const DIFF_STYLE_KEY = 'phoenix-diff-style';
 
 function initialDiffStyle(): DiffStyle {
-  const stored = localStorage.getItem(DIFF_STYLE_KEY);
-  return stored === 'split' ? 'split' : 'unified';
+  return readLocalStorage(DIFF_STYLE_KEY) === 'split' ? 'split' : 'unified';
 }
 
 export function useDiffStyle(): { diffStyle: DiffStyle; toggleDiffStyle: () => void } {
@@ -20,7 +20,7 @@ export function useDiffStyle(): { diffStyle: DiffStyle; toggleDiffStyle: () => v
   const toggleDiffStyle = useCallback(() => {
     setDiffStyle((prev) => {
       const next = prev === 'unified' ? 'split' : 'unified';
-      localStorage.setItem(DIFF_STYLE_KEY, next);
+      writeLocalStorage(DIFF_STYLE_KEY, next);
       return next;
     });
   }, []);
