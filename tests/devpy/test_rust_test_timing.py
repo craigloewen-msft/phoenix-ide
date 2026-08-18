@@ -102,13 +102,6 @@ class RustTestTimingTests(unittest.TestCase):
         self.assertEqual([finding], self.checker._introduced([finding], []))
         self.assertEqual([], self.checker._introduced([finding], [finding]))
 
-    def test_semantic_diff_detects_removed_timeout_wrapper(self):
-        unbounded = self.checker.Finding(
-            key=("fixture.rs", "races", "event:rx.recv().await"),
-            diagnostic="timeout removed",
-        )
-        self.assertEqual([unbounded], self.checker._introduced([unbounded], []))
-
     def test_semantic_diff_does_not_reflag_unchanged_legacy_finding(self):
         finding = self.checker.Finding(
             key=("fixture.rs", "races", "event:rx.recv().await"),

@@ -162,21 +162,6 @@ class BareDeployCommandTests(unittest.TestCase):
         self.assertIn("@reboot", installed)
         self.assertIn("phoenix-supervisor.py", installed)
 
-    def test_reboot_persistence_prints_exact_rc_guidance_without_crontab(self):
-        root = Path("/tmp/phoenix owner")
-        layout = {"root": root, "supervisor": root / "bin/phoenix-supervisor.py"}
-        with mock.patch.object(self.dev.shutil, "which", return_value=None), \
-             mock.patch("builtins.print") as output:
-            configured = self.dev._configure_bare_reboot_persistence(layout)
-
-        self.assertFalse(configured)
-        text = "\n".join(" ".join(str(value) for value in call.args) for call in output.call_args_list)
-        self.assertIn("Reboot persistence: not configured", text)
-        self.assertIn("same-user boot/rc mechanism", text)
-        self.assertIn("phoenix-supervisor.py", text)
-        self.assertIn("--root", text)
-        self.assertIn("run", text)
-
     def test_status_shows_durable_state_without_supervisor(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

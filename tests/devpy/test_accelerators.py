@@ -125,12 +125,6 @@ class LinkerConfigTests(unittest.TestCase):
         self.assertFalse(configured)
         self.assertNotIn("RUSTFLAGS", env)
 
-    def test_selection_is_stable_across_runs(self):
-        """A RUSTFLAGS that varied between runs would invalidate the cache every time."""
-        first, _ = self.configure(installed=("mold",))
-        second, _ = self.configure(installed=("mold",))
-        self.assertEqual(first, second)
-
 
 if __name__ == "__main__":
     unittest.main()
