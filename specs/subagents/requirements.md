@@ -269,6 +269,21 @@ THE SYSTEM SHALL constrain the LLM-visible choices to the model ids registered f
 that conversation
 AND SHALL reject an unknown or stale id before spawning any task in the batch
 
+WHEN a model id belongs to the frozen catalog but its live route is no longer
+available
+THE SYSTEM SHALL reject the spawn before any task starts
+AND SHALL distinguish route unavailability from an unknown model id
+
+THE SYSTEM SHALL describe each LLM-visible model choice from the same frozen
+registry catalog used for spawn-time validation
+
+WHEN that catalog contains a local model
+THE SYSTEM SHALL identify its local execution and remote-rate-limit independence
+in the model choice description
+AND SHALL leave the decision to select it with the parent model
+
 **Rationale:** Defaults should be the easiest valid representation. Empty
 placeholder strings and server-process-relative paths must not turn inheritance
 into a validation failure or move a child outside the parent's project context.
+Descriptions let a parent make an informed explicit delegation choice without a
+second model catalog in system-prompt prose or an invisible automatic router.

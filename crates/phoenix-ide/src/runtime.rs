@@ -3036,7 +3036,7 @@ impl RuntimeManager {
             } else {
                 Arc::from(phoenix_agents::discover_agents(context.filesystem_root()))
             };
-        let available_model_ids = self.llm_registry.available_models();
+        let subagent_model_catalog = self.llm_registry.subagent_model_catalog();
         context.is_coordinator = is_coordinator;
 
         let tool_executor = if is_sub_agent {
@@ -3048,7 +3048,7 @@ impl RuntimeManager {
                 registry,
                 self.mcp_manager.clone(),
                 agent_catalog.clone(),
-                Arc::from(available_model_ids.clone()),
+                Arc::from(subagent_model_catalog.clone()),
             )
         } else {
             use crate::db::ConvMode;
@@ -3075,7 +3075,7 @@ impl RuntimeManager {
                     ConvMode::Explore { .. } => ToolRegistry::explore(
                         &context.tasks_dir_name,
                         agent_catalog.to_vec(),
-                        available_model_ids.clone(),
+                        subagent_model_catalog.clone(),
                         ExploreToolPolicy::from_platform(&self.platform),
                     ),
                     ConvMode::Direct => {
@@ -3085,7 +3085,7 @@ impl RuntimeManager {
                         // default branch (REQ-PROJ-036).
                         let registry = ToolRegistry::direct(
                             agent_catalog.to_vec(),
-                            available_model_ids.clone(),
+                            subagent_model_catalog.clone(),
                         );
                         if phoenix_core::git::detect_git_repo_root(context.filesystem_root())
                             .is_some()
@@ -3099,7 +3099,7 @@ impl RuntimeManager {
                         // Full tool suite plus `propose_task` (non-blocking fork
                         // proposal — REQ-PROJ-036). Work/Branch always sit on git
                         // history, so the tool is always offered.
-                        ToolRegistry::direct(agent_catalog.to_vec(), available_model_ids.clone())
+                        ToolRegistry::direct(agent_catalog.to_vec(), subagent_model_catalog.clone())
                             .with_propose_task()
                             .with_commission_review()
                     }
@@ -3108,7 +3108,7 @@ impl RuntimeManager {
                     registry,
                     self.mcp_manager.clone(),
                     agent_catalog.clone(),
-                    Arc::from(available_model_ids.clone()),
+                    Arc::from(subagent_model_catalog.clone()),
                 )
             }
         };

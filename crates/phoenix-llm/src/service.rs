@@ -19,11 +19,45 @@ fn empty_tags() -> &'static BTreeMap<String, String> {
     EMPTY.get_or_init(BTreeMap::new)
 }
 
+enum ServiceAuth {
+    Required(LlmAuth),
+    None,
+}
+
+impl ServiceAuth {
+    async fn resolve_required(&self) -> Result<super::ResolvedAuth, LlmError> {
+        match self {
+            Self::Required(auth) => auth.resolve().await,
+            Self::None => Err(LlmError::invalid_request(
+                "Unauthenticated LLM route cannot use an authenticated wire backend",
+            )),
+        }
+    }
+
+    async fn resolve_optional_bearer(&self) -> Result<Option<String>, LlmError> {
+        match self {
+            Self::Required(auth) => Ok(Some(auth.resolve().await?.credential)),
+            Self::None => Ok(None),
+        }
+    }
+
+    async fn invalidate(&self) -> bool {
+        match self {
+            Self::Required(auth) => auth.invalidate().await,
+            Self::None => false,
+        }
+    }
+
+    const fn is_required(&self) -> bool {
+        matches!(self, Self::Required(_))
+    }
+}
+
 /// Unified service implementation that dispatches by API format
 pub struct LlmServiceImpl {
     pub spec: ModelSpec,
-    /// LLM auth: credential source + header style.
-    pub auth: LlmAuth,
+    auth: ServiceAuth,
+    telemetry_provider: &'static str,
     pub anthropic_base_url: Option<String>,
     pub openai_responses_base_url: Option<String>,
     pub openai_chat_completions_base_url: Option<String>,
@@ -62,14 +96,36 @@ impl LlmServiceImpl {
         custom_headers: Vec<(String, String)>,
         request_tags: BTreeMap<String, String>,
     ) -> Self {
+        let telemetry_provider = spec.backend.header_value();
         Self {
             spec,
-            auth,
+            auth: ServiceAuth::Required(auth),
+            telemetry_provider,
             anthropic_base_url,
             openai_responses_base_url,
             openai_chat_completions_base_url,
             custom_headers,
             request_tags,
+            use_codex_backend: false,
+            codex_credential: None,
+            codex_ws_sessions: Arc::new(Mutex::new(openai::CodexWsSessions::default())),
+        }
+    }
+
+    /// Build the dedicated local Ollama route. Its lack of authentication is a
+    /// typed service property, not an empty or fabricated API key.
+    #[must_use]
+    pub fn new_ollama(spec: ModelSpec, chat_endpoint: String) -> Self {
+        debug_assert_eq!(spec.backend.api_format(), ApiFormat::OpenAIChatCompletions);
+        Self {
+            spec,
+            auth: ServiceAuth::None,
+            telemetry_provider: "ollama",
+            anthropic_base_url: None,
+            openai_responses_base_url: None,
+            openai_chat_completions_base_url: Some(chat_endpoint),
+            custom_headers: Vec::new(),
+            request_tags: BTreeMap::new(),
             use_codex_backend: false,
             codex_credential: None,
             codex_ws_sessions: Arc::new(Mutex::new(openai::CodexWsSessions::default())),
@@ -88,7 +144,8 @@ impl LlmServiceImpl {
     ) -> Self {
         Self {
             spec,
-            auth,
+            auth: ServiceAuth::Required(auth),
+            telemetry_provider: "openai",
             anthropic_base_url: None,
             openai_responses_base_url: Some(CODEX_BACKEND_URL.to_string()),
             openai_chat_completions_base_url: None,
@@ -187,10 +244,11 @@ impl LlmServiceImpl {
     /// (signing in with Codex from Phoenix) reaches the wire.
     fn headers_for_provider(&self) -> Vec<(String, String)> {
         let mut headers = self.custom_headers.clone();
-        if !headers.is_empty()
-            || self.anthropic_base_url.is_some()
-            || self.openai_responses_base_url.is_some()
-            || self.openai_chat_completions_base_url.is_some()
+        if self.auth.is_required()
+            && (!headers.is_empty()
+                || self.anthropic_base_url.is_some()
+                || self.openai_responses_base_url.is_some()
+                || self.openai_chat_completions_base_url.is_some())
         {
             // Auto-inject provider header if not already present
             if !headers
@@ -240,7 +298,7 @@ impl LlmServiceImpl {
         if let Some(telemetry) = &request.telemetry {
             telemetry.attempt_capture.begin(
                 telemetry,
-                self.spec.backend.header_value(),
+                self.telemetry_provider,
                 &self.spec.id,
                 transport,
             );
@@ -268,7 +326,7 @@ impl LlmServiceImpl {
                 .await
             }
             ApiFormat::OpenAIResponses => {
-                let key = self.auth.resolve().await?.credential;
+                let key = self.auth.resolve_required().await?.credential;
                 self.begin_provider_attempt(request, super::LlmTransport::HttpJson);
                 let headers = self.headers_for_provider();
                 openai::complete(
@@ -283,12 +341,12 @@ impl LlmServiceImpl {
                 .await
             }
             ApiFormat::OpenAIChatCompletions => {
-                let key = self.auth.resolve().await?.credential;
+                let key = self.auth.resolve_optional_bearer().await?;
                 self.begin_provider_attempt(request, super::LlmTransport::HttpJson);
                 let headers = self.headers_for_provider();
                 openai::complete_chat(
                     &self.spec,
-                    &key,
+                    key.as_deref(),
                     self.openai_chat_completions_base_url.as_deref(),
                     &headers,
                     self.effective_request_tags(self.openai_chat_completions_base_url.as_deref()),
@@ -321,7 +379,7 @@ impl LlmServiceImpl {
                 .await
             }
             ApiFormat::OpenAIResponses => {
-                let key = self.auth.resolve().await?.credential;
+                let key = self.auth.resolve_required().await?.credential;
                 let transport = if self.use_codex_backend {
                     super::LlmTransport::Websocket
                 } else {
@@ -343,12 +401,12 @@ impl LlmServiceImpl {
                 .await
             }
             ApiFormat::OpenAIChatCompletions => {
-                let key = self.auth.resolve().await?.credential;
+                let key = self.auth.resolve_optional_bearer().await?;
                 self.begin_provider_attempt(request, super::LlmTransport::HttpSse);
                 let headers = self.headers_for_provider();
                 openai::complete_streaming_chat(
                     &self.spec,
-                    &key,
+                    key.as_deref(),
                     self.openai_chat_completions_base_url.as_deref(),
                     &headers,
                     self.effective_request_tags(self.openai_chat_completions_base_url.as_deref()),
@@ -362,7 +420,7 @@ impl LlmServiceImpl {
 
     /// Resolve auth credential for this request.
     async fn resolve_auth(&self) -> Result<super::ResolvedAuth, super::LlmError> {
-        self.auth.resolve().await
+        self.auth.resolve_required().await
     }
 }
 
@@ -371,6 +429,15 @@ mod tests {
     use super::*;
     use crate::all_models;
     use crate::registry::{AuthStyle, StaticCredential};
+    use axum::{
+        body::{Body, Bytes},
+        extract::State,
+        http::HeaderMap,
+        response::Response,
+        routing::post,
+        Json, Router,
+    };
+    use std::sync::Mutex as StdMutex;
 
     #[derive(Debug)]
     struct MissingCredential;
@@ -433,6 +500,120 @@ mod tests {
         t
     }
 
+    #[derive(Clone, Default)]
+    struct CapturedChatRequest {
+        headers: Arc<StdMutex<Option<HeaderMap>>>,
+        body: Arc<StdMutex<Option<serde_json::Value>>>,
+    }
+
+    async fn capture_chat_request(
+        State(capture): State<CapturedChatRequest>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Json<serde_json::Value> {
+        *capture.headers.lock().unwrap() = Some(headers);
+        *capture.body.lock().unwrap() = Some(serde_json::from_slice(&body).unwrap());
+        Json(serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "local result"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+        }))
+    }
+
+    async fn capture_streaming_chat_request(
+        State(capture): State<CapturedChatRequest>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        *capture.headers.lock().unwrap() = Some(headers);
+        *capture.body.lock().unwrap() = Some(serde_json::from_slice(&body).unwrap());
+        let stream = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"local stream\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Response::builder()
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(stream))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ollama_route_omits_auth_and_uses_configured_wire_model() {
+        let capture = CapturedChatRequest::default();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_chat_request))
+            .with_state(capture.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let service = LlmServiceImpl::new_ollama(
+            crate::ollama_gpt_oss_model("custom-gpt-oss-tag"),
+            format!("http://{address}/v1/chat/completions"),
+        );
+        let (mut request, _) = request_with_capture();
+        request.tools.push(crate::ToolDefinition {
+            name: "inspect_code".to_string(),
+            description: "Inspect code".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            defer_loading: false,
+        });
+
+        let response = service.complete(&request).await.unwrap();
+
+        assert!(response.content.iter().any(
+            |block| matches!(block, crate::ContentBlock::Text { text } if text == "local result")
+        ));
+        let headers = capture.headers.lock().unwrap().clone().unwrap();
+        assert!(headers.get("authorization").is_none());
+        assert!(headers.get("x-api-key").is_none());
+        assert!(headers.get("provider").is_none());
+        let body = capture.body.lock().unwrap().clone().unwrap();
+        assert_eq!(body["model"], "custom-gpt-oss-tag");
+        assert_eq!(body["tools"][0]["function"]["name"], "inspect_code");
+        assert_eq!(body["tool_choice"], "auto");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ollama_streaming_route_omits_auth() {
+        let capture = CapturedChatRequest::default();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_streaming_chat_request))
+            .with_state(capture.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let service = LlmServiceImpl::new_ollama(
+            crate::ollama_gpt_oss_model("gpt-oss:120b"),
+            format!("http://{address}/v1/chat/completions"),
+        );
+        let (request, _) = request_with_capture();
+        let (chunk_tx, mut chunk_rx) = mpsc::channel(4);
+
+        let response = service
+            .complete_streaming(&request, &chunk_tx)
+            .await
+            .unwrap();
+
+        assert!(response.content.iter().any(
+            |block| matches!(block, crate::ContentBlock::Text { text } if text == "local stream")
+        ));
+        assert!(matches!(
+            chunk_rx.try_recv().unwrap(),
+            crate::TokenChunk::Text(text) if text == "local stream"
+        ));
+        let headers = capture.headers.lock().unwrap().clone().unwrap();
+        assert!(headers.get("authorization").is_none());
+        assert!(headers.get("x-api-key").is_none());
+        let body = capture.body.lock().unwrap().clone().unwrap();
+        assert_eq!(body["stream"], true);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn local_auth_failure_does_not_finalize_provider_attempt() {
         let spec = all_models()
@@ -482,6 +663,26 @@ mod tests {
             ],
             BTreeMap::new(),
         )
+    }
+
+    #[test]
+    fn ollama_and_cloud_chat_services_keep_endpoint_and_auth_separate() {
+        let cloud = chat_gateway_service_with_api_name("cloud/model");
+        let ollama = LlmServiceImpl::new_ollama(
+            crate::ollama_gpt_oss_model("gpt-oss:120b"),
+            "http://127.0.0.1:11434/v1/chat/completions".to_string(),
+        );
+
+        assert_eq!(
+            cloud.openai_chat_completions_base_url.as_deref(),
+            Some("https://gateway.example/v1/chat/completions")
+        );
+        assert!(cloud.auth.is_required());
+        assert_eq!(
+            ollama.openai_chat_completions_base_url.as_deref(),
+            Some("http://127.0.0.1:11434/v1/chat/completions")
+        );
+        assert!(!ollama.auth.is_required());
     }
 
     #[test]

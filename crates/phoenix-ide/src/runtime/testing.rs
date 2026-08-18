@@ -146,7 +146,7 @@ pub struct MockToolExecutor {
     outputs: HashMap<String, ToolOutput>,
     definitions: Vec<ToolDefinition>,
     clearable: std::collections::HashSet<String>,
-    model_ids: Arc<[String]>,
+    model_catalog: Arc<[phoenix_core::domain::sm_state::SubAgentModelChoice]>,
     /// Record of tool executions
     pub executions: Mutex<Vec<(String, Value)>>,
 }
@@ -158,7 +158,7 @@ impl MockToolExecutor {
             outputs: HashMap::new(),
             definitions: Vec::new(),
             clearable: std::collections::HashSet::new(),
-            model_ids: Arc::from(Vec::new()),
+            model_catalog: Arc::from(Vec::new()),
             executions: Mutex::new(Vec::new()),
         }
     }
@@ -183,7 +183,15 @@ impl MockToolExecutor {
     }
 
     pub fn with_subagent_models(mut self, model_ids: Vec<String>) -> Self {
-        self.model_ids = Arc::from(model_ids);
+        self.model_catalog = Arc::from(
+            model_ids
+                .into_iter()
+                .map(|id| phoenix_core::domain::sm_state::SubAgentModelChoice {
+                    description: format!("Test model {id}"),
+                    id,
+                })
+                .collect::<Vec<_>>(),
+        );
         self
     }
 
@@ -215,8 +223,8 @@ impl ToolExecutor for MockToolExecutor {
         self.definitions.clone()
     }
 
-    fn subagent_model_ids(&self) -> Arc<[String]> {
-        self.model_ids.clone()
+    fn subagent_model_catalog(&self) -> Arc<[phoenix_core::domain::sm_state::SubAgentModelChoice]> {
+        self.model_catalog.clone()
     }
 
     fn clearable_tool_names(&self) -> std::collections::HashSet<String> {

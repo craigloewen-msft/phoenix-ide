@@ -32,6 +32,14 @@ pub struct ReadImageInput {
     pub path: String,
 }
 
+/// A registered model choice frozen into a parent conversation's
+/// `spawn_agents` schema and reused for spawn-time validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubAgentModelChoice {
+    pub id: String,
+    pub description: String,
+}
+
 /// Task specification for `spawn_agents` tool
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubAgentTask {

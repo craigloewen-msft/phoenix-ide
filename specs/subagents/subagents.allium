@@ -49,6 +49,11 @@ value SubAgentTask {
                                   -- must match a discovered agent name
 }
 
+value SubAgentModelChoice {
+    id: String
+    description: String
+}
+
 -- The resolved spec the runtime spawns the sub-agent from.
 -- Every field is concrete: defaults applied, model validated, cwd
 -- resolved.
@@ -62,6 +67,15 @@ value SubAgentSpec {
     max_turns: Integer            -- > 0
     agent_name: String?           -- named agent that produced this spec (see specs/agents/)
     persona: String?              -- resolved agent body; replaces the base preamble
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity FrozenSubAgentModelCatalog {
+    parent_id: String
+    choices: List<SubAgentModelChoice>
 }
 
 ------------------------------------------------------------
@@ -179,6 +193,22 @@ rule SpawnRejectedWorkSubAgentAlreadyActive {
 -- 3. MODEL VALIDATION (REQ-PROJ-008, REQ-SA-007)
 -- ===========================================================
 
+rule SpawnModelCatalogFrozen {
+    when: BuildSpawnAgentsSchema(parent)
+    ensures: FrozenSubAgentModelCatalog.created(
+        parent_id: parent.id,
+        choices: registered_subagent_model_choices(parent)
+    )
+
+    @guidance
+        -- `registered_subagent_model_choices(parent)` returns the sorted model
+        -- ids and descriptions registered when the parent runtime is built.
+        -- The same frozen catalog renders the model enum and is consumed by
+        -- spawn-time validation. Local-model descriptions state locality and
+        -- remote-rate-limit independence; selection remains the parent model's
+        -- explicit decision.
+}
+
 -- An explicit `model` field on a task must exist in the LLM registry.
 -- Defaulting (Explore -> cheapest per provider; Work -> parent's model)
 -- never produces an unknown model, so this only checks overrides.
@@ -197,6 +227,20 @@ rule SpawnRejectedUnknownModel {
         --       LlmRegistry.cheap_model_for_provider(parent.model_id)
         --   t.mode = work,    t.model absent => parent.model_id
         --   t.model present  => t.model (after this check)
+}
+
+rule SpawnRejectedUnavailableAdvertisedModel {
+    when: SpawnAgentsToolInvoked(parent, tasks)
+    requires: any_task_model_is_in_frozen_catalog_but_live_route_is_unavailable(
+        tasks, parent)
+    ensures: SpawnAgentsRejected(parent,
+        reason: "Advertised model route is no longer available")
+
+    @guidance
+        -- `any_task_model_is_in_frozen_catalog_but_live_route_is_unavailable`
+        -- is true when an explicit model id was shown in this parent's frozen
+        -- schema but no service for that id remains in the live registry. This
+        -- is distinct from an unknown id and is rejected before any child starts.
 }
 
 -- An `agent_type` on a task must match a discovered agent name (see

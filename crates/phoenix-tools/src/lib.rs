@@ -62,7 +62,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use browser::BrowserSession;
 use phoenix_core::domain::bash_progress::BashToolProgress;
-use phoenix_core::domain::sm_state::ExploreBashCapability;
+use phoenix_core::domain::sm_state::{ExploreBashCapability, SubAgentModelChoice};
 use phoenix_core::llm_service::LlmSelector;
 use phoenix_core::platform::PlatformCapability;
 use phoenix_core::work_scope::ResourceScopeKey;
@@ -852,10 +852,10 @@ fn browser_tools() -> Vec<Arc<dyn Tool>> {
 /// what's available (REQ-AG-004). Empty when none are discovered.
 fn parent_coordination_tools(
     agents: Vec<phoenix_agents::AgentDefinition>,
-    model_ids: Vec<String>,
+    models: Vec<SubAgentModelChoice>,
 ) -> Vec<Arc<dyn Tool>> {
     vec![
-        Arc::new(SpawnAgentsTool::with_catalogs(agents, model_ids)),
+        Arc::new(SpawnAgentsTool::with_catalogs(agents, models)),
         Arc::new(AskUserQuestionTool),
         Arc::new(SkillTool),
     ]
@@ -924,15 +924,15 @@ impl ToolRegistry {
     pub fn explore(
         tasks_dir_name: &str,
         agents: Vec<phoenix_agents::AgentDefinition>,
-        model_ids: Vec<String>,
+        models: Vec<SubAgentModelChoice>,
         policy: ExploreToolPolicy,
     ) -> Self {
         match policy.bash() {
             ExploreBashCapability::Sandboxed => {
-                Self::explore_with_sandbox(tasks_dir_name, agents, model_ids, policy)
+                Self::explore_with_sandbox(tasks_dir_name, agents, models, policy)
             }
             ExploreBashCapability::Unavailable => {
-                Self::explore_no_sandbox(tasks_dir_name, agents, model_ids)
+                Self::explore_no_sandbox(tasks_dir_name, agents, models)
             }
         }
     }
@@ -958,11 +958,11 @@ impl ToolRegistry {
     pub fn explore_no_sandbox(
         tasks_dir_name: &str,
         agents: Vec<phoenix_agents::AgentDefinition>,
-        model_ids: Vec<String>,
+        models: Vec<SubAgentModelChoice>,
     ) -> Self {
         let mut tools = read_only_tools();
         tools.extend(browser_tools());
-        tools.extend(parent_coordination_tools(agents, model_ids));
+        tools.extend(parent_coordination_tools(agents, models));
         tools.push(Arc::new(PatchTool::for_task_proposal_drafts(
             tasks_dir_name,
         )));
@@ -977,7 +977,7 @@ impl ToolRegistry {
     pub fn explore_with_sandbox(
         tasks_dir_name: &str,
         agents: Vec<phoenix_agents::AgentDefinition>,
-        model_ids: Vec<String>,
+        models: Vec<SubAgentModelChoice>,
         policy: ExploreToolPolicy,
     ) -> Self {
         debug_assert!(policy.has_sandboxed_bash());
@@ -985,7 +985,7 @@ impl ToolRegistry {
         tools.extend(browser_tools());
         tools.push(Arc::new(SandboxedBashTool));
         if policy.allow_top_level_spawn_agents() {
-            tools.extend(parent_coordination_tools(agents, model_ids));
+            tools.extend(parent_coordination_tools(agents, models));
         } else {
             tools.extend(explore_coordination_tools());
         }
@@ -1006,8 +1006,11 @@ impl ToolRegistry {
     /// Create tool registry for Direct mode.
     /// Full tool suite -- same as Work mode.
     #[must_use]
-    pub fn direct(agents: Vec<phoenix_agents::AgentDefinition>, model_ids: Vec<String>) -> Self {
-        Self::new_with_options(false, agents, model_ids)
+    pub fn direct(
+        agents: Vec<phoenix_agents::AgentDefinition>,
+        models: Vec<SubAgentModelChoice>,
+    ) -> Self {
+        Self::new_with_options(false, agents, models)
     }
 
     /// Add `propose_task` to a writing-mode registry (Work, Branch, or
@@ -1084,7 +1087,7 @@ impl ToolRegistry {
     fn new_with_options(
         is_sub_agent: bool,
         agents: Vec<phoenix_agents::AgentDefinition>,
-        model_ids: Vec<String>,
+        models: Vec<SubAgentModelChoice>,
     ) -> Self {
         let mut tools = read_only_tools();
         tools.extend(write_tools());
@@ -1097,7 +1100,7 @@ impl ToolRegistry {
             // Parent conversations can read the terminal, spawn sub-agents,
             // ask user questions, and invoke skills.
             tools.extend(parent_terminal_tools());
-            tools.extend(parent_coordination_tools(agents, model_ids));
+            tools.extend(parent_coordination_tools(agents, models));
         }
 
         Self { tools }

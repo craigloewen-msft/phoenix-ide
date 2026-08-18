@@ -1,9 +1,10 @@
 //! Model registry for managing available LLM providers
 
 use super::{
-    all_models, codex_credential, discover_models, merge_model_specs, parse_external_models,
-    CodexCredential, DiscoveredModels, DiscoveryConfig, LlmService, LlmServiceImpl, LlmTransport,
-    LoggingService, ModelBackend, ModelInfo, ModelSource,
+    all_models, codex_credential, discover_models, discover_unauthenticated_model_ids,
+    merge_model_specs, ollama_gpt_oss_model, parse_external_models, CodexCredential,
+    DiscoveredModels, DiscoveryConfig, LlmService, LlmServiceImpl, LlmTransport, LoggingService,
+    ModelBackend, ModelInfo, ModelSource,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use std::collections::{HashMap, HashSet};
@@ -162,6 +163,12 @@ pub struct LlmConfig {
     pub openai_responses_base_url: Option<String>,
     /// Direct URL override for the `OpenAI` Chat Completions endpoint.
     pub openai_chat_completions_base_url: Option<String>,
+    /// Exact local Ollama Chat Completions endpoint. `None` disables probing.
+    pub ollama_chat_completions_base_url: Option<String>,
+    /// Ollama wire model tag that must appear in `/v1/models` before registration.
+    pub ollama_model: String,
+    /// Whether the deterministic in-process mock model is registered.
+    pub mock_model_enabled: bool,
     /// Extra headers to inject on every LLM request (newline-separated "key: value").
     /// Parsed from `LLM_CUSTOM_HEADERS` env var. A `provider` header is auto-injected
     /// based on which provider is being called.
@@ -225,6 +232,12 @@ impl std::fmt::Debug for LlmConfig {
                 "openai_chat_completions_base_url",
                 &self.openai_chat_completions_base_url,
             )
+            .field(
+                "ollama_chat_completions_base_url",
+                &self.ollama_chat_completions_base_url,
+            )
+            .field("ollama_model", &self.ollama_model)
+            .field("mock_model_enabled", &self.mock_model_enabled)
             .field("custom_headers", &self.custom_headers)
             .field("request_tags", &self.request_tags)
             .field("auth_style", &self.auth_style)
@@ -249,6 +262,9 @@ impl Clone for LlmConfig {
             openai_base_url: self.openai_base_url.clone(),
             openai_responses_base_url: self.openai_responses_base_url.clone(),
             openai_chat_completions_base_url: self.openai_chat_completions_base_url.clone(),
+            ollama_chat_completions_base_url: self.ollama_chat_completions_base_url.clone(),
+            ollama_model: self.ollama_model.clone(),
+            mock_model_enabled: self.mock_model_enabled,
             custom_headers: self.custom_headers.clone(),
             request_tags: self.request_tags.clone(),
             auth_style: self.auth_style,
@@ -273,6 +289,9 @@ impl Default for LlmConfig {
             openai_base_url: None,
             openai_responses_base_url: None,
             openai_chat_completions_base_url: None,
+            ollama_chat_completions_base_url: None,
+            ollama_model: "gpt-oss:120b".to_string(),
+            mock_model_enabled: false,
             custom_headers: Vec::new(),
             request_tags: std::collections::BTreeMap::new(),
             auth_style: AuthStyle::ApiKey,
@@ -306,6 +325,19 @@ impl LlmConfig {
             .or_else(|| legacy_openai_base_url_for_responses(openai_base_url.as_deref()));
         let openai_chat_completions_base_url = endpoint_env("OPENAI_CHAT_COMPLETIONS_BASE_URL")
             .or_else(|| legacy_openai_base_url_for_chat(openai_base_url.as_deref()));
+        let ollama_chat_completions_base_url =
+            if std::env::var("PHOENIX_DISABLE_OLLAMA").is_ok_and(|value| value == "1") {
+                None
+            } else {
+                endpoint_env("OLLAMA_CHAT_COMPLETIONS_BASE_URL")
+                    .or_else(|| Some("http://127.0.0.1:11434/v1/chat/completions".to_string()))
+            };
+        let ollama_model = std::env::var("OLLAMA_MODEL")
+            .ok()
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or_else(|| "gpt-oss:120b".to_string());
+        let mock_model_enabled =
+            std::env::var("PHOENIX_ENABLE_MOCK_MODEL").is_ok_and(|value| value == "1");
 
         // Parse newline-separated "key: value" pairs (supports real newlines and literal \n)
         let custom_headers = std::env::var("LLM_CUSTOM_HEADERS")
@@ -379,6 +411,9 @@ impl LlmConfig {
             openai_base_url,
             openai_responses_base_url,
             openai_chat_completions_base_url,
+            ollama_chat_completions_base_url,
+            ollama_model,
+            mock_model_enabled,
             custom_headers,
             request_tags,
             auth_style: if std::env::var("LLM_AUTH_HEADER")
@@ -633,7 +668,7 @@ impl ModelRegistry {
             .iter()
             .find(|id| services.contains_key(**id))
             .map(|id| (*id).to_string())
-            .or_else(|| services.keys().next().cloned())
+            .or_else(|| services.keys().min().cloned())
             .unwrap_or_else(|| "claude-sonnet-5".to_string())
     }
 
@@ -643,6 +678,12 @@ impl ModelRegistry {
     /// endpoints derived from `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`. Falls back
     /// to the configured model list if discovery is unavailable or unhelpful.
     pub async fn new_with_discovery(config: &LlmConfig) -> Self {
+        let registry = Self::new_with_provider_discovery(config).await;
+        registry.register_discovered_ollama(config).await;
+        registry
+    }
+
+    async fn new_with_provider_discovery(config: &LlmConfig) -> Self {
         let Some(discovery) = Self::build_discovery_config(config).await else {
             return Self::new(config);
         };
@@ -704,6 +745,72 @@ impl ModelRegistry {
             current_codex_credential: std::sync::RwLock::new(config.codex_credential.clone()),
             config: Arc::new(config.clone()),
         }
+    }
+
+    async fn register_discovered_ollama(&self, config: &LlmConfig) {
+        if config.external_models_only {
+            return;
+        }
+        let Some(chat_endpoint) = config.ollama_chat_completions_base_url.as_deref() else {
+            return;
+        };
+        let Some(models_url) = derive_models_url(chat_endpoint) else {
+            tracing::warn!(
+                endpoint = chat_endpoint,
+                "Ollama endpoint cannot produce a model-list URL; local GPT-OSS unavailable"
+            );
+            return;
+        };
+        let discovered =
+            match discover_unauthenticated_model_ids(&models_url, Duration::from_millis(750)).await
+            {
+                Ok(models) => models,
+                Err(error) => {
+                    tracing::debug!(
+                        endpoint = models_url,
+                        failure = %error,
+                        "Ollama discovery unavailable"
+                    );
+                    return;
+                }
+            };
+        if !discovered.contains(&config.ollama_model) {
+            tracing::debug!(
+                model = %config.ollama_model,
+                "Ollama is reachable but configured GPT-OSS model is not installed"
+            );
+            return;
+        }
+
+        let spec = ollama_gpt_oss_model(&config.ollama_model);
+        let service: Arc<dyn LlmService> = Arc::new(LoggingService::new(
+            Arc::new(LlmServiceImpl::new_ollama(
+                spec.clone(),
+                chat_endpoint.to_string(),
+            )),
+            "ollama",
+            LlmTransport::HttpSse,
+        ));
+        let mut services = self.services.write().expect("services lock poisoned");
+        let mut specs = self.specs.write().expect("specs lock poisoned");
+        if services.contains_key(&spec.id) || specs.contains_key(&spec.id) {
+            tracing::warn!(
+                model = %spec.id,
+                "Ollama model ID conflicts with an existing registry model; keeping existing route"
+            );
+            return;
+        }
+        services.insert(spec.id.clone(), service);
+        specs.insert(spec.id.clone(), spec.clone());
+        if let Ok(mut default_model) = self.default_model.write() {
+            *default_model = Self::pick_default_model(&services, config);
+        }
+        tracing::info!(
+            model = %spec.id,
+            wire_model = %spec.api_name,
+            endpoint = chat_endpoint,
+            "registered local Ollama delegation model"
+        );
     }
 
     /// Return the model specs selected by the configured catalog policy.
@@ -842,10 +949,13 @@ impl ModelRegistry {
         spec: &super::ModelSpec,
         config: &LlmConfig,
     ) -> Option<Arc<dyn LlmService>> {
+        if spec.source == ModelSource::Ollama {
+            return None;
+        }
+
         // Mock provider: opt-in only via PHOENIX_ENABLE_MOCK_MODEL=1
         if spec.backend == ModelBackend::Mock {
-            let enabled = std::env::var("PHOENIX_ENABLE_MOCK_MODEL").is_ok_and(|v| v == "1");
-            if !enabled {
+            if !config.mock_model_enabled {
                 return None;
             }
             let service: Arc<dyn LlmService> = Arc::new(super::mock::MockLlmService);
@@ -1072,6 +1182,32 @@ impl ModelRegistry {
         let mut models: Vec<_> = services.keys().cloned().collect();
         models.sort();
         models
+    }
+
+    /// Return the frozen model choices exposed to parent agents through
+    /// `spawn_agents`. IDs and descriptions come from the same registered specs
+    /// that own request routing and spawn validation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal registry lock is poisoned.
+    pub fn subagent_model_catalog(
+        &self,
+    ) -> Vec<phoenix_core::domain::sm_state::SubAgentModelChoice> {
+        let services = self.services.read().expect("services lock poisoned");
+        let specs = self.specs.read().expect("specs lock poisoned");
+        let mut choices: Vec<_> = specs
+            .iter()
+            .filter(|(id, _)| services.contains_key(*id))
+            .map(
+                |(_, spec)| phoenix_core::domain::sm_state::SubAgentModelChoice {
+                    id: spec.id.clone(),
+                    description: spec.description.clone(),
+                },
+            )
+            .collect();
+        choices.sort_by(|left, right| left.id.cmp(&right.id));
+        choices
     }
 
     /// Get detailed information about available models
@@ -1522,19 +1658,181 @@ pub struct CodexReloadOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::{Body, Bytes},
+        extract::State,
+        http::Response,
+        routing::get,
+        Json, Router,
+    };
     use std::collections::HashSet;
+
+    async fn list_test_models(State(models): State<Arc<[String]>>) -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "data": models
+                .iter()
+                .map(|id| serde_json::json!({"id": id}))
+                .collect::<Vec<_>>()
+        }))
+    }
+
+    async fn malformed_test_models() -> &'static str {
+        "not json"
+    }
+
+    async fn oversized_chunked_test_models() -> Response<Body> {
+        let chunks = tokio_stream::iter([
+            Ok::<_, std::convert::Infallible>(Bytes::from(vec![b'x'; 200 * 1024])),
+            Ok(Bytes::from(vec![b'x'; 100 * 1024])),
+        ]);
+        Response::builder().body(Body::from_stream(chunks)).unwrap()
+    }
+
+    async fn test_models_endpoint(models: Vec<&str>) -> (String, tokio::task::JoinHandle<()>) {
+        let models: Arc<[String]> =
+            Arc::from(models.into_iter().map(str::to_string).collect::<Vec<_>>());
+        let app = Router::new()
+            .route("/v1/models", get(list_test_models))
+            .with_state(models);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}/v1/chat/completions"), server)
+    }
 
     #[test]
     fn codex_bridge_transport_is_websocket_across_registration_paths() {
         assert_eq!(codex_bridge_transport(), LlmTransport::Websocket);
     }
 
+    #[tokio::test]
+    async fn ollama_registers_only_after_matching_model_discovery() {
+        let (endpoint, server) = test_models_endpoint(vec!["gpt-oss:120b"]).await;
+        let registry = ModelRegistry::new_with_discovery(&LlmConfig {
+            ollama_chat_completions_base_url: Some(endpoint),
+            ..Default::default()
+        })
+        .await;
+
+        assert!(registry
+            .available_models()
+            .contains(&"ollama/gpt-oss:120b".to_string()));
+        let info = registry
+            .available_model_info()
+            .into_iter()
+            .find(|model| model.id == "ollama/gpt-oss:120b")
+            .unwrap();
+        assert_eq!(info.provider, "Ollama");
+        assert!(info
+            .description
+            .contains("without consuming remote provider rate limits"));
+        assert!(registry
+            .subagent_model_catalog()
+            .iter()
+            .any(|model| model.id == "ollama/gpt-oss:120b"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ollama_missing_model_is_not_advertised() {
+        let (endpoint, server) = test_models_endpoint(vec!["other-model"]).await;
+        let registry = ModelRegistry::new_with_discovery(&LlmConfig {
+            ollama_chat_completions_base_url: Some(endpoint),
+            ..Default::default()
+        })
+        .await;
+
+        assert!(!registry
+            .available_models()
+            .contains(&"ollama/gpt-oss:120b".to_string()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn malformed_ollama_listing_is_not_advertised() {
+        let app = Router::new().route("/v1/models", get(malformed_test_models));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let registry = ModelRegistry::new_with_discovery(&LlmConfig {
+            ollama_chat_completions_base_url: Some(format!("http://{address}/v1/chat/completions")),
+            ..Default::default()
+        })
+        .await;
+
+        assert!(!registry
+            .available_models()
+            .contains(&"ollama/gpt-oss:120b".to_string()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chunked_ollama_listing_is_rejected_before_exceeding_body_limit() {
+        let app = Router::new().route("/v1/models", get(oversized_chunked_test_models));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let error = discover_unauthenticated_model_ids(
+            &format!("http://{address}/v1/models"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, super::super::ModelDiscoveryError::InvalidResponse);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ollama_coexists_with_authenticated_chat_completions_route() {
+        let (endpoint, server) = test_models_endpoint(vec!["gpt-oss:120b"]).await;
+        let cloud_model = external_chat_completions_model();
+        let registry = ModelRegistry::new(&LlmConfig {
+            openai_api_key: Some("cloud-key".to_string()),
+            openai_chat_completions_base_url: Some(
+                "https://cloud.example/v1/chat/completions".to_string(),
+            ),
+            external_models: vec![cloud_model.clone()],
+            ..Default::default()
+        });
+        registry
+            .register_discovered_ollama(&LlmConfig {
+                ollama_chat_completions_base_url: Some(endpoint),
+                ..Default::default()
+            })
+            .await;
+
+        assert!(registry.get(&cloud_model.id).is_some());
+        assert!(registry.get("ollama/gpt-oss:120b").is_some());
+        server.abort();
+    }
+
     #[test]
     fn test_no_api_keys_no_models() {
-        let config = LlmConfig::default();
+        let config = LlmConfig {
+            mock_model_enabled: false,
+            ..Default::default()
+        };
         let registry = ModelRegistry::new(&config);
         // Without PHOENIX_ENABLE_MOCK_MODEL=1, no models are available
         assert!(registry.available_models().is_empty());
+    }
+
+    #[test]
+    fn default_fallback_is_deterministic_by_model_id() {
+        let first = external_chat_completions_model();
+        let mut second = first.clone();
+        second.id = "aaa-deterministic".to_string();
+        second.api_name = "aaa-deterministic".to_string();
+        let registry = ModelRegistry::new(&LlmConfig {
+            openai_api_key: Some("key".to_string()),
+            external_models_only: true,
+            external_models: vec![first, second],
+            ..Default::default()
+        });
+
+        assert_eq!(registry.default_model_id(), "aaa-deterministic");
     }
 
     #[test]

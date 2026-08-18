@@ -2320,7 +2320,7 @@ pub(crate) struct ResponsesApiUsage {
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_chat(
     spec: &ModelSpec,
-    api_key: &str,
+    api_key: Option<&str>,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
     request_tags: &BTreeMap<String, String>,
@@ -2337,10 +2337,10 @@ pub async fn complete_chat(
         .build()
         .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
 
-    let mut builder = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json");
+    let mut builder = client.post(&url).header("Content-Type", "application/json");
+    if let Some(api_key) = api_key {
+        builder = builder.header("Authorization", format!("Bearer {api_key}"));
+    }
     builder = apply_source_header(builder, custom_headers);
     let response = builder.json(&chat_request).send().await.map_err(|e| {
         if e.is_timeout() {
@@ -2374,7 +2374,7 @@ pub async fn complete_chat(
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_streaming_chat(
     spec: &ModelSpec,
-    api_key: &str,
+    api_key: Option<&str>,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
     request_tags: &BTreeMap<String, String>,
@@ -2400,9 +2400,11 @@ pub async fn complete_streaming_chat(
 
     let mut builder = client
         .post(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
         .header("Accept", "text/event-stream");
+    if let Some(api_key) = api_key {
+        builder = builder.header("Authorization", format!("Bearer {api_key}"));
+    }
     builder = apply_source_header(builder, custom_headers);
     let dispatch_at = Instant::now();
     let response = builder.json(&chat_request).send().await.map_err(|e| {

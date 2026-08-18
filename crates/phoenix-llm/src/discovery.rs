@@ -4,9 +4,13 @@
 //! which configured models are available.
 
 use crate::ModelBackend;
+use futures::StreamExt;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::sync::OnceLock;
+use std::time::Duration;
+
+const MAX_MODELS_RESPONSE_BYTES: usize = 256 * 1024;
 
 /// Configuration for model discovery
 pub struct DiscoveryConfig {
@@ -89,6 +93,74 @@ impl DiscoveredModels {
             ModelBackend::Mock => empty_ids(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelDiscoveryError {
+    Client,
+    Request,
+    HttpStatus(u16),
+    InvalidResponse,
+}
+
+impl std::fmt::Display for ModelDiscoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client => formatter.write_str("client_setup"),
+            Self::Request => formatter.write_str("request_failed"),
+            Self::HttpStatus(status) => write!(formatter, "http_{status}"),
+            Self::InvalidResponse => formatter.write_str("invalid_response"),
+        }
+    }
+}
+
+/// Query an OpenAI-compatible model listing without authentication.
+///
+/// This is intentionally separate from provider discovery: local Ollama must
+/// never inherit cloud credentials or custom headers, and failure must not use
+/// the configured-model fallback that is appropriate for authenticated routes.
+///
+/// # Errors
+///
+/// Returns a bounded classification when the client cannot be built, the request
+/// fails or times out, the endpoint returns a non-success status, or the response
+/// exceeds the size limit or is not a valid model listing.
+pub async fn discover_unauthenticated_model_ids(
+    url: &str,
+    timeout: Duration,
+) -> Result<HashSet<String>, ModelDiscoveryError> {
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| ModelDiscoveryError::Client)?;
+    let response = client
+        .get(url)
+        .header("User-Agent", "phoenix-ide-ollama-discovery")
+        .send()
+        .await
+        .map_err(|_| ModelDiscoveryError::Request)?;
+    if !response.status().is_success() {
+        return Err(ModelDiscoveryError::HttpStatus(response.status().as_u16()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_MODELS_RESPONSE_BYTES as u64)
+    {
+        return Err(ModelDiscoveryError::InvalidResponse);
+    }
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| ModelDiscoveryError::Request)?;
+        if body.len().saturating_add(chunk.len()) > MAX_MODELS_RESPONSE_BYTES {
+            return Err(ModelDiscoveryError::InvalidResponse);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let models: ModelsResponse =
+        serde_json::from_slice(&body).map_err(|_| ModelDiscoveryError::InvalidResponse)?;
+    Ok(models.data.into_iter().map(|model| model.id).collect())
 }
 
 /// Discover available model IDs from configured model-listing endpoints.

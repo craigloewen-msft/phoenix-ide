@@ -400,6 +400,7 @@ def _server_env(tmpdir: Path, parent_env: dict[str, str] | None = None) -> dict[
             "CODEX_HOME": str(isolated_codex),
             "PHOENIX_DATA_DIR": str(isolated_data),
             "PHOENIX_ENABLE_MOCK_MODEL": "1",
+            "PHOENIX_DISABLE_OLLAMA": "1",
             "DEFAULT_MODEL": "mock",
             "PHOENIX_DB_PATH": str(tmpdir / "phoenix.db"),
             "PHOENIX_BIND_ADDR": "127.0.0.1",
@@ -416,6 +417,10 @@ def _server_env(tmpdir: Path, parent_env: dict[str, str] | None = None) -> dict[
         "OPENAI_API_KEY",
         "LLM_API_KEY_HELPER",
         "OPENAI_USE_CODEX_AUTH",
+        "PHOENIX_LLM_MODELS",
+        "PHOENIX_LLM_MODELS_ONLY",
+        "OLLAMA_CHAT_COMPLETIONS_BASE_URL",
+        "OLLAMA_MODEL",
         "PHOENIX_PASSWORD",
         "PHOENIX_TLS",
         "PHOENIX_TLS_CERT_PATH",
@@ -1320,6 +1325,10 @@ class HarnessIsolationTests(unittest.TestCase):
                 "ANTHROPIC_API_KEY": "secret",
                 "OPENAI_API_KEY": "secret",
                 "LLM_API_KEY_HELPER": "secret-helper",
+                "PHOENIX_LLM_MODELS": "secret-catalog",
+                "PHOENIX_LLM_MODELS_ONLY": "1",
+                "OLLAMA_CHAT_COMPLETIONS_BASE_URL": "http://real-ollama/v1/chat/completions",
+                "OLLAMA_MODEL": "private-model",
                 "E2E_RUST_LOG": "debug",
             }
             env = _server_env(tmpdir, parent)
@@ -1334,9 +1343,15 @@ class HarnessIsolationTests(unittest.TestCase):
             self.assertEqual(env["PHOENIX_TRACE_EXPORTER"], "none")
             self.assertEqual(env["RUST_LOG"], "debug")
             self.assertEqual(env["DEFAULT_MODEL"], "mock")
+            self.assertEqual(env["PHOENIX_ENABLE_MOCK_MODEL"], "1")
+            self.assertEqual(env["PHOENIX_DISABLE_OLLAMA"], "1")
             self.assertNotIn("ANTHROPIC_API_KEY", env)
             self.assertNotIn("OPENAI_API_KEY", env)
             self.assertNotIn("LLM_API_KEY_HELPER", env)
+            self.assertNotIn("PHOENIX_LLM_MODELS", env)
+            self.assertNotIn("PHOENIX_LLM_MODELS_ONLY", env)
+            self.assertNotIn("OLLAMA_CHAT_COMPLETIONS_BASE_URL", env)
+            self.assertNotIn("OLLAMA_MODEL", env)
             self.assertNotIn("PHOENIX_LOG_FILE", env)
             self.assertNotIn("DD_TRACE_ENABLED", env)
             self.assertNotIn("DD_TRACE_AGENT_URL", env)

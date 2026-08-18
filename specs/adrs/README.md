@@ -40,6 +40,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [026](026_review-progress-is-a-content-addressed-checkpoint.md) | Review progress is a content-addressed checkpoint, not the git index | Accepted | REQ-RV-001 … REQ-RV-009 |
 | [027](027_expanded-diff-context-is-addressed-by-blob-object-id.md) | Expanded diff context is addressed by blob object id | Accepted | REQ-DIFFEXP-001 … REQ-DIFFEXP-007 |
 | [028](028_expansion-resolution-route-is-stated-not-inferred.md) | The expansion resolution route is stated by the caller, not inferred from the diff section | Accepted | REQ-DIFFEXP-002, REQ-DIFFEXP-004 |
+| [029](029_local-llm-routes-own-auth-and-delegation-metadata.md) | Local LLM routes own authentication and delegation metadata | Accepted | REQ-LLM-002, REQ-LLM-003, REQ-LLM-003a, REQ-SA-011 |
 
 ## For agents: which decisions bind your task
 
@@ -71,6 +72,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
 | Storing per-file review progress, or anything that would contend for the git index | 026 |
 | Showing file content alongside a diff, or any content whose version must match a captured snapshot | 027, 028 |
+| Adding a local LLM route or exposing model suitability to delegating agents | 029 |
 
 ## Decision dependencies
 
@@ -101,7 +103,8 @@ ADR-000 (adopt spEARS v2 for new work)
       └── ADR-025 (Continuation compaction is an idempotent durable operation)
       ├── ADR-021 (The Coordinator surface is chat-only)
       │   └── ADR-022 (The Coordinator uses bounded relational evidence)
-      └── ADR-023 (Projects accept taskmd files by default and plain markdown briefs through one task-source seam)
+      ├── ADR-023 (Projects accept taskmd files by default and plain markdown briefs through one task-source seam)
+      └── ADR-029 (Local LLM routes own authentication and delegation metadata)
 ```
 
 ## Conventions

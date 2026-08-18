@@ -57,7 +57,10 @@ pub use codex_credential::{
     CodexCredential, CODEX_BACKEND_URL, CODEX_BRIDGE_CONTEXT_WINDOW, CODEX_USAGE_URL,
 };
 pub use credential_helper::{CredentialHelper, CredentialStatus};
-pub use discovery::{discover_models, DiscoveredModels, DiscoveryConfig};
+pub use discovery::{
+    discover_models, discover_unauthenticated_model_ids, DiscoveredModels, DiscoveryConfig,
+    ModelDiscoveryError,
+};
 pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
 // AutoRetryPolicy / UserResumePolicy live in phoenix-core
 // (phoenix_core::domain::retry_policy) and are not re-exported here: nothing
@@ -67,8 +70,8 @@ pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
 // and the executor mapper. CreditsSnapshot / RateLimitWindow live behind it,
 // accessed via the `rate_limit` submodule.
 pub use models::{
-    all_models, merge_model_specs, parse_external_models, EffortCapabilities, ModelBackend,
-    ModelInfo, ModelSource, ModelSpec, NativeDefault, DEFAULT_MAX_OUTPUT_TOKENS,
+    all_models, merge_model_specs, ollama_gpt_oss_model, parse_external_models, EffortCapabilities,
+    ModelBackend, ModelInfo, ModelSource, ModelSpec, NativeDefault, DEFAULT_MAX_OUTPUT_TOKENS,
 };
 #[allow(unused_imports)]
 pub use rate_limit::{CreditsSnapshot, QuotaDetails, RateLimitWindow};

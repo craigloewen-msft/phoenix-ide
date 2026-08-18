@@ -30,6 +30,11 @@ AND SHALL NOT append hidden provider-specific path suffixes
 WHEN no base URL override is configured
 THE SYSTEM SHALL connect directly to provider APIs
 
+WHEN the local Ollama route is configured
+THE SYSTEM SHALL keep its exact endpoint and unauthenticated transport separate
+from authenticated Chat Completions routes
+AND SHALL NOT send an authorization or API-key header to Ollama
+
 **Rationale:** Explicit endpoint URLs keep deployment configuration honest and avoid legacy gateway-root path construction.
 
 ---
@@ -52,6 +57,14 @@ WHEN an external-only model catalog is configured
 THE SYSTEM SHALL exclude built-in model definitions
 AND expose only valid models declared by the external catalog
 
+WHEN Ollama model discovery reports the configured GPT-OSS wire tag
+THE SYSTEM SHALL register the local model under a stable Phoenix model id
+
+WHEN Ollama is unreachable, returns an invalid model listing, or does not report
+the configured GPT-OSS wire tag
+THE SYSTEM SHALL leave the local model unavailable
+AND SHALL NOT apply configured-model fallback to that local route
+
 **Rationale:** Opportunistic discovery from exact endpoint overrides lets configured models be validated without making model listing mandatory.
 
 ---
@@ -65,6 +78,10 @@ AND SHALL skip discovery when the configured URL has no path segment to replace
 
 WHEN a model-list endpoint returns models
 THE SYSTEM SHALL match discovered IDs against configured model IDs, wire model names, and backend-prefixed aliases
+
+WHEN querying the local Ollama model-list endpoint
+THE SYSTEM SHALL use a bounded unauthenticated request
+AND SHALL accept only a bounded valid model-list response
 
 WHEN model-list discovery returns no usable configured models for a wire-format backend
 THE SYSTEM SHALL fall back to the configured model list for that backend

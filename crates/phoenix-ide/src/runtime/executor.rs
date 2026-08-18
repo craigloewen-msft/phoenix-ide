@@ -3889,9 +3889,11 @@ where
         // tool call then reports failure instead of SpawnAgentsComplete) when a
         // later task's effective model is unknown. Build-and-validate first,
         // then send the whole batch.
-        let frozen_model_ids = self.tool_executor.subagent_model_ids();
-        let frozen_model_ids: std::collections::HashSet<&str> =
-            frozen_model_ids.iter().map(String::as_str).collect();
+        let frozen_model_catalog = self.tool_executor.subagent_model_catalog();
+        let frozen_model_ids: std::collections::HashSet<&str> = frozen_model_catalog
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
         let mut specs: Vec<SubAgentSpec> = Vec::with_capacity(input.tasks.len());
 
         for (task, &(agent, mode)) in input.tasks.iter().zip(&resolved_tasks) {
@@ -3947,13 +3949,25 @@ where
             let explicit_model = nonblank(task.model.as_deref())
                 .or_else(|| agent.and_then(|definition| nonblank(definition.model.as_deref())));
             let resolved_model = if let Some(model) = explicit_model {
-                if !frozen_model_ids.contains(model) || self.llm_registry.get(model).is_none() {
+                if !frozen_model_ids.contains(model) {
                     let result = ToolResult::error(
                         tool_use_id.clone(),
                         format!(
                             "Unknown model '{}'. Available: {:?}",
                             model,
                             frozen_model_ids.iter().copied().collect::<Vec<_>>()
+                        ),
+                    );
+                    return Ok(Some(Event::ToolComplete {
+                        tool_use_id,
+                        result,
+                    }));
+                }
+                if self.llm_registry.get(model).is_none() {
+                    let result = ToolResult::error(
+                        tool_use_id.clone(),
+                        format!(
+                            "Model '{model}' was advertised when this conversation started but is no longer available. Start a fresh conversation after restoring the model route."
                         ),
                     );
                     return Ok(Some(Event::ToolComplete {
@@ -13233,7 +13247,9 @@ mod work_subagent_cwd_guard_tests {
             Some(Event::ToolComplete { result, .. }) => {
                 let message = tool_result_text(&result);
                 assert!(
-                    message.contains("Unknown model 'test-model'"),
+                    message.contains(
+                        "was advertised when this conversation started but is no longer available"
+                    ),
                     "got: {message}"
                 );
             }

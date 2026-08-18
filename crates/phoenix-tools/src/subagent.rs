@@ -7,6 +7,7 @@
 use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use phoenix_agents::AgentDefinition;
+use phoenix_core::domain::sm_state::SubAgentModelChoice;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -107,7 +108,7 @@ impl Tool for SubmitErrorTool {
 #[derive(Default)]
 pub struct SpawnAgentsTool {
     agents: Vec<AgentDefinition>,
-    model_ids: Vec<String>,
+    models: Vec<SubAgentModelChoice>,
 }
 
 impl SpawnAgentsTool {
@@ -117,7 +118,7 @@ impl SpawnAgentsTool {
     pub fn new() -> Self {
         Self {
             agents: Vec::new(),
-            model_ids: Vec::new(),
+            models: Vec::new(),
         }
     }
 
@@ -128,7 +129,7 @@ impl SpawnAgentsTool {
     pub fn with_agents(agents: Vec<AgentDefinition>) -> Self {
         Self {
             agents,
-            model_ids: Vec::new(),
+            models: Vec::new(),
         }
     }
 
@@ -136,8 +137,8 @@ impl SpawnAgentsTool {
     /// same registry-backed model IDs. The caller supplies a sorted snapshot so
     /// the schema remains stable for the conversation.
     #[must_use]
-    pub fn with_catalogs(agents: Vec<AgentDefinition>, model_ids: Vec<String>) -> Self {
-        Self { agents, model_ids }
+    pub fn with_catalogs(agents: Vec<AgentDefinition>, models: Vec<SubAgentModelChoice>) -> Self {
+        Self { agents, models }
     }
 }
 
@@ -198,10 +199,22 @@ impl Tool for SpawnAgentsTool {
             }
         });
 
+        let model_ids: Vec<&str> = self.models.iter().map(|model| model.id.as_str()).collect();
         task_props["model"]["anyOf"] = json!([
-            { "enum": self.model_ids },
+            { "enum": model_ids },
             { "pattern": "^\\s*$" }
         ]);
+        if !self.models.is_empty() {
+            use std::fmt::Write as _;
+            let description = task_props["model"]["description"]
+                .as_str()
+                .expect("model description is a string");
+            let mut description = format!("{description} Available models:");
+            for model in &self.models {
+                let _ = write!(description, "\n- {}: {}", model.id, model.description);
+            }
+            task_props["model"]["description"] = Value::String(description);
+        }
 
         // REQ-AG-004: surface discovered named agents as a typed agent_type
         // enum. Omitted entirely when none are discovered, so the schema is a
@@ -337,6 +350,13 @@ mod tests {
         assert!(result.output().contains("Error submitted"));
     }
 
+    fn model(id: &str, description: &str) -> SubAgentModelChoice {
+        SubAgentModelChoice {
+            id: id.to_string(),
+            description: description.to_string(),
+        }
+    }
+
     fn agent(name: &str, description: &str) -> AgentDefinition {
         AgentDefinition {
             name: name.to_string(),
@@ -417,7 +437,7 @@ mod tests {
     fn schema_exposes_registry_model_ids() {
         let schema = SpawnAgentsTool::with_catalogs(
             Vec::new(),
-            vec!["gpt-a".to_string(), "gpt-b".to_string()],
+            vec![model("gpt-a", "Model A"), model("gpt-b", "Model B")],
         )
         .input_schema();
         assert_eq!(
@@ -427,9 +447,29 @@ mod tests {
     }
 
     #[test]
+    fn schema_describes_local_delegation_model() {
+        let schema = SpawnAgentsTool::with_catalogs(
+            Vec::new(),
+            vec![model(
+                "ollama/gpt-oss:120b",
+                "Local GPT-OSS 120B via Ollama; useful for bounded delegated work without consuming remote provider rate limits",
+            )],
+        )
+        .input_schema();
+        let description = schema["properties"]["tasks"]["items"]["properties"]["model"]
+            ["description"]
+            .as_str()
+            .unwrap();
+
+        assert!(description.contains("ollama/gpt-oss:120b"));
+        assert!(description.contains("Local GPT-OSS 120B via Ollama"));
+        assert!(description.contains("without consuming remote provider rate limits"));
+    }
+
+    #[test]
     fn schema_model_constraint_includes_blank_default() {
-        let schema =
-            SpawnAgentsTool::with_catalogs(Vec::new(), vec!["gpt-a".to_string()]).input_schema();
+        let schema = SpawnAgentsTool::with_catalogs(Vec::new(), vec![model("gpt-a", "Model A")])
+            .input_schema();
         let model = &schema["properties"]["tasks"]["items"]["properties"]["model"];
         assert_eq!(model["anyOf"][0], json!({ "enum": ["gpt-a"] }));
         assert_eq!(model["anyOf"][1], json!({ "pattern": "^\\s*$" }));
