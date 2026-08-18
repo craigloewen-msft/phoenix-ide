@@ -505,6 +505,11 @@ fn validate_submitted_text(content: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+#[allow(
+    irrefutable_let_patterns,
+    clippy::useless_conversion,
+    reason = "libc stat field widths vary across supported Unix targets"
+)]
 #[cfg(unix)]
 fn stat_matches_metadata(stat: &nix::sys::stat::FileStat, metadata: &fs::Metadata) -> bool {
     let Ok(stat_dev) = u64::try_from(stat.st_dev) else {
@@ -643,6 +648,10 @@ pub(crate) async fn put_conversation_file(
         return Err(version_conflict());
     }
 
+    #[allow(
+        clippy::useless_conversion,
+        reason = "libc mode_t width varies across supported Unix targets"
+    )]
     #[cfg(unix)]
     let permissions = fs::Permissions::from_mode(u32::from(current.stat.st_mode) & 0o777);
     #[cfg(not(unix))]
