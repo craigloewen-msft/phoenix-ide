@@ -157,6 +157,31 @@ In CI, gating mode must be explicit: full runs set `PHOENIX_CHECK_ALL=1`, gated
 runs set `PHOENIX_CHECK_BASE`; `check` refuses to auto-derive a base under
 `CI=true` (a derived base on a main push would silently skip every lane).
 
+#### If `check` feels slow, install the accelerators first
+
+`check`'s Rust critical path is built around three host tools. Without them
+cargo still works, so the run stays *green* while taking its slowest documented
+path — which is why a slow `check` is usually a missing-tooling problem, not a
+too-many-tests problem. CI installs all three; a dev machine has to opt in.
+
+```bash
+cargo install cargo-nextest --locked   # or: https://get.nexte.st
+cargo install sccache --locked         # distro packages also fine
+# plus mold (preferred) or lld on PATH — dev.py wires up RUSTFLAGS itself
+```
+
+Measured on a 20-core aarch64 host, same commit, `./dev.py check --all`:
+**403s without any of them → 92s with all three** (-77%). `cargo test` alone went
+189s → 82s, because plain `cargo test` runs test binaries sequentially *and*
+holds the cargo target lock for the whole run, serializing the e2e lane behind
+it. `check` reports which accelerators are missing both before the lanes start
+(so you can abort and install) and in the final summary (so a CI log or a
+`| tail` transcript still explains itself).
+
+The first run after installing is slower than the steady state: changing
+`RUSTFLAGS` for the linker invalidates the cache once, and sccache starts cold.
+Judge the win on the second run.
+
 #### Reading `check` output — get the lane summary on the first run
 
 `check` is a multi-minute run whose per-test output buries the one line that
