@@ -120,31 +120,86 @@ Move the accelerator advisory so it prints *before* the lanes start, not only
 after they finish. A developer should learn they are on the slow path at second
 zero. Keep the existing end-of-run copy for the CI log.
 
-Optionally add a `./dev.py doctor` (or fold into `./dev.py status`) that reports
-nextest/sccache/linker presence, so the answer to "why is check slow" is one
-command rather than a code read.
+Done in `_print_accelerator_advisories`, which now takes `upcoming=` to select
+the tense ("will run without" vs "ran without"). The advisory list is computed
+once, before the lane threads start, and the same value is printed at both ends
+— so the two emissions cannot disagree. Covered by `AdvisoryRenderingTests` in
+`tests/devpy/test_accelerators.py`.
 
-### Step 4 — Cheap, reversible proptest case reduction
+A separate `./dev.py doctor` was considered and skipped: the early advisory
+already answers "why is this slow?" at the moment the user is asking it, and a
+second surface reporting the same three probes would be a parallel
+representation to keep in sync.
 
-Only the heavy-per-case set identified above, and only via `ProptestConfig`
-case counts — no property deletions, so the generators and invariants stay:
+### Step 4 — Cheap, reversible proptest case reduction — NOT DONE, measurement says no
 
-- `phoenix-state-machine` random walks: 256 -> 64
-- creation-protocol simulators: 512 -> 128
-- `phoenix-llm/src/sse.rs` split fuzzers: 200-300 -> 64
-- `phoenix-terminal/src/relay.rs` async relay proptests: 256 -> 64
+The plan made this conditional: "decide with the number, not in advance." The
+number came back decisive.
 
-Leave the ~90 cheap pure proptests at their defaults; they cost little and carry
-real invariant coverage. Note that reducing cases weakens the search, so pair
-this with a nightly/CI-only full-strength run rather than lowering it everywhere
-unconditionally.
+```
+cargo nextest run --workspace -E 'test(/prop_/)'
+  Summary [1.443s] 120 tests run: 120 passed, 2799 skipped
+```
+
+The entire property-test suite — all ~27,220 configured cases across 120
+properties — runs in **1.44 seconds** wall under nextest, because nextest
+parallelises them across cores and each case is a pure in-memory transition.
+Cutting the heavy properties from 256/512 cases to 64/128 would save a fraction
+of one second on a 92s check, and would buy that by shrinking the search space
+of exactly the properties that cover the state machine's random walks and the
+creation-protocol simulator.
+
+That is a bad trade, so it was not made. No `ProptestConfig` value was changed.
+The original 402.9s baseline made proptests *look* expensive only because plain
+`cargo test` was running the whole workspace's test binaries sequentially.
+Fixing the runner dissolved the problem the case reduction was meant to treat.
 
 ### Step 5 — Default to a scoped local check
 
-The gating machinery already exists (`_gate_lanes`, `--lanes`, `PHOENIX_CHECK_BASE`).
-The fix is ergonomic: make the common local invocation obviously cheap, and make
-`--all` the deliberate pre-push action. Document the one-liner in AGENTS.md next
-to the existing check guidance.
+The gating machinery (`_gate_lanes`, `--lanes`, `PHOENIX_CHECK_BASE`) already
+works and needed no code change. What was missing was that nobody knew the
+accelerators were load-bearing. Documented in AGENTS.md next to the existing
+check guidance, with the measured before/after so the next person does not have
+to rediscover it.
+
+## Results
+
+Same host, same commit, `./dev.py check --all`, time as reported by check:
+
+| Run | check time | wall | notes |
+|---|---:|---:|---|
+| Baseline (no accelerators) | 402.9s | 6m43s | tool itself reported all 3 missing |
+| Accelerators installed, first run | 285.8s | 4m47s | pays one-time rebuild: RUSTFLAGS changed, sccache cold (2.45% hit rate) |
+| Accelerators installed, steady state | **91.6s** | **1m32s** | **-77% vs baseline** |
+
+Per-lane, baseline → steady state:
+
+| Lane | Before | After |
+|---|---:|---:|
+| cargo test | 188.9s | 82.5s |
+| dev.py unit tests | 212.1s | 20.0s |
+| e2e | 268.1s | 34.1s |
+| codegen | 55.7s | 1.8s |
+| cargo clippy | 105.4s | 3.8s |
+| cargo test compile | 154.5s | 5.8s |
+| tsc typecheck | 52.5s | 1.2s |
+
+Zero tests were deleted and zero properties were weakened to get this.
+
+### Pre-existing failures, not caused by this work
+
+This branch changes only `dev.py`, `tests/devpy/test_accelerators.py`, and
+`AGENTS.md`, so it cannot affect Rust test outcomes. Observed across runs:
+
+- `phoenix-tools bash::operations::tests::dropping_unregistered_spawn_kills_the_process_group`
+  — fails on this host in isolation too (5s `tokio::time::timeout` waiting for a
+  process group to die). Same load-sensitive-timeout family as tasks 02718 /
+  36021.
+- `e2e continuation` (50s poll timeout) and one `TaskApprovalReader` vitest —
+  each failed in one run and passed in another, which is the signature of the
+  ambient-load flakes tracked by 02718 / 15002 / 82005.
+
+None were introduced here and none are in this task's scope.
 
 ## Acceptance evidence
 
