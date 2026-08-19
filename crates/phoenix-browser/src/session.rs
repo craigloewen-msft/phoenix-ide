@@ -13,6 +13,7 @@ use chromiumoxide::{
 use futures::StreamExt;
 use serde::{Serialize, Serializer};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -378,6 +379,90 @@ pub fn fetcher_cache_dir() -> PathBuf {
     PhoenixRuntimeEnvironment::detect().chromium_cache_dir()
 }
 
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn collect_browser_executables(root: &Path, max_depth: usize, candidates: &mut Vec<PathBuf>) {
+    if max_depth == 0 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    entries.reverse();
+
+    for entry in entries {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_browser_executables(&path, max_depth - 1, candidates);
+            continue;
+        }
+
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if matches!(
+            name,
+            "chrome" | "chromium" | "chrome-headless-shell" | "chrome.exe"
+        ) && is_executable_file(&path)
+        {
+            candidates.push(path);
+        }
+    }
+}
+
+fn cached_browser_candidates_in(
+    home: &Path,
+    phoenix_cache_dir: &Path,
+    system_playwright_root: &Path,
+) -> Vec<PathBuf> {
+    let roots = [
+        phoenix_cache_dir.to_path_buf(),
+        system_playwright_root.to_path_buf(),
+        home.join(".cache").join("ms-playwright"),
+        home.join(".cache").join("puppeteer").join("chrome"),
+        home.join(".local").join("share").join("chromiumoxide"),
+    ];
+    let mut candidates = Vec::new();
+    for root in roots {
+        collect_browser_executables(&root, 4, &mut candidates);
+    }
+    candidates.dedup();
+    candidates
+}
+
+fn cached_browser_candidates() -> Vec<PathBuf> {
+    let runtime_env = PhoenixRuntimeEnvironment::detect();
+    cached_browser_candidates_in(
+        runtime_env.home(),
+        &runtime_env.chromium_cache_dir(),
+        Path::new("/opt/pw-browsers"),
+    )
+}
+
 #[derive(Debug)]
 enum BrowserTerminationError {
     KillFailed(String),
@@ -522,7 +607,8 @@ impl BrowserSession {
     ///      can set this manually to point at any Chrome they trust.
     ///   2. System Chrome via chromiumoxide's lookup (PATH + standard
     ///      install paths).
-    ///   3. `BrowserFetcher` downloads a compatible Chromium and caches it.
+    ///   3. Existing Playwright, Puppeteer, Phoenix, or chromiumoxide caches.
+    ///   4. `BrowserFetcher` downloads a compatible Chromium and caches it.
     async fn new(scope_key: &str) -> Result<Self, BrowserError> {
         // 1. Explicit env-var override — used by the test harness in
         //    sandboxes where Chrome lives at a non-standard path that
@@ -554,11 +640,27 @@ impl BrowserSession {
         match Self::launch_and_init(scope_key, None).await {
             Ok(session) => return Ok(session),
             Err(e) => {
-                tracing::info!("System Chrome not available ({e}), trying fetcher...");
+                tracing::info!("System Chrome not available ({e}), checking browser caches...");
             }
         }
 
-        // 2. Download / use cached Chrome via fetcher
+        // 3. Browser caches not covered by chromiumoxide's system lookup.
+        // This is required on Linux ARM64, where Chromiumoxide's downloader
+        // has no platform entry but Playwright can provide a native Chromium.
+        for candidate in cached_browser_candidates() {
+            tracing::info!("Using cached Chrome candidate at {}", candidate.display());
+            match Self::launch_and_init(scope_key, Some(&candidate)).await {
+                Ok(session) => return Ok(session),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %candidate.display(),
+                        "Cached Chrome candidate failed to launch ({e}); trying next candidate"
+                    );
+                }
+            }
+        }
+
+        // 4. Download / use cached Chrome via fetcher.
         let cache_dir = Self::fetcher_cache_dir();
         tracing::info!("Downloading Chrome to {cache_dir:?} (first run only)...");
 
@@ -2348,6 +2450,77 @@ mod lifecycle_hook_tests {
             reap.is_empty(),
             "first hook (all-live) must win; second hook ignored"
         );
+    }
+}
+
+#[cfg(test)]
+mod browser_discovery_tests {
+    use super::cached_browser_candidates_in;
+    use std::fs;
+    use std::path::Path;
+
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::create_dir_all(path.parent().expect("browser executable parent")).unwrap();
+        fs::write(path, b"browser").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn make_executable(path: &Path) {
+        fs::create_dir_all(path.parent().expect("browser executable parent")).unwrap();
+        fs::write(path, b"browser").unwrap();
+    }
+
+    #[test]
+    fn cached_browser_discovery_finds_native_playwright_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let phoenix_cache = temp.path().join(".cache/phoenix-ide/chromium");
+        let system_cache = temp.path().join("opt-pw-browsers");
+        let system_chrome = system_cache
+            .join("chromium-1234")
+            .join("chrome-linux")
+            .join("chrome");
+        let user_chrome = temp
+            .path()
+            .join(".cache")
+            .join("ms-playwright")
+            .join("chromium-5678")
+            .join("chrome-linux-arm64")
+            .join("chrome");
+        make_executable(&system_chrome);
+        make_executable(&user_chrome);
+
+        let candidates = cached_browser_candidates_in(temp.path(), &phoenix_cache, &system_cache);
+
+        assert!(candidates.contains(&system_chrome));
+        assert!(candidates.contains(&user_chrome));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_browser_discovery_ignores_non_executable_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let phoenix_cache = temp.path().join(".cache/phoenix-ide/chromium");
+        let chrome = temp
+            .path()
+            .join(".cache")
+            .join("ms-playwright")
+            .join("chromium-1234")
+            .join("chrome-linux")
+            .join("chrome");
+        fs::create_dir_all(chrome.parent().unwrap()).unwrap();
+        fs::write(&chrome, b"browser").unwrap();
+
+        let candidates = cached_browser_candidates_in(
+            temp.path(),
+            &phoenix_cache,
+            &temp.path().join("missing-system-cache"),
+        );
+
+        assert!(!candidates.contains(&chrome));
     }
 }
 
