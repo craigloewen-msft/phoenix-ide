@@ -4806,6 +4806,12 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
 # is absent cargo still works, so the run stays green while silently taking
 # its slowest documented path. These advisories make that cost visible in the
 # summary the user already reads, with the exact command that fixes it.
+#
+# The advisory is emitted twice by design, and the two emissions answer
+# different questions. The pre-lane emission answers "should I fix my machine
+# before waiting?" and is only useful before the cost is paid. The end-of-run
+# emission answers "why was that slow?" and is the one that survives in a CI
+# log or a `| tail` transcript.
 
 
 class Advisory(NamedTuple):
@@ -4876,10 +4882,17 @@ def _accelerator_advisories(
     return advisories
 
 
-def _print_accelerator_advisories(advisories: list[Advisory]) -> None:
+def _print_accelerator_advisories(advisories: list[Advisory], *, upcoming: bool = False) -> None:
+    """Report missing accelerators.
+
+    `upcoming` selects the pre-lane wording (the cost has not been paid yet, so
+    the run can still be aborted and the tools installed first); the default is
+    the post-run wording that explains a slow run after the fact.
+    """
     if not advisories:
         return
-    print(f"\n  \u26a0 slow path: this check ran without {len(advisories)} "
+    tense = "will run" if upcoming else "ran"
+    print(f"\n  \u26a0 slow path: this check {tense} without {len(advisories)} "
           f"accelerator{'s' if len(advisories) > 1 else ''}")
     for item in advisories:
         print(f"      - {item.what}")
@@ -6061,6 +6074,17 @@ def cmd_check(
         ("pkglock", check_package_lock_clean),
         ("e2e", lane_e2e),
     ]
+    # Computed before the lanes start so the pre-lane emission and the
+    # end-of-run emission cannot disagree: one value, printed twice.
+    advisories = _accelerator_advisories(
+        nextest=has_nextest,
+        compiler_cache=selected_compiler_cache,
+        # A check with no cargo lane never consults the linker, so its
+        # absence cost nothing and is not worth reporting.
+        linker_configured=linker_configured or not cargo_active,
+    )
+    _print_accelerator_advisories(advisories, upcoming=True)
+
     threads = [threading.Thread(target=_lane(fn), name=name)
                for name, fn in _lane_targets if name in active]
     # daemon=True so a hung lane does not block interpreter shutdown after
@@ -6114,14 +6138,6 @@ def cmd_check(
         })
     for message in profile_messages:
         print(f"  i  {message}")
-
-    advisories = _accelerator_advisories(
-        nextest=has_nextest,
-        compiler_cache=selected_compiler_cache,
-        # A check with no cargo lane never consults the linker, so its
-        # absence cost nothing and is not worth reporting.
-        linker_configured=linker_configured or not cargo_active,
-    )
 
     total_elapsed = time.monotonic() - t_start
     if failures:

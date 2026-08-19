@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import os
 import unittest
 from pathlib import Path
@@ -81,6 +83,53 @@ class AdvisoryTests(unittest.TestCase):
             self.assertTrue(item.what.strip())
             self.assertTrue(item.cost.strip())
             self.assertTrue(item.install.strip())
+
+
+class AdvisoryRenderingTests(unittest.TestCase):
+    """The advisory is printed twice per run; wording must match the moment."""
+
+    def setUp(self):
+        self.dev = load_devpy()
+
+    def render(self, advisories, **kwargs):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.dev._print_accelerator_advisories(advisories, **kwargs)
+        return buffer.getvalue()
+
+    def sample(self):
+        return [self.dev.Advisory(
+            "cargo-nextest not installed",
+            "runs test binaries sequentially",
+            "cargo install cargo-nextest --locked",
+        )]
+
+    def test_nothing_is_printed_when_fully_accelerated(self):
+        self.assertEqual("", self.render([]))
+        self.assertEqual("", self.render([], upcoming=True))
+
+    def test_pre_lane_emission_is_future_tense(self):
+        """Printed before the cost is paid, so it must not claim the run is over."""
+        output = self.render(self.sample(), upcoming=True)
+        self.assertIn("will run without", output)
+
+    def test_post_run_emission_is_past_tense(self):
+        output = self.render(self.sample())
+        self.assertIn("ran without", output)
+        self.assertNotIn("will run without", output)
+
+    def test_both_emissions_carry_the_install_command(self):
+        """The fix must be actionable at whichever end the reader is looking."""
+        for kwargs in ({}, {"upcoming": True}):
+            output = self.render(self.sample(), **kwargs)
+            self.assertIn("cargo install cargo-nextest --locked", output)
+            self.assertIn("runs test binaries sequentially", output)
+
+    def test_plural_agreement_tracks_the_advisory_count(self):
+        one = self.render(self.sample())
+        self.assertIn("1 accelerator", one)
+        self.assertNotIn("1 accelerators", one)
+        self.assertIn("2 accelerators", self.render(self.sample() * 2))
 
 
 class LinkerConfigTests(unittest.TestCase):
