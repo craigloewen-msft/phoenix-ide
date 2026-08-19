@@ -542,17 +542,19 @@ pub fn merge_model_specs(mut builtins: Vec<ModelSpec>, external: &[ModelSpec]) -
 }
 
 /// Build the local GPT-OSS model specification after Ollama discovery proves
-/// that `wire_model` is installed. The registry owns the stable Phoenix ID;
-/// Ollama owns the configurable wire tag.
+/// that `wire_model` is installed and a capability probe reports what it serves.
+/// The registry owns the stable Phoenix ID; Ollama owns both the configurable
+/// wire tag and `context_window`, which is whatever that tag actually serves
+/// rather than the architecture ceiling.
 #[must_use]
-pub fn ollama_gpt_oss_model(wire_model: &str) -> ModelSpec {
+pub fn ollama_gpt_oss_model(wire_model: &str, context_window: usize) -> ModelSpec {
     ModelSpec {
         id: "ollama/gpt-oss:120b".into(),
         api_name: wire_model.into(),
         backend: ModelBackend::OpenAIChatCompletions,
         family: "Ollama".into(),
         description: "Local GPT-OSS 120B via Ollama; useful for bounded delegated work without consuming remote provider rate limits".into(),
-        context_window: 131_072,
+        context_window,
         max_output_tokens: None,
         recommended: false,
         supports_tool_search: false,
@@ -785,14 +787,14 @@ mod tests {
 
     #[test]
     fn ollama_gpt_oss_has_distinct_registry_and_wire_ids() {
-        let model = ollama_gpt_oss_model("custom-gpt-oss-tag");
+        let model = ollama_gpt_oss_model("custom-gpt-oss-tag", 32_768);
 
         assert_eq!(model.id, "ollama/gpt-oss:120b");
         assert_eq!(model.api_name, "custom-gpt-oss-tag");
         assert_eq!(model.backend, ModelBackend::OpenAIChatCompletions);
         assert_eq!(model.family, "Ollama");
         assert_eq!(model.source, ModelSource::Ollama);
-        assert_eq!(model.context_window, 131_072);
+        assert_eq!(model.context_window, 32_768);
         assert_eq!(model.output_token_limit(), None);
         assert_eq!(model.effort_capabilities, EffortCapabilities::Unknown);
     }

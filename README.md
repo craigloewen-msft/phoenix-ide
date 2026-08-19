@@ -180,7 +180,7 @@ you (prod reads `.phoenix-ide.env` from the repo root of the checkout you deploy
 | `OPENAI_RESPONSES_BASE_URL` | Exact endpoint for OpenAI Responses-compatible models | — |
 | `OPENAI_CHAT_COMPLETIONS_BASE_URL` | Exact endpoint for OpenAI Chat Completions-compatible models | — |
 | `OLLAMA_CHAT_COMPLETIONS_BASE_URL` | Exact endpoint for the local Ollama Chat Completions route | `http://127.0.0.1:11434/v1/chat/completions` |
-| `OLLAMA_MODEL` | Ollama wire tag to discover as the local GPT-OSS worker | `gpt-oss:120b` |
+| `OLLAMA_MODEL` | Pin an exact Ollama wire tag for the local GPT-OSS worker. Unset, Phoenix selects a GPU-forced alias (`gpt-oss:120b-gpu`) and registers nothing if none is installed | auto-select GPU alias |
 | `PHOENIX_DISABLE_OLLAMA` | `1` disables local Ollama discovery (useful for isolated test/server environments) | off |
 | `DEFAULT_MODEL` | Preferred default model ID (used only if it actually registers) | first registered model |
 | `PHOENIX_LLM_MODELS` | Inline JSON array of additional model specs to add to the built-in registry | — |
@@ -191,8 +191,24 @@ you (prod reads `.phoenix-ide.env` from the repo root of the checkout you deploy
 | `LLM_AUTH_HEADER` | `bearer` → send the key as `Authorization: Bearer …`; anything else → provider's native API-key header | api-key style |
 | `PHOENIX_ENABLE_MOCK_MODEL` | `1` → register the deterministic mock provider (testing only) | off |
 
-To enable local GPT-OSS delegation: run `ollama pull gpt-oss:120b`, start Ollama,
-and restart Phoenix.
+To enable local GPT-OSS delegation, Phoenix needs a wire tag that pins the model
+fully onto the GPU. Ollama's OpenAI-compatible endpoint accepts no per-request
+placement or context options, so a tag that leaves those to Ollama's scheduler
+can spill weights into host RAM and fail every request. Phoenix therefore
+registers the worker only when it can confirm full GPU offload, and derives the
+advertised context window from what the tag actually serves.
+
+Create the alias from a pulled model, then restart Phoenix:
+
+```sh
+ollama pull gpt-oss:120b
+printf 'FROM gpt-oss:120b\nPARAMETER num_gpu 999\nPARAMETER num_ctx 32768\n' \
+  | ollama create gpt-oss:120b-gpu -f /dev/stdin
+```
+
+Raise `num_ctx` toward the model's 131072 ceiling if the GPU has headroom for
+the extra KV cache; Phoenix picks up the new value on its next start. Set
+`OLLAMA_MODEL` to pin a different tag by name, which is honored exactly.
 
 `PHOENIX_LLM_MODELS` is additive. It does not override built-in model IDs; a
 configured duplicate ID is ignored and Phoenix logs a warning while keeping the

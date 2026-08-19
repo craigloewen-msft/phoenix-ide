@@ -60,15 +60,28 @@ from configured or built-in model specifications
 AND SHALL independently register availability-gated local routes when their own
 configuration and discovery requirements are satisfied
 
-WHEN Ollama model discovery reports the configured GPT-OSS wire tag
-THE SYSTEM SHALL register the local model under a stable Phoenix model id
+WHEN no operator wire tag is configured for the local GPT-OSS route
+THE SYSTEM SHALL select only a wire tag that persists full GPU offload
+AND SHALL NOT select a wire tag that leaves layer placement to the Ollama scheduler
 
-WHEN Ollama is unreachable, returns an invalid model listing, or does not report
-the configured GPT-OSS wire tag
+WHEN an operator explicitly configures a GPT-OSS wire tag
+THE SYSTEM SHALL use that exact tag
+AND SHALL NOT substitute any other tag
+
+WHEN a selected GPT-OSS wire tag is reported by model discovery
+THE SYSTEM SHALL confirm from the serving host both the tag's GPU offload setting
+and the context length it serves
+AND SHALL register the local model under a stable Phoenix model id
+AND SHALL advertise the served context length clamped to the model architecture's maximum
+
+WHEN Ollama is unreachable, returns an invalid model listing, does not report a
+selectable GPT-OSS wire tag, does not confirm full GPU offload, or does not
+report the context length the tag serves
 THE SYSTEM SHALL leave the local model unavailable
 AND SHALL NOT apply configured-model fallback to that local route
+AND SHALL NOT substitute an assumed context length
 
-**Rationale:** Opportunistic discovery from exact endpoint overrides lets configured models be validated without making model listing mandatory.
+**Rationale:** Opportunistic discovery from exact endpoint overrides lets configured models be validated without making model listing mandatory. The local route carries an extra obligation: Phoenix cannot send per-request placement or context options over the OpenAI-compatible wire format, so the tag's own persisted parameters are the only thing determining whether a request fits in VRAM and how much context survives. Advertising a route Phoenix cannot verify yields either an out-of-memory failure on every request or silent prompt truncation, so unverifiable capability is treated as unavailability rather than resolved with a default.
 
 ---
 
