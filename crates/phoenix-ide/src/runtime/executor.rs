@@ -3892,9 +3892,12 @@ where
         // later task's effective model is unknown. Build-and-validate first,
         // then send the whole batch.
         let frozen_model_catalog = self.tool_executor.subagent_model_catalog();
-        let frozen_model_ids: std::collections::HashSet<&str> = frozen_model_catalog
+        let frozen_model_choices: std::collections::HashMap<
+            &str,
+            &crate::state_machine::state::SubAgentModelChoice,
+        > = frozen_model_catalog
             .iter()
-            .map(|model| model.id.as_str())
+            .map(|model| (model.id.as_str(), model))
             .collect();
         let mut specs: Vec<SubAgentSpec> = Vec::with_capacity(input.tasks.len());
 
@@ -3957,13 +3960,13 @@ where
             let explicit_model = nonblank(task.model.as_deref())
                 .or_else(|| agent.and_then(|definition| nonblank(definition.model.as_deref())));
             let resolved_model = if let Some(model) = explicit_model {
-                if !frozen_model_ids.contains(model) {
+                if !frozen_model_choices.contains_key(model) {
                     let result = ToolResult::error(
                         tool_use_id.clone(),
                         format!(
                             "Unknown model '{}'. Available: {:?}",
                             model,
-                            frozen_model_ids.iter().copied().collect::<Vec<_>>()
+                            frozen_model_choices.keys().copied().collect::<Vec<_>>()
                         ),
                     );
                     return Ok(Some(Event::ToolComplete {
@@ -3992,7 +3995,9 @@ where
                             .cheap_model_id_for_provider(&self.context.model_id);
                         match resolved_effort {
                             Some(effort)
-                                if !self.llm_registry.supports_effort(&cheap_model, effort) =>
+                                if !frozen_model_choices.get(cheap_model.as_str()).is_some_and(
+                                    |model| model.effort_capability.supports(effort),
+                                ) =>
                             {
                                 self.context.model_id.clone()
                             }
@@ -4003,13 +4008,15 @@ where
                 }
             };
 
-            // Resolve max turns (REQ-PROJ-008)
             if let Some(effort) = resolved_effort {
-                if !self.llm_registry.supports_effort(&resolved_model, effort) {
+                let supports_effort = frozen_model_choices
+                    .get(resolved_model.as_str())
+                    .is_some_and(|model| model.effort_capability.supports(effort));
+                if !supports_effort {
                     let result = ToolResult::error(
                         tool_use_id.clone(),
                         format!(
-                            "Effort '{effort}' is not supported by sub-agent model '{resolved_model}'. Use effort: \"default\" to use that model's native behavior, or choose a compatible effort."
+                            "Effort '{effort}' is not supported by sub-agent model '{resolved_model}'. Set effort: \"default\" explicitly to use that model's native behavior; omitting effort may inherit the parent's override."
                         ),
                     );
                     return Ok(Some(Event::ToolComplete {
@@ -12905,7 +12912,8 @@ mod work_subagent_cwd_guard_tests {
     use crate::db::ToolOutcome;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::state_machine::state::{
-        SpawnAgentsInput, SubAgentEffortSelection, SubAgentMode, SubAgentTask, ToolInput,
+        SpawnAgentsInput, SubAgentEffortSelection, SubAgentMode, SubAgentModelChoice,
+        SubAgentModelEffortCapability, SubAgentTask, ToolInput,
     };
     use crate::state_machine::ConvContext;
     use crate::system_prompt::ModeContext;
@@ -12915,6 +12923,14 @@ mod work_subagent_cwd_guard_tests {
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
+
+    fn test_model_choice(id: &str) -> SubAgentModelChoice {
+        SubAgentModelChoice {
+            id: id.to_string(),
+            description: format!("Test model {id}"),
+            effort_capability: SubAgentModelEffortCapability::Unknown,
+        }
+    }
 
     fn runtime_in_mode(
         working_dir: &std::path::Path,
@@ -12939,7 +12955,9 @@ mod work_subagent_cwd_guard_tests {
             ConvState::Idle,
             storage,
             Arc::new(MockLlmClient::new("test-model")),
-            Arc::new(MockToolExecutor::new().with_subagent_models(vec!["test-model".to_string()])),
+            Arc::new(
+                MockToolExecutor::new().with_subagent_models(vec![test_model_choice("test-model")]),
+            ),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(crate::tools::BashHandleRegistry::new()),
             Arc::new(crate::tools::TmuxRegistry::new()),
@@ -12958,11 +12976,7 @@ mod work_subagent_cwd_guard_tests {
             anthropic_api_key: Some("test-key".to_string()),
             ..LlmConfig::default()
         }));
-        let model_ids = registry
-            .subagent_model_catalog()
-            .into_iter()
-            .map(|model| model.id)
-            .collect();
+        let model_catalog = registry.subagent_model_catalog();
         let mut context = ConvContext::new(
             "effort-parent",
             working_dir.to_path_buf(),
@@ -12981,7 +12995,7 @@ mod work_subagent_cwd_guard_tests {
             ConvState::Idle,
             Arc::new(InMemoryStorage::new()),
             Arc::new(MockLlmClient::new("claude-sonnet-5")),
-            Arc::new(MockToolExecutor::new().with_subagent_models(model_ids)),
+            Arc::new(MockToolExecutor::new().with_subagent_models(model_catalog)),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(crate::tools::BashHandleRegistry::new()),
             Arc::new(crate::tools::TmuxRegistry::new()),
@@ -13268,6 +13282,39 @@ mod work_subagent_cwd_guard_tests {
     }
 
     #[tokio::test]
+    async fn explicit_incompatible_effort_rejects_before_fanout_with_default_guidance() {
+        let parent = TempDir::new().expect("parent tempdir");
+        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let mut rt =
+            runtime_with_anthropic_effort(parent.path()).with_spawn_channels(spawn_tx, cancel_tx);
+
+        let event = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "inspect cheaply".to_string(),
+                    cwd: None,
+                    mode: Some(SubAgentMode::Explore),
+                    model: Some("claude-haiku-4-5".to_string()),
+                    effort: Some(SubAgentEffortSelection::Explicit(ModelEffort::Medium)),
+                    max_turns: None,
+                    agent_type: None,
+                }],
+            }))
+            .await
+            .unwrap();
+
+        let Some(Event::ToolComplete { result, .. }) = event else {
+            panic!("expected effort compatibility error");
+        };
+        let message = tool_result_text(&result);
+        assert!(message.contains("Effort 'medium' is not supported"));
+        assert!(message.contains("Set effort: \"default\" explicitly"));
+        assert!(message.contains("omitting effort may inherit the parent's override"));
+        assert!(spawn_rx.try_recv().is_err(), "no task may start");
+    }
+
+    #[tokio::test]
     async fn omitted_incompatible_effort_rejects_entire_batch_before_fanout() {
         let parent = TempDir::new().expect("parent tempdir");
         let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(2);
@@ -13306,7 +13353,8 @@ mod work_subagent_cwd_guard_tests {
         };
         let message = tool_result_text(&result);
         assert!(message.contains("Effort 'xhigh' is not supported"));
-        assert!(message.contains("effort: \"default\""));
+        assert!(message.contains("Set effort: \"default\" explicitly"));
+        assert!(message.contains("omitting effort may inherit the parent's override"));
         assert!(spawn_rx.try_recv().is_err(), "no task may start");
     }
 

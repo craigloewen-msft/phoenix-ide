@@ -293,10 +293,21 @@ THE SYSTEM SHALL replace any inherited parent override with that level
 
 WHEN a resolved explicit child effort is unsupported by the resolved child model
 THE SYSTEM SHALL reject the whole spawn call before any child in the batch starts
-AND SHALL identify `"default"` as the model-native alternative
+AND SHALL instruct the parent to set `effort` to `"default"` explicitly
+AND SHALL explain that omission may inherit the parent's incompatible override
 
 THE SYSTEM SHALL describe each LLM-visible model choice from the same frozen
 registry catalog used for spawn-time validation
+AND SHALL preserve whether that model's effort capability is supported, unknown,
+or unsupported in that catalog
+
+WHEN a frozen model choice has supported explicit effort levels
+THE SYSTEM SHALL list exactly those levels alongside the model choice
+AND SHALL also identify `"default"` as valid model-native behavior
+
+WHEN a frozen model choice has unknown or unsupported explicit effort capability
+THE SYSTEM SHALL describe that choice as accepting only `effort: "default"`
+AND SHALL warn that omitting `effort` may inherit the parent's explicit override
 
 WHEN that catalog contains a local model
 THE SYSTEM SHALL identify its local execution and remote-rate-limit independence
@@ -308,5 +319,7 @@ placeholder strings and server-process-relative paths must not turn inheritance
 into a validation failure or move a child outside the parent's project context.
 The distinct `"default"` sentinel lets a parent opt out of its explicit override
 without conflating model-native behavior with the real `"none"` effort level.
-Descriptions let a parent make an informed explicit delegation choice without a
-second model catalog in system-prompt prose or an invisible automatic router.
+Model-specific effort descriptions prevent a global effort vocabulary from
+implying that every value is valid for every model. Descriptions let a parent
+make an informed explicit delegation choice without a second model catalog in
+system-prompt prose or an invisible automatic router.
