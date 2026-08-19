@@ -748,9 +748,6 @@ impl ModelRegistry {
     }
 
     async fn register_discovered_ollama(&self, config: &LlmConfig) {
-        if config.external_models_only {
-            return;
-        }
         let Some(chat_endpoint) = config.ollama_chat_completions_base_url.as_deref() else {
             return;
         };
@@ -1730,6 +1727,38 @@ mod tests {
             .subagent_model_catalog()
             .iter()
             .any(|model| model.id == "ollama/gpt-oss:120b"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ollama_coexists_with_external_only_catalog_without_restoring_builtins() {
+        let (endpoint, server) = test_models_endpoint(vec!["gpt-oss:120b"]).await;
+        let external = external_gateway_model();
+        let external_id = external.id.clone();
+        let registry = ModelRegistry::new_with_discovery(&LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            external_models: vec![external],
+            external_models_only: true,
+            ollama_chat_completions_base_url: Some(endpoint),
+            ..Default::default()
+        })
+        .await;
+
+        assert_eq!(
+            registry.available_models(),
+            vec![external_id, "ollama/gpt-oss:120b".to_string()]
+        );
+        assert!(registry.get("claude-sonnet-5").is_none());
+        assert!(registry.get("gpt-5.6-sol").is_none());
+        let local_choice = registry
+            .subagent_model_catalog()
+            .into_iter()
+            .find(|model| model.id == "ollama/gpt-oss:120b")
+            .expect("discovered Ollama model should be available for delegation");
+        assert!(local_choice.description.contains("Local GPT-OSS 120B"));
+        assert!(local_choice
+            .description
+            .contains("without consuming remote provider rate limits"));
         server.abort();
     }
 

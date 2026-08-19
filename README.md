@@ -197,8 +197,14 @@ and restart Phoenix.
 `PHOENIX_LLM_MODELS` is additive. It does not override built-in model IDs; a
 configured duplicate ID is ignored and Phoenix logs a warning while keeping the
 built-in definition. The value is parsed at startup, and invalid JSON or invalid
-fields are logged and ignored without removing built-in models. Each configured
-model object has this shape:
+fields are logged and ignored without removing built-in models.
+
+Set `PHOENIX_LLM_MODELS_ONLY=1` to exclude built-in model definitions and use
+the external specifications as the authoritative configured catalog. This does
+not suppress independently configured local routes: Ollama remains eligible when
+its model is discovered, unless `PHOENIX_DISABLE_OLLAMA=1` is set.
+
+Each configured model object has this shape:
 
 ```json
 [

@@ -55,7 +55,10 @@ THE SYSTEM SHALL return only models that are currently available
 
 WHEN an external-only model catalog is configured
 THE SYSTEM SHALL exclude built-in model definitions
-AND expose only valid models declared by the external catalog
+AND expose only valid models declared by the external catalog among routes sourced
+from configured or built-in model specifications
+AND SHALL independently register availability-gated local routes when their own
+configuration and discovery requirements are satisfied
 
 WHEN Ollama model discovery reports the configured GPT-OSS wire tag
 THE SYSTEM SHALL register the local model under a stable Phoenix model id
