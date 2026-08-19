@@ -59,6 +59,7 @@ _DEV_TRACING = None
 _DEV_TRACE_AVAILABLE = None
 _DEV_CURRENT_SPAN = contextvars.ContextVar("phoenix_dev_current_span", default=None)
 _CHECK_PROFILE = None
+_BUILD_GIT_SHA_ENV = "PHOENIX_BUILD_GIT_SHA"
 _DEV_TRACE_PACKAGES = (
     "opentelemetry-sdk>=1.39,<2",
     "opentelemetry-exporter-otlp-proto-http>=1.39,<2",
@@ -1779,7 +1780,45 @@ def ensure_ui_deps():
     (UI_DIR / "dist").mkdir(exist_ok=True)
 
 
-def _run_cargo_build(args: list[str], cwd: Path, profile: str) -> None:
+def _git_build_identity(root: Path = ROOT) -> str:
+    """Return the source identity Cargo should compile into Phoenix."""
+    sha = subprocess.run(
+        ["git", "rev-parse", "--short=12", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    if sha.returncode != 0 or not sha.stdout.strip():
+        return "unknown"
+
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    if dirty.returncode != 0:
+        return "unknown"
+    suffix = "-dirty" if dirty.stdout.strip() else ""
+    return f"{sha.stdout.strip()}{suffix}"
+
+
+def _cargo_build_env(root: Path = ROOT) -> dict[str, str]:
+    env = os.environ.copy()
+    env[_BUILD_GIT_SHA_ENV] = _git_build_identity(root)
+    return env
+
+
+def _configure_cargo_build_identity(root: Path = ROOT) -> None:
+    os.environ[_BUILD_GIT_SHA_ENV] = _git_build_identity(root)
+
+
+def _run_cargo_build(
+    args: list[str],
+    cwd: Path,
+    profile: str,
+    env: dict[str, str] | None = None,
+) -> None:
     started_at = time.monotonic()
     lock_timer = CargoLockWaitTimer(started_at)
     span = _begin_dev_span("dev.build", {"build.profile": profile})
@@ -1789,6 +1828,7 @@ def _run_cargo_build(args: list[str], cwd: Path, profile: str) -> None:
         proc = subprocess.Popen(
             args,
             cwd=cwd,
+            env=env,
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
@@ -1832,7 +1872,12 @@ def build_rust(release: bool = True):
     if release:
         args.append("--release")
     print("Building Rust backend...")
-    _run_cargo_build(args, ROOT, "release" if release else "debug")
+    _run_cargo_build(
+        args,
+        ROOT,
+        "release" if release else "debug",
+        env=_cargo_build_env(),
+    )
 
 
 def tls_enabled_from_env(env: dict[str, str]) -> bool:
@@ -7409,6 +7454,7 @@ def prod_build(strip: bool = True, target: str | None = "x86_64-unknown-linux-mu
     
     # Build Rust
     build_env = os.environ.copy()
+    build_env[_BUILD_GIT_SHA_ENV] = commit
     needs_cross = target and sys.platform != "linux"
     if needs_cross:
         raise SystemExit(f"Cross-compilation not supported on {sys.platform}; use CI for release builds.")
@@ -9791,6 +9837,7 @@ def main():
         cmd_taskmd(sys.argv[2:])
         return
     if len(sys.argv) >= 2 and sys.argv[1] == "drive-turn":
+        _configure_cargo_build_identity()
         cmd_drive_turn(sys.argv[2:])
         return
 
@@ -10027,6 +10074,7 @@ def main():
     )
 
     args = parser.parse_args()
+    _configure_cargo_build_identity()
 
     # --pretty composes from the global flag and the per-subcommand flag.
     pretty = args.pretty_global or getattr(args, "pretty", False)
@@ -10199,4 +10247,3 @@ if __name__ == "__main__":
         _shutdown_dev_tracing(failure)
     if failed_command_exit is not None:
         sys.exit(failed_command_exit)
-

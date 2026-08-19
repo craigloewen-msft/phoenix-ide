@@ -69,6 +69,7 @@ ok "UI built"
 info "Building Rust ($TARGET)"
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 export CC_x86_64_unknown_linux_musl="x86_64-linux-musl-gcc"
+export PHOENIX_BUILD_GIT_SHA="$(git -C "$BUILD_WORKTREE" rev-parse HEAD)"
 cargo build --release --target "$TARGET" --manifest-path "$BUILD_WORKTREE/Cargo.toml"
 ok "Rust built"
 
