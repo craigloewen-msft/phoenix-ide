@@ -2,9 +2,9 @@
 
 use super::{
     all_models, codex_credential, discover_models, discover_unauthenticated_model_ids,
-    merge_model_specs, ollama_gpt_oss_model, parse_external_models, CodexCredential,
-    DiscoveredModels, DiscoveryConfig, LlmService, LlmServiceImpl, LlmTransport, LoggingService,
-    ModelBackend, ModelInfo, ModelSource,
+    merge_model_specs, ollama_gpt_oss_model, parse_external_models,
+    probe_ollama_model_capabilities, CodexCredential, DiscoveredModels, DiscoveryConfig,
+    LlmService, LlmServiceImpl, LlmTransport, LoggingService, ModelBackend, ModelInfo, ModelSource,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use std::collections::{HashMap, HashSet};
@@ -62,6 +62,53 @@ impl CredentialSource for StaticCredential {
     }
     async fn invalidate(&self) -> bool {
         false // Static credentials can't be invalidated — retry won't help
+    }
+}
+
+/// Ollama wire tag Phoenix will ask for, and how that choice was made.
+///
+/// Phoenix's stable model ID is deliberately separate from Ollama's wire tag,
+/// and the *provenance* of the tag changes what Phoenix is allowed to do with
+/// it: an operator pin must be honoured exactly, while automatic selection may
+/// choose among known-good candidates. Keeping provenance in the type stops
+/// that distinction from being re-derived later by comparing against a magic
+/// string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OllamaWireModel {
+    /// `OLLAMA_MODEL` was set: use exactly this tag or register nothing.
+    Pinned(String),
+    /// No operator choice: select from GPU-forced candidates found in discovery.
+    Automatic,
+}
+
+/// Tags automatic selection will accept, in preference order.
+///
+/// Only GPU-forced aliases qualify. The plain `gpt-oss:120b` tag is absent by
+/// design: without persisted `num_gpu`, Ollama's scheduler is free to spill
+/// mixture-of-experts weights into host RAM, which Phoenix cannot prevent over
+/// the OpenAI-compatible route and cannot detect before the request fails.
+const AUTOMATIC_OLLAMA_WIRE_MODELS: &[&str] = &["gpt-oss:120b-gpu"];
+
+impl OllamaWireModel {
+    /// Resolve the wire tag to request from a set of discovered tags.
+    #[must_use]
+    pub fn select<'a>(&'a self, discovered: &'a HashSet<String>) -> Option<&'a str> {
+        match self {
+            Self::Pinned(tag) => discovered.contains(tag).then_some(tag.as_str()),
+            Self::Automatic => AUTOMATIC_OLLAMA_WIRE_MODELS
+                .iter()
+                .copied()
+                .find(|candidate| discovered.contains(*candidate)),
+        }
+    }
+
+    /// Human-readable description of what this selection was looking for.
+    #[must_use]
+    pub fn expected(&self) -> String {
+        match self {
+            Self::Pinned(tag) => tag.clone(),
+            Self::Automatic => AUTOMATIC_OLLAMA_WIRE_MODELS.join(", "),
+        }
     }
 }
 
@@ -165,8 +212,9 @@ pub struct LlmConfig {
     pub openai_chat_completions_base_url: Option<String>,
     /// Exact local Ollama Chat Completions endpoint. `None` disables probing.
     pub ollama_chat_completions_base_url: Option<String>,
-    /// Ollama wire model tag that must appear in `/v1/models` before registration.
-    pub ollama_model: String,
+    /// Which Ollama wire tag to request, and whether an operator chose it.
+    /// The selected tag must appear in `/v1/models` before registration.
+    pub ollama_model: OllamaWireModel,
     /// Whether the deterministic in-process mock model is registered.
     pub mock_model_enabled: bool,
     /// Extra headers to inject on every LLM request (newline-separated "key: value").
@@ -290,7 +338,7 @@ impl Default for LlmConfig {
             openai_responses_base_url: None,
             openai_chat_completions_base_url: None,
             ollama_chat_completions_base_url: None,
-            ollama_model: "gpt-oss:120b".to_string(),
+            ollama_model: OllamaWireModel::Automatic,
             mock_model_enabled: false,
             custom_headers: Vec::new(),
             request_tags: std::collections::BTreeMap::new(),
@@ -335,7 +383,7 @@ impl LlmConfig {
         let ollama_model = std::env::var("OLLAMA_MODEL")
             .ok()
             .filter(|model| !model.trim().is_empty())
-            .unwrap_or_else(|| "gpt-oss:120b".to_string());
+            .map_or(OllamaWireModel::Automatic, OllamaWireModel::Pinned);
         let mock_model_enabled =
             std::env::var("PHOENIX_ENABLE_MOCK_MODEL").is_ok_and(|value| value == "1");
 
@@ -555,6 +603,36 @@ fn derive_models_url(base_url: &str) -> Option<String> {
     Some(format!("{}models", &path[..endpoint_start]))
 }
 
+/// Derive Ollama's native `/api/show` URL from its exact chat endpoint.
+///
+/// `/api/show` is Ollama-native rather than OpenAI-compatible, so it hangs off
+/// the server root instead of the `/v1` prefix that carries the chat route.
+fn derive_ollama_show_url(base_url: &str) -> Option<String> {
+    let path = base_url
+        .split('?')
+        .next()
+        .unwrap_or(base_url)
+        .trim_end_matches('/');
+    let scheme_end = path.find("://").map_or(0, |idx| idx + 3);
+    let root_end = path.strip_suffix("/v1/chat/completions").map_or_else(
+        || path.rfind('/').filter(|end| *end > scheme_end),
+        |root| Some(root.len()),
+    )?;
+    if root_end <= scheme_end {
+        return None;
+    }
+    #[allow(clippy::string_slice)]
+    Some(format!("{}/api/show", &path[..root_end]))
+}
+
+/// Layers a wire tag must pin to the GPU before Phoenix will advertise it.
+///
+/// Ollama expresses "offload every layer" as a `num_gpu` far above any real
+/// layer count (the `~/local-ai-gpu` aliases use 999). Requiring a high floor
+/// distinguishes a deliberate full-offload alias from a partial-offload tag
+/// whose remaining layers would land in host RAM.
+const MIN_OLLAMA_GPU_LAYERS: u32 = 900;
+
 const fn codex_bridge_transport() -> LlmTransport {
     LlmTransport::Websocket
 }
@@ -771,15 +849,49 @@ impl ModelRegistry {
                     return;
                 }
             };
-        if !discovered.contains(&config.ollama_model) {
-            tracing::debug!(
-                model = %config.ollama_model,
-                "Ollama is reachable but configured GPT-OSS model is not installed"
+        let Some(wire_model) = config.ollama_model.select(&discovered) else {
+            tracing::info!(
+                expected = %config.ollama_model.expected(),
+                "Ollama is reachable but no GPU-forced GPT-OSS tag is installed; local worker unavailable"
+            );
+            return;
+        };
+
+        let Some(show_url) = derive_ollama_show_url(chat_endpoint) else {
+            tracing::warn!(
+                endpoint = chat_endpoint,
+                "Ollama endpoint cannot produce an /api/show URL; local GPT-OSS unavailable"
+            );
+            return;
+        };
+        let capabilities = match probe_ollama_model_capabilities(
+            &show_url,
+            wire_model,
+            Duration::from_millis(750),
+        )
+        .await
+        {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                tracing::info!(
+                    endpoint = show_url,
+                    wire_model,
+                    failure = %error,
+                    "Cannot confirm Ollama GPU residency or context window; local worker unavailable"
+                );
+                return;
+            }
+        };
+        if capabilities.gpu_layers < MIN_OLLAMA_GPU_LAYERS {
+            tracing::info!(
+                wire_model,
+                gpu_layers = capabilities.gpu_layers,
+                "Ollama tag does not force full GPU offload; local worker unavailable"
             );
             return;
         }
 
-        let spec = ollama_gpt_oss_model(&config.ollama_model);
+        let spec = ollama_gpt_oss_model(wire_model, capabilities.context_length);
         let service: Arc<dyn LlmService> = Arc::new(LoggingService::new(
             Arc::new(LlmServiceImpl::new_ollama(
                 spec.clone(),
@@ -805,6 +917,8 @@ impl ModelRegistry {
         tracing::info!(
             model = %spec.id,
             wire_model = %spec.api_name,
+            gpu_layers = capabilities.gpu_layers,
+            context_window = capabilities.context_length,
             endpoint = chat_endpoint,
             "registered local Ollama delegation model"
         );
@@ -1664,6 +1778,46 @@ mod tests {
     };
     use std::collections::HashSet;
 
+    /// A wire tag's persisted parameters, as `/api/show` would report them.
+    #[derive(Clone)]
+    struct TestTag {
+        num_gpu: Option<u32>,
+        num_ctx: Option<usize>,
+        architecture_context: Option<usize>,
+    }
+
+    impl TestTag {
+        /// A GPU-forced alias: the shape `~/local-ai-gpu` produces.
+        fn gpu() -> Self {
+            Self {
+                num_gpu: Some(999),
+                num_ctx: Some(32_768),
+                architecture_context: Some(131_072),
+            }
+        }
+
+        /// A plain pulled tag: no persisted GPU or context parameters.
+        fn plain() -> Self {
+            Self {
+                num_gpu: None,
+                num_ctx: None,
+                architecture_context: Some(131_072),
+            }
+        }
+
+        fn with_num_ctx(mut self, num_ctx: usize) -> Self {
+            self.num_ctx = Some(num_ctx);
+            self
+        }
+
+        fn with_num_gpu(mut self, num_gpu: u32) -> Self {
+            self.num_gpu = Some(num_gpu);
+            self
+        }
+    }
+
+    type TestTags = Arc<std::collections::HashMap<String, TestTag>>;
+
     async fn list_test_models(State(models): State<Arc<[String]>>) -> Json<serde_json::Value> {
         Json(serde_json::json!({
             "data": models
@@ -1671,6 +1825,44 @@ mod tests {
                 .map(|id| serde_json::json!({"id": id}))
                 .collect::<Vec<_>>()
         }))
+    }
+
+    async fn show_test_model(
+        State(tags): State<TestTags>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response<Body> {
+        use std::fmt::Write as _;
+
+        let Some(tag) = body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|model| tags.get(model))
+        else {
+            return Response::builder()
+                .status(404)
+                .body(Body::from("model not found"))
+                .unwrap();
+        };
+        let mut parameters = String::new();
+        if let Some(num_ctx) = tag.num_ctx {
+            let _ = writeln!(parameters, "num_ctx                        {num_ctx}");
+        }
+        if let Some(num_gpu) = tag.num_gpu {
+            let _ = writeln!(parameters, "num_gpu                        {num_gpu}");
+        }
+        parameters.push_str("temperature                    1\n");
+        let mut model_info = serde_json::Map::new();
+        if let Some(context) = tag.architecture_context {
+            model_info.insert("gptoss.context_length".into(), context.into());
+        }
+        let payload = serde_json::json!({
+            "parameters": parameters,
+            "model_info": model_info,
+        });
+        Response::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
     }
 
     async fn malformed_test_models() -> &'static str {
@@ -1685,16 +1877,39 @@ mod tests {
         Response::builder().body(Body::from_stream(chunks)).unwrap()
     }
 
-    async fn test_models_endpoint(models: Vec<&str>) -> (String, tokio::task::JoinHandle<()>) {
-        let models: Arc<[String]> =
-            Arc::from(models.into_iter().map(str::to_string).collect::<Vec<_>>());
+    /// Serve `/v1/models` plus the `/api/show` capability probe for each tag.
+    async fn test_ollama_endpoint(
+        tags: Vec<(&str, TestTag)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let models: Arc<[String]> = Arc::from(
+            tags.iter()
+                .map(|(id, _)| (*id).to_string())
+                .collect::<Vec<_>>(),
+        );
+        let shows: TestTags = Arc::new(
+            tags.into_iter()
+                .map(|(id, tag)| (id.to_string(), tag))
+                .collect(),
+        );
         let app = Router::new()
-            .route("/v1/models", get(list_test_models))
-            .with_state(models);
+            .route("/v1/models", get(list_test_models).with_state(models))
+            .route("/api/show", axum::routing::post(show_test_model))
+            .with_state(shows);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{address}/v1/chat/completions"), server)
+    }
+
+    /// Endpoint whose tags are all GPU-forced aliases.
+    async fn test_models_endpoint(models: Vec<&str>) -> (String, tokio::task::JoinHandle<()>) {
+        test_ollama_endpoint(
+            models
+                .into_iter()
+                .map(|model| (model, TestTag::gpu()))
+                .collect(),
+        )
+        .await
     }
 
     #[test]
@@ -1704,7 +1919,7 @@ mod tests {
 
     #[tokio::test]
     async fn ollama_registers_only_after_matching_model_discovery() {
-        let (endpoint, server) = test_models_endpoint(vec!["gpt-oss:120b"]).await;
+        let (endpoint, server) = test_models_endpoint(vec!["gpt-oss:120b-gpu"]).await;
         let registry = ModelRegistry::new_with_discovery(&LlmConfig {
             ollama_chat_completions_base_url: Some(endpoint),
             ..Default::default()
@@ -1731,8 +1946,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ollama_automatic_selection_prefers_gpu_alias_over_plain_tag() {
+        let (endpoint, server) = test_ollama_endpoint(vec![
+            ("gpt-oss:120b", TestTag::plain()),
+            ("gpt-oss:120b-gpu", TestTag::gpu()),
+        ])
+        .await;
+        let registry = ModelRegistry::new_with_discovery(&LlmConfig {
+            ollama_chat_completions_base_url: Some(endpoint),
+            ..Default::default()
+        })
+        .await;
+
+        let specs = registry.specs.read().unwrap();
+        let spec = specs.get("ollama/gpt-oss:120b").unwrap();
+        assert_eq!(spec.api_name, "gpt-oss:120b-gpu");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ollama_plain_tag_alone_leaves_worker_unavailable() {
+        let (endpoint, server) =
+            test_ollama_endpoint(vec![("gpt-oss:120b", TestTag::plain())]).await;
+        let registry = ModelRegistry::new_with_discovery(&LlmConfig {
+            ollama_chat_completions_base_url: Some(endpoint),
+            ..Default::default()
+        })
+        .await;
+
+        assert!(!registry
+            .available_models()
+            .contains(&"ollama/gpt-oss:120b".to_string()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ollama_explicit_pin_is_honored_exactly_without_substitution() {
+        let (endpoint, server) = test_ollama_endpoint(vec![
+            ("gpt-oss:120b-gpu", TestTag::gpu()),
+            ("custom:tag", TestTag::gpu().with_num_ctx(8_192)),
+        ])
+        .await;
+        let registry = ModelRegistry::new_with_discovery(&LlmConfig {
+            ollama_chat_completions_base_url: Some(endpoint),
+            ollama_model: OllamaWireModel::Pinned("custom:tag".to_string()),
+            ..Default::default()
+        })
+        .await;
+
+        let specs = registry.specs.read().unwrap();
+        let spec = specs.get("ollama/gpt-oss:120b").unwrap();
+        assert_eq!(spec.api_name, "custom:tag");
+        assert_eq!(spec.context_window, 8_192);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ollama_explicit_pin_missing_from_listing_fails_closed() {
+        let (endpoint, server) =
+            test_ollama_endpoint(vec![("gpt-oss:120b-gpu", TestTag::gpu())]).await;
+        let registry = ModelRegistry::new_with_discovery(&LlmConfig {
+            ollama_chat_completions_base_url: Some(endpoint),
+            ollama_model: OllamaWireModel::Pinned("not-installed:tag".to_string()),
+            ..Default::default()
+        })
+        .await;
+
+        assert!(!registry
+            .available_models()
+            .contains(&"ollama/gpt-oss:120b".to_string()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ollama_context_window_comes_from_the_served_tag() {
+        let (endpoint, server) = test_ollama_endpoint(vec![(
+            "gpt-oss:120b-gpu",
+            TestTag::gpu().with_num_ctx(65_536),
+        )])
+        .await;
+        let registry = ModelRegistry::new_with_discovery(&LlmConfig {
+            ollama_chat_completions_base_url: Some(endpoint),
+            ..Default::default()
+        })
+        .await;
+
+        assert_eq!(registry.context_window("ollama/gpt-oss:120b"), 65_536);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ollama_context_window_is_clamped_to_the_architecture_maximum() {
+        let (endpoint, server) = test_ollama_endpoint(vec![(
+            "gpt-oss:120b-gpu",
+            TestTag::gpu().with_num_ctx(999_999),
+        )])
+        .await;
+        let registry = ModelRegistry::new_with_discovery(&LlmConfig {
+            ollama_chat_completions_base_url: Some(endpoint),
+            ..Default::default()
+        })
+        .await;
+
+        assert_eq!(registry.context_window("ollama/gpt-oss:120b"), 131_072);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ollama_partial_gpu_offload_leaves_worker_unavailable() {
+        let (endpoint, server) =
+            test_ollama_endpoint(vec![("gpt-oss:120b-gpu", TestTag::gpu().with_num_gpu(12))]).await;
+        let registry = ModelRegistry::new_with_discovery(&LlmConfig {
+            ollama_chat_completions_base_url: Some(endpoint),
+            ..Default::default()
+        })
+        .await;
+
+        assert!(!registry
+            .available_models()
+            .contains(&"ollama/gpt-oss:120b".to_string()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ollama_unavailable_capability_probe_leaves_worker_unavailable() {
+        // Lists the alias but serves no /api/show route at all.
+        let models: Arc<[String]> = Arc::from(vec!["gpt-oss:120b-gpu".to_string()]);
+        let app = Router::new()
+            .route("/v1/models", get(list_test_models))
+            .with_state(models);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let registry = ModelRegistry::new_with_discovery(&LlmConfig {
+            ollama_chat_completions_base_url: Some(format!("http://{address}/v1/chat/completions")),
+            ..Default::default()
+        })
+        .await;
+
+        assert!(!registry
+            .available_models()
+            .contains(&"ollama/gpt-oss:120b".to_string()));
+        server.abort();
+    }
+
+    #[test]
+    fn ollama_show_url_is_derived_from_the_server_root() {
+        assert_eq!(
+            derive_ollama_show_url("http://127.0.0.1:11434/v1/chat/completions"),
+            Some("http://127.0.0.1:11434/api/show".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn ollama_coexists_with_external_only_catalog_without_restoring_builtins() {
-        let (endpoint, server) = test_models_endpoint(vec!["gpt-oss:120b"]).await;
+        let (endpoint, server) = test_models_endpoint(vec!["gpt-oss:120b-gpu"]).await;
         let external = external_gateway_model();
         let external_id = external.id.clone();
         let registry = ModelRegistry::new_with_discovery(&LlmConfig {
@@ -1815,7 +2184,7 @@ mod tests {
 
     #[tokio::test]
     async fn ollama_coexists_with_authenticated_chat_completions_route() {
-        let (endpoint, server) = test_models_endpoint(vec!["gpt-oss:120b"]).await;
+        let (endpoint, server) = test_models_endpoint(vec!["gpt-oss:120b-gpu"]).await;
         let cloud_model = external_chat_completions_model();
         let registry = ModelRegistry::new(&LlmConfig {
             openai_api_key: Some("cloud-key".to_string()),

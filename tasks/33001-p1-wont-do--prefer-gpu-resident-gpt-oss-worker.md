@@ -1,5 +1,18 @@
 # Route Phoenix GPT-OSS delegation through the GPU-resident Ollama alias
 
+**Superseded by task 50009.** That task implements GPU-alias routing with a
+stricter policy: automatic selection accepts *only* a GPU-forced alias and
+leaves the worker unavailable otherwise. The plain-tag fallback proposed below
+was deliberately rejected, because on a host whose GPU cannot be reached by the
+scheduler's own choice that fallback silently reproduces the out-of-memory
+failure it was meant to avoid. Task 50009 also derives the advertised context
+window from the serving host rather than assuming the architecture maximum.
+
+The analysis below remains accurate as the original diagnosis of the wire-tag
+defect.
+
+---
+
 ## Observed journey
 
 - The operator uses `~/local-ai-gpu` to run GPT OSS through a persistent Dockerized Ollama service and wants Phoenix's `ollama/gpt-oss:120b` worker to use that service in a way that forces the model into GPU memory.

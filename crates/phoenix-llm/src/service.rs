@@ -551,7 +551,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let service = LlmServiceImpl::new_ollama(
-            crate::ollama_gpt_oss_model("custom-gpt-oss-tag"),
+            crate::ollama_gpt_oss_model("custom-gpt-oss-tag", 32_768),
             format!("http://{address}/v1/chat/completions"),
         );
         let (mut request, _) = request_with_capture();
@@ -588,7 +588,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let service = LlmServiceImpl::new_ollama(
-            crate::ollama_gpt_oss_model("gpt-oss:120b"),
+            crate::ollama_gpt_oss_model("gpt-oss:120b", 32_768),
             format!("http://{address}/v1/chat/completions"),
         );
         let (request, _) = request_with_capture();
@@ -669,7 +669,7 @@ mod tests {
     fn ollama_and_cloud_chat_services_keep_endpoint_and_auth_separate() {
         let cloud = chat_gateway_service_with_api_name("cloud/model");
         let ollama = LlmServiceImpl::new_ollama(
-            crate::ollama_gpt_oss_model("gpt-oss:120b"),
+            crate::ollama_gpt_oss_model("gpt-oss:120b", 32_768),
             "http://127.0.0.1:11434/v1/chat/completions".to_string(),
         );
 

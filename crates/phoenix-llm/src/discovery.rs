@@ -11,6 +11,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 const MAX_MODELS_RESPONSE_BYTES: usize = 256 * 1024;
+/// `/api/show` carries tokenizer metadata, so it needs more headroom than a
+/// model listing while staying bounded.
+const MAX_SHOW_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Configuration for model discovery
 pub struct DiscoveryConfig {
@@ -161,6 +164,140 @@ pub async fn discover_unauthenticated_model_ids(
     let models: ModelsResponse =
         serde_json::from_slice(&body).map_err(|_| ModelDiscoveryError::InvalidResponse)?;
     Ok(models.data.into_iter().map(|model| model.id).collect())
+}
+
+/// Serving capabilities Phoenix must confirm before advertising a local model.
+///
+/// Phoenix cannot set per-request `num_gpu`/`num_ctx` over the OpenAI-compatible
+/// route, so the wire tag's own persisted parameters decide both whether a
+/// request lands fully on the GPU and how much context it really serves. Both
+/// facts come from one probe and both are required: a partial answer is
+/// [`OllamaProbeError::MissingCapability`], never a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OllamaModelCapabilities {
+    /// Layers the tag pins to the GPU (`num_gpu`).
+    pub gpu_layers: u32,
+    /// Context the tag actually serves: `num_ctx` clamped to the architecture max.
+    pub context_length: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OllamaProbeError {
+    Discovery(ModelDiscoveryError),
+    /// Reached the endpoint but a required parameter was absent or unparseable.
+    MissingCapability(&'static str),
+}
+
+impl std::fmt::Display for OllamaProbeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Discovery(error) => error.fmt(formatter),
+            Self::MissingCapability(field) => write!(formatter, "missing_{field}"),
+        }
+    }
+}
+
+/// Ollama's native `/api/show` response, narrowed to the capability fields.
+#[derive(Debug, Deserialize)]
+struct ShowResponse {
+    /// Newline-separated `name<whitespace>value` pairs of persisted parameters.
+    #[serde(default)]
+    parameters: String,
+    /// Architecture metadata keyed by model family, e.g. `gptoss.context_length`.
+    #[serde(default)]
+    model_info: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Read a parameter out of the whitespace-separated `parameters` blob.
+fn show_parameter(parameters: &str, name: &str) -> Option<u64> {
+    parameters.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next()? != name {
+            return None;
+        }
+        fields.next()?.parse().ok()
+    })
+}
+
+/// The architecture's trained context ceiling, published as `<family>.context_length`.
+fn architecture_context_length(
+    model_info: &serde_json::Map<String, serde_json::Value>,
+) -> Option<u64> {
+    model_info
+        .iter()
+        .find(|(key, _)| key.ends_with(".context_length"))
+        .and_then(|(_, value)| value.as_u64())
+}
+
+/// Probe Ollama's native `/api/show` for a wire tag's serving capabilities.
+///
+/// Deliberately unauthenticated and bounded, matching
+/// [`discover_unauthenticated_model_ids`]: the local route must never inherit
+/// cloud credentials, and a failure must leave the model unregistered rather
+/// than fall back to a fabricated default.
+///
+/// # Errors
+///
+/// Returns [`OllamaProbeError::Discovery`] when the endpoint cannot be reached,
+/// returns a non-success status, or exceeds the size limit; and
+/// [`OllamaProbeError::MissingCapability`] when the tag does not publish the
+/// `num_gpu`, `num_ctx`, or architecture context values Phoenix requires.
+pub async fn probe_ollama_model_capabilities(
+    url: &str,
+    model: &str,
+    timeout: Duration,
+) -> Result<OllamaModelCapabilities, OllamaProbeError> {
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| OllamaProbeError::Discovery(ModelDiscoveryError::Client))?;
+    let response = client
+        .post(url)
+        .header("User-Agent", "phoenix-ide-ollama-discovery")
+        .json(&serde_json::json!({ "model": model }))
+        .send()
+        .await
+        .map_err(|_| OllamaProbeError::Discovery(ModelDiscoveryError::Request))?;
+    if !response.status().is_success() {
+        return Err(OllamaProbeError::Discovery(
+            ModelDiscoveryError::HttpStatus(response.status().as_u16()),
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_SHOW_RESPONSE_BYTES as u64)
+    {
+        return Err(OllamaProbeError::Discovery(
+            ModelDiscoveryError::InvalidResponse,
+        ));
+    }
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| OllamaProbeError::Discovery(ModelDiscoveryError::Request))?;
+        if body.len().saturating_add(chunk.len()) > MAX_SHOW_RESPONSE_BYTES {
+            return Err(OllamaProbeError::Discovery(
+                ModelDiscoveryError::InvalidResponse,
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let show: ShowResponse = serde_json::from_slice(&body)
+        .map_err(|_| OllamaProbeError::Discovery(ModelDiscoveryError::InvalidResponse))?;
+
+    let gpu_layers = show_parameter(&show.parameters, "num_gpu")
+        .ok_or(OllamaProbeError::MissingCapability("num_gpu"))?;
+    let num_ctx = show_parameter(&show.parameters, "num_ctx")
+        .ok_or(OllamaProbeError::MissingCapability("num_ctx"))?;
+    let architecture_max = architecture_context_length(&show.model_info)
+        .ok_or(OllamaProbeError::MissingCapability("context_length"))?;
+
+    Ok(OllamaModelCapabilities {
+        gpu_layers: u32::try_from(gpu_layers).unwrap_or(u32::MAX),
+        context_length: usize::try_from(num_ctx.min(architecture_max))
+            .map_err(|_| OllamaProbeError::MissingCapability("num_ctx"))?,
+    })
 }
 
 /// Discover available model IDs from configured model-listing endpoints.

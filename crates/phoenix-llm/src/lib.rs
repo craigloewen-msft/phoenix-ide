@@ -58,8 +58,9 @@ pub use codex_credential::{
 };
 pub use credential_helper::{CredentialHelper, CredentialStatus};
 pub use discovery::{
-    discover_models, discover_unauthenticated_model_ids, DiscoveredModels, DiscoveryConfig,
-    ModelDiscoveryError,
+    discover_models, discover_unauthenticated_model_ids, probe_ollama_model_capabilities,
+    DiscoveredModels, DiscoveryConfig, ModelDiscoveryError, OllamaModelCapabilities,
+    OllamaProbeError,
 };
 pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
 // AutoRetryPolicy / UserResumePolicy live in phoenix-core
@@ -77,7 +78,9 @@ pub use models::{
 pub use rate_limit::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
 #[allow(unused_imports)]
 // CredentialSource + ResolvedAuth + AuthStyle: public API for downstream consumers
-pub use registry::{AuthStyle, CredentialSource, LlmAuth, LlmConfig, ModelRegistry, ResolvedAuth};
+pub use registry::{
+    AuthStyle, CredentialSource, LlmAuth, LlmConfig, ModelRegistry, OllamaWireModel, ResolvedAuth,
+};
 pub use service::LlmServiceImpl;
 // `types` (ContentBlock, Usage, ImageSource, …) live in phoenix-core. Alias
 // the module back as `types` and glob-re-export so both `phoenix_llm::types::X`
