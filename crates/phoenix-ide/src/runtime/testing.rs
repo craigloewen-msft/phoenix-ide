@@ -182,16 +182,11 @@ impl MockToolExecutor {
         self
     }
 
-    pub fn with_subagent_models(mut self, model_ids: Vec<String>) -> Self {
-        self.model_catalog = Arc::from(
-            model_ids
-                .into_iter()
-                .map(|id| phoenix_core::domain::sm_state::SubAgentModelChoice {
-                    description: format!("Test model {id}"),
-                    id,
-                })
-                .collect::<Vec<_>>(),
-        );
+    pub fn with_subagent_models(
+        mut self,
+        models: Vec<phoenix_core::domain::sm_state::SubAgentModelChoice>,
+    ) -> Self {
+        self.model_catalog = Arc::from(models);
         self
     }
 

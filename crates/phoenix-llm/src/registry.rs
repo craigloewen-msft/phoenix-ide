@@ -1309,13 +1309,32 @@ impl ModelRegistry {
         let specs = self.specs.read().expect("specs lock poisoned");
         let mut choices: Vec<_> = specs
             .iter()
-            .filter(|(id, _)| services.contains_key(*id))
-            .map(
-                |(_, spec)| phoenix_core::domain::sm_state::SubAgentModelChoice {
+            .filter_map(|(id, spec)| {
+                let service = services.get(id)?;
+                let effort_capability = match spec.effort_capabilities_for(service.as_ref()) {
+                    super::EffortCapabilities::Unsupported => {
+                        phoenix_core::domain::sm_state::SubAgentModelEffortCapability::Unsupported
+                    }
+                    super::EffortCapabilities::Unknown => {
+                        phoenix_core::domain::sm_state::SubAgentModelEffortCapability::Unknown
+                    }
+                    super::EffortCapabilities::Supported(capabilities) => {
+                        let mut levels = capabilities.levels().iter().copied();
+                        let first = levels
+                            .next()
+                            .expect("supported effort capabilities are non-empty");
+                        phoenix_core::domain::sm_state::SubAgentModelEffortCapability::supported(
+                            first,
+                            levels.collect(),
+                        )
+                    }
+                };
+                Some(phoenix_core::domain::sm_state::SubAgentModelChoice {
                     id: spec.id.clone(),
                     description: spec.description.clone(),
-                },
-            )
+                    effort_capability,
+                })
+            })
             .collect();
         choices.sort_by(|left, right| left.id.cmp(&right.id));
         choices
@@ -1938,10 +1957,15 @@ mod tests {
         assert!(info
             .description
             .contains("without consuming remote provider rate limits"));
-        assert!(registry
+        let model = registry
             .subagent_model_catalog()
-            .iter()
-            .any(|model| model.id == "ollama/gpt-oss:120b"));
+            .into_iter()
+            .find(|model| model.id == "ollama/gpt-oss:120b")
+            .expect("Ollama model should be advertised for delegation");
+        assert_eq!(
+            model.effort_capability,
+            phoenix_core::domain::sm_state::SubAgentModelEffortCapability::Unknown
+        );
         server.abort();
     }
 
@@ -2305,6 +2329,59 @@ mod tests {
         assert_eq!(info.provider, "Anthropic");
         assert_eq!(info.context_window, 262_000);
         assert!(!info.recommended);
+    }
+
+    #[test]
+    fn subagent_catalog_projects_supported_unknown_and_unsupported_effort_capabilities() {
+        use phoenix_core::domain::llm_types::ModelEffort;
+        use phoenix_core::domain::sm_state::SubAgentModelEffortCapability;
+
+        let unknown = parse_external_models(
+            r#"[{"id":"unknown-model","backend":"anthropic","description":"Unknown model","context_window":128000,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"unknown"}}]"#,
+        )
+        .unwrap()
+        .remove(0);
+        let supported = parse_external_models(
+            r#"[{"id":"supported-model","backend":"anthropic","description":"Supported model","context_window":128000,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"supported","levels":["low","high"],"native_default":"high"}}]"#,
+        )
+        .unwrap()
+        .remove(0);
+        let unsupported = parse_external_models(
+            r#"[{"id":"unsupported-model","backend":"anthropic","description":"Unsupported model","context_window":128000,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"unsupported"}}]"#,
+        )
+        .unwrap()
+        .remove(0);
+        let registry = ModelRegistry::new(&LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            external_models: vec![unknown, supported, unsupported],
+            external_models_only: true,
+            ..Default::default()
+        });
+        let catalog = registry.subagent_model_catalog();
+        let by_id = |id: &str| {
+            catalog
+                .iter()
+                .find(|model| model.id == id)
+                .expect("configured model should be in sub-agent catalog")
+        };
+
+        assert_eq!(
+            by_id("unknown-model").effort_capability,
+            SubAgentModelEffortCapability::Unknown
+        );
+        assert_eq!(
+            by_id("unsupported-model").effort_capability,
+            SubAgentModelEffortCapability::Unsupported
+        );
+        let SubAgentModelEffortCapability::Supported(levels) =
+            &by_id("supported-model").effort_capability
+        else {
+            panic!("supported model should retain supported effort levels");
+        };
+        assert_eq!(
+            levels.iter().collect::<Vec<_>>(),
+            vec![ModelEffort::Low, ModelEffort::High]
+        );
     }
 
     #[test]

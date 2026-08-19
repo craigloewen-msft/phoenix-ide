@@ -53,6 +53,7 @@ value SubAgentTask {
 value SubAgentModelChoice {
     id: String
     description: String
+    effort_capability: SubAgentModelEffortCapability
 }
 
 -- The resolved spec the runtime spawns the sub-agent from.
@@ -90,6 +91,16 @@ enum SubAgentMode { explore | work }
 -- values use the provider-neutral ModelEffort vocabulary from specs/llm.
 enum SubAgentEffort {
     default | none | minimal | low | medium | high | xhigh | max
+}
+
+-- Unknown and unsupported remain distinct registry facts. Both accept only the
+-- `default` spawn selection because neither proves an explicit level is valid.
+enum SubAgentModelEffortSupport { supported | unknown | unsupported }
+
+value SubAgentModelEffortCapability {
+    support: SubAgentModelEffortSupport
+    first_explicit_level: String when support = supported
+    additional_explicit_levels: List<String> when support = supported
 }
 
 -- Tool registries selectable for a sub-agent. The registry shape itself
@@ -209,12 +220,19 @@ rule SpawnModelCatalogFrozen {
     )
 
     @guidance
-        -- `registered_subagent_model_choices(parent)` returns the sorted model
-        -- ids and descriptions registered when the parent runtime is built.
-        -- The same frozen catalog renders the model enum and is consumed by
-        -- spawn-time validation. Local-model descriptions state locality and
-        -- remote-rate-limit independence; selection remains the parent model's
-        -- explicit decision.
+        -- `registered_subagent_model_choices(parent)` returns sorted model ids,
+        -- descriptions, and route-aware effort capabilities registered when the
+        -- parent runtime is built. Supported capabilities carry the exact
+        -- non-empty explicit level list; unknown and unsupported carry no
+        -- explicit levels while remaining distinct facts.
+        --
+        -- The same frozen catalog renders the model enum, appends per-model
+        -- effort guidance, and is consumed by spawn-time validation. Supported
+        -- models advertise `default` plus exactly their explicit levels.
+        -- Unknown and unsupported models advertise `effort: "default"` only and
+        -- warn that omission may inherit the parent's incompatible override.
+        -- Local-model descriptions also state locality and remote-rate-limit
+        -- independence; selection remains the parent model's explicit decision.
 }
 
 -- An explicit `model` field on a task must exist in the LLM registry.
@@ -262,8 +280,10 @@ rule SpawnRejectedUnsupportedEffort {
         -- any spawn request. Omitted effort inherits parent.explicit_effort;
         -- `default` resolves to none; an explicit level resolves to itself.
         -- Reject the entire batch when any non-null resolved effort is absent
-        -- from the resolved model's effort capabilities. The error identifies
-        -- `effort: \"default\"` as the child model-native alternative.
+        -- from the resolved model's frozen effort capabilities. The error tells
+        -- the parent to set `effort: \"default\"` explicitly and explains that
+        -- omission may inherit the parent's incompatible override. The spawn
+        -- manager rechecks the live route as a capability-drift defense.
 }
 
 -- An `agent_type` on a task must match a discovered agent name (see

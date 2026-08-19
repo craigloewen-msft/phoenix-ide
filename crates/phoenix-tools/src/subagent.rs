@@ -8,7 +8,9 @@ use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use phoenix_agents::AgentDefinition;
 use phoenix_core::domain::llm_types::ModelEffort;
-use phoenix_core::domain::sm_state::{SpawnAgentsInput, SubAgentModelChoice};
+use phoenix_core::domain::sm_state::{
+    SpawnAgentsInput, SubAgentModelChoice, SubAgentModelEffortCapability,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -174,7 +176,7 @@ impl Tool for SpawnAgentsTool {
             },
             "effort": {
                 "type": "string",
-                "description": "Reasoning-effort selection for this sub-agent. Omit to inherit the parent's explicit effort override. Use \"default\" to use the selected child model's native behavior, or choose an explicit supported effort level."
+                "description": "Reasoning-effort selection for this sub-agent. Omission inherits the parent's explicit effort override and can therefore be incompatible with a different child model. Use \"default\" to guarantee the selected child model's native behavior. Models marked default-only require \"default\"; otherwise choose only a listed explicit level."
             },
             "max_turns": {
                 "type": "integer",
@@ -200,7 +202,25 @@ impl Tool for SpawnAgentsTool {
                 .expect("model description is a string");
             let mut description = format!("{description} Available models:");
             for model in &self.models {
-                let _ = write!(description, "\n- {}: {}", model.id, model.description);
+                let effort_guidance = match &model.effort_capability {
+                    SubAgentModelEffortCapability::Supported(levels) => {
+                        let levels = levels
+                            .iter()
+                            .map(ModelEffort::as_wire_name)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("effort: \"default\" or one of [{levels}]")
+                    }
+                    SubAgentModelEffortCapability::Unknown
+                    | SubAgentModelEffortCapability::Unsupported => {
+                        "effort: \"default\" only (do not omit: omission may inherit the parent's override)".to_string()
+                    }
+                };
+                let _ = write!(
+                    description,
+                    "\n- {}: {}; {}",
+                    model.id, model.description, effort_guidance
+                );
             }
             task_props["model"]["description"] = Value::String(description);
         }
@@ -339,11 +359,23 @@ mod tests {
         assert!(result.output().contains("Error submitted"));
     }
 
-    fn model(id: &str, description: &str) -> SubAgentModelChoice {
+    fn model(
+        id: &str,
+        description: &str,
+        effort_capability: SubAgentModelEffortCapability,
+    ) -> SubAgentModelChoice {
         SubAgentModelChoice {
             id: id.to_string(),
             description: description.to_string(),
+            effort_capability,
         }
+    }
+
+    fn supported_efforts(
+        first: ModelEffort,
+        additional: Vec<ModelEffort>,
+    ) -> SubAgentModelEffortCapability {
+        SubAgentModelEffortCapability::supported(first, additional)
     }
 
     fn agent(name: &str, description: &str) -> AgentDefinition {
@@ -434,15 +466,23 @@ mod tests {
         let description = task_schema["properties"]["effort"]["description"]
             .as_str()
             .unwrap();
-        assert!(description.contains("Omit to inherit"));
-        assert!(description.contains("native behavior"));
+        assert!(description.contains("Omission inherits"));
+        assert!(description.contains("can therefore be incompatible"));
+        assert!(description.contains("Models marked default-only require \"default\""));
     }
 
     #[test]
     fn schema_exposes_registry_model_ids() {
         let schema = SpawnAgentsTool::with_catalogs(
             Vec::new(),
-            vec![model("gpt-a", "Model A"), model("gpt-b", "Model B")],
+            vec![
+                model(
+                    "gpt-a",
+                    "Model A",
+                    supported_efforts(ModelEffort::Low, vec![ModelEffort::High]),
+                ),
+                model("gpt-b", "Model B", SubAgentModelEffortCapability::Unknown),
+            ],
         )
         .input_schema();
         assert_eq!(
@@ -458,6 +498,7 @@ mod tests {
             vec![model(
                 "ollama/gpt-oss:120b",
                 "Local GPT-OSS 120B via Ollama; useful for bounded delegated work without consuming remote provider rate limits",
+                SubAgentModelEffortCapability::Unknown,
             )],
         )
         .input_schema();
@@ -469,12 +510,45 @@ mod tests {
         assert!(description.contains("ollama/gpt-oss:120b"));
         assert!(description.contains("Local GPT-OSS 120B via Ollama"));
         assert!(description.contains("without consuming remote provider rate limits"));
+        assert!(description.contains(
+            "ollama/gpt-oss:120b: Local GPT-OSS 120B via Ollama; useful for bounded delegated work without consuming remote provider rate limits; effort: \"default\" only (do not omit: omission may inherit the parent's override)"
+        ));
+        assert!(!description
+            .contains("ollama/gpt-oss:120b: Local GPT-OSS 120B via Ollama; effort: \"medium\""));
+    }
+
+    #[test]
+    fn schema_lists_exact_supported_efforts_for_each_model() {
+        let schema = SpawnAgentsTool::with_catalogs(
+            Vec::new(),
+            vec![model(
+                "effort-model",
+                "Effort model",
+                supported_efforts(ModelEffort::Low, vec![ModelEffort::High]),
+            )],
+        )
+        .input_schema();
+        let description = schema["properties"]["tasks"]["items"]["properties"]["model"]
+            ["description"]
+            .as_str()
+            .unwrap();
+
+        assert!(description
+            .contains("effort-model: Effort model; effort: \"default\" or one of [low, high]"));
+        assert!(!description.contains("medium"));
     }
 
     #[test]
     fn schema_model_constraint_includes_blank_default() {
-        let schema = SpawnAgentsTool::with_catalogs(Vec::new(), vec![model("gpt-a", "Model A")])
-            .input_schema();
+        let schema = SpawnAgentsTool::with_catalogs(
+            Vec::new(),
+            vec![model(
+                "gpt-a",
+                "Model A",
+                SubAgentModelEffortCapability::Unsupported,
+            )],
+        )
+        .input_schema();
         let model = &schema["properties"]["tasks"]["items"]["properties"]["model"];
         assert_eq!(model["anyOf"][0], json!({ "enum": ["gpt-a"] }));
         assert_eq!(model["anyOf"][1], json!({ "pattern": "^\\s*$" }));

@@ -35,10 +35,52 @@ pub struct ReadImageInput {
 
 /// A registered model choice frozen into a parent conversation's
 /// `spawn_agents` schema and reused for spawn-time validation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubAgentModelChoice {
     pub id: String,
     pub description: String,
+    pub effort_capability: SubAgentModelEffortCapability,
+}
+
+/// Route-aware effort capability projected into the frozen sub-agent catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubAgentModelEffortCapability {
+    Unsupported,
+    Unknown,
+    Supported(SupportedSubAgentModelEfforts),
+}
+
+impl SubAgentModelEffortCapability {
+    #[must_use]
+    pub fn supported(
+        first: crate::domain::llm_types::ModelEffort,
+        additional: Vec<crate::domain::llm_types::ModelEffort>,
+    ) -> Self {
+        Self::Supported(SupportedSubAgentModelEfforts { first, additional })
+    }
+
+    #[must_use]
+    pub fn supports(&self, effort: crate::domain::llm_types::ModelEffort) -> bool {
+        matches!(self, Self::Supported(levels) if levels.contains(effort))
+    }
+}
+
+/// Non-empty explicit effort levels accepted by one registered model route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupportedSubAgentModelEfforts {
+    first: crate::domain::llm_types::ModelEffort,
+    additional: Vec<crate::domain::llm_types::ModelEffort>,
+}
+
+impl SupportedSubAgentModelEfforts {
+    pub fn iter(&self) -> impl Iterator<Item = crate::domain::llm_types::ModelEffort> + '_ {
+        std::iter::once(self.first).chain(self.additional.iter().copied())
+    }
+
+    #[must_use]
+    pub fn contains(&self, effort: crate::domain::llm_types::ModelEffort) -> bool {
+        self.first == effort || self.additional.contains(&effort)
+    }
 }
 
 /// Per-task reasoning-effort selection for `spawn_agents`.
