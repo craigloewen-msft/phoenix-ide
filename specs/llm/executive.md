@@ -20,7 +20,7 @@ Implements `LlmService` trait with `complete()` method returning `LlmResponse`. 
 | **REQ-LLM-003a:** Model Discovery | ✅ Complete | Cloud discovery may fall back; bounded unauthenticated Ollama discovery never does |
 | **REQ-LLM-003b:** Typed Model Effort Capability Registry | ✅ Complete | Constructor-validated known-native, unknown, unsupported, and supported-level capability states |
 | **REQ-LLM-004:** Request Format | ✅ Complete | LlmRequest with system, messages, tools |
-| **REQ-LLM-004a–004f:** Reasoning Effort Lifecycle | ✅ Complete | Native omission, explicit overrides, atomic switches, subagent inheritance, provider translation, and output reservation |
+| **REQ-LLM-004a–004f:** Reasoning Effort Lifecycle | ✅ Complete | Native omission, explicit overrides, atomic switches, per-task inherited/default/explicit subagent selection, provider translation, and output reservation |
 | **REQ-LLM-005:** Response Handling | ✅ Complete | Normalized to ContentBlock variants |
 | **REQ-LLM-006:** Error Classification | ✅ Complete | Transient throttles, user-resumable quota exhaustion, model overload, and explicit Codex depletion states are classified separately |
 | **REQ-LLM-006a:** Plan-Aware Quota Messages (Codex Backend) | ✅ Complete | Structured Codex quota normalization, plan-aware resumable messages, and authoritative account quota UI with reset timestamps formatted in the browser's local timezone |

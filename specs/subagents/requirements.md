@@ -148,6 +148,12 @@ explicit model override:
   registry snapshot used for spawn-time validation.
 - An omitted or blank `model` selects the mode default rather than an invalid
   explicit override.
+- The optional `effort` field independently controls the child conversation's
+  explicit reasoning-effort override. Omission preserves a compatible explicit
+  parent override; `"default"` selects the child model's native behavior; an
+  explicit effort level replaces the parent override after capability validation.
+- Model and effort are resolved and validated together for every task before any
+  child in the spawn batch starts.
 
 **Rationale:** Mode-based defaults cover the same cost/capability
 trade-off that tiers addressed, while the explicit model override handles
@@ -274,6 +280,21 @@ available
 THE SYSTEM SHALL reject the spawn before any task starts
 AND SHALL distinguish route unavailability from an unknown model id
 
+WHEN `effort` is omitted from a sub-agent task
+THE SYSTEM SHALL inherit the parent's explicit reasoning-effort override when one exists
+AND SHALL use the child model's native behavior when the parent has no explicit override
+
+WHEN `effort` is `"default"`
+THE SYSTEM SHALL persist no explicit effort override on the child
+AND SHALL resolve native behavior from the selected child model
+
+WHEN `effort` is an explicit effort level
+THE SYSTEM SHALL replace any inherited parent override with that level
+
+WHEN a resolved explicit child effort is unsupported by the resolved child model
+THE SYSTEM SHALL reject the whole spawn call before any child in the batch starts
+AND SHALL identify `"default"` as the model-native alternative
+
 THE SYSTEM SHALL describe each LLM-visible model choice from the same frozen
 registry catalog used for spawn-time validation
 
@@ -285,5 +306,7 @@ AND SHALL leave the decision to select it with the parent model
 **Rationale:** Defaults should be the easiest valid representation. Empty
 placeholder strings and server-process-relative paths must not turn inheritance
 into a validation failure or move a child outside the parent's project context.
+The distinct `"default"` sentinel lets a parent opt out of its explicit override
+without conflating model-native behavior with the real `"none"` effort level.
 Descriptions let a parent make an informed explicit delegation choice without a
 second model catalog in system-prompt prose or an invisible automatic router.

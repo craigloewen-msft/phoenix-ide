@@ -6,8 +6,11 @@ Sub-agents enable parallel task execution by spawning independent child
 conversations that run concurrently and report results back to a parent
 conversation. Each sub-agent runs in isolation and cannot spawn its own
 sub-agents. The parent specifies mode (explore for read-only research,
-work for write access) and optionally a model and turn budget per
-sub-agent. Each parent receives a frozen registry catalog of model IDs and
+work for write access) and optionally a model, reasoning effort, and turn budget
+per sub-agent. An omitted effort inherits the parent's explicit override,
+`default` selects the child model's native behavior, and an explicit level
+replaces the parent override after whole-batch compatibility validation. Each
+parent receives a frozen registry catalog of model IDs and
 concise descriptions on the `spawn_agents` schema; this lets it explicitly
 select an available local worker such as Ollama GPT-OSS when suitable without an
 invisible automatic router. Mode enforcement rejects Work sub-agent requests from Explore parents
@@ -59,7 +62,11 @@ only the architectural seams.
   history for synthesis. The admission guard remains a malformed-response
   backstop.
 - **Spawn defaults** treat blank model/cwd overrides as absent and resolve relative
-  cwd values from the parent conversation. Model IDs plus descriptions are frozen
+  cwd values from the parent conversation. Effort is a typed three-way selection:
+  omission inherits the parent's explicit override, `default` resolves to no child
+  override, and an explicit level replaces inheritance. Model/effort compatibility
+  is validated for every task before fan-out, then the resolved nullable effort is
+  written atomically with the child model. Model IDs plus descriptions are frozen
   from one registered catalog used by both schema rendering and executor
   validation; local execution and remote-rate-limit independence are therefore
   visible where the parent makes its explicit model choice.
@@ -88,7 +95,7 @@ only the architectural seams.
 | **REQ-SA-008:** Context Injection via Read-First | ❌ Not Started | `read_first` field not yet on `SubAgentTask`; deferred |
 | **REQ-SA-009:** Terminal Handle Identity for Wake Contracts | Proposed | Child conversation / agent id is the sub-agent wake handle |
 | **REQ-SA-010:** Turn-Limit Grace Prompt Integrity | ✅ Complete | Grace request advertises terminal tools only; Work guidance routes unfinished required edits through `submit_error` |
-| **REQ-SA-011:** Spawn Override Defaults and Path Base | ✅ Complete | Blank overrides inherit; relative cwd is parent-relative; model IDs/descriptions share one frozen registry catalog |
+| **REQ-SA-011:** Spawn Override Defaults and Path Base | ✅ Complete | Blank model/cwd overrides inherit; effort distinguishes inherited, model-default, and explicit values; model/effort pairs validate before fan-out |
 
 **Progress:** 9 of 11 implemented (one explicitly superseded; one deferred; one proposed for wake runtime).
 

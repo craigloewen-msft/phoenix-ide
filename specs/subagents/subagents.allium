@@ -44,6 +44,7 @@ value SubAgentTask {
     cwd: String?                  -- working-directory override
     mode: SubAgentMode?           -- absent => agent default, else explore
     model: String?                -- explicit model id (must exist in registry)
+    effort: SubAgentEffort?       -- absent => inherit parent explicit override
     max_turns: Integer?           -- override per-mode default
     agent_type: String?           -- named agent persona (see specs/agents/);
                                   -- must match a discovered agent name
@@ -64,6 +65,7 @@ value SubAgentSpec {
     timeout: Duration             -- mandatory (REQ-SA-006)
     mode: SubAgentMode
     model_id: String              -- exists in LLM registry
+    explicit_effort: String?      -- none => child model-native behavior
     max_turns: Integer            -- > 0
     agent_name: String?           -- named agent that produced this spec (see specs/agents/)
     persona: String?              -- resolved agent body; replaces the base preamble
@@ -83,6 +85,12 @@ entity FrozenSubAgentModelCatalog {
 ------------------------------------------------------------
 
 enum SubAgentMode { explore | work }
+
+-- `default` is a child-inheritance policy, not a ModelEffort level. Explicit
+-- values use the provider-neutral ModelEffort vocabulary from specs/llm.
+enum SubAgentEffort {
+    default | none | minimal | low | medium | high | xhigh | max
+}
 
 -- Tool registries selectable for a sub-agent. The registry shape itself
 -- lives in code (crates/phoenix-ide/src/tools.rs); the spec only names
@@ -243,6 +251,21 @@ rule SpawnRejectedUnavailableAdvertisedModel {
         -- is distinct from an unknown id and is rejected before any child starts.
 }
 
+rule SpawnRejectedUnsupportedEffort {
+    when: SpawnAgentsToolInvoked(parent, tasks)
+    requires: any_resolved_model_effort_pair_is_unsupported(tasks, parent)
+    ensures: SpawnAgentsRejected(parent,
+        reason: "Effort is not supported by sub-agent model")
+
+    @guidance
+        -- Resolve every task's model and explicit child effort before sending
+        -- any spawn request. Omitted effort inherits parent.explicit_effort;
+        -- `default` resolves to none; an explicit level resolves to itself.
+        -- Reject the entire batch when any non-null resolved effort is absent
+        -- from the resolved model's effort capabilities. The error identifies
+        -- `effort: \"default\"` as the child model-native alternative.
+}
+
 -- An `agent_type` on a task must match a discovered agent name (see
 -- specs/agents/). Defaulting never invents an agent_type, so this only
 -- checks the LLM-supplied value. Mirrors SpawnRejectedUnknownModel.
@@ -353,6 +376,7 @@ rule SubAgentSpecsResolved {
     requires: work_task_count(tasks) = 0
         or active_work_subagents(parent) = 0
     requires: not any_task_has_unknown_model(tasks)
+    requires: not any_resolved_model_effort_pair_is_unsupported(tasks, parent)
     requires: not any_task_has_unknown_agent_type(tasks, parent.working_dir)
     requires: not any_task_effective_cwd_resolves_to_system_root(
         tasks, parent.working_dir)
@@ -385,6 +409,16 @@ rule SubAgentSpecsResolved {
         --     resolve_mode(t)=explore =>
         --         LlmRegistry.cheap_model_for_provider(parent.model_id)
         --     resolve_mode(t)=work    => parent.model_id
+        --
+        --   resolve_explicit_effort(t, parent):
+        --     t.effort absent       => parent.explicit_effort
+        --     t.effort = default    => none
+        --     else                  => t.effort
+        --
+        -- For the Explore mode default only, if the cheap model cannot support
+        -- resolve_explicit_effort(t, parent), resolve_model_id falls back to
+        -- parent.model_id. Explicit task/agent models never silently change;
+        -- SpawnRejectedUnsupportedEffort rejects incompatible pairs instead.
         --
         --   resolve_persona(t)    => resolve_agent(t).body   (none when no agent)
         --   resolve_agent_name(t) => resolve_agent(t).name   (none when no agent)

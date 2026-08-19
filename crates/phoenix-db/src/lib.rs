@@ -1080,6 +1080,28 @@ pub enum ContinuationCommitOutcome {
     Stale,
 }
 
+/// Fully resolved values required to create a sub-agent conversation.
+///
+/// `explicit_effort = None` has one meaning here: use the selected child
+/// model's native behavior. Parent-effort inheritance must be resolved by the
+/// spawn layer before constructing this input.
+pub struct SubAgentConversationCreation<'a> {
+    pub id: &'a str,
+    pub slug: &'a str,
+    pub cwd: &'a str,
+    pub parent_id: &'a str,
+    pub model: &'a str,
+    pub explicit_effort: Option<ModelEffort>,
+    pub conv_mode: &'a ConvMode,
+    pub llm_language: phoenix_core::llm_language::LlmLanguage,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InitialConversationEffort {
+    InheritParent,
+    Resolved(Option<ModelEffort>),
+}
+
 #[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
@@ -3116,7 +3138,7 @@ impl Database {
     /// # Panics
     ///
     /// Panics if persisted JSON columns cannot be (de)serialized.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_conversation_with_project(
         &self,
         id: &str,
@@ -3132,11 +3154,74 @@ impl Database {
         seed_label: Option<&str>,
         llm_language: phoenix_core::llm_language::LlmLanguage,
     ) -> DbResult<Conversation> {
+        self.create_conversation_with_project_and_effort(
+            id,
+            slug,
+            cwd,
+            user_initiated,
+            parent_id,
+            model,
+            project_id,
+            conv_mode,
+            desired_base_branch,
+            seed_parent_id,
+            seed_label,
+            llm_language,
+            InitialConversationEffort::InheritParent,
+        )
+        .await
+    }
+
+    /// Create a sub-agent with its model and resolved nullable explicit effort
+    /// written atomically in the initial conversation row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the parent is missing or persistence fails.
+    pub async fn create_sub_agent_conversation(
+        &self,
+        input: SubAgentConversationCreation<'_>,
+    ) -> DbResult<Conversation> {
+        self.create_conversation_with_project_and_effort(
+            input.id,
+            input.slug,
+            input.cwd,
+            false,
+            Some(input.parent_id),
+            Some(input.model),
+            None,
+            input.conv_mode,
+            None,
+            None,
+            None,
+            input.llm_language,
+            InitialConversationEffort::Resolved(input.explicit_effort),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn create_conversation_with_project_and_effort(
+        &self,
+        id: &str,
+        slug: &str,
+        cwd: &str,
+        user_initiated: bool,
+        parent_id: Option<&str>,
+        model: Option<&str>,
+        project_id: Option<&str>,
+        conv_mode: &ConvMode,
+        desired_base_branch: Option<&str>,
+        seed_parent_id: Option<&str>,
+        seed_label: Option<&str>,
+        llm_language: phoenix_core::llm_language::LlmLanguage,
+        initial_effort: InitialConversationEffort,
+    ) -> DbResult<Conversation> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
         let cm = conv_mode_columns(conv_mode);
         let now_str = now.to_rfc3339();
-        let (inherited_scope, inherited_effort) = if let Some(parent_id) = parent_id {
+        let (inherited_scope, parent_effort) = if let Some(parent_id) = parent_id {
             let row = sqlx::query(
                 "SELECT work_scope_id, effort FROM conversations WHERE id = ?1 AND work_scope_id IS NOT NULL",
             )
@@ -3158,6 +3243,17 @@ impl Database {
             }
         } else {
             (None, None)
+        };
+        // A resolved child must attach to its parent's existing scope; unlike
+        // generic parent-linked creation it must never mint an orphan scope.
+        if let (InitialConversationEffort::Resolved(_), Some(parent_id), None) =
+            (initial_effort, parent_id, inherited_scope.as_ref())
+        {
+            return Err(DbError::ConversationNotFound(parent_id.to_string()));
+        }
+        let initial_effort = match initial_effort {
+            InitialConversationEffort::InheritParent => parent_effort,
+            InitialConversationEffort::Resolved(effort) => effort,
         };
         let runtime_role = if parent_id.is_some() {
             RuntimeRole::SubAgent
@@ -3202,7 +3298,7 @@ impl Database {
             .bind(conv_state_kind(&ConvState::Idle))
             .bind(&now_str)
             .bind(model)
-            .bind(inherited_effort.map(ModelEffort::as_wire_name))
+            .bind(initial_effort.map(ModelEffort::as_wire_name))
             .bind(project_id)
             .bind(desired_base_branch)
             .bind(seed_parent_id)
@@ -3264,7 +3360,7 @@ impl Database {
             archived: false,
             model: model.map(String::from),
             project_id: project_id.map(String::from),
-            effort: inherited_effort,
+            effort: initial_effort,
             conv_mode: conv_mode.clone(),
             runtime_role,
             work_scope_id: Some(created_work_scope_id),
@@ -15120,6 +15216,96 @@ mod tests {
         .unwrap();
         let child = db.get_conversation("effort-child").await.unwrap();
         assert_eq!(child.effort, Some(ModelEffort::High));
+    }
+
+    #[tokio::test]
+    async fn sub_agent_creation_persists_resolved_effort_without_losing_parent_scope() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent = db
+            .create_conversation(
+                "resolved-effort-parent",
+                "resolved-effort-parent",
+                "/tmp",
+                true,
+                None,
+                Some("parent-model"),
+            )
+            .await
+            .unwrap();
+        db.update_conversation_model_and_effort(
+            &parent.id,
+            "parent-model",
+            Some(ModelEffort::Xhigh),
+        )
+        .await
+        .unwrap();
+        let mode = ConvMode::Explore {
+            worktree_path: None,
+            next_taskmd_id_hint: None,
+        };
+
+        db.create_sub_agent_conversation(SubAgentConversationCreation {
+            id: "default-effort-child",
+            slug: "default-effort-child",
+            cwd: "/tmp",
+            parent_id: &parent.id,
+            model: "child-model",
+            explicit_effort: None,
+            conv_mode: &mode,
+            llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+        })
+        .await
+        .unwrap();
+        db.create_sub_agent_conversation(SubAgentConversationCreation {
+            id: "explicit-effort-child",
+            slug: "explicit-effort-child",
+            cwd: "/tmp",
+            parent_id: &parent.id,
+            model: "child-model",
+            explicit_effort: Some(ModelEffort::Low),
+            conv_mode: &mode,
+            llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+        })
+        .await
+        .unwrap();
+        let default_child = db.get_conversation("default-effort-child").await.unwrap();
+        let explicit_child = db.get_conversation("explicit-effort-child").await.unwrap();
+
+        assert_eq!(default_child.effort, None);
+        assert_eq!(explicit_child.effort, Some(ModelEffort::Low));
+        assert_eq!(default_child.model.as_deref(), Some("child-model"));
+        assert_eq!(default_child.work_scope_id, parent.work_scope_id);
+        assert_eq!(explicit_child.work_scope_id, parent.work_scope_id);
+        assert_eq!(default_child.runtime_role, RuntimeRole::SubAgent);
+    }
+
+    #[tokio::test]
+    async fn sub_agent_creation_requires_an_existing_parent_scope() {
+        let db = Database::open_in_memory().await.unwrap();
+        let mode = ConvMode::Explore {
+            worktree_path: None,
+            next_taskmd_id_hint: None,
+        };
+
+        let error = db
+            .create_sub_agent_conversation(SubAgentConversationCreation {
+                id: "orphan-child",
+                slug: "orphan-child",
+                cwd: "/tmp",
+                parent_id: "missing-parent",
+                model: "child-model",
+                explicit_effort: None,
+                conv_mode: &mode,
+                llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, DbError::ConversationNotFound(id) if id == "missing-parent"));
+        assert!(matches!(
+            db.get_conversation("orphan-child").await,
+            Err(DbError::ConversationNotFound(_))
+        ));
     }
 
     #[tokio::test]

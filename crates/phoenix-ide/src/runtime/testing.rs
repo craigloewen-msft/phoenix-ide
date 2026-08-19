@@ -2734,6 +2734,7 @@ mod tests {
                 cwd: None,
                 mode: None,
                 model: None,
+                effort: None,
                 max_turns: None,
                 agent_type: None,
             })

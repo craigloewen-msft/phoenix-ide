@@ -2392,14 +2392,14 @@ impl RuntimeManager {
             }
         };
 
-        if let Some(effort) = parent_conv.effort {
+        if let Some(effort) = spec.explicit_effort {
             if !self.llm_registry.supports_effort(&spec.model_id, effort) {
                 let _ = parent_event_tx
                     .send(Event::SubAgentResult {
                         agent_id: spec.agent_id,
                         outcome: SubAgentOutcome::Failure {
                             error: format!(
-                                "Parent effort '{effort}' is not supported by sub-agent model '{}'",
+                                "Resolved effort '{effort}' is not supported by sub-agent model '{}'",
                                 spec.model_id
                             ),
                             error_kind: crate::db::ErrorKind::SubAgentError,
@@ -2442,20 +2442,16 @@ impl RuntimeManager {
         let slug = format!("sub-{}", spec.agent_id.get(..8).unwrap_or(&spec.agent_id));
         let conv = match self
             .db
-            .create_conversation_with_project(
-                &spec.agent_id,
-                &slug,
-                spec_cwd.raw(),
-                false, // user_initiated = false
-                Some(&parent_conversation_id),
-                Some(&spec.model_id), // inherit parent's model
-                None,                 // project_id
-                &sub_conv_mode,
-                None,                     // desired_base_branch
-                None, // seed_parent_id (sub-agents use `parent_conversation_id` above)
-                None, // seed_label
-                parent_conv.llm_language, // inherit language from parent
-            )
+            .create_sub_agent_conversation(crate::db::SubAgentConversationCreation {
+                id: &spec.agent_id,
+                slug: &slug,
+                cwd: spec_cwd.raw(),
+                parent_id: &parent_conversation_id,
+                model: &spec.model_id,
+                explicit_effort: spec.explicit_effort,
+                conv_mode: &sub_conv_mode,
+                llm_language: parent_conv.llm_language,
+            })
             .await
         {
             Ok(c) => c,

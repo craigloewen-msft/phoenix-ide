@@ -7,7 +7,8 @@
 use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use phoenix_agents::AgentDefinition;
-use phoenix_core::domain::sm_state::SubAgentModelChoice;
+use phoenix_core::domain::llm_types::ModelEffort;
+use phoenix_core::domain::sm_state::{SpawnAgentsInput, SubAgentModelChoice};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -142,27 +143,6 @@ impl SpawnAgentsTool {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct SpawnAgentsInput {
-    tasks: Vec<TaskSpec>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Authoritative parsing/resolution happens in the executor.
-struct TaskSpec {
-    task: String,
-    #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
-    mode: Option<String>, // "explore" or "work"
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    max_turns: Option<u32>,
-    #[serde(default)]
-    agent_type: Option<String>,
-}
-
 #[async_trait]
 impl Tool for SpawnAgentsTool {
     fn name(&self) -> &'static str {
@@ -192,12 +172,21 @@ impl Tool for SpawnAgentsTool {
                 "type": "string",
                 "description": "LLM model override. Omit or leave blank to use the mode default. When set, choose one of the model IDs available in this environment's model registry."
             },
+            "effort": {
+                "type": "string",
+                "description": "Reasoning-effort selection for this sub-agent. Omit to inherit the parent's explicit effort override. Use \"default\" to use the selected child model's native behavior, or choose an explicit supported effort level."
+            },
             "max_turns": {
                 "type": "integer",
                 "minimum": 1,
                 "description": "Maximum LLM turns before forced completion. Defaults to 20 (explore) or 50 (work)."
             }
         });
+
+        let effort_values: Vec<&str> = std::iter::once("default")
+            .chain(ModelEffort::ALL.iter().map(|effort| effort.as_wire_name()))
+            .collect();
+        task_props["effort"]["enum"] = json!(effort_values);
 
         let model_ids: Vec<&str> = self.models.iter().map(|model| model.id.as_str()).collect();
         task_props["model"]["anyOf"] = json!([
@@ -431,6 +420,22 @@ mod tests {
         );
         assert!(desc.contains("docs-writer: Writes docs"));
         assert!(desc.contains("security-reviewer: Finds vulns"));
+    }
+
+    #[test]
+    fn schema_exposes_optional_default_and_explicit_effort_choices() {
+        let schema = SpawnAgentsTool::new().input_schema();
+        let task_schema = &schema["properties"]["tasks"]["items"];
+        assert_eq!(task_schema["required"], json!(["task"]));
+        assert_eq!(
+            task_schema["properties"]["effort"]["enum"],
+            json!(["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"])
+        );
+        let description = task_schema["properties"]["effort"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(description.contains("Omit to inherit"));
+        assert!(description.contains("native behavior"));
     }
 
     #[test]

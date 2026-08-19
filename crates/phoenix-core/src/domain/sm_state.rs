@@ -7,6 +7,7 @@ use crate::domain::patch_types::PatchInput;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 
 // ============================================================================
@@ -40,6 +41,44 @@ pub struct SubAgentModelChoice {
     pub description: String,
 }
 
+/// Per-task reasoning-effort selection for `spawn_agents`.
+///
+/// This is deliberately separate from [`crate::domain::llm_types::ModelEffort`]:
+/// `ModelDefault` resets the child to model-native behavior, while
+/// `Explicit(ModelEffort::None)` is a real provider effort level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubAgentEffortSelection {
+    ModelDefault,
+    Explicit(crate::domain::llm_types::ModelEffort),
+}
+
+impl Serialize for SubAgentEffortSelection {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::ModelDefault => "default",
+            Self::Explicit(effort) => effort.as_wire_name(),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for SubAgentEffortSelection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value == "default" {
+            return Ok(Self::ModelDefault);
+        }
+        crate::domain::llm_types::ModelEffort::from_str(&value)
+            .map(Self::Explicit)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Task specification for `spawn_agents` tool
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubAgentTask {
@@ -50,6 +89,8 @@ pub struct SubAgentTask {
     pub mode: Option<SubAgentMode>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<SubAgentEffortSelection>,
     #[serde(default)]
     pub max_turns: Option<u32>,
     /// Named agent persona to spawn (see `specs/agents/`). Must match a
@@ -558,6 +599,36 @@ impl ToolInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subagent_effort_distinguishes_omitted_default_and_explicit_none() {
+        let omitted: SubAgentTask = serde_json::from_value(serde_json::json!({
+            "task": "inspect"
+        }))
+        .unwrap();
+        let model_default: SubAgentTask = serde_json::from_value(serde_json::json!({
+            "task": "inspect",
+            "effort": "default"
+        }))
+        .unwrap();
+        let explicit_none: SubAgentTask = serde_json::from_value(serde_json::json!({
+            "task": "inspect",
+            "effort": "none"
+        }))
+        .unwrap();
+
+        assert_eq!(omitted.effort, None);
+        assert_eq!(
+            model_default.effort,
+            Some(SubAgentEffortSelection::ModelDefault)
+        );
+        assert_eq!(
+            explicit_none.effort,
+            Some(SubAgentEffortSelection::Explicit(
+                crate::domain::llm_types::ModelEffort::None
+            ))
+        );
+    }
 
     #[test]
     fn legacy_bash_tool_input_deserializes_as_modern_run() {
@@ -2297,6 +2368,9 @@ pub struct SubAgentSpec {
     pub mode: SubAgentMode,
     /// Resolved model ID for this sub-agent
     pub model_id: String,
+    /// Resolved explicit effort override. `None` means the selected model's
+    /// native behavior; parent inheritance has already been resolved.
+    pub explicit_effort: Option<crate::domain::llm_types::ModelEffort>,
     /// Maximum LLM turns before forced completion
     pub max_turns: u32,
     /// Named agent that produced this spec, if any (see `specs/agents/`).

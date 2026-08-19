@@ -189,7 +189,18 @@ AND SHALL NOT copy the parent's resolved model-native reasoning-effort value as 
 WHEN the parent conversation is using only model-native default behavior
 THE child conversation SHALL resolve its own model-native default from its selected model independently
 
-**Rationale:** A native default belongs to the selected model, not to the parent conversation. Copying the resolved native value into a child would freeze a provider-specific default across model boundaries and make non-overrides look user-explicit.
+WHEN a subagent task omits its effort selection
+THE SYSTEM SHALL copy the parent's explicit reasoning-effort override when one exists
+
+WHEN a subagent task selects `"default"`
+THE SYSTEM SHALL not copy the parent's explicit override
+AND SHALL resolve the child model's native behavior independently
+
+WHEN a subagent task selects an explicit reasoning-effort level
+THE SYSTEM SHALL use that level instead of the parent's override
+AND SHALL reject the spawn before any child starts when the child model cannot represent it
+
+**Rationale:** A native default belongs to the selected model, not to the parent conversation. Copying the resolved native value into a child would freeze a provider-specific default across model boundaries and make non-overrides look user-explicit. An explicit `"default"` child selection is distinct from omission so existing inheritance remains stable while heterogeneous child models can deliberately decline an incompatible parent override.
 
 ---
 

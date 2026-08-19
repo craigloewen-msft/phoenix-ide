@@ -544,6 +544,7 @@ SubAgentTaskSpec {
   cwd: Option<String>,       // optional — working directory override
   mode: SubAgentMode,        // optional — defaults based on parent mode (see below)
   model: Option<String>,     // optional — LLM model override (e.g., "haiku", "sonnet")
+  effort: Option<String>,    // optional — inherited, "default", or explicit effort level
   max_turns: Option<u32>,    // optional — maximum LLM turns before forced completion
 }
 
@@ -598,6 +599,12 @@ Each mode has a default model. The parent can override per-task.
 The optional `model` field on `SubAgentTaskSpec` overrides the default. Valid
 values are model IDs known to the LLM registry (e.g., `"claude-sonnet-4-6"`,
 `"claude-haiku-4-5"`). Invalid model IDs produce a tool error at spawn time.
+
+The optional `effort` field controls the child's explicit reasoning-effort
+selection. Omission inherits the parent's explicit override, `"default"` uses
+the child model's native behavior, and an explicit level replaces the inherited
+override. Every resolved model/effort pair is validated before any child in the
+batch starts.
 
 #### One-Writer Constraint
 

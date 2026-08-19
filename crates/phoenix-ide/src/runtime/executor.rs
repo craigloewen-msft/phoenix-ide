@@ -3718,7 +3718,9 @@ where
         &mut self,
         tool: ToolCall,
     ) -> Result<Option<Event>, String> {
-        use crate::state_machine::state::{PendingSubAgent, SpawnAgentsInput, SubAgentSpec};
+        use crate::state_machine::state::{
+            PendingSubAgent, SpawnAgentsInput, SubAgentEffortSelection, SubAgentSpec,
+        };
 
         let tool_use_id = tool.id.clone();
         let input_value = tool.input.to_value();
@@ -3943,6 +3945,12 @@ where
                 }));
             }
 
+            let resolved_effort = match task.effort {
+                None => self.context.effort,
+                Some(SubAgentEffortSelection::ModelDefault) => None,
+                Some(SubAgentEffortSelection::Explicit(effort)) => Some(effort),
+            };
+
             // Resolve model: task field > agent default > mode default
             // (REQ-AG-005, REQ-PROJ-008). An explicit model from either the
             // task or the agent definition must exist in the registry.
@@ -3982,7 +3990,7 @@ where
                         let cheap_model = self
                             .llm_registry
                             .cheap_model_id_for_provider(&self.context.model_id);
-                        match self.context.effort {
+                        match resolved_effort {
                             Some(effort)
                                 if !self.llm_registry.supports_effort(&cheap_model, effort) =>
                             {
@@ -3996,6 +4004,21 @@ where
             };
 
             // Resolve max turns (REQ-PROJ-008)
+            if let Some(effort) = resolved_effort {
+                if !self.llm_registry.supports_effort(&resolved_model, effort) {
+                    let result = ToolResult::error(
+                        tool_use_id.clone(),
+                        format!(
+                            "Effort '{effort}' is not supported by sub-agent model '{resolved_model}'. Use effort: \"default\" to use that model's native behavior, or choose a compatible effort."
+                        ),
+                    );
+                    return Ok(Some(Event::ToolComplete {
+                        tool_use_id,
+                        result,
+                    }));
+                }
+            }
+
             let max_turns = task.max_turns.unwrap_or(match mode {
                 SubAgentMode::Explore => 20,
                 SubAgentMode::Work => 50,
@@ -4004,6 +4027,11 @@ where
             tracing::debug!(
                 mode = ?mode,
                 model_source = if explicit_model.is_some() { "override" } else { "default" },
+                effort_source = match task.effort {
+                    None => "parent",
+                    Some(SubAgentEffortSelection::ModelDefault) => "model_default",
+                    Some(SubAgentEffortSelection::Explicit(_)) => "override",
+                },
                 cwd_source = if cwd_override.is_some() { "override" } else { "parent" },
                 "resolved sub-agent spawn defaults"
             );
@@ -4015,6 +4043,7 @@ where
                 timeout: DEFAULT_SUBAGENT_TIMEOUT,
                 mode,
                 model_id: resolved_model,
+                explicit_effort: resolved_effort,
                 max_turns,
                 agent_name: agent.map(|a| a.name.clone()),
                 persona: agent.map(|a| a.body.clone()),
@@ -12875,11 +12904,14 @@ mod work_subagent_cwd_guard_tests {
     use super::*;
     use crate::db::ToolOutcome;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
-    use crate::state_machine::state::{SpawnAgentsInput, SubAgentMode, SubAgentTask, ToolInput};
+    use crate::state_machine::state::{
+        SpawnAgentsInput, SubAgentEffortSelection, SubAgentMode, SubAgentTask, ToolInput,
+    };
     use crate::state_machine::ConvContext;
     use crate::system_prompt::ModeContext;
     use crate::tools::BrowserSessionManager;
-    use phoenix_llm::ModelRegistry;
+    use phoenix_core::domain::llm_types::{EffectiveEffort, ModelEffort};
+    use phoenix_llm::{LlmConfig, ModelRegistry};
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
@@ -12916,6 +12948,48 @@ mod work_subagent_cwd_guard_tests {
             event_rx,
             event_tx_dup,
             broadcaster,
+        )
+    }
+
+    fn runtime_with_anthropic_effort(
+        working_dir: &std::path::Path,
+    ) -> ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
+        let registry = Arc::new(ModelRegistry::new(&LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            ..LlmConfig::default()
+        }));
+        let model_ids = registry
+            .subagent_model_catalog()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        let mut context = ConvContext::new(
+            "effort-parent",
+            working_dir.to_path_buf(),
+            "claude-sonnet-5",
+            1_000_000,
+        );
+        context.mode_context = Some(ModeContext::Direct);
+        context.mode = crate::state_machine::state::ModeKind::Direct;
+        context.effort = Some(ModelEffort::Xhigh);
+        context.effective_effort = EffectiveEffort::explicit(ModelEffort::Xhigh);
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+
+        ConversationRuntime::new(
+            context,
+            ConvState::Idle,
+            Arc::new(InMemoryStorage::new()),
+            Arc::new(MockLlmClient::new("claude-sonnet-5")),
+            Arc::new(MockToolExecutor::new().with_subagent_models(model_ids)),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            registry,
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            SseBroadcaster::new(128, 0),
         )
     }
 
@@ -12963,6 +13037,7 @@ mod work_subagent_cwd_guard_tests {
                     cwd: Some("/".to_string()),
                     mode: Some(SubAgentMode::Explore),
                     model: None,
+                    effort: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -12995,6 +13070,7 @@ mod work_subagent_cwd_guard_tests {
                     cwd: None,
                     mode: Some(SubAgentMode::Explore),
                     model: None,
+                    effort: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -13027,6 +13103,7 @@ mod work_subagent_cwd_guard_tests {
                     cwd: Some(deep.to_string_lossy().to_string()),
                     mode: Some(SubAgentMode::Explore),
                     model: None,
+                    effort: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -13064,6 +13141,7 @@ mod work_subagent_cwd_guard_tests {
                     cwd: Some(outside.path().to_string_lossy().to_string()),
                     mode: Some(SubAgentMode::Work),
                     model: None,
+                    effort: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -13102,6 +13180,7 @@ mod work_subagent_cwd_guard_tests {
                     cwd: None,
                     mode: Some(SubAgentMode::Work),
                     model: None,
+                    effort: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -13130,6 +13209,136 @@ mod work_subagent_cwd_guard_tests {
         assert_eq!(rt.active_work_subagents, 1);
     }
 
+    #[tokio::test]
+    async fn model_default_effort_keeps_explicit_model_that_cannot_support_parent_override() {
+        let parent = TempDir::new().expect("parent tempdir");
+        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let mut rt =
+            runtime_with_anthropic_effort(parent.path()).with_spawn_channels(spawn_tx, cancel_tx);
+
+        let event = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "inspect cheaply".to_string(),
+                    cwd: None,
+                    mode: Some(SubAgentMode::Explore),
+                    model: Some("claude-haiku-4-5".to_string()),
+                    effort: Some(SubAgentEffortSelection::ModelDefault),
+                    max_turns: None,
+                    agent_type: None,
+                }],
+            }))
+            .await
+            .unwrap();
+
+        assert!(matches!(event, Some(Event::SpawnAgentsComplete { .. })));
+        let request = spawn_rx.try_recv().expect("spawn request");
+        assert_eq!(request.spec.model_id, "claude-haiku-4-5");
+        assert_eq!(request.spec.explicit_effort, None);
+    }
+
+    #[tokio::test]
+    async fn explicit_child_effort_replaces_parent_override() {
+        let parent = TempDir::new().expect("parent tempdir");
+        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let mut rt =
+            runtime_with_anthropic_effort(parent.path()).with_spawn_channels(spawn_tx, cancel_tx);
+
+        let event = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "review".to_string(),
+                    cwd: None,
+                    mode: Some(SubAgentMode::Explore),
+                    model: Some("claude-sonnet-4-6".to_string()),
+                    effort: Some(SubAgentEffortSelection::Explicit(ModelEffort::Low)),
+                    max_turns: None,
+                    agent_type: None,
+                }],
+            }))
+            .await
+            .unwrap();
+
+        assert!(matches!(event, Some(Event::SpawnAgentsComplete { .. })));
+        let request = spawn_rx.try_recv().expect("spawn request");
+        assert_eq!(request.spec.model_id, "claude-sonnet-4-6");
+        assert_eq!(request.spec.explicit_effort, Some(ModelEffort::Low));
+    }
+
+    #[tokio::test]
+    async fn omitted_incompatible_effort_rejects_entire_batch_before_fanout() {
+        let parent = TempDir::new().expect("parent tempdir");
+        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(2);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let mut rt =
+            runtime_with_anthropic_effort(parent.path()).with_spawn_channels(spawn_tx, cancel_tx);
+
+        let event = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![
+                    SubAgentTask {
+                        task: "valid first task".to_string(),
+                        cwd: None,
+                        mode: Some(SubAgentMode::Explore),
+                        model: Some("claude-haiku-4-5".to_string()),
+                        effort: Some(SubAgentEffortSelection::ModelDefault),
+                        max_turns: None,
+                        agent_type: None,
+                    },
+                    SubAgentTask {
+                        task: "invalid later task".to_string(),
+                        cwd: None,
+                        mode: Some(SubAgentMode::Explore),
+                        model: Some("claude-haiku-4-5".to_string()),
+                        effort: None,
+                        max_turns: None,
+                        agent_type: None,
+                    },
+                ],
+            }))
+            .await
+            .unwrap();
+
+        let Some(Event::ToolComplete { result, .. }) = event else {
+            panic!("expected effort compatibility error");
+        };
+        let message = tool_result_text(&result);
+        assert!(message.contains("Effort 'xhigh' is not supported"));
+        assert!(message.contains("effort: \"default\""));
+        assert!(spawn_rx.try_recv().is_err(), "no task may start");
+    }
+
+    #[tokio::test]
+    async fn omitted_effort_preserves_parent_override_and_default_model_fallback() {
+        let parent = TempDir::new().expect("parent tempdir");
+        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let mut rt =
+            runtime_with_anthropic_effort(parent.path()).with_spawn_channels(spawn_tx, cancel_tx);
+
+        let event = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "inspect".to_string(),
+                    cwd: None,
+                    mode: Some(SubAgentMode::Explore),
+                    model: None,
+                    effort: None,
+                    max_turns: None,
+                    agent_type: None,
+                }],
+            }))
+            .await
+            .unwrap();
+
+        assert!(matches!(event, Some(Event::SpawnAgentsComplete { .. })));
+        let request = spawn_rx.try_recv().expect("spawn request");
+        assert_eq!(request.spec.model_id, "claude-sonnet-5");
+        assert_eq!(request.spec.explicit_effort, Some(ModelEffort::Xhigh));
+    }
+
     /// An `agent_type` that matches no discovered agent is rejected before any
     /// sub-agent is spawned (REQ-AG-007). The empty worktree has no
     /// `.claude/agents/`, so discovery returns nothing and the lookup fails.
@@ -13145,6 +13354,7 @@ mod work_subagent_cwd_guard_tests {
                     cwd: None,
                     mode: None,
                     model: None,
+                    effort: None,
                     max_turns: None,
                     agent_type: Some("ghost".to_string()),
                 }],
@@ -13190,6 +13400,7 @@ mod work_subagent_cwd_guard_tests {
                         cwd: None,
                         mode: Some(SubAgentMode::Explore),
                         model: None,
+                        effort: None,
                         max_turns: None,
                         agent_type: None,
                     },
@@ -13198,6 +13409,7 @@ mod work_subagent_cwd_guard_tests {
                         cwd: None,
                         mode: Some(SubAgentMode::Explore),
                         model: Some("ghost-model".to_string()),
+                        effort: None,
                         max_turns: None,
                         agent_type: None,
                     },
@@ -13236,6 +13448,7 @@ mod work_subagent_cwd_guard_tests {
                     cwd: None,
                     mode: Some(SubAgentMode::Explore),
                     model: Some("test-model".to_string()),
+                    effort: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -13269,6 +13482,7 @@ mod work_subagent_cwd_guard_tests {
                     cwd: Some("  ".to_string()),
                     mode: Some(SubAgentMode::Explore),
                     model: Some(String::new()),
+                    effort: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -13300,6 +13514,7 @@ mod work_subagent_cwd_guard_tests {
                     cwd: Some("nested".to_string()),
                     mode: Some(SubAgentMode::Explore),
                     model: None,
+                    effort: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -13343,6 +13558,7 @@ mod work_subagent_cwd_guard_tests {
                     cwd: None,
                     mode: Some(SubAgentMode::Explore),
                     model: None,
+                    effort: None,
                     max_turns: None,
                     agent_type: Some("reviewer".to_string()),
                 }],
@@ -13385,6 +13601,7 @@ mod work_subagent_cwd_guard_tests {
                     cwd: Some(nested.to_string_lossy().to_string()),
                     mode: Some(SubAgentMode::Work),
                     model: None,
+                    effort: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -13428,6 +13645,7 @@ mod work_subagent_cwd_guard_tests {
                     cwd: Some(symlink.to_string_lossy().to_string()),
                     mode: Some(SubAgentMode::Work),
                     model: None,
+                    effort: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -13544,6 +13762,7 @@ mod work_subagent_cwd_guard_tests {
                     cwd: Some(traversing),
                     mode: Some(SubAgentMode::Work),
                     model: None,
+                    effort: None,
                     max_turns: None,
                     agent_type: None,
                 }],
